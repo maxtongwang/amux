@@ -13,6 +13,7 @@ pub mod scratchpad;
 pub mod prompt_block;
 pub mod land_queue;
 pub mod worker_identity;
+pub mod rename_identity;
 pub mod contract_fresh;
 pub mod prod_change;
 pub mod runner;
@@ -540,6 +541,9 @@ pub fn router_with_connector_transport(
         // worker's minted token. Inside require_bearer, so it sees only
         // admitted requests.
         .layer(axum::middleware::from_fn(worker_identity::enforce))
+        // A renamed worker's process still claims its old name; resolve it to
+        // the current one before the token check and every handler read it.
+        .layer(axum::middleware::from_fn(rename_identity::resolve_headers))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,
