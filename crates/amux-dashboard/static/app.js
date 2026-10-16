@@ -39243,8 +39243,8 @@ async function _focusAnswer() {
     + 'placeholder="Your reply — sent to the owning worker and recorded on the card"></textarea>', 'Send');
   const ans = (document.getElementById('focus-ans') || {}).value || '';
   if (!ok || !ans.trim()) return;
-  if (sess) { try { await _focusSend(sess, '[Ethan, re ' + item.id + '] ' + ans); } catch(e) {} }
-  await _focusPatch(item.id, { desc_append: '`answered` Ethan: ' + ans });
+  if (sess) { try { await _focusSend(sess, '[Owner, re ' + item.id + '] ' + ans); } catch(e) {} }
+  await _focusPatch(item.id, { desc_append: '`answered` owner: ' + ans });
   await _focusResolveTag(item);
   showToast('Answered ' + item.id);
   _focusRebuild(); if (_focusIdx >= _focusList.length) _focusIdx = _focusList.length - 1;
@@ -39252,8 +39252,8 @@ async function _focusAnswer() {
 }
 async function _focusDecide(verdict) {
   const item = _focusList[_focusIdx]; if (!item) return;
-  await _focusPatch(item.id, { desc_append: '`decision` Ethan ' + verdict.toUpperCase() + ' ' + new Date().toISOString().slice(0,10) });
-  if (item.session) { try { await _focusSend(item.session, '[Ethan decision on ' + item.id + '] ' + verdict.toUpperCase() + ' — proceed accordingly.'); } catch(e) {} }
+  await _focusPatch(item.id, { desc_append: '`decision` owner ' + verdict.toUpperCase() + ' ' + new Date().toISOString().slice(0,10) });
+  if (item.session) { try { await _focusSend(item.session, '[Owner decision on ' + item.id + '] ' + verdict.toUpperCase() + ' — proceed accordingly.'); } catch(e) {} }
   await _focusResolveTag(item);
   showToast(item.id + ' ' + verdict);
   _focusRebuild(); if (_focusIdx >= _focusList.length) _focusIdx = _focusList.length - 1;
@@ -39263,7 +39263,7 @@ async function _focusNudge() {
   const item = _focusList[_focusIdx]; if (!item) return;
   if (item.session) { await _focusSend(item.session,
     '[amux] Please advance ' + item.id + ' (' + (item.title||'').slice(0,60) + '): work it now, or post a status-update / mark its blocker. It is showing as blocked.'); }
-  await _focusPatch(item.id, { desc_append: '`nudge` Ethan asked ' + (item.session||'?') + ' to advance this' });
+  await _focusPatch(item.id, { desc_append: '`nudge` owner asked ' + (item.session||'?') + ' to advance this' });
   showToast('Nudged ' + (item.session||'') + ' on ' + item.id);
   _focusRebuild(); if (_focusIdx >= _focusList.length) _focusIdx = _focusList.length - 1;
   _focusNext();

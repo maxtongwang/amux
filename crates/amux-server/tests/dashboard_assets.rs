@@ -2386,3 +2386,19 @@ fn every_notification_emitter_goes_through_the_shared_gate() {
     let feedback = asset("state/feedback.mjs");
     assert!(feedback.contains("amuxNotifyAllowed?.('toast')"), "the press layer's success toast must ask the gate");
 }
+
+/// The dashboard files a needs-input send-back as Harness text by matching its
+/// opening words. The server owns that wording (needs_input_auto::send_back_text)
+/// and the client copies it into a regex, so a reword on one side alone would turn
+/// every send-back into "Unclassified". Pin both sides to the same phrase.
+#[test]
+fn the_dashboard_classifies_the_servers_send_back_wording() {
+    let phrase = "This is yours to do; the owner's needs-input policy returns";
+    let text = amux_server::api::needs_input_auto::send_back_text("MM-1", "Can you mint a key?");
+    assert!(text.contains(phrase), "the server's send-back changed wording: {text}");
+    let app = asset("app.js");
+    assert!(
+        app.contains("/This is yours to do; (?:Ethan's|the owner's) needs-input policy returns/"),
+        "app.js no longer matches the server's send-back wording ({phrase})"
+    );
+}

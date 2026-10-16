@@ -3,7 +3,7 @@
 Rung 3 of the access ladder (AMUX-5300). Try these in order:
 
 1. **amux browser**: `/api/browser/*` on an amux Chrome profile.
-2. **CDP into Ethan's real Chrome**: the `chrome-cdp` skill.
+2. **CDP into the owner's real Chrome**: the `chrome-cdp` skill.
 3. **amux computer**: a disposable Linux desktop driven by screenshots, clicks and keystrokes. Use it only when rungs 1 and 2 cannot reach the thing.
 
 `amux help computer` prints the verbs plus the live context: limits, and which saved profile holds cookies for which sites (a cookie is not proof of a login; the screenshot is).

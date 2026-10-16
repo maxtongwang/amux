@@ -234,7 +234,7 @@ export async function syncSite(CDPClass, cdp, sessionId, { profile: explicit = '
   const reg = api('POST', '/api/browser/save-profile', {
     name: profile,
     host: cap.site,
-    label: had?.label ? '' : `Logins for ${cap.site}, saved from Ethan's Chrome over CDP on ${new Date().toISOString().slice(0, 10)}.`,
+    label: had?.label ? '' : `Logins for ${cap.site}, saved from the owner's Chrome over CDP on ${new Date().toISOString().slice(0, 10)}.`,
   });
   const out = {
     profile, site: cap.site, appended_to_existing: !!had, reason, ...res,
