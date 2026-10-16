@@ -140,6 +140,17 @@ if [[ -z "${AMUX_SESSION:-}" ]]; then
   unset _mr43_tname
 fi
 
+# Both stale-name corrections below are recorded once per variable and old name in
+# cli-transport.jsonl, which the next reachable call ships to the server log, so a log
+# sweep can count renamed workers still running under their launch name.
+_log_identity_healed() {
+  local var="$1" from="$2" to="$3" mark="$CC_HOME/state/identity-healed.$1.$2"
+  [ -e "$mark" ] && return 0
+  mkdir -p "$CC_HOME/state" 2>/dev/null && : > "$mark" 2>/dev/null
+  printf '{"ts":%s,"event":"stale_env_identity_healed","var":"%s","from":"%s","to":"%s","session":"%s","cli":"bash"}\n' \
+    "$(date -u +%s)" "$var" "$from" "$to" "$to" >> "$CC_HOME/cli-transport.jsonl" 2>/dev/null || true
+}
+
 # AMUX-4033: a STALE $AMUX_SESSION, which the empty check above cannot see.
 #
 # Renaming a running worker moves its env file and renames its tmux session,
@@ -162,6 +173,27 @@ if [[ -n "${AMUX_SESSION:-}" && ! -f "$CC_HOME/sessions/$AMUX_SESSION.env" ]]; t
     if [[ "$_stale_true" != "$AMUX_SESSION" && -f "$CC_HOME/sessions/$_stale_true.env" ]]; then
       export AMUX_SESSION_STALE="$AMUX_SESSION"
       export AMUX_SESSION="$_stale_true"
+      _log_identity_healed AMUX_SESSION "$AMUX_SESSION_STALE" "$_stale_true"
+    fi
+  fi
+  unset _stale_tname _stale_true
+fi
+
+# The same stale name in $AMUX_WORKER (2026-10-16). Spawn injects AMUX_WORKER beside
+# AMUX_SESSION, and every attribution header reads ${AMUX_WORKER:-${AMUX_SESSION:-}},
+# so correcting AMUX_SESSION alone left X-Amux-Worker on the old name: a worker renamed
+# dot-agent -> tmux-window-naming kept sending as `dot-agent`, a name in no group, and
+# `amux send dev-lead` was refused at the group boundary although both are in `dev`.
+# Same narrow test as above: the claimed name has NO session file and the caller's
+# own pane names one that does.
+if [[ -n "${AMUX_WORKER:-}" && ! -f "$CC_HOME/sessions/$AMUX_WORKER.env" ]]; then
+  _stale_tname="$(_own_pane_session)"
+  if [[ "$_stale_tname" == amux-* ]]; then
+    _stale_true="${_stale_tname#amux-}"
+    if [[ "$_stale_true" != "$AMUX_WORKER" && -f "$CC_HOME/sessions/$_stale_true.env" ]]; then
+      export AMUX_WORKER_STALE="$AMUX_WORKER"
+      export AMUX_WORKER="$_stale_true"
+      _log_identity_healed AMUX_WORKER "$AMUX_WORKER_STALE" "$_stale_true"
     fi
   fi
   unset _stale_tname _stale_true
