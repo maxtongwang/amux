@@ -2845,6 +2845,10 @@ pub(crate) async fn dispatch_pending_callbacks(
         let Some(target) = row.callback_session.clone() else {
             continue;
         };
+        // A requester renamed after the card was armed answers to its current
+        // name; a live worker holding the stored name keeps it.
+        let target = super::rename_identity::current_name(&super::session_verbs::home(), &target)
+            .unwrap_or(target);
         let sender = row.session.clone().unwrap_or_else(|| "board".into());
         // Derive the return address from the durable dependency graph, never
         // from remembered prose. A callback must resume the requester's task,

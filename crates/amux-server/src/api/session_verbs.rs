@@ -32330,6 +32330,68 @@ fn move_if(old: &Path, new: &Path, label: &str, steps: &mut Vec<String>) -> Resu
     Ok(())
 }
 
+/// Point the moved env file's `CC_NAME` at the new name, skip-if-done.
+///
+/// The env file moved but kept `CC_NAME="<old>"`, so a relaunch read the old
+/// name from it. Rewritten atomically (temp file + rename in the same
+/// directory) with the original file mode; every other line is kept verbatim.
+fn rewrite_cc_name(env: &Path, new_name: &str, steps: &mut Vec<String>) -> Result<(), String> {
+    let text = match std::fs::read_to_string(env) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            steps.push("cc-name: no env file".into());
+            return Ok(());
+        }
+        Err(e) => return Err(format!("cc-name: read failed: {e}")),
+    };
+    let want = format!("CC_NAME=\"{new_name}\"");
+    let mut found = false;
+    let mut changed = false;
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| {
+            let Some(value) = line.trim_start().strip_prefix("CC_NAME=") else {
+                return line.to_string();
+            };
+            found = true;
+            if value.trim().trim_matches(|c| c == '"' || c == '\'') == new_name {
+                return line.to_string();
+            }
+            changed = true;
+            want.clone()
+        })
+        .collect();
+    if !found {
+        steps.push("cc-name: no CC_NAME line".into());
+        return Ok(());
+    }
+    if !changed {
+        steps.push("cc-name: already current".into());
+        return Ok(());
+    }
+    let mut body = lines.join("\n");
+    if text.ends_with('\n') {
+        body.push('\n');
+    }
+    let mode = std::fs::metadata(env)
+        .map_err(|e| format!("cc-name: stat failed: {e}"))?
+        .permissions();
+    let tmp = env.with_file_name(format!(
+        ".{}.{}.rename.tmp",
+        env.file_name().and_then(|n| n.to_str()).unwrap_or("env"),
+        std::process::id()
+    ));
+    let wrote = std::fs::write(&tmp, body)
+        .and_then(|_| std::fs::set_permissions(&tmp, mode))
+        .and_then(|_| std::fs::rename(&tmp, env));
+    if let Err(e) = wrote {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cc-name: rewrite failed: {e}"));
+    }
+    steps.push("cc-name: rewritten".into());
+    Ok(())
+}
+
 async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response {
     let new_name = sanitize_session_name(raw_new);
     if new_name.is_empty() {
@@ -32415,6 +32477,31 @@ async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response
     // 2-6. Registry + per-session files, each convergent.
     if let Err(e) = move_if(&old_env, &new_env, "env", &mut steps) {
         return fail(&steps, e);
+    }
+    if let Err(e) = rewrite_cc_name(&new_env, &new_name, &mut steps) {
+        return fail(&steps, e);
+    }
+    // The rule-10 token hashes are keyed by name. The running process keeps
+    // its token, and its old-name header now resolves to the new name
+    // (rename_identity), so the hashes must be found under the new name.
+    {
+        let h = home();
+        for (old_p, new_p, label) in [
+            (
+                super::worker_identity::hash_path(&h, name),
+                super::worker_identity::hash_path(&h, &new_name),
+                "worker-token",
+            ),
+            (
+                super::worker_identity::runs_dir(&h, name),
+                super::worker_identity::runs_dir(&h, &new_name),
+                "worker-run-tokens",
+            ),
+        ] {
+            if let Err(e) = move_if(&old_p, &new_p, label, &mut steps) {
+                return fail(&steps, e);
+            }
+        }
     }
     if let Err(e) = move_if(&mem_file(name), &mem_file(&new_name), "memory", &mut steps) {
         return fail(&steps, e);
@@ -32565,10 +32652,39 @@ async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response
     );
     // 9. Re-export AMUX_SESSION for future panes (py:76416) — best-effort;
     //    the RUNNING shell keeps its env until restart, same as Python.
-    if is_running(&new_name).await {
+    let running = is_running(&new_name).await;
+    if running {
         let stq = st(&new_name);
-        let _ = tmux(&["setenv", "-t", &stq, "AMUX_SESSION", &new_name]).await;
-        steps.push("tmux-env: AMUX_SESSION re-exported for future panes".into());
+        for key in ["AMUX_SESSION", "AMUX_WORKER", "AMUX_STATUS_WORKER"] {
+            let _ = tmux(&["setenv", "-t", &stq, key, &new_name]).await;
+        }
+        steps.push("tmux-env: AMUX_SESSION/AMUX_WORKER/AMUX_STATUS_WORKER re-exported for future panes".into());
+    }
+    // 10. The rename record: the running process still claims the old name,
+    //     and rename_identity resolves that claim to this one. A failure here
+    //     does not undo the rename; it is reported and logged, because without
+    //     the record the worker's sends are attributed to a dead name.
+    match super::rename_identity::record(&home(), name, &new_name) {
+        Ok(()) => steps.push("rename-record: written".into()),
+        Err(e) => {
+            tracing::warn!(old = name, new = %new_name, error = %e, verdict = "rename_record_failed",
+                measured = true, n_considered = 1,
+                "rename record not written; the renamed worker's old-name requests will not resolve");
+            steps.push(format!("rename-record: FAILED ({e})"));
+        }
+    }
+    // 11. Tell the running worker its new name. Its environment still says the
+    //     old one; requests resolve either way, but its own prose should not.
+    //     Automation, so an isolated worker refuses it (reported, not forced).
+    if running {
+        let notice = format!(
+            "[amux] This worker was renamed from {name} to {new_name}. Your environment still says {name}; \
+             amux attributes it to {new_name}. Use {new_name} when naming yourself."
+        );
+        match steer_enqueue(state, &new_name, &notice, "rename-notice", "").await {
+            Ok(_) => steps.push("rename-notice: queued".into()),
+            Err(why) => steps.push(format!("rename-notice: not queued ({why})")),
+        }
     }
     emit_event(
         state,
@@ -45578,6 +45694,155 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         let (st, _) = call(&app, "PUT", "/api/sessions/sib/config", Some(json!({}))).await;
         assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED);
     }
+    /// A renamed worker's running process still claims its old name in the
+    /// worker headers (2026-10-16: `amux-setup-complete`, renamed from
+    /// `claude-0b`, was refused as `claude-0b [{}] -> dev-lead [{"dev"}]`).
+    /// Through the real resolver layer, its old-name send and card land on the
+    /// new name, a chain resolves, and a new worker reusing the old name keeps
+    /// its own identity.
+    #[tokio::test]
+    async fn a_renamed_workers_old_name_resolves_to_its_current_name() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _dir) = state();
+        std::fs::write(
+            env_path("rid-src"),
+            "# updated: x\nCC_NAME=\"rid-src\"\nCC_TAGS=dev\nCC_AUTO_START=0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(env_path("rid-src"), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        std::fs::write(env_path("rid-peer"), "CC_TAGS=dev\nCC_AUTO_START=0\n").unwrap();
+        std::fs::create_dir_all(home.path().join("worker-tokens")).unwrap();
+        std::fs::write(home.path().join("worker-tokens/rid-src.sha256"), "digest").unwrap();
+        let app: Router = Router::new()
+            .nest("/api/board", crate::api::board::routes())
+            .merge(routes())
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn(
+                crate::api::rename_identity::resolve_headers,
+            ));
+
+        let (st, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/rid-src/config",
+            Some(json!({"rename": "rid-dst"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let steps = v["steps"].to_string();
+        assert!(steps.contains("cc-name: rewritten"), "{steps}");
+        assert!(steps.contains("rename-record: written"), "{steps}");
+        assert!(steps.contains("worker-token: moved"), "{steps}");
+        let env = std::fs::read_to_string(env_path("rid-dst")).unwrap();
+        assert!(env.contains("CC_NAME=\"rid-dst\"\n"), "{env}");
+        assert!(!env.contains("rid-src"), "{env}");
+        assert!(env.contains("CC_TAGS=dev\n") && env.starts_with("# updated: x\n"), "{env}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(env_path("rid-dst")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the rewrite keeps the env file's mode");
+        }
+        assert!(home.path().join("worker-tokens/rid-dst.sha256").exists());
+
+        // The old name's send to a same-group peer is accepted and attributed
+        // to the new name.
+        let (st, v) = call_with(
+            &app,
+            "POST",
+            "/api/sessions/rid-peer/send",
+            Some(json!({"text": "hello from a renamed worker"})),
+            &[("x-amux-worker", "rid-src")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let sender: String = state
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT sender FROM steering_queue WHERE session='rid-peer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sender, "rid-dst");
+
+        // A card with a callback, created under the old name, belongs to and
+        // returns to the new name.
+        let (st, v) = call_with(
+            &app,
+            "POST",
+            "/api/board",
+            Some(json!({"title": "renamed requester card", "callback": true})),
+            &[("x-amux-session", "rid-src")],
+        )
+        .await;
+        assert!(st.is_success(), "{st} {v}");
+        let (owner, callback): (String, String) = state
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT session, callback_session FROM issues WHERE title='renamed requester card'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((owner.as_str(), callback.as_str()), ("rid-dst", "rid-dst"));
+
+        // A chain: rid-src -> rid-dst -> rid-third.
+        let (st, v) = call(
+            &app,
+            "PATCH",
+            "/api/sessions/rid-dst/config",
+            Some(json!({"rename": "rid-third"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, v) = call_with(
+            &app,
+            "POST",
+            "/api/sessions/rid-peer/send",
+            Some(json!({"text": "second hop"})),
+            &[("x-amux-worker", "rid-src")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let senders: Vec<String> = {
+            let conn = state.store.read().unwrap();
+            let mut q = conn
+                .prepare("SELECT sender FROM steering_queue WHERE session='rid-peer' ORDER BY rowid")
+                .unwrap();
+            let rows = q.query_map([], |r| r.get(0)).unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        assert_eq!(senders, vec!["rid-dst".to_string(), "rid-third".to_string()]);
+
+        // A new worker created under the old name is not redirected: it is
+        // outside the peer's group, so its send is refused as itself.
+        std::fs::write(env_path("rid-src"), "CC_TAGS=other\nCC_AUTO_START=0\n").unwrap();
+        let (st, v) = call_with(
+            &app,
+            "POST",
+            "/api/sessions/rid-peer/send",
+            Some(json!({"text": "not the renamed worker"})),
+            &[("x-amux-worker", "rid-src")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], json!("worker_group_boundary"), "{v}");
+        assert!(v["error"].as_str().unwrap().contains("rid-src"), "{v}");
+    }
+
     /// The owner-addendum rename matrix: noop, happy-path cascade with
     /// attached rows, retry-after-partial convergence, target collision.
     #[tokio::test]
@@ -45590,6 +45855,13 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             .with_writer(CapturedLogs(captured_logs.clone()))
             .finish();
         let _subscriber = tracing::subscriber::set_default(subscriber);
+        // tracing-core's single-dispatch fast path registers a callsite against
+        // the registering thread's default only. A concurrent test that calls
+        // rename_session first (on a thread with no subscriber) would cache
+        // Never for the marker below. A second live dispatch forces
+        // registration to consult every collector (same fix as
+        // runtime_jobs::message_capture's `_registration_peer`).
+        let _registration_peer = tracing::Dispatch::new(tracing_subscriber::registry());
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join("sessions")).unwrap();
         let _home = crate::api::settings::test_env::set_home(home.path());
