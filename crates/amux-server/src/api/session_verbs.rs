@@ -24906,7 +24906,7 @@ async fn debug_needsyou_digest(State(state): State<AppState>, RawQuery(q): RawQu
                      less than `n_considered` when `truncated` is true -- that is the cap \
                      working, not the count being wrong (autofix.rs: a prior digest emitted 92 \
                      cards in one SMS). No delivery channel is wired to this endpoint; which one \
-                     to use is Ethan's call, still open on AF-510.",
+                     to use is the owner's call, still open on AF-510.",
         }),
         total,
     ))

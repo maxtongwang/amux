@@ -998,9 +998,9 @@ async fn send_or_paused(acts: &dyn Actions, state: &AppState, worker: &str, text
 pub fn send_back_text(card: &str, q: &str) -> String {
     let r = if card.is_empty() { String::new() } else { format!(" ({card})") };
     format!(
-        "Sent back{r}: \"{q}\". This is yours to do; Ethan's needs-input policy returns key, sign-in, grant \
+        "Sent back{r}: \"{q}\". This is yours to do; the owner's needs-input policy returns key, sign-in, grant \
          and rotation asks to the worker. Reach it yourself down the ladder: 1) amux browser with a saved \
-         profile, 2) CDP into Ethan's Chrome (/chrome-cdp, his sign-ins are live), 3) CUA (`amux computer`). \
+         profile, 2) CDP into the owner's Chrome (/chrome-cdp, their sign-ins are live), 3) CUA (`amux computer`). \
          Mint keys in the UI you reach and store them where the ask says; never print a secret. Rotate by \
          replacement: create the new one, move every consumer, verify, then revoke the old. Stop and re-file \
          needsyou only if all three rungs fail, or the step spends money, reaches someone outside, or \

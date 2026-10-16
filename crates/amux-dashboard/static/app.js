@@ -1,3 +1,4 @@
+// amux dashboard SPA — the single-file client the amux server serves at /
 // ── localStorage write guard (disk RCA 2026-10-14, 2026-10-15) ──────────────
 // WebKit keeps localStorage in SQLite and appends every write to its WAL, which
 // it does not shrink while the app runs. The dashboard rewrote its caches on
@@ -17693,7 +17694,8 @@ function _classifyPromptKind(promptText) {
   // is the harness acting on standing policy, so Harness, never Human.
   if (clean.includes("(Approved automatically under the owner's needs-input policy.)")) return 'amux';
   // Its send-back (needs_input_auto.rs send_back_text) is harness text too.
-  if (clean.includes("This is yours to do; Ethan's needs-input policy returns")) return 'amux';
+  // Before the text named the owner generically it said "Ethan's"; history still holds both.
+  if (/This is yours to do; (?:Ethan's|the owner's) needs-input policy returns/.test(clean)) return 'amux';
   // The Messages tab is a fetched snapshot; cmdHistoryAdd is the immediate
   // record of a prompt submitted while this terminal is open. Using the
   // snapshot EXCLUSIVELY made every new prompt "Unclassified" until Messages
