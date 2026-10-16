@@ -811,6 +811,17 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// The steer text for one unaccounted lane. The owner is a parameter (the caller
+/// reads `owner_name()`), so the nudge names the install's own owner rather than
+/// one hardcoded person, and a test can pin it without touching the environment.
+fn accountability_nudge_text(owner: &str, msgs: u64, since_h: u64, snippet: &str) -> String {
+    format!(
+        "[amux accountability] You have {msgs} message(s) from {owner} in the last {since_h}h with \
+         no board card created or moved — the work isn't tracked yet. Please open a board card \
+         for the ask (owned by you) and pursue it. Most recent: \"{snippet}\"",
+    )
+}
+
 /// One sweep: nudge every lane that has been unaccounted longer than the
 /// cooldown. Public(crate) so a test can drive it against a seeded store.
 pub(crate) async fn accountability_tick(state: &AppState) {
@@ -884,11 +895,8 @@ pub(crate) async fn accountability_tick(state: &AppState) {
         if now - last < cooldown_s {
             continue; // within cooldown — one nudge/day, not one/tick
         }
-        let text = format!(
-            "[amux accountability] You have {msgs} message(s) from Ethan in the last {since_h}h with \
-             no board card created or moved — the work isn't tracked yet. Please open a board card \
-             for the ask (owned by you) and pursue it. Most recent: \"{snippet}\"",
-        );
+        let owner = crate::api::turn_end::owner_name();
+        let text = accountability_nudge_text(&owner, msgs, since_h, &snippet);
         let _ =
             crate::api::session_verbs::steer_enqueue(state, &worker, &text, "accountability", "")
                 .await;
@@ -1103,6 +1111,16 @@ mod tests {
     use axum::body::Body;
     use axum::http::{header, Request, StatusCode};
     use tower::ServiceExt;
+
+    /// The nudge reached an install whose owner is Max as "message(s) from Ethan":
+    /// the sender was hardcoded. It must name the owner it is given, and only them.
+    #[test]
+    fn the_accountability_nudge_names_the_installs_owner() {
+        let text = accountability_nudge_text("Max", 2, 24, "did they use a mock?");
+        assert!(text.contains("2 message(s) from Max in the last 24h"), "{text}");
+        assert!(text.contains("Most recent: \"did they use a mock?\""), "{text}");
+        assert!(!text.contains("Ethan"), "no other person's name: {text}");
+    }
 
     fn app() -> (axum::Router, SharedStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
