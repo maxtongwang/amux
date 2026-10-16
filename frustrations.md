@@ -5983,3 +5983,24 @@ COST: About 12 tool calls: three wrong writes onto my own card, two desc_shrink_
 FIX: When the caller has exactly one open candidate, require the comparison to name
   shared work, not shared lane, before folding; and document `tags` (or a real
   `create` opt-out) in the CLAUDE.md board recipe beside the 201/200 check.
+
+## A renamed worker's `amux send` is refused at the group boundary under its launch name
+AREA: attribution
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-10-16
+SESSION: tmux-window-naming
+CARD: TWN-1
+SYMPTOM: After dot-agent was renamed (via control-center-work and gmail-backup-encryption) to
+  tmux-window-naming and put in group `dev`, `amux send dev-lead --stdin` answered
+  "worker group boundary refused: dot-agent [{}] -> dev-lead [{"dev"}]", even with
+  AMUX_SESSION=tmux-window-naming set by hand. AMUX-4033 corrects a stale AMUX_SESSION from the
+  pane, but AMUX_WORKER kept the launch name and every attribution header reads
+  ${AMUX_WORKER:-${AMUX_SESSION:-}}, so X-Amux-Worker still said dot-agent, a lane with no groups.
+COST: The lead's status request went unanswered, and two refused sends ended in "do not retry".
+  About 15 tool calls to trace it through worker_identity.rs and the CLI. Every worker renamed
+  while running (8 that day, by a 3-hourly rename job) lost team messaging until restart.
+FIX: The CLI corrects AMUX_WORKER with the same narrow test as AMUX-4033 (claimed name has no
+  session file, the caller's own amux- pane names one that does), and both corrections log
+  `stale_env_identity_healed` once per variable and old name to cli-transport.jsonl, which ships
+  to the server log. Test: scripts/test-cli-stale-worker.py (fails on the prior CLI).

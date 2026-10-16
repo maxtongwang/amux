@@ -166,6 +166,8 @@ jobs:
           ./scripts/test-frustration-scan.sh
       - name: direct delivery verdicts survive scanner SQL and output (AF-889)
         run: python3 scripts/test-frustration-delivery.py
+      - name: a renamed worker's CLI calls carry its new name, not its launch name (TWN-1)
+        run: python3 scripts/test-cli-stale-worker.py
       # The THEME scanner's cells (AF-341). Wired in the same commit that adds the
       # scanner, because the step above records what happens otherwise: that
       # harness existed unwired and its 6 cells ran for nobody.
