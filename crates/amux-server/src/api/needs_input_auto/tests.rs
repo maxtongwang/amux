@@ -364,6 +364,8 @@ fn owner_action_asks_go_back_to_the_worker_unless_the_boundary_holds_them() {
     assert!(matches!(decide(&off, &item("card", "credential", "credential", "Can you mint a key?")), Decision::Never(_)));
     let t = send_back_text("MM-83", "Can you mint a key?");
     assert!(t.contains("CDP") && t.contains("amux computer") && t.contains("revoke the old") && !t.contains('\u{2014}'));
+    // The send-back is steered to every install's workers: it names the owner, not one person.
+    assert!(!t.contains("Ethan"), "{t}");
 }
 
 #[tokio::test]

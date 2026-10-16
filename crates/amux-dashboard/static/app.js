@@ -1,3 +1,4 @@
+// amux dashboard SPA — the single-file client the amux server serves at /
 // ── localStorage write guard (disk RCA 2026-10-14, 2026-10-15) ──────────────
 // WebKit keeps localStorage in SQLite and appends every write to its WAL, which
 // it does not shrink while the app runs. The dashboard rewrote its caches on
@@ -17693,7 +17694,8 @@ function _classifyPromptKind(promptText) {
   // is the harness acting on standing policy, so Harness, never Human.
   if (clean.includes("(Approved automatically under the owner's needs-input policy.)")) return 'amux';
   // Its send-back (needs_input_auto.rs send_back_text) is harness text too.
-  if (clean.includes("This is yours to do; Ethan's needs-input policy returns")) return 'amux';
+  // Before the text named the owner generically it said "Ethan's"; history still holds both.
+  if (/This is yours to do; (?:Ethan's|the owner's) needs-input policy returns/.test(clean)) return 'amux';
   // The Messages tab is a fetched snapshot; cmdHistoryAdd is the immediate
   // record of a prompt submitted while this terminal is open. Using the
   // snapshot EXCLUSIVELY made every new prompt "Unclassified" until Messages
@@ -39241,8 +39243,8 @@ async function _focusAnswer() {
     + 'placeholder="Your reply — sent to the owning worker and recorded on the card"></textarea>', 'Send');
   const ans = (document.getElementById('focus-ans') || {}).value || '';
   if (!ok || !ans.trim()) return;
-  if (sess) { try { await _focusSend(sess, '[Ethan, re ' + item.id + '] ' + ans); } catch(e) {} }
-  await _focusPatch(item.id, { desc_append: '`answered` Ethan: ' + ans });
+  if (sess) { try { await _focusSend(sess, '[Owner, re ' + item.id + '] ' + ans); } catch(e) {} }
+  await _focusPatch(item.id, { desc_append: '`answered` owner: ' + ans });
   await _focusResolveTag(item);
   showToast('Answered ' + item.id);
   _focusRebuild(); if (_focusIdx >= _focusList.length) _focusIdx = _focusList.length - 1;
@@ -39250,8 +39252,8 @@ async function _focusAnswer() {
 }
 async function _focusDecide(verdict) {
   const item = _focusList[_focusIdx]; if (!item) return;
-  await _focusPatch(item.id, { desc_append: '`decision` Ethan ' + verdict.toUpperCase() + ' ' + new Date().toISOString().slice(0,10) });
-  if (item.session) { try { await _focusSend(item.session, '[Ethan decision on ' + item.id + '] ' + verdict.toUpperCase() + ' — proceed accordingly.'); } catch(e) {} }
+  await _focusPatch(item.id, { desc_append: '`decision` owner ' + verdict.toUpperCase() + ' ' + new Date().toISOString().slice(0,10) });
+  if (item.session) { try { await _focusSend(item.session, '[Owner decision on ' + item.id + '] ' + verdict.toUpperCase() + ' — proceed accordingly.'); } catch(e) {} }
   await _focusResolveTag(item);
   showToast(item.id + ' ' + verdict);
   _focusRebuild(); if (_focusIdx >= _focusList.length) _focusIdx = _focusList.length - 1;
@@ -39261,7 +39263,7 @@ async function _focusNudge() {
   const item = _focusList[_focusIdx]; if (!item) return;
   if (item.session) { await _focusSend(item.session,
     '[amux] Please advance ' + item.id + ' (' + (item.title||'').slice(0,60) + '): work it now, or post a status-update / mark its blocker. It is showing as blocked.'); }
-  await _focusPatch(item.id, { desc_append: '`nudge` Ethan asked ' + (item.session||'?') + ' to advance this' });
+  await _focusPatch(item.id, { desc_append: '`nudge` owner asked ' + (item.session||'?') + ' to advance this' });
   showToast('Nudged ' + (item.session||'') + ' on ' + item.id);
   _focusRebuild(); if (_focusIdx >= _focusList.length) _focusIdx = _focusList.length - 1;
   _focusNext();

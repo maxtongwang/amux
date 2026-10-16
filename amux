@@ -2657,7 +2657,7 @@ Ordinary choices should proceed. If no human act is required, work the blocker:
   amux board backlog $id --trigger \"<the condition that re-arms it>\"   external wait
   amux board doing $id                                                work the blocker
 
-  amux board needsyou $id --actor Ethan --ask decision --question \"...?\" --unblocks \"...\""
+  amux board needsyou $id --actor <owner name> --ask decision --question \"...?\" --unblocks \"...\""
 }
 
 # A response can be unreadable AFTER a write landed. Stop before any dependent
@@ -3609,7 +3609,7 @@ sys.exit(1 if sys.argv[2]=="1" and not v["valid"] else 0)
       _needsyou_types_or_die "$ask_type" "$id"
       case "$(printf '%s' "$ask_actor" | tr '[:upper:]' '[:lower:]')" in
         ''|human|user|owner|someone|you|me) die "amux board needsyou: --actor must name the specific person or external actor who can answer.
-Generic placeholders are not routable. Example: --actor Ethan or --actor vendor-support" ;;
+Generic placeholders are not routable. Example: --actor <owner name> or --actor vendor-support" ;;
       esac
       [[ -n "$ask" ]] || die "amux board needsyou: --question is required — one sentence, what you are asking.
   amux board needsyou $id --actor $ask_actor --ask $ask_type --question \"...?\" --unblocks \"...\""
@@ -5129,7 +5129,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                    --unblocks-file. An untyped park is refused and
                                    prints the five types (AF-318).
                                    A sign-in/login ask auto-gets a clickable resume link into
-                                   this session's live browser view (Ethan clicks to sign in).
+                                   this session's live browser view (the owner clicks to sign in).
   amux board ask <ID> [question]   Ask the owning worker to post a status update
   amux board status-update <ID> …  (for the owning worker) post status to the board
                                    (prose, --stdin or --file <path>; NOT the gate flags below)
@@ -5786,7 +5786,7 @@ amux computer — a disposable Linux desktop (CUA) for sites rungs 1-2 cannot re
   amux computer context                Ladder, verbs, and which profile has cookies for which site
   amux computer stop                   Remove the sandbox (idle ones stop after 15 min anyway)
 
-Ladder: 1) amux browser  2) CDP into Ethan's real Chrome  3) amux computer.
+Ladder: 1) amux browser  2) CDP into the owner's real Chrome  3) amux computer.
 Loop: screenshot, read coordinates off the image, act, screenshot to confirm.
 EOF
 }
@@ -9162,8 +9162,8 @@ cmd_cdp() {
   if [ $# -eq 0 ]; then
     node "$script" 2>&1 | sed -n '1,30p'
     echo
-    echo "Ethan's Chrome carries his live sign-ins. Start with: amux cdp list; then amux cdp open <url>, amux cdp eval <target> <js>, amux cdp shot <target>."
-    echo "Stop at any password, CAPTCHA or 2-step prompt: that rung is Ethan's."
+    echo "The owner's Chrome carries their live sign-ins. Start with: amux cdp list; then amux cdp open <url>, amux cdp eval <target> <js>, amux cdp shot <target>."
+    echo "Stop at any password, CAPTCHA or 2-step prompt: that rung is the owner's."
     return 0
   fi
   node "$script" "$@"

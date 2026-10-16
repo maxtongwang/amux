@@ -24906,7 +24906,7 @@ async fn debug_needsyou_digest(State(state): State<AppState>, RawQuery(q): RawQu
                      less than `n_considered` when `truncated` is true -- that is the cap \
                      working, not the count being wrong (autofix.rs: a prior digest emitted 92 \
                      cards in one SMS). No delivery channel is wired to this endpoint; which one \
-                     to use is Ethan's call, still open on AF-510.",
+                     to use is the owner's call, still open on AF-510.",
         }),
         total,
     ))
@@ -27137,7 +27137,7 @@ pub(crate) fn no_reply_path_stamp(origin: &str, is_isolated: bool) -> Option<Str
         return None;
     }
     Some(format!(
-        "\n\n[no reply path: `{origin}` is an isolated (raw-agent) worker. A peer send back to it is REFUSED — it is reachable only by its owner from the dashboard. If this message asks you something, answer via Ethan or relay through a lane that is not isolated; do not write a reply you cannot deliver.]"
+        "\n\n[no reply path: `{origin}` is an isolated (raw-agent) worker. A peer send back to it is REFUSED — it is reachable only by its owner from the dashboard. If this message asks you something, answer via the owner or relay through a lane that is not isolated; do not write a reply you cannot deliver.]"
     ))
 }
 
@@ -35727,6 +35727,10 @@ mod tests {
         assert!(
             stamp.contains("do not write a reply you cannot deliver"),
             "the cost being prevented is a reply written and then rejected: {stamp}"
+        );
+        assert!(
+            !stamp.contains("Ethan"),
+            "the relay is the install's owner, not one named person: {stamp}"
         );
     }
 
