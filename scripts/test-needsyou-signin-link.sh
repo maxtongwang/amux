@@ -6,7 +6,7 @@
 #
 # This is a CLI-side write (the desc_append PATCH body is built in the shell), so
 # NO server log could catch a regression — this test is the guard, same as
-# test-register-merge.sh. It runs the REAL shipped verb against a MOCK curl that
+# test-cli-register-through-server.sh. It runs the REAL shipped verb against a MOCK curl that
 # captures the PATCH bodies, so it needs no live server and mutates no board.
 set -euo pipefail
 cd "$(dirname "$0")/.."

@@ -2212,6 +2212,7 @@ pub async fn config_worker(
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
     if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(&headers, crate::api::session_verbs::names_messaging_authority(&body)) { return refusal; }
+    if let Some(refusal) = crate::api::session_verbs::config_pane_write_refusal(&headers, &name, &body) { return refusal; }
     crate::api::session_verbs::config_patch(&state, &name, &body).await
 }
 
@@ -2852,6 +2853,127 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "owner duplicate: {v}");
         let (st, _, v) = send(&app, "POST", "/api/workers", Some(json!({"display_name": "w-group", "cwd": "/tmp/w", "group": grp.as_str()}))).await;
         assert_eq!(st, StatusCode::CREATED, "owner create with group: {v}");
+    }
+
+    // ---- fix/group-boundary-keys-ephemeral-register: pane writers ----------
+
+    /// Every pane writer outside the keys/start/instructions/git-push verbs
+    /// takes the send path's group boundary (`session_verbs::pane_write_refusal`
+    /// over `cross_group_policy_ok`): a worker's interrupt, Chat-tab send or
+    /// typed `/model` into ANOTHER group's worker is refused; the same group
+    /// and the owner are allowed. Each allowed control stops at a later,
+    /// side-effect-free answer (empty text, no turn running), so the test
+    /// proves the gate let it through without launching anything. Fails on the
+    /// base, where every refused case below reached its handler.
+    #[tokio::test]
+    async fn pane_writers_stay_inside_a_shared_group() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        membership_fleet(home.path());
+        let (app, _db) = app();
+        let dev = [("X-Amux-Session", "dev-a")];
+        let lead = [("X-Amux-Session", "dev-lead")];
+        const BOUNDARY: &str = "worker_group_boundary";
+        let refused: Vec<(&str, String, Value)> = vec![
+            ("POST", "/api/sessions/ops-a/chat/interrupt".into(), json!({})),
+            ("POST", "/api/sessions/ops-a@chat/send".into(), json!({"text": "approve it"})),
+            ("PATCH", "/api/sessions/ops-a/config".into(), json!({"model": "opus"})),
+            ("PATCH", "/api/sessions/ops-a".into(), json!({"effort": "low"})),
+            ("PATCH", "/api/workers/ops-a/config".into(), json!({"model": "opus"})),
+        ];
+        for (m, path, body) in &refused {
+            let (st, _, v) = send_with(&app, m, path, Some(body.clone()), &dev).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(BOUNDARY)), "dev-a {m} {path}: {v}");
+            // The X-Amux-Worker spelling is the same identity.
+            let (st, _, v) = send_with(&app, m, path, Some(body.clone()), &[("X-Amux-Worker", "dev-a")]).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(BOUNDARY)), "X-Amux-Worker {m} {path}: {v}");
+        }
+        // Same group and owner: past the gate.
+        for headers in [&lead[..], &[][..]] {
+            let (st, _, v) = send_with(&app, "POST", "/api/sessions/dev-a/chat/interrupt", Some(json!({})), headers).await;
+            assert_eq!((st, v["interrupted"].clone()), (StatusCode::OK, json!(false)), "{headers:?} interrupt: {v}");
+            let (st, _, v) = send_with(&app, "POST", "/api/sessions/dev-a@chat/send", Some(json!({"text": " "})), headers).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{headers:?} chat-tab send reaches the empty-text check: {v}");
+            assert_eq!(v["error"], "empty message", "{headers:?}: {v}");
+        }
+        let (st, _, v) = send(&app, "POST", "/api/sessions/ops-a/chat/interrupt", Some(json!({}))).await;
+        assert_eq!(st, StatusCode::OK, "owner interrupts any group: {v}");
+        // A config PATCH that types nothing into the pane is not this gate's.
+        let (_, _, v) = send_with(&app, "PATCH", "/api/sessions/ops-a/config", Some(json!({"desc": "x"})), &dev).await;
+        assert_ne!(v["code"], json!(BOUNDARY), "a non-pane config key is not a pane write: {v}");
+        // Same group: the model change passes the boundary.
+        let (_, _, v) = send_with(&app, "PATCH", "/api/sessions/dev-a/config", Some(json!({"model": "opus"})), &lead).await;
+        assert_ne!(v["code"], json!(BOUNDARY), "same-group model change: {v}");
+    }
+
+    /// The create-time prompt of a worker-made create carries its creator's
+    /// server-verified origin; an owner create stays the owner's words. Fails
+    /// on the base, where a lead's prompt was queued as unstamped owner input.
+    #[tokio::test]
+    async fn a_create_prompt_carries_its_creator() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        membership_fleet(home.path());
+        let (app, db) = app();
+        let dir = home.path().join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut body = create_body(&dir, "dev-new", json!(["dev"]));
+        body["prompt"] = json!("ship the parser");
+        let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(body), &[("X-Amux-Session", "dev-lead")]).await;
+        assert!(st.is_success(), "lead create: {v}");
+        let mut body = create_body(&dir, "owned-new", json!(["ops"]));
+        body["prompt"] = json!("ship the parser");
+        let (st, _, v) = send(&app, "POST", "/api/sessions", Some(body)).await;
+        assert!(st.is_success(), "owner create: {v}");
+        // The queue write runs in a spawned task: wait for both rows.
+        let conn = rusqlite::Connection::open(db.path().join("amux-test.db")).unwrap();
+        let queued = |session: &str| -> Option<String> {
+            conn.query_row("SELECT text FROM steering_queue WHERE session=?1", [session], |r| r.get(0)).ok()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (queued("dev-new").is_none() || queued("owned-new").is_none()) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let lead_text = queued("dev-new").expect("the lead's create prompt was queued");
+        assert!(lead_text.starts_with("[amux-origin: dev-lead "), "stamped with the lead: {lead_text}");
+        assert!(lead_text.ends_with("ship the parser"), "{lead_text}");
+        assert_eq!(queued("owned-new").as_deref(), Some("ship the parser"), "an owner create is unstamped");
+    }
+
+    /// `amux register` re-registers through PUT /api/scope, whose env merge
+    /// creates a missing file. A session writing "its own" worker layer under
+    /// a name with no session was therefore a create past the create rule.
+    /// Fails on the base, where `ghost.env` was written.
+    #[tokio::test]
+    async fn a_scope_env_write_cannot_create_a_worker() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        membership_fleet(home.path());
+        let (app, _db) = app();
+        let write = |name: &str| json!({"level": "worker", "name": name, "capability": "env",
+            "value": {"CC_DIR": "/tmp", "CC_FLAGS": ""}});
+        let (st, _, v) = send_with(&app, "PUT", "/api/scope", Some(write("ghost")), &[("X-Amux-Session", "ghost")]).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::NOT_FOUND, json!("no_such_worker")), "{v}");
+        assert!(!home.path().join("sessions/ghost.env").exists(), "the refused write created the worker");
+        // Controls: a worker merges its own existing layer, keeping its groups.
+        let (st, _, v) = send_with(&app, "PUT", "/api/scope", Some(write("dev-a")), &[("X-Amux-Session", "dev-a")]).await;
+        assert_eq!(st, StatusCode::OK, "own existing layer: {v}");
+        assert_eq!(crate::api::session_verbs::lane_groups("dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
+        // The AMUX-3117 rule, now held by the server (scripts/test-register-merge.sh
+        // pinned it on the CLI's own file write, which no longer exists): a
+        // re-register updates the keys it owns and keeps every other key.
+        std::fs::write(home.path().join("sessions/dev-r.env"),
+            "CC_DIR=\"/old\"\nCC_FLAGS=\"--model sonnet\"\nCC_DESC=\"important description\"\nCC_TAGS=\"dev\"\nCC_MCP=\"chrome\"\n").unwrap();
+        let mut merge = write("dev-r");
+        merge["value"] = json!({"CC_DIR": "/new", "CC_FLAGS": "--model opus"});
+        let (st, _, v) = send_with(&app, "PUT", "/api/scope", Some(merge), &[("X-Amux-Session", "dev-r")]).await;
+        assert_eq!(st, StatusCode::OK, "re-register merge: {v}");
+        let env = crate::api::session_verbs::EnvFile::load(&home.path().join("sessions/dev-r.env"));
+        assert_eq!((env.get("CC_DIR"), env.get("CC_FLAGS")), (Some("/new"), Some("--model opus")));
+        assert_eq!((env.get("CC_DESC"), env.get("CC_MCP"), env.get("CC_TAGS")),
+            (Some("important description"), Some("chrome"), Some("dev")), "unmanaged keys survive");
+        let text = std::fs::read_to_string(home.path().join("sessions/dev-r.env")).unwrap();
+        assert_eq!(text.lines().filter(|l| l.starts_with("CC_FLAGS=")).count(), 1, "{text}");
     }
 
     // ---- RR-0034 test list ----------------------------------------------

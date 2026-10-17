@@ -521,10 +521,6 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/test-push-consent.sh
-      - name: a register write merges rather than clobbering a peer's
-        run: |
-          set -uo pipefail
-          bash scripts/test-register-merge.sh
       - name: a second-person resend fires only when it should (positive control)
         run: |
           set -uo pipefail
@@ -699,6 +695,12 @@ jobs:
       # while a CLI still sending `reviewer` leaves the feature dead.
       - name: CLI board request routes to the target
         run: ./scripts/test-board-request-routes-to-target.sh
+      # register/exec/--keys go through the server and never write a session
+      # file or a pane themselves, so the create rule and the group boundary
+      # reach the CLI. Its own step: a CLI that writes the file passes every
+      # server test while bypassing all of them.
+      - name: CLI register, exec and keys go through the server
+        run: ./scripts/test-cli-register-through-server.sh
       # AMUX-4705: a piped brief splits into a one-line title and a body. Its
       # own step because the failure is silent: the card is created, exit 0, and
       # the title is a paragraph.

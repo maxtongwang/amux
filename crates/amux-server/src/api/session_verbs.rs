@@ -24620,6 +24620,13 @@ async fn dispatch(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        // A Chat tab speaks for the owner (chat_speaks_for_owner), so a lane's
+        // send into ANOTHER group's worker's tab was a route across the
+        // boundary with owner reach on the far side. Same rule as a send to
+        // the worker itself.
+        if method == Method::POST {
+            if let Some(refusal) = pane_write_refusal(&headers, &worker, "chat-tab:send") { return refusal; }
+        }
         return super::chat_worker::companion_route(
             &state, &worker, method == Method::POST, &action, receipt, &body, &caller,
         )
@@ -27166,16 +27173,24 @@ pub(crate) fn no_reply_path_stamp(origin: &str, is_isolated: bool) -> Option<Str
 
 /// A lane's groups, from `CC_TAGS` in its env file.
 pub(crate) fn lane_groups(lane: &str) -> std::collections::BTreeSet<String> {
-    parse_env(lane)
-        .get("CC_TAGS")
+    let env = parse_env(lane);
+    // A project executor's retired fleet-wide `ephemeral` group (driver.rs
+    // `executor_groups`) is not membership: executors configured before that
+    // change still carry it in their env file until their next configure, and
+    // it must not join them to every other project's executors meanwhile.
+    let project_executor = env.get("CC_EPHEMERAL") == Some("1") && env.get("CC_PROJECT").is_some_and(|p| !p.trim().is_empty());
+    env.get("CC_TAGS")
         .map(|v| {
             v.split(',')
                 .map(|t| t.trim().trim_matches('"').to_lowercase())
-                .filter(|t| !t.is_empty())
+                .filter(|t| !t.is_empty() && !(project_executor && t == RETIRED_EXECUTOR_GROUP))
                 .collect()
         })
         .unwrap_or_default()
 }
+
+/// The group every project executor used to share across projects.
+const RETIRED_EXECUTOR_GROUP: &str = "ephemeral";
 
 /// Why a worker-to-worker send is allowed, or `Err(reason)` if it is not.
 ///
@@ -31777,6 +31792,9 @@ pub(crate) async fn report_post(
 
 async fn patch_dispatch(state: &AppState, name: &str, action: &str, body: &Value, headers: &HeaderMap) -> Response {
     if let Some(refusal) = membership_patch_refusal(headers, names_messaging_authority(body)) { return refusal; }
+    if action == "config" {
+        if let Some(refusal) = config_pane_write_refusal(headers, name, body) { return refusal; }
+    }
     match action {
         "commit-guard" => commit_guard_patch_verb(name, body),
         "config" => config_patch(state, name, body).await,
@@ -32859,9 +32877,36 @@ pub(crate) fn membership_refusal_body(headers: &HeaderMap, membership_named: boo
 
 /// The worker this request speaks for, or empty for the owner/dashboard and
 /// verified human members (the same attribution as the membership rule).
-fn worker_origin(headers: &HeaderMap) -> String {
+pub(crate) fn worker_origin(headers: &HeaderMap) -> String {
     if super::org::local_member_actor(headers).is_some() { return String::new(); }
     hdr_worker(headers)
+}
+
+/// The group boundary for a request that writes into `target`'s pane or turn
+/// without being a message: an interrupt, a typed slash command, a send into
+/// its Chat tab. It is [`cross_group_policy_ok`], the predicate a text send
+/// already runs (fix/group-boundary-keys-ephemeral-register), as a 403: owner,
+/// dashboard, verified members, self and chat-for-owner pass; a worker reaches
+/// only workers it shares a group with, and never an isolated one. `verb`
+/// names the path in the log line so a sweep can count refusals per writer.
+/// The keys/start/instructions/git-push verbs take the same rule through the
+/// attribution follow-up's gate; the two can be unified on one name later.
+pub(crate) fn pane_write_refusal(headers: &HeaderMap, target: &str, verb: &'static str) -> Option<Response> {
+    let origin = worker_origin(headers);
+    let reason = cross_group_policy_ok(&origin, target).err()?;
+    tracing::warn!(origin = %origin, target, verb, verdict = "pane_write_group_boundary",
+        measured = true, n_considered = 1, "a worker tried to write into another group's pane");
+    Some(jresp(StatusCode::FORBIDDEN, json!({"ok": false, "code": "worker_group_boundary", "error": reason, "verb": verb})))
+}
+
+/// Config keys whose change is typed into the RUNNING agent's pane as a slash
+/// command (`/model`, `/effort`, see `apply_live_config_change`).
+const PANE_TYPED_CONFIG_KEYS: [&str; 2] = ["model", "effort"];
+
+/// [`pane_write_refusal`] for a config PATCH that would type into the pane.
+pub(crate) fn config_pane_write_refusal(headers: &HeaderMap, target: &str, body: &Value) -> Option<Response> {
+    if !PANE_TYPED_CONFIG_KEYS.iter().any(|k| body.get(*k).is_some()) { return None; }
+    pane_write_refusal(headers, target, "config:model")
 }
 
 /// The group whose members may create workers (Max, 2026-10-16: "Only leads

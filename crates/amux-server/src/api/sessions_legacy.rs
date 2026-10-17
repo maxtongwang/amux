@@ -4534,6 +4534,25 @@ fn create_tags(body: &serde_json::Value) -> Vec<String> {
     crate::api::session_verbs::tags_of(body.get("tags"))
 }
 
+/// The create-time prompt as it will be delivered. It rides the durable queue
+/// as owner input (it is the first instruction of a create the create rule
+/// already authorized), so a worker-made create (a lead making a team worker)
+/// carries the SAME server-verified `[amux-origin: <lead>]` stamp a send from
+/// that lead carries; otherwise the lead's words reach the new worker as the
+/// owner's. An owner/dashboard create is unstamped. The origin is
+/// `session_verbs::worker_origin`, the attribution the create rule used.
+fn create_prompt_text(headers: &HeaderMap, name: &str, prompt: &str) -> String {
+    let origin = crate::api::session_verbs::worker_origin(headers);
+    match crate::api::session_verbs::origin_stamped(&origin, name, prompt) {
+        Some(stamped) if !prompt.trim().is_empty() => {
+            tracing::info!(session = %name, origin = %origin, verdict = "create_prompt_origin_stamped",
+                measured = true, n_considered = 1, "a worker-created worker's first prompt carries its creator's origin");
+            stamped
+        }
+        _ => prompt.to_string(),
+    }
+}
+
 pub async fn create_session_legacy(
     State(_state): State<AppState>,
     headers: HeaderMap,
@@ -4816,7 +4835,7 @@ pub async fn create_session_legacy(
                 false
             }
         });
-    let prompt = s("prompt");
+    let prompt = create_prompt_text(&headers, &name, &s("prompt"));
     if autostart {
         let st = _state.clone();
         let n = name.clone();
