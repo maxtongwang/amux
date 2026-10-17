@@ -288,7 +288,9 @@ pub(crate) fn claim_applying(state: &AppState, code: &str, actor: &str, action: 
 
 /// The grant codes a line names (`amux grant 7K3Q`, any case).
 pub(crate) fn codes_in(text: &str) -> Vec<String> {
-    let re = regex::Regex::new(r"(?i)\bamux\s+grant\s+([A-Za-z0-9]{4})\b").expect("static regex");
+    // Every Messages row passes through here: compile once.
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"(?i)\bamux\s+grant\s+([A-Za-z0-9]{4})\b").expect("static regex"));
     re.captures_iter(text).map(|c| c[1].to_ascii_uppercase()).collect()
 }
 
