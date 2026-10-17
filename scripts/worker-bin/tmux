@@ -1,0 +1,219 @@
+#!/bin/bash
+# Worker-pane tmux guard: refuses kill-server/kill-session/kill-pane (and -K) on the
+# live amux tmux server. Installed to ~/.amux/worker-bin/tmux, which amux prepends to
+# WORKER PANE PATHs only; the amux server never has this directory on its PATH.
+# Everything else, and kills on an explicitly different -S/-L socket, execs the real
+# tmux by absolute path (AMUX_REAL_TMUX, else /opt/homebrew/bin/tmux, /usr/local/bin/tmux,
+# /usr/bin/tmux). Exit 1 on refusal; 127 when no real tmux can be found.
+
+set -u
+set -f  # no globbing when splitting nested command text
+
+die_missing() {
+  printf 'tmux guard: %s\n' "$1" >&2
+  exit 127
+}
+
+# Resolve the real tmux by absolute path. An explicit AMUX_REAL_TMUX never falls
+# back: a test that names a fake must never reach a real server by accident.
+if [ -n "${AMUX_REAL_TMUX:-}" ]; then
+  REAL="$AMUX_REAL_TMUX"
+  case "$REAL" in /*) ;; *) die_missing "AMUX_REAL_TMUX must be an absolute path (got '$REAL')" ;; esac
+  [ -x "$REAL" ] || die_missing "AMUX_REAL_TMUX=$REAL is not executable"
+else
+  REAL=
+  for cand in /opt/homebrew/bin/tmux /usr/local/bin/tmux /usr/bin/tmux; do
+    if [ -x "$cand" ] && ! [ "$cand" -ef "$0" ]; then REAL="$cand"; break; fi
+  done
+  [ -n "$REAL" ] || die_missing "no real tmux found (set AMUX_REAL_TMUX to its absolute path)"
+fi
+if [ "$REAL" -ef "$0" ]; then
+  die_missing "the real tmux resolves to this guard ($REAL); refusing to recurse"
+fi
+
+ARGV=("$@")
+
+# --- global options -----------------------------------------------------------
+# tmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name] [-S socket-path]
+#      [-T features] [command ...]. Flags cluster (-2u, -uLname, -S/path).
+sock_S=""; have_S=0
+sock_L=""; have_L=0
+have_K=0
+shell_cmd=0
+i=0
+n=$#
+while [ "$i" -lt "$n" ]; do
+  a="${ARGV[$i]}"
+  case "$a" in
+    --) i=$((i + 1)); break ;;
+    -?*) ;;
+    *) break ;;
+  esac
+  j=1
+  len=${#a}
+  while [ "$j" -lt "$len" ]; do
+    c="${a:$j:1}"
+    case "$c" in
+      c|f|L|S|T)
+        rest="${a:$((j + 1))}"
+        if [ -n "$rest" ]; then
+          val="$rest"
+        else
+          i=$((i + 1))
+          val="${ARGV[$i]:-}"
+        fi
+        case "$c" in
+          S) sock_S="$val"; have_S=1 ;;
+          L) sock_L="$val"; have_L=1 ;;
+          c) shell_cmd=1 ;;
+        esac
+        j=$len
+        ;;
+      K) have_K=1; j=$((j + 1)) ;;
+      *) j=$((j + 1)) ;;
+    esac
+  done
+  i=$((i + 1))
+done
+cmd_start=$i
+
+# -c runs a shell command (login-shell use), not a tmux command; any tmux it
+# runs resolves through this guard again.
+if [ "$shell_cmd" -eq 1 ]; then
+  exec "$REAL" "$@"
+fi
+
+# --- is the target the live server? --------------------------------------------
+uid="$(id -u 2>/dev/null || echo 0)"
+live_sock="${TMUX:-}"
+live_sock="${live_sock%%,*}"
+default_real="/tmp/tmux-$uid/default"
+default_env="${TMUX_TMPDIR:-/tmp}/tmux-$uid/default"
+
+same_path() {
+  # $1 vs $2: identical text, or the same existing file (sockets included).
+  [ -n "$2" ] || return 1
+  [ "$1" = "$2" ] && return 0
+  [ -e "$1" ] && [ -e "$2" ] && [ "$1" -ef "$2" ] && return 0
+  return 1
+}
+
+target_is_live() {
+  local t
+  if [ "$have_S" -eq 1 ]; then
+    t="$sock_S"
+  elif [ "$have_L" -eq 1 ]; then
+    [ "$sock_L" = "default" ] && return 0
+    t="${TMUX_TMPDIR:-/tmp}/tmux-$uid/$sock_L"
+  else
+    return 0
+  fi
+  same_path "$t" "$live_sock" && return 0
+  same_path "$t" "$default_real" && return 0
+  same_path "$t" "$default_env" && return 0
+  return 1
+}
+
+# --- protected command names -----------------------------------------------------
+# tmux accepts an exact name, an alias, or an unambiguous prefix. Refuse the
+# kill-pane alias and every prefix of a protected name from "kill-p"/"kill-s" on
+# (ambiguous ones like kill-se are rejected by tmux anyway).
+is_protected_word() {
+  local w="$1" name
+  [ "$w" = "killp" ] && return 0
+  [ "${#w}" -ge 6 ] || return 1
+  for name in kill-server kill-session kill-pane; do
+    case "$name" in "$w"*) return 0 ;; esac
+  done
+  return 1
+}
+
+refuse() {
+  local why="$1" log_dir="${AMUX_HOME:-$HOME/.amux}/logs" joined
+  printf -v joined '%q ' "${ARGV[@]}"
+  joined="${joined% }"
+  mkdir -p "$log_dir" 2>/dev/null
+  printf '%s pwd=%q argv=%s reason=%q verdict=tmux_guard_refused\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" "$joined" "$why" \
+    >>"$log_dir/tmux-guard.log" 2>/dev/null
+  cat >&2 <<EOF
+tmux guard: refused '$why' on the LIVE amux tmux server (verdict=tmux_guard_refused).
+Killing it ends every worker pane in the fleet. For a throwaway tmux, use a private
+socket in a fresh environment, and let it end on its own:
+  d=\$(mktemp -d); env -u TMUX -u TMUX_PANE TMUX_TMPDIR="\$d" tmux -S "\$d/sock" new-session -d 'sleep 3'
+A kill on that explicit -S socket passes through:
+  env -u TMUX -u TMUX_PANE tmux -S <your mktemp>/sock kill-server
+EOF
+  exit 1
+}
+
+if ! target_is_live; then
+  exec "$REAL" "$@"
+fi
+
+[ "$have_K" -eq 1 ] && refuse "-K"
+
+# Commands whose arguments tmux RUNS (a shell command, or a nested tmux command): only these
+# have their argument text scanned, so a kill cannot ride inside if-shell, run-shell, a new
+# window's shell command or a key binding. Every other argument is data (a message, a buffer,
+# send-keys text, a window name) and passes untouched. Aliases and unique prefixes included.
+runs_its_arguments() {
+  local w="$1" name
+  case "$w" in
+    run|if|confirm|bind|new|neww|splitw|respawnp|respawnw|pipep|popup|menu) return 0 ;;
+  esac
+  [ "${#w}" -ge 3 ] || return 1
+  for name in run-shell if-shell confirm-before bind-key command-prompt display-menu display-popup \
+              set-hook new-session new-window split-window respawn-pane respawn-window pipe-pane; do
+    case "$name" in "$w"*) return 0 ;; esac
+  done
+  return 1
+}
+
+# --- command chain -----------------------------------------------------------------
+# Commands separate on an argument ";" (shell \;) or one ending in an unescaped ";".
+# The first word of each command is its name and is always checked.
+expect_name=1
+runs=0
+skip_value=0
+i=$cmd_start
+while [ "$i" -lt "$n" ]; do
+  a="${ARGV[$i]}"
+  i=$((i + 1))
+  sep_after=0
+  if [ "$a" = ";" ]; then
+    expect_name=1
+    continue
+  fi
+  case "$a" in
+    *\\\;) a="${a%\\;};" ;;
+    *\;) a="${a%;}"; sep_after=1 ;;
+  esac
+  if [ "$expect_name" -eq 1 ]; then
+    first="${a%%[[:space:]]*}"
+    is_protected_word "$first" && refuse "$first"
+    runs=0
+    skip_value=0
+    names=0
+    runs_its_arguments "$first" && runs=1
+    case "$first" in new|neww|new-*) names=1 ;; esac
+    expect_name=0
+  elif [ "$runs" -eq 1 ] && [ "$skip_value" -eq 1 ]; then
+    skip_value=0                    # the value of a flag (-n name, -t target, -c dir): data
+  elif [ "$runs" -eq 1 ] && [[ "$a" =~ ^-[A-Za-z]+$ ]]; then
+    # Only the NAME of a new session or window (-n / -s) is skipped as data. Every other word is
+    # scanned: guessing option arity per command once let `new-window -k 'tmux kill-server'`
+    # through (-k takes no value), and over-refusing a word is safe where under-refusing is not.
+    [ "$names" -eq 1 ] && case "${a: -1}" in n|s) skip_value=1 ;; esac
+  elif [ "$runs" -eq 1 ]; then
+    # Nested command text: split on whitespace, quotes, braces and ";".
+    words="$(printf '%s' "$a" | tr "\"'{}();\\\\\t\n" '          ')"
+    for w in $words; do
+      is_protected_word "$w" && refuse "$w (inside: $a)"
+    done
+  fi
+
+  [ "$sep_after" -eq 1 ] && expect_name=1
+done
+
+exec "$REAL" "$@"

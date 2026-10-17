@@ -86,6 +86,18 @@ owes two things: the fix, and a log signal so the next instance self-announces
 Tool-event hooks need a `matcher` (regex). `"*"` is invalid; use `".*"`.
 Verify a hook by what it WROTE, not by the settings file.
 
+**Worker tmux guard.** Worker panes get `~/.amux/worker-bin` first on PATH
+(`worker_tmux_guard_rc` in `api/session_verbs.rs`; installed from
+`scripts/worker-bin/tmux` by `install.sh`). Its `tmux` refuses `kill-server`,
+`kill-session`, `kill-pane` (with abbreviations, chains and `-K`) aimed at the
+live server: no `-S`/`-L`, `-S` equal to `$TMUX`'s socket, or `-L default`.
+It exits 1 and logs `verdict=tmux_guard_refused` to `~/.amux/logs/tmux-guard.log`.
+Everything else execs the real tmux (`AMUX_REAL_TMUX`, else Homebrew/system).
+The server's own PATH never contains worker-bin. For a throwaway tmux, use a
+private socket and let it end on its own:
+`d=$(mktemp -d); env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$d" tmux -S "$d/sock" new-session -d 'sleep 3'`.
+Tests use a fake real tmux via `AMUX_REAL_TMUX` (`scripts/test-worker-tmux-guard.py`).
+
 ## Workflow
 
 - **No auto-pull.** Shared checkout; the freshness hook reports staleness, the human decides.
