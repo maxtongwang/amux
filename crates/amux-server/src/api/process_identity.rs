@@ -37,8 +37,10 @@
 //! `tailscaled` to 127.0.0.1, whose sockets this user cannot list. A loopback
 //! connection with no visible holder is that forward only when a root
 //! tailscaled is among the unlistable processes and no worker (or unprovable
-//! process) is connected to this host's own tailnet front door (its tailnet
-//! address, port 443), the one way a local worker could ride the forward.
+//! process) is connected to any of this host's own tailnet addresses on any
+//! port (the front door, from the interfaces, never the serve config), the one
+//! way a local worker could ride the forward. A peer on one of this host's own
+//! non-loopback addresses with no visible holder gets the same test.
 //!
 //! On a platform without a resolver the layer does nothing and says so once
 //! (`process_attribution_unavailable`, measured=false): that is today's
@@ -186,7 +188,9 @@ pub(crate) struct Scan {
 /// The lookups [`decide`] consults, behind a trait so every branch, including
 /// the failure and forwarding ones, is tested through the shipped decision.
 pub(crate) trait Lookups {
-    fn scan(&self, client: SocketAddr, server: SocketAddr) -> Result<Scan, os::LookupError>;
+    fn scan(&self, client: SocketAddr, server: SocketAddr, door: &FrontDoor) -> Result<Scan, os::LookupError>;
+    /// This host's own interface addresses.
+    fn own_addresses(&self) -> Result<Vec<std::net::IpAddr>, String>;
     /// Pids of root-owned processes named `tailscaled`.
     fn root_tailscaled(&self) -> Result<Vec<u32>, String>;
     fn panes(&self, fresh: bool) -> Result<Panes, String>;
@@ -219,15 +223,24 @@ fn decide(conn: Conn, l: &dyn Lookups) -> Origin {
             Origin::Remote
         };
     };
-    let scan = match l.scan(peer, server) {
+    let own = l.own_addresses();
+    // A peer on this host (loopback, or one of its own addresses) can be a
+    // local process; only a peer provably elsewhere may be Remote outright.
+    // Interfaces unreadable: every peer is treated as possibly local.
+    let local_peer = peer.ip().is_loopback()
+        || match &own {
+            Ok(addrs) => addrs.contains(&peer.ip()),
+            Err(_) => true,
+        };
+    let scan = match l.scan(peer, server, &front_door_for(&own)) {
         Ok(s) => s,
         Err(os::LookupError::Unsupported(why)) => return Origin::Unavailable(why),
         Err(os::LookupError::Failed(why)) => {
-            return if peer.ip().is_loopback() { Origin::Unattributed(why) } else { Origin::Remote };
+            return if local_peer { Origin::Unattributed(why) } else { Origin::Remote };
         }
     };
     if scan.holders.is_empty() {
-        if !peer.ip().is_loopback() {
+        if !local_peer {
             return Origin::Remote;
         }
         return forwarded(peer, &scan, l);
@@ -250,8 +263,8 @@ fn inventory_failed(peer: SocketAddr, n: usize, why: &str) -> Origin {
     Origin::IdentityUnavailable(format!("tmux pane inventory failed: {why}"))
 }
 
-/// A loopback connection with no visible holder: the owner's phone through
-/// tailscale serve, or nothing provable.
+/// A connection from this host (loopback or an own address) with no visible
+/// holder: the owner's phone through tailscale serve, or nothing provable.
 fn forwarded(peer: SocketAddr, scan: &Scan, l: &dyn Lookups) -> Origin {
     let forwarder = match l.root_tailscaled() {
         Ok(pids) => pids.into_iter().find(|p| scan.uninspectable.contains(p)),
@@ -285,8 +298,11 @@ fn forwarded(peer: SocketAddr, scan: &Scan, l: &dyn Lookups) -> Origin {
 struct OsLookups;
 
 impl Lookups for OsLookups {
-    fn scan(&self, client: SocketAddr, server: SocketAddr) -> Result<Scan, os::LookupError> {
-        os::scan(client, server)
+    fn scan(&self, client: SocketAddr, server: SocketAddr, door: &FrontDoor) -> Result<Scan, os::LookupError> {
+        os::scan(client, server, door)
+    }
+    fn own_addresses(&self) -> Result<Vec<std::net::IpAddr>, String> {
+        own_addresses()
     }
     fn root_tailscaled(&self) -> Result<Vec<u32>, String> {
         root_tailscaled_cached()
@@ -337,7 +353,7 @@ impl PeerResolver for OsResolver {
         }
         let origin = decide(conn, &OsLookups);
         if let (Origin::Worker(_), Some(server)) = (&origin, conn.server) {
-            if let Ok(scan) = os::scan(conn.peer, server) {
+            if let Ok(scan) = os::scan(conn.peer, server, &front_door_for(&own_addresses())) {
                 if let Ok(mut m) = holder_memo().lock() {
                     if m.len() > 4096 {
                         m.retain(|_, (at, _)| at.elapsed() < MEMO_TTL);
@@ -406,15 +422,16 @@ fn run_bounded(cmd: &mut std::process::Command, limit: Duration) -> Result<(bool
     let err = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
     let status = match child.wait_timeout(limit) {
         Ok(Some(status)) => status,
-        Ok(None) => {
+        waited => {
+            // Killed: its pipes close, so the readers finish and are joined
+            // rather than left running.
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!("{program} did not answer within {}ms", limit.as_millis()));
-        }
-        Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("could not wait for {program}: {e}"));
+            let _ = (out.join(), err.join());
+            return Err(match waited {
+                Err(e) => format!("could not wait for {program}: {e}"),
+                _ => format!("{program} did not answer within {}ms", limit.as_millis()),
+            });
         }
     };
     let out = out.join().map_err(|_| format!("{program}: stdout reader failed"))?;
@@ -510,84 +527,65 @@ pub(crate) fn is_tailnet(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// The ports `tailscale serve` exposes on this host's tailnet addresses, or
-/// None when they cannot be read (then every tailnet port counts: fail closed).
+/// This host's own interface addresses, from getifaddrs.
+pub(crate) fn own_addresses() -> Result<Vec<std::net::IpAddr>, String> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs allocates a list we walk read-only and free once.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(format!("getifaddrs failed: {}", std::io::Error::last_os_error()));
+    }
+    let mut out = vec![];
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a node of the list getifaddrs returned.
+        let ifa = unsafe { &*cur };
+        if !ifa.ifa_addr.is_null() {
+            // SAFETY: the family says which sockaddr layout the address has.
+            let family = unsafe { (*ifa.ifa_addr).sa_family } as libc::c_int;
+            if family == libc::AF_INET {
+                let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                out.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))));
+            } else if family == libc::AF_INET6 {
+                let sin6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+                out.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr)).to_canonical());
+            }
+        }
+        cur = ifa.ifa_next;
+    }
+    // SAFETY: freed once, after the walk.
+    unsafe { libc::freeifaddrs(head) };
+    Ok(out)
+}
+
+/// Which connections may reach this host's tailscale serve front door.
+///
+/// NOT read from the serve configuration (review round 8: its shape varies,
+/// Foreground and Services sections parsed as "nothing served" and switched
+/// the guard off, twice in one class). Any connection to any of this host's
+/// tailnet addresses, on any port, counts; when the interfaces cannot be read,
+/// any tailnet address counts. Both only ever make a forward ambiguous.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ServedPorts {
-    Known(std::collections::BTreeSet<u16>),
-    Unknown,
+pub(crate) enum FrontDoor {
+    /// This host's tailnet addresses.
+    Own(Vec<std::net::IpAddr>),
+    /// The interfaces could not be read: every tailnet address.
+    AnyTailnet,
 }
 
-/// The port set from `tailscale serve status --json`: the `TCP` map's keys and
-/// the port of each `Web` host ("name:port"). Unparseable JSON is Unknown.
-pub(crate) fn parse_served_ports(json: &str) -> ServedPorts {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return ServedPorts::Unknown };
-    let mut ports = std::collections::BTreeSet::new();
-    if let Some(tcp) = v.get("TCP").and_then(|t| t.as_object()) {
-        for k in tcp.keys() {
-            match k.parse::<u16>() {
-                Ok(p) => {
-                    ports.insert(p);
-                }
-                Err(_) => return ServedPorts::Unknown,
-            }
-        }
-    }
-    if let Some(web) = v.get("Web").and_then(|w| w.as_object()) {
-        for k in web.keys() {
-            match k.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()) {
-                Some(p) => {
-                    ports.insert(p);
-                }
-                None => return ServedPorts::Unknown,
-            }
-        }
-    }
-    ServedPorts::Known(ports)
-}
-
-type ServedCache = Mutex<Option<(Instant, ServedPorts)>>;
-
-/// Served ports, read at most every 10s. A failed read is Unknown and not
-/// cached, so the next connection tries again.
-pub(crate) fn served_ports_cached() -> ServedPorts {
-    static CACHE: OnceLock<ServedCache> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
-    if let Ok(g) = cache.lock() {
-        if let Some((at, ports)) = g.as_ref() {
-            if at.elapsed() < Duration::from_secs(10) {
-                return ports.clone();
-            }
-        }
-    }
-    let read = ["tailscale", "/usr/local/bin/tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"]
-        .iter()
-        .find_map(|bin| {
-            let (ok, out, _) = run_bounded(std::process::Command::new(bin).args(["serve", "status", "--json"]), Duration::from_secs(2)).ok()?;
-            ok.then(|| parse_served_ports(&out))
-        });
-    match read {
-        Some(ports @ ServedPorts::Known(_)) => {
-            if let Ok(mut g) = cache.lock() {
-                *g = Some((Instant::now(), ports.clone()));
-            }
-            ports
-        }
-        _ => ServedPorts::Unknown,
+pub(crate) fn front_door_for(own: &Result<Vec<std::net::IpAddr>, String>) -> FrontDoor {
+    match own {
+        Ok(addrs) => FrontDoor::Own(addrs.iter().copied().filter(|ip| is_tailnet(*ip)).collect()),
+        Err(_) => FrontDoor::AnyTailnet,
     }
 }
 
-/// A socket that may be connected to this host's tailscale serve front door:
-/// a tailnet address on a served port, whatever the local end (review round 7:
-/// a worker can bind loopback or a LAN address and still reach this host's
-/// tailnet IP). Other tailnet hosts on those ports match too; that only makes a
-/// forward ambiguous, which fails closed. Served ports unknown: any tailnet port.
-pub(crate) fn is_front_door(_local: SocketAddr, remote: SocketAddr, served: &ServedPorts) -> bool {
-    is_tailnet(remote.ip())
-        && match served {
-            ServedPorts::Known(ports) => ports.contains(&remote.port()),
-            ServedPorts::Unknown => true,
-        }
+/// Whether a socket whose remote end is `remote` may be at the front door.
+pub(crate) fn is_front_door(remote: SocketAddr, door: &FrontDoor) -> bool {
+    let ip = remote.ip().to_canonical();
+    match door {
+        FrontDoor::Own(addrs) => addrs.contains(&ip),
+        FrontDoor::AnyTailnet => is_tailnet(ip),
+    }
 }
 
 type Shared = Arc<dyn PeerResolver>;
@@ -763,7 +761,7 @@ pub(crate) mod os {
     pub(super) use super::linux::{holds, ppid_of, root_tailscaled, scan, tty_of};
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    pub(super) fn scan(_client: SocketAddr, _server: SocketAddr) -> Result<super::Scan, LookupError> {
+    pub(super) fn scan(_client: SocketAddr, _server: SocketAddr, _door: &super::FrontDoor) -> Result<super::Scan, LookupError> {
         Err(LookupError::Unsupported("no socket-owner lookup on this platform"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -973,12 +971,11 @@ mod macos {
         Some((addr(&ini.insi_laddr, v4, ini.insi_lport), addr(&ini.insi_faddr, v4, ini.insi_fport)))
     }
 
-    pub(crate) fn scan(client: SocketAddr, server: SocketAddr) -> Result<super::Scan, LookupError> {
+    pub(crate) fn scan(client: SocketAddr, server: SocketAddr, door: &super::FrontDoor) -> Result<super::Scan, LookupError> {
         let pids = all_pids();
         if pids.is_empty() {
             return Err(LookupError::Failed("proc_listallpids returned nothing".into()));
         }
-        let served = super::served_ports_cached();
         let mut out = super::Scan::default();
         for pid in pids.into_iter().filter(|&p| p > 0) {
             let fds = match socket_fds(pid) {
@@ -989,17 +986,17 @@ mod macos {
                 }
                 Err(_) => continue, // exited, or no fds to list
             };
-            let (mut holds, mut door) = (false, false);
+            let (mut holds, mut at_door) = (false, false);
             for fd in fds {
                 if let Some((local, remote)) = endpoints(pid, fd) {
                     holds |= local == client && remote == server;
-                    door |= super::is_front_door(local, remote, &served);
+                    at_door |= super::is_front_door(remote, door);
                 }
             }
             if holds {
                 out.holders.push(pid as u32);
             }
-            if door {
+            if at_door {
                 out.front_door.push(pid as u32);
             }
         }
@@ -1104,11 +1101,10 @@ mod linux {
             .collect())
     }
 
-    pub(crate) fn scan(client: SocketAddr, server: SocketAddr) -> Result<super::Scan, LookupError> {
+    pub(crate) fn scan(client: SocketAddr, server: SocketAddr, door: &super::FrontDoor) -> Result<super::Scan, LookupError> {
         let rows = sockets()?;
         let target: HashSet<u64> = rows.iter().filter(|(l, r, _)| *l == client && *r == server).map(|(_, _, i)| *i).collect();
-        let served = super::served_ports_cached();
-        let doors: HashSet<u64> = rows.iter().filter(|(l, r, _)| super::is_front_door(*l, *r, &served)).map(|(_, _, i)| *i).collect();
+        let doors: HashSet<u64> = rows.iter().filter(|(_, r, _)| super::is_front_door(*r, door)).map(|(_, _, i)| *i).collect();
         let mut out = super::Scan::default();
         let procs = std::fs::read_dir("/proc").map_err(|e| LookupError::Failed(e.to_string()))?;
         for entry in procs.flatten() {
@@ -1277,30 +1273,36 @@ mod tests {
     fn root_tailscaled_is_read_from_the_process_table_and_the_front_door_is_this_hosts_tailnet_443() {
         assert_eq!(parse_root_tailscaled("  416     0 tailscaled\n  417   501 tailscaled\n  418     0 tailscale\n"), vec![416]);
         let a = |s: &str| s.parse::<SocketAddr>().unwrap();
-        let served = parse_served_ports(r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:8824"}}}"#);
-        assert_eq!(served, ServedPorts::Known([443].into()));
-        assert!(is_front_door(a("100.85.233.44:50000"), a("100.85.233.44:443"), &served));
-        assert!(is_front_door(a("[fd7a:115c:a1e0::b132:e92c]:50000"), a("[fd7a:115c:a1e0::b132:e92c]:443"), &served));
-        assert!(is_front_door(a("192.168.1.207:50000"), a("100.85.233.44:443"), &served), "a LAN-bound worker reaching the tailnet IP");
-        assert!(is_front_door(a("127.0.0.1:50000"), a("100.85.233.44:443"), &served), "a loopback-bound worker reaching the tailnet IP");
-        assert!(is_front_door(a("100.85.233.44:50000"), a("100.85.233.45:443"), &served), "another tailnet host: ambiguous, fails closed");
-        assert!(!is_front_door(a("100.85.233.44:50000"), a("100.85.233.44:8824"), &served), "not a served port");
-        assert!(!is_front_door(a("192.168.1.207:50000"), a("192.168.1.207:443"), &served), "not tailnet");
-        // Every served port counts, including web handlers.
-        let more = parse_served_ports(r#"{"TCP":{"443":{},"8443":{}},"Web":{"macbook.tail213292.ts.net:10000":{}}}"#);
-        assert_eq!(more, ServedPorts::Known([443, 8443, 10000].into()));
-        assert!(is_front_door(a("127.0.0.1:1"), a("100.85.233.44:10000"), &more));
-        // Unreadable serve status: every tailnet port counts.
-        assert_eq!(parse_served_ports("not json"), ServedPorts::Unknown);
-        assert_eq!(parse_served_ports(r#"{"TCP":{"x":{}}}"#), ServedPorts::Unknown);
-        assert!(is_front_door(a("127.0.0.1:1"), a("100.85.233.44:8824"), &ServedPorts::Unknown));
-        assert!(!is_front_door(a("127.0.0.1:1"), a("192.168.1.207:443"), &ServedPorts::Unknown));
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        // The front door comes from this host's interfaces, never the serve
+        // config: whatever tailscale serve exposes (TCP, Web, Foreground or
+        // Services sections, or nothing at all), every port of every own
+        // tailnet address counts.
+        let own = front_door_for(&Ok(vec![ip("127.0.0.1"), ip("192.168.1.207"), ip("100.85.233.44"), ip("fd7a:115c:a1e0::b132:e92c")]));
+        assert_eq!(own, FrontDoor::Own(vec![ip("100.85.233.44"), ip("fd7a:115c:a1e0::b132:e92c")]));
+        for port in [443u16, 8443, 10000, 8824, 1] {
+            assert!(is_front_door(SocketAddr::new(ip("100.85.233.44"), port), &own), "port {port}");
+        }
+        assert!(is_front_door(a("[fd7a:115c:a1e0::b132:e92c]:443"), &own));
+        assert!(!is_front_door(a("100.85.233.45:443"), &own), "another tailnet host is not this host's front door");
+        assert!(!is_front_door(a("192.168.1.207:443"), &own), "a LAN address is not the tailnet front door");
+        assert!(!is_front_door(a("127.0.0.1:8824"), &own));
+        // Interfaces unreadable: every tailnet address counts (fail closed).
+        let blind = front_door_for(&Err("getifaddrs failed".into()));
+        assert_eq!(blind, FrontDoor::AnyTailnet);
+        assert!(is_front_door(a("100.85.233.45:22"), &blind));
+        assert!(!is_front_door(a("192.168.1.207:443"), &blind));
+        // No tailnet interface at all: nothing is the front door.
+        assert!(!is_front_door(a("100.85.233.44:443"), &front_door_for(&Ok(vec![ip("127.0.0.1")]))));
+        // The real interface list reads on this host.
+        assert!(own_addresses().is_ok_and(|v| v.iter().any(|i| i.is_loopback())), "loopback is an own address");
     }
 
     /// Fake lookups for the shipped decision.
     #[derive(Clone)]
     struct Fake {
         scan: Result<Scan, String>,
+        own: Result<Vec<std::net::IpAddr>, String>,
         tailscaled: Result<Vec<u32>, String>,
         cached: Result<Panes, String>,
         fresh: Result<Panes, String>,
@@ -1310,6 +1312,7 @@ mod tests {
         fn holders(h: &[u32]) -> Self {
             Fake {
                 scan: Ok(Scan { holders: h.to_vec(), ..Default::default() }),
+                own: Ok(own_ips()),
                 tailscaled: Ok(vec![]),
                 cached: Ok(panes()),
                 fresh: Ok(panes()),
@@ -1320,6 +1323,7 @@ mod tests {
         fn forwarded(front_door: &[u32]) -> Self {
             Fake {
                 scan: Ok(Scan { holders: vec![], uninspectable: vec![416], front_door: front_door.to_vec() }),
+                own: Ok(own_ips()),
                 tailscaled: Ok(vec![416]),
                 cached: Ok(panes()),
                 fresh: Ok(panes()),
@@ -1327,9 +1331,16 @@ mod tests {
         }
     }
 
+    fn own_ips() -> Vec<std::net::IpAddr> {
+        ["127.0.0.1", "192.168.1.207", "100.85.233.44"].iter().map(|s| s.parse().unwrap()).collect()
+    }
+
     impl Lookups for Fake {
-        fn scan(&self, _: SocketAddr, _: SocketAddr) -> Result<Scan, os::LookupError> {
+        fn scan(&self, _: SocketAddr, _: SocketAddr, _: &FrontDoor) -> Result<Scan, os::LookupError> {
             self.scan.clone().map_err(os::LookupError::Failed)
+        }
+        fn own_addresses(&self) -> Result<Vec<std::net::IpAddr>, String> {
+            self.own.clone()
         }
         fn root_tailscaled(&self) -> Result<Vec<u32>, String> {
             self.tailscaled.clone()
@@ -1361,9 +1372,20 @@ mod tests {
         assert!(matches!(decide(lo(1), &failed), Origin::IdentityUnavailable(_)));
         // The server end unknown on a loopback connection: never owner.
         assert!(matches!(decide(Conn { server: None, ..lo(1) }, &Fake::holders(&[301])), Origin::Unattributed(_)));
-        // A genuinely remote peer (no local holder, not loopback).
+        // A genuinely remote peer (no local holder, not an own address).
         let remote = Conn { peer: "192.168.1.50:5000".parse().unwrap(), server: Some("192.168.1.207:8824".parse().unwrap()) };
         assert_eq!(decide(remote, &Fake::holders(&[])), Origin::Remote);
+        // Review carried note: a peer on one of this host's own non-loopback
+        // addresses with no visible holder is not Remote outright; it gets the
+        // forward test, so without a root tailscaled it is refused.
+        for own in ["192.168.1.207:5000", "100.85.233.44:5000"] {
+            let c = Conn { peer: own.parse().unwrap(), server: Some("192.168.1.207:8824".parse().unwrap()) };
+            assert!(matches!(decide(c, &Fake::holders(&[])), Origin::Unattributed(_)), "{own}");
+            assert_eq!(decide(c, &Fake::forwarded(&[])), Origin::Remote, "{own} via a proven forward");
+        }
+        // Interfaces unreadable: no peer can be shown to be elsewhere.
+        let blind = Fake { own: Err("getifaddrs failed".into()), ..Fake::holders(&[]) };
+        assert!(matches!(decide(remote, &blind), Origin::Unattributed(_)));
     }
 
     /// Review B1 (6c98cf27), dev-lead's tests 1-3.
@@ -1398,63 +1420,72 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn os_lookup_matches_the_exact_connection_on_both_ends() {
-        use std::os::fd::FromRawFd;
         let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let a = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let client_end = a.local_addr().unwrap();
-        let (_a_srv, _) = listener.accept().unwrap();
         let server_a = SocketAddr::from(([127, 0, 0, 1], port));
-        let me = std::process::id();
-        let scan_a = os::scan(client_end, server_a).expect("scan on a supported platform");
-        assert_eq!(scan_a.holders, vec![me], "the exact connection, by this pid");
-        assert!(os::holds(me, client_end, server_a));
-        // A second server address on this host for the same client end.
-        let other_ip = local_non_loopback_ip();
-        let Some(other_ip) = other_ip else {
+        let Some(other_ip) = local_non_loopback_ip() else {
             panic!("this test needs a non-loopback address on the host to reproduce a shared client end");
         };
         let server_b = SocketAddr::new(other_ip, port);
-        // SAFETY: a fresh socket, configured with plain setsockopt/bind/connect,
+        // Both sockets set SO_REUSEADDR/SO_REUSEPORT before binding (Linux
+        // requires it of the first holder too), as review B2's worker did.
+        let a = reuse_connect(std::net::Ipv4Addr::LOCALHOST, 0, server_a);
+        let client_end = a.local_addr().unwrap();
+        let (a_srv, _) = listener.accept().unwrap();
+        let me = std::process::id();
+        let door = front_door_for(&own_addresses());
+        let scan_a = os::scan(client_end, server_a, &door).expect("scan on a supported platform");
+        assert_eq!(scan_a.holders, vec![me], "the exact connection, by this pid");
+        assert!(os::holds(me, client_end, server_a));
+        let b = reuse_connect(std::net::Ipv4Addr::LOCALHOST, client_end.port(), server_b);
+        let (b_srv, b_peer) = listener.accept().unwrap();
+        assert_eq!(b_peer, client_end, "the server sees the same client end for both connections");
+        assert!(os::holds(me, client_end, server_b));
+        assert_eq!(os::scan(client_end, server_b, &door).unwrap().holders, vec![me]);
+        // Close A: its connection is no longer held, although B still holds the
+        // same client end. Local-end-only matching would still say "held".
+        drop(a);
+        drop(a_srv);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!os::holds(me, client_end, server_a), "a closed connection is not inherited by another sharing its client end");
+        assert!(os::scan(client_end, server_a, &door).unwrap().holders.is_empty());
+        assert!(os::holds(me, client_end, server_b));
+        drop((b, b_srv));
+        assert!(os::ppid_of(me).is_some(), "parent of this process must be readable");
+        let _ = os::tty_of(me);
+    }
+
+    /// A TCP client socket with SO_REUSEADDR and SO_REUSEPORT, bound to
+    /// `local_ip:local_port` (0 = any port), connected to `server`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn reuse_connect(local_ip: std::net::Ipv4Addr, local_port: u16, server: SocketAddr) -> std::net::TcpStream {
+        use std::os::fd::FromRawFd;
+        let std::net::IpAddr::V4(server_ip) = server.ip() else { panic!("v4 expected") };
+        let sin = |ip: std::net::Ipv4Addr, p: u16| libc::sockaddr_in {
+            #[cfg(target_os = "macos")]
+            sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: p.to_be(),
+            sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(ip.octets()) },
+            sin_zero: [0; 8],
+        };
+        // SAFETY: a fresh socket configured with plain setsockopt/bind/connect,
         // then owned by a TcpStream that closes it.
-        let b = unsafe {
+        unsafe {
             let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
             assert!(fd >= 0);
             let one: libc::c_int = 1;
             let sz = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            assert_eq!(libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, (&one as *const libc::c_int).cast(), sz), 0);
-            let sin = |ip: std::net::Ipv4Addr, p: u16| libc::sockaddr_in {
-                #[cfg(target_os = "macos")]
-                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: p.to_be(),
-                sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(ip.octets()) },
-                sin_zero: [0; 8],
-            };
-            let std::net::IpAddr::V4(other4) = other_ip else { panic!("v4 expected") };
-            let local = sin(std::net::Ipv4Addr::LOCALHOST, client_end.port());
+            for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
+                assert_eq!(libc::setsockopt(fd, libc::SOL_SOCKET, opt, (&one as *const libc::c_int).cast(), sz), 0);
+            }
             let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-            assert_eq!(libc::bind(fd, (&local as *const libc::sockaddr_in).cast(), len), 0, "share the client end");
-            let remote = sin(other4, port);
-            assert_eq!(libc::connect(fd, (&remote as *const libc::sockaddr_in).cast(), len), 0, "connect to the other server address");
+            let local = sin(local_ip, local_port);
+            assert_eq!(libc::bind(fd, (&local as *const libc::sockaddr_in).cast(), len), 0, "bind the client end");
+            let remote = sin(server_ip, server.port());
+            assert_eq!(libc::connect(fd, (&remote as *const libc::sockaddr_in).cast(), len), 0, "connect");
             std::net::TcpStream::from_raw_fd(fd)
-        };
-        let (_b_srv, b_peer) = listener.accept().unwrap();
-        assert_eq!(b_peer, client_end, "the server sees the same client end for both connections");
-        assert!(os::holds(me, client_end, server_b));
-        assert_eq!(os::scan(client_end, server_b).unwrap().holders, vec![me]);
-        // Close A: its connection is no longer held, although B still holds the
-        // same client end. Local-end-only matching would still say "held".
-        drop(a);
-        drop(_a_srv);
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(!os::holds(me, client_end, server_a), "a closed connection is not inherited by another sharing its client end");
-        assert!(os::scan(client_end, server_a).unwrap().holders.is_empty());
-        assert!(os::holds(me, client_end, server_b));
-        drop(b);
-        // This process's ancestry walks to the root and its tty (if any) reads.
-        assert!(os::ppid_of(me).is_some(), "parent of this process must be readable");
-        let _ = os::tty_of(me);
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1499,7 +1530,7 @@ mod tests {
         assert!(!server_side.is_empty(), "no live connections to decide");
         for (server, peer) in server_side {
             let origin = decide(Conn { peer, server: Some(server) }, &OsLookups);
-            let scan = os::scan(peer, server).ok();
+            let scan = os::scan(peer, server, &front_door_for(&own_addresses())).ok();
             println!("LIVE {peer} -> {server}: {origin:?} holders={:?}", scan.map(|s| s.holders));
         }
     }
