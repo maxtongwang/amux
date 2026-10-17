@@ -1,7 +1,10 @@
--- Structured grants (maxtongwang/ai-config#160): a widening change mrpopo
--- asks for, stored exactly, applied once on Max's approval. Times are epoch
--- seconds (now_f64). Status: pending, applying, applied, failed, denied,
--- expired. Transitions are also appended to the delegated-change log.
+-- Structured grants (maxtongwang/ai-config#160): the audit unit for a
+-- widening change mrpopo makes. Cite mode (default) records the cited row and
+-- applies at once; passkey mode stores it pending until approved. Times are
+-- epoch seconds (now_f64). Status: pending, applying, applied, failed,
+-- denied, expired, undone. `changes` holds each changed key's before/after
+-- (never a secret value) for one-step undo. Transitions are also appended to
+-- the delegated-change log.
 CREATE TABLE IF NOT EXISTS _amux_delegation_grants (
     code         TEXT PRIMARY KEY,
     actor        TEXT NOT NULL,
@@ -18,6 +21,10 @@ CREATE TABLE IF NOT EXISTS _amux_delegation_grants (
     status       TEXT NOT NULL DEFAULT 'pending',
     decided_by   TEXT,
     decided_at   REAL,
-    evidence_row INTEGER
+    evidence_row INTEGER,
+    cited_excerpt TEXT,
+    changes      TEXT,
+    undoable     INTEGER,
+    mode         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_delegation_grants_status ON _amux_delegation_grants(status, created_at);

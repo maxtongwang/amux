@@ -549,7 +549,7 @@ pub fn router_with_connector_transport(
         // admitted requests.
         // Inside rule 10: buffer a delegable mutating request so a change that
         // needs Max's approval can be stored as an exact grant (ai-config #160).
-        .layer(axum::middleware::from_fn(delegation_grants::capture))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), delegation_grants::capture))
         .layer(axum::middleware::from_fn(worker_identity::enforce))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

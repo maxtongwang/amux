@@ -151,7 +151,9 @@ fn cases(e: &Env) -> Vec<Case> {
             path: format!("/api/sessions/{OPS_A}/config"),
             refused: json!({"send_allow": DEV_A}),
             allowed_as: MRPOPO,
-            allowed: json!({"send_allow": DEV_A}),
+            // Clearing the legacy allowance: the endpoint refuses any
+            // non-empty value for everyone (shared groups only).
+            allowed: json!({"send_allow": ""}),
             needs_ref: true,
         },
     ]
@@ -190,19 +192,22 @@ async fn every_config_mutating_route_consults_delegation() {
             let (st, v) = e.call(Who::Owner, "POST", "/api/workers", Some(json!({"name": DEV_B, "cwd": "/tmp"}))).await;
             assert!(st.is_success(), "fixture: owner registers {DEV_B}'s store row: {st} {v}");
         }
-        // A grant row (mrpopo) consults the table too: it answers 202 with a
-        // pending grant and logs the request.
-        let (st, v) = e.call(Who::Worker(c.allowed_as), c.method, &c.path, Some(c.allowed.clone())).await;
-        if c.needs_ref && st != axum::http::StatusCode::ACCEPTED {
-            failures.push(format!("{} as {}: expected a pending grant (202), got {st} {v}", c.name, c.allowed_as));
-            continue;
-        }
+        // A grant row (mrpopo) cites Max's row in another lane: it applies and
+        // logs the change plus the grant.
+        let body = if c.needs_ref {
+            let row = e.seed_pane_prompt(MAX_PANE, "Max's instruction", now_s() - 30.0);
+            cited(c.allowed.clone(), row)
+        } else {
+            c.allowed.clone()
+        };
+        let (st, v) = e.call(Who::Worker(c.allowed_as), c.method, &c.path, Some(body)).await;
         if !st.is_success() {
             failures.push(format!("{} as {}: {st} {v}", c.name, c.allowed_as));
             continue;
         }
-        if e.log_entries().len() != 1 {
-            failures.push(format!("{}: allowed delegated change logged {} entries", c.name, e.log_entries().len()));
+        let want = if c.needs_ref { 2 } else { 1 };
+        if e.log_entries().len() != want {
+            failures.push(format!("{}: allowed delegated change logged {} entries, want {want}", c.name, e.log_entries().len()));
         }
     }
     assert!(failures.is_empty(), "routes that did not consult delegation:\n{}", failures.join("\n"));

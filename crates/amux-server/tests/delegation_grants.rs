@@ -1,13 +1,15 @@
-//! Structured grants (maxtongwang/ai-config#160): mrpopo's widening change is
-//! stored as a pending grant and applied exactly once, only on Max's approval.
-//! Approval is ONLY an owner send attributed Remote containing
-//! `amux grant <code>`, or the owner's Approve over a Remote-verified
-//! connection. In-process requests carry no Remote verdict, so the approving
-//! paths are proven in the lib tests (api/delegation_grants.rs, with #7's
-//! resolver); this suite proves every non-Remote path does NOT approve.
+//! Structured grants (maxtongwang/ai-config#160), HTTP level.
 //!
-//! Run under `amux-isolated`; the harness (delegation_support) isolates HOME,
-//! AMUX_HOME, CC_HOME and tmux.
+//! CITE MODE (default): mrpopo's widening change cites one of Max's typed
+//! rows in another lane and applies at once, recorded as a grant: logged, fed
+//! to the leads, undoable in one step. Own-lane, delivered, stale or missing
+//! citations are refused.
+//! PASSKEY MODE (`AMUX_DELEGATION_APPROVAL=passkey`, owner-only): the change is
+//! a pending grant; only the approval proof (a non-local Remote owner) applies
+//! it. In-process requests carry no Remote verdict, so the approving path is
+//! proven in the lib tests (api/delegation_grants.rs, with #7's resolver).
+//!
+//! Run under `amux-isolated`.
 
 mod delegation_support;
 
@@ -18,104 +20,125 @@ fn cfg(w: &str) -> String {
     format!("/api/sessions/{w}/config")
 }
 
-async fn ask_yolo(e: &Env) -> String {
-    let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_A), Some(json!({"toggle_yolo": true, "why": "Max asked"}))).await;
-    assert_grant_pending(st, &v, "mrpopo asks for yolo on a worker")
-}
-
 fn yolo_on(e: &Env) -> bool {
     let t = e.env_text(DEV_A);
     t.contains("dangerously") || t.contains("CC_AUTO_CONTINUE=\"1\"")
 }
 
 #[tokio::test]
-async fn a_grant_is_created_logged_and_posted_but_not_applied() {
+async fn cite_mode_applies_at_once_logs_feeds_and_undoes_exactly() {
     let e = setup().await;
     let before = e.snapshot();
-    let code = ask_yolo(&e).await;
-    assert_eq!(e.grant_status(&code), "pending");
-    assert_eq!(before, e.snapshot(), "a pending grant changes nothing");
-    let entries = e.log_entries();
-    assert_eq!(entries.len(), 1, "{entries:?}");
-    assert_eq!(entries[0]["action"], json!("grant:requested"));
-    assert_eq!(entries[0]["grant"], json!(code));
-    assert!(entries[0]["after"]["sentence"].as_str().is_some_and(|s| s.contains(&format!("amux grant {code}"))), "{}", entries[0]);
-    // The leads feed carries the exact sentence (queued asynchronously).
-    let mut seen = false;
+    let row = e.seed_pane_prompt(MAX_PANE, &format!("turn on yolo for {DEV_A}"), now_s() - 30.0);
+    let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_A), Some(cited(json!({"toggle_yolo": true, "why": "Max asked"}), row))).await;
+    assert_allowed(st, &v, "cited change applies");
+    let code = e.latest_grant();
+    assert_eq!(e.grant_status(&code), "applied");
+    assert!(yolo_on(&e), "{}", e.env_text(DEV_A));
+    let actions: Vec<String> = e.log_entries().iter().filter_map(|m| m["action"].as_str().map(str::to_string)).collect();
+    assert!(actions.contains(&"grant:applied".to_string()), "{actions:?}");
+    let mut fed = false;
     for _ in 0..40 {
-        if e.queued_for(DEV_LEAD).iter().any(|t| t.contains(&format!("amux grant {code}"))) {
-            seen = true;
+        if e.queued_for(DEV_LEAD).iter().any(|t| t.contains(&format!("amux grant {code}")) && t.contains("turn on yolo")) {
+            fed = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    assert!(seen, "the leads feed names the grant: {:?}", e.queued_for(DEV_LEAD));
+    assert!(fed, "the leads feed carries the sentence and the cited excerpt: {:?}", e.queued_for(DEV_LEAD));
+    // Undo: a plain worker may not; the owner may; the state is restored exactly.
+    let (st, v) = e.call(Who::Worker(DEV_A), "POST", &format!("/api/delegation/grants/{code}/undo"), None).await;
+    assert_refused(st, &v, "a worker undoing");
+    let (st, v) = e.call(Who::Owner, "POST", &format!("/api/delegation/grants/{code}/undo"), None).await;
+    assert_allowed(st, &v, "owner undoes");
+    assert_eq!(e.grant_status(&code), "undone");
+    assert_eq!(before, e.snapshot(), "undo restores exactly");
+    assert!(e.log_entries().iter().any(|m| m["action"] == json!("grant:undone")), "{:?}", e.log_entries());
 }
 
-/// Pane rows never approve, in another lane or the actor's own: any lane's
-/// process can mint one through its own /report.
 #[tokio::test]
-async fn a_typed_pane_row_never_approves() {
+async fn cite_mode_refuses_own_lane_delivered_stale_and_missing_citations() {
     let e = setup().await;
-    let code = ask_yolo(&e).await;
-    for lane in [MAX_PANE, DEV_LEAD, MRPOPO] {
-        let (st, v) = e.type_in_pane(lane, &format!("go ahead: amux grant {code}")).await;
-        assert_allowed(st, &v, "the report itself is accepted");
-        assert_eq!(e.grant_status(&code), "pending", "a pane row in {lane} must not approve");
+    let now = now_s();
+    let own = e.seed_pane_prompt(MRPOPO, &format!("turn on yolo for {DEV_A}"), now - 30.0);
+    let delivered = e.seed_pane_prompt(MAX_PANE, &format!("[amux-origin: {DEV_LEAD}] turn on yolo for {DEV_A}"), now - 30.0);
+    let stale = e.seed_pane_prompt(MAX_PANE, &format!("turn on yolo for {DEV_A}"), now - 90_000.0);
+    let before = e.snapshot();
+    for (body, code) in [
+        (json!({"toggle_yolo": true}), "cite_missing"),
+        (cited(json!({"toggle_yolo": true}), own), "max_ref_own_lane"),
+        (cited(json!({"toggle_yolo": true}), delivered), "max_ref_not_human_typed"),
+        (cited(json!({"toggle_yolo": true}), stale), "max_ref_stale"),
+    ] {
+        let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_A), Some(body)).await;
+        assert_code(st, &v, code, code);
+    }
+    assert_eq!(before, e.snapshot());
+    assert_eq!(e.latest_grant(), "", "a refused citation records no grant");
+}
+
+#[tokio::test]
+async fn a_lead_or_worker_citing_max_gets_nothing() {
+    let e = setup().await;
+    let row = e.seed_pane_prompt(MAX_PANE, &format!("turn on yolo for {DEV_A}"), now_s() - 30.0);
+    for who in [DEV_LEAD, DEV_A, OPS_A] {
+        let (st, v) = e.call(Who::Worker(who), "PATCH", &cfg(DEV_A), Some(cited(json!({"toggle_yolo": true}), row))).await;
+        assert_refused(st, &v, &format!("{who} citing Max"));
     }
     assert!(!yolo_on(&e));
-    assert!(!e.log_entries().iter().any(|m| m["action"] == json!("grant:approved")), "{:?}", e.log_entries());
 }
 
 #[tokio::test]
-async fn a_wrong_code_does_nothing() {
+async fn passkey_mode_creates_pending_grants_that_local_requests_cannot_approve() {
     let e = setup().await;
-    let code = ask_yolo(&e).await;
-    let wrong = if code == "ZZZZ" { "YYYY" } else { "ZZZZ" };
-    let (st, v) = e.call(Who::Owner, "POST", &format!("/api/delegation/grants/{wrong}/deny"), None).await;
-    assert_eq!(st.as_u16(), 404, "{v}");
+    e.set_mode("passkey");
+    let row = e.seed_pane_prompt(MAX_PANE, &format!("turn on yolo for {DEV_A}"), now_s() - 30.0);
+    let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_A), Some(cited(json!({"toggle_yolo": true}), row))).await;
+    let code = assert_grant_pending(st, &v, "passkey mode: pending even with a citation");
+    assert!(!yolo_on(&e));
+    // A pane row naming the code, and a local owner Approve, are not proof.
+    e.type_in_pane(MAX_PANE, &format!("amux grant {code}")).await;
     assert_eq!(e.grant_status(&code), "pending");
-}
-
-#[tokio::test]
-async fn the_owner_approve_route_requires_remote_and_deny_works() {
-    let e = setup().await;
-    let code = ask_yolo(&e).await;
-    // In-process owner with no process verdict: refused. A client-supplied
-    // verdict header is stripped by attribution, so it is refused too.
     let (st, v) = e.call(Who::Owner, "POST", &format!("/api/delegation/grants/{code}/approve"), None).await;
-    assert_code(st, &v, "grant_approve_requires_remote", "owner without Remote");
-    // A worker never approves.
+    assert_code(st, &v, "grant_approve_requires_remote", "a local owner approve");
     let (st, v) = e.call(Who::Worker(DEV_LEAD), "POST", &format!("/api/delegation/grants/{code}/approve"), None).await;
     assert_code(st, &v, "grant_owner_only", "a lead approving");
-    assert_eq!(e.grant_status(&code), "pending");
     // Deny: owner only, final.
     let (st, v) = e.call(Who::Worker(MRPOPO), "POST", &format!("/api/delegation/grants/{code}/deny"), None).await;
     assert_code(st, &v, "grant_owner_only", "mrpopo denying");
     let (st, v) = e.call(Who::Owner, "POST", &format!("/api/delegation/grants/{code}/deny"), None).await;
     assert_allowed(st, &v, "owner denies");
     assert_eq!(e.grant_status(&code), "denied");
-    let (st, _) = e.call(Who::Owner, "POST", &format!("/api/delegation/grants/{code}/approve"), None).await;
-    assert_eq!(st.as_u16(), 403, "still refused locally");
-    assert_eq!(e.grant_status(&code), "denied", "a denied grant never applies");
     assert!(!yolo_on(&e));
-    assert!(e.log_entries().iter().any(|m| m["action"] == json!("grant:denied")), "{:?}", e.log_entries());
+}
+
+/// The mode setting is owner-only: hands-only for every worker, mrpopo included.
+#[tokio::test]
+async fn the_mode_setting_is_owner_only() {
+    let e = setup().await;
+    let row = e.seed_pane_prompt(MAX_PANE, "switch delegation to cite mode", now_s() - 30.0);
+    for who in [MRPOPO, DEV_LEAD, DEV_A] {
+        for (level, name) in [("global", ""), ("worker", DEV_A)] {
+            let body = cited(scope_body(level, name, "env", json!({"AMUX_DELEGATION_APPROVAL": "cite"})), row);
+            let (st, v) = e.call(Who::Worker(who), "PUT", "/api/scope", Some(body)).await;
+            assert_refused(st, &v, &format!("{who} switching the mode at {level}"));
+        }
+    }
+    let (st, v) = e.call(Who::Owner, "PUT", "/api/scope", Some(scope_body("global", "", "env", json!({"AMUX_DELEGATION_APPROVAL": "passkey"})))).await;
+    assert_allowed(st, &v, "the owner switches the mode");
 }
 
 #[tokio::test]
-async fn pending_grants_are_listed_for_the_owner() {
+async fn whoami_answers_in_process() {
     let e = setup().await;
-    let code = ask_yolo(&e).await;
-    let (st, v) = e.call(Who::Owner, "GET", "/api/delegation/grants", None).await;
-    assert_allowed(st, &v, "owner lists grants");
-    assert_eq!(v["measured"], json!(true));
-    assert!(v["grants"].as_array().unwrap().iter().any(|g| g["code"] == json!(code) && g["status"] == json!("pending")), "{v}");
-    let (st, v) = e.call(Who::Worker(DEV_A), "GET", "/api/delegation/grants", None).await;
-    assert_refused(st, &v, "a plain worker cannot list grants");
+    let (st, v) = e.call(Who::Owner, "GET", "/api/delegation/whoami", None).await;
+    assert_allowed(st, &v, "whoami");
+    assert_eq!((v["process_origin"].clone(), v["forwarded"].clone(), v["approval_proof"].clone()), (json!(null), json!(false), json!(false)), "{v}");
+    assert_eq!(v["mode"], json!("cite"));
 }
 
 /// ai-config #175: the owner's alert channels are owner-only, or mrpopo
-/// through a grant; a lead or a worker is refused.
+/// citing Max; a lead or a worker is refused.
 #[tokio::test]
 async fn alerts_config_goes_through_the_table() {
     let e = setup().await;
@@ -125,7 +148,10 @@ async fn alerts_config_goes_through_the_table() {
         assert_refused(st, &v, &format!("{who} sets alerts config"));
     }
     let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", "/api/alerts/config", Some(body.clone())).await;
-    assert_grant_pending(st, &v, "mrpopo asks for an alerts change");
+    assert_code(st, &v, "cite_missing", "mrpopo without a citation");
+    let row = e.seed_pane_prompt(MAX_PANE, "set my alert phone to +15550100", now_s() - 30.0);
+    let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", "/api/alerts/config", Some(cited(body.clone(), row))).await;
+    assert_allowed(st, &v, "mrpopo citing Max");
     let (st, v) = e.call(Who::Owner, "PATCH", "/api/alerts/config", Some(body)).await;
     assert_allowed(st, &v, "owner sets alerts config");
 }

@@ -28628,6 +28628,10 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             } else {
                 None
             };
+            tracing::info!(session = %name, process_origin = process_origin.unwrap_or(""),
+                forwarded = process_origin == Some(super::process_identity::REMOTE_FORWARDED),
+                verdict = "owner_send_process_origin", measured = true, n_considered = 1,
+                "an owner send and its process origin (only a non-local Remote one approves a pending grant)");
             let meta = DeliveryMeta {
                 client_meta: client_meta_raw.as_deref(),
                 process_origin,

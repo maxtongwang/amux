@@ -47507,12 +47507,15 @@ async function _delegationGrantsLoad() {
     const r = await fetch(API + '/api/delegation/grants', { headers: _authHeaders() });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) { box.innerHTML = '<p class="ui-error" role="alert">' + esc(d.error || ('HTTP ' + r.status)) + '</p>'; return; }
-    const pending = (d.grants || []).filter(g => g.status === 'pending');
-    box.innerHTML = pending.length ? '<ol class="vault-audit">' + pending.map(g => '<li><span class="vault-audit-ev">' + esc(g.code) + '</span>'
-      + '<span class="vault-audit-what">' + esc(g.sentence || '') + '</span>'
-      + '<button class="btn" onclick="_delegationGrantDecide(' + "'" + esc(g.code) + "'" + ',\'approve\')">Approve</button> '
-      + '<button class="btn" onclick="_delegationGrantDecide(' + "'" + esc(g.code) + "'" + ',\'deny\')">Deny</button></li>').join('') + '</ol>'
-      : '<p class="ui-help">No pending grants.</p>';
+    const all = d.grants || [];
+    const btn = (code, verb, label) => '<button class="btn" onclick="_delegationGrantDecide(' + "'" + esc(code) + "'" + ',\'' + verb + '\')">' + label + '</button> ';
+    const row = (g, buttons) => '<li><span class="vault-audit-ev">' + esc(g.code) + ' · ' + esc(g.status) + '</span>'
+      + '<span class="vault-audit-what">' + esc(g.sentence || '') + (g.cited_excerpt ? ' <span class="ui-help">cited: “' + esc(g.cited_excerpt) + '”</span>' : '') + '</span>' + buttons + '</li>';
+    const pending = all.filter(g => g.status === 'pending');
+    const applied = all.filter(g => g.status === 'applied');
+    box.innerHTML = '<p class="ui-help">Mode: ' + esc(d.mode || 'cite') + '.</p>'
+      + (pending.length ? '<ol class="vault-audit">' + pending.map(g => row(g, btn(g.code, 'approve', 'Approve') + btn(g.code, 'deny', 'Deny'))).join('') + '</ol>' : '<p class="ui-help">No pending grants.</p>')
+      + (applied.length ? '<p class="ui-help">Applied (undo restores the state before):</p><ol class="vault-audit">' + applied.map(g => row(g, btn(g.code, 'undo', 'Undo'))).join('') + '</ol>' : '');
   } catch (err) { box.innerHTML = '<p class="ui-error" role="alert">Could not load pending grants</p>'; }
 }
 async function _delegationGrantDecide(code, verb) {

@@ -135,8 +135,11 @@ fn flat(s: &str, max: usize) -> String {
 /// The leads feed line: `delegated: <actor> <action> <target> (why)`.
 pub(crate) fn feed_text(c: &DelegatedChange) -> String {
     // A grant request carries its exact sentence, so Max sees what he approves.
-    if let Some(sentence) = c.after.get("sentence").and_then(Value::as_str).filter(|_| c.action == "grant:requested") {
-        return format!("delegated, pending Max: {}", flat(sentence, 600));
+    if let Some(sentence) = c.after.get("sentence").and_then(Value::as_str) {
+        let what = c.action.strip_prefix("grant:").unwrap_or(&c.action);
+        let cited = c.after.get("cited_excerpt").and_then(Value::as_str)
+            .map(|x| format!(" (cited Max: \"{}\")", flat(x, 200))).unwrap_or_default();
+        return format!("delegated grant {what}: {}{cited}", flat(sentence, 600));
     }
     let why = c.why.as_deref().map(|w| format!(" ({})", flat(w, 200))).unwrap_or_default();
     format!("delegated: {} {} {}{why}", flat(&c.actor, 64), flat(&c.action, 64), flat(&c.target, 120))

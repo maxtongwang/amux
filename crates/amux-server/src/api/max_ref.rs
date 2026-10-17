@@ -14,14 +14,20 @@
 //! that lane (the `pane_prompts` delivery ring and the lane's other
 //! `cmd_history` rows). A relayed text that matches exactly never counts.
 //!
-//! APPROVAL RULE ([`approval_source_allowed`], settled 2026-10-17): a grant is
-//! approved ONLY by an owner send whose process origin is Remote (another
-//! host over the tailnet), or by the Approve button (owner plus Remote). Pane
-//! rows never approve, in any lane and Remote Control included: any lane's
-//! process can post its own UserPromptSubmit to `/report` and mint one, and a
-//! same-user process can type into the owner's pane (ai-config#136). Outside
-//! sends never approve: a worker reaches Outside through `launchctl submit`.
-//! A Remote verdict is the one proof no local process can produce.
+//! TWO RULES (dev-lead, 2026-10-17), each one function:
+//! - CITATION ([`cite_source_allowed`], cite mode, the default): a widening
+//!   change cites one of Max's rows. It qualifies when it is human-typed, not
+//!   an amux delivery, fresh, within the window of the cited time, and in a
+//!   lane OTHER than the actor's own; in the actor's own lane only a
+//!   non-local Remote owner send counts (a lane can mint its own pane rows
+//!   through `/report`, and a worker reaches Outside or the forwarded Remote
+//!   through `launchctl submit`). Accepted limit (ai-config#136): ANOTHER lane
+//!   can mint a pane row the same way; in cite mode that is mitigated by the
+//!   audit log, the leads feed and one-step undo, not prevented.
+//! - APPROVAL ([`approval_source_allowed`], passkey mode): a pending grant is
+//!   approved only by an owner send from a NON-LOCAL Remote peer (the phone or
+//!   another device on the tailnet). A tailscale-serve forward over loopback
+//!   (`remote-forwarded`) is not owner proof.
 use super::pane_prompts;
 use super::AppState;
 
@@ -30,8 +36,14 @@ pub(crate) enum MaxRefRefusal {
     NoSuchRow,
     NotHumanTyped,
     Stale,
-    /// Human, but not an owner send attributed Remote: a pane row or an Outside send.
+    /// Human, but not an owner send from a non-local Remote peer.
     NotRemoteOwnerSend,
+    /// No citation was given.
+    Missing,
+    /// The cited time is too far from the cited row.
+    OutsideWindow,
+    /// A citation in the actor's own lane that is not a non-local Remote owner send.
+    OwnLane,
 }
 
 impl MaxRefRefusal {
@@ -41,10 +53,15 @@ impl MaxRefRefusal {
             Self::NotHumanTyped => "max_ref_not_human_typed",
             Self::Stale => "max_ref_stale",
             Self::NotRemoteOwnerSend => "max_ref_not_remote_owner_send",
+            Self::Missing => "cite_missing",
+            Self::OutsideWindow => "max_ref_outside_window",
+            Self::OwnLane => "max_ref_own_lane",
         }
     }
 }
 
+/// |row.ts - cited time| must not exceed this.
+pub(crate) const CITE_WINDOW_S: f64 = 600.0;
 /// now - row.ts must not exceed this.
 pub(crate) const MAX_REF_MAX_AGE_S: f64 = 86_400.0;
 /// Bounds every query; a lane writes a few rows a minute.
@@ -63,7 +80,7 @@ struct Row {
     text: String,
     ts: f64,
     source: Option<HumanSource>,
-    /// process_origin = remote: the tailnet forwarder from another host.
+    /// process_origin = remote: a non-local peer (owner proof); never the forwarded verdict.
     remote: bool,
 }
 
@@ -75,7 +92,7 @@ fn human_source(ctype: &str, origin: &str, delivery: &str, process_origin: &str)
     if delivery == "pane" && origin == "pane" {
         return Some(HumanSource::Pane);
     }
-    if matches!(delivery, "direct" | "queued") && matches!(process_origin, "outside" | "remote") {
+    if matches!(delivery, "direct" | "queued") && matches!(process_origin, "outside" | "remote" | "remote-forwarded") {
         return Some(HumanSource::OwnerSend);
     }
     None
@@ -96,7 +113,7 @@ fn rows(state: &AppState, sql_where: &str, params: &[&dyn rusqlite::ToSql]) -> R
                 text: r.get(2)?,
                 ts: r.get::<_, i64>(7)? as f64 / 1000.0,
                 source: human_source(&ctype, &origin, &delivery, &po),
-                remote: po == "remote",
+                remote: po == super::process_identity::REMOTE_DIRECT,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -145,8 +162,8 @@ pub(crate) fn is_amux_delivery(state: &AppState, session: &str, row_id: i64, tex
     pane_prompts::classify(text, &delivered) != pane_prompts::PaneVerdict::Record
 }
 
-/// THE grant-approval rule: only an owner send attributed Remote. One
-/// function, so a ruling is a one-line change.
+/// THE passkey-mode approval rule: only an owner send from a non-local
+/// Remote peer. One function, so a ruling is a one-line change.
 pub(crate) fn approval_source_allowed(source: HumanSource, remote: bool) -> bool {
     source == HumanSource::OwnerSend && remote
 }
@@ -170,6 +187,92 @@ fn row_qualifies_at(state: &AppState, row_id: i64, now: f64) -> Result<(), MaxRe
         return Err(MaxRefRefusal::NotRemoteOwnerSend);
     }
     Ok(())
+}
+
+/// A citation of one of Max's rows: its id, or a session and time (the
+/// nearest qualifying row within [`CITE_WINDOW_S`]).
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]
+pub(crate) struct Cite {
+    #[serde(default)]
+    pub row_id: Option<i64>,
+    #[serde(default)]
+    pub session: Option<String>,
+    /// Unix seconds.
+    #[serde(default)]
+    pub time: Option<f64>,
+}
+
+/// The row a citation resolved to.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Cited {
+    pub row_id: i64,
+    pub session: String,
+    pub excerpt: String,
+}
+
+/// THE citation rule (cite mode): another lane's human row counts; in the
+/// actor's own lane only a non-local Remote owner send.
+pub(crate) fn cite_source_allowed(actor: &str, session: &str, source: HumanSource, remote: bool) -> bool {
+    let own = session == actor || super::chat_worker::companion_parent(actor) == Some(session);
+    !own || (source == HumanSource::OwnerSend && remote)
+}
+
+fn qualify_cited(state: &AppState, row: &Row, actor: &str, now: f64) -> Result<(), MaxRefRefusal> {
+    let source = row.source.ok_or(MaxRefRefusal::NotHumanTyped)?;
+    if now - row.ts > MAX_REF_MAX_AGE_S {
+        return Err(MaxRefRefusal::Stale);
+    }
+    if is_amux_delivery(state, &row.session, row.id, &row.text, row.ts, source) {
+        return Err(MaxRefRefusal::NotHumanTyped);
+    }
+    if !cite_source_allowed(actor, &row.session, source, row.remote) {
+        return Err(MaxRefRefusal::OwnLane);
+    }
+    Ok(())
+}
+
+/// Resolve and qualify `cite` for `actor`.
+pub(crate) fn cite_row(state: &AppState, cite: Option<&Cite>, actor: &str) -> Result<Cited, MaxRefRefusal> {
+    cite_row_at(state, cite, actor, crate::config::now_f64())
+}
+
+fn cite_row_at(state: &AppState, cite: Option<&Cite>, actor: &str, now: f64) -> Result<Cited, MaxRefRefusal> {
+    let cite = cite.ok_or(MaxRefRefusal::Missing)?;
+    let cited = |row: Row| Cited { row_id: row.id, session: row.session, excerpt: row.text.chars().take(200).collect() };
+    if let Some(id) = cite.row_id {
+        let row = rows(state, "id=?1", &[&id]).map_err(|_| MaxRefRefusal::NoSuchRow)?.into_iter().next().ok_or(MaxRefRefusal::NoSuchRow)?;
+        if cite.time.is_some_and(|t| (row.ts - t).abs() > CITE_WINDOW_S) {
+            return Err(MaxRefRefusal::OutsideWindow);
+        }
+        qualify_cited(state, &row, actor, now)?;
+        return Ok(cited(row));
+    }
+    let (Some(session), Some(time)) = (cite.session.as_deref().filter(|s| !s.trim().is_empty()), cite.time.filter(|t| t.is_finite())) else {
+        return Err(MaxRefRefusal::Missing);
+    };
+    let near = rows(state, "session=?1 AND ts BETWEEN ?2 AND ?3", &[&session, &ms(time - CITE_WINDOW_S), &ms(time + CITE_WINDOW_S)])
+        .map_err(|_| MaxRefRefusal::NoSuchRow)?;
+    if near.is_empty() {
+        return Err(MaxRefRefusal::NoSuchRow);
+    }
+    let mut best: Option<(Row, f64)> = None;
+    let mut first_err = MaxRefRefusal::NotHumanTyped;
+    for row in near {
+        match qualify_cited(state, &row, actor, now) {
+            Ok(()) => {
+                let d = (row.ts - time).abs();
+                if best.as_ref().is_none_or(|(_, bd)| d < *bd) {
+                    best = Some((row, d));
+                }
+            }
+            Err(e) => {
+                if first_err == MaxRefRefusal::NotHumanTyped && e != MaxRefRefusal::NotHumanTyped {
+                    first_err = e;
+                }
+            }
+        }
+    }
+    best.map(|(r, _)| cited(r)).ok_or(first_err)
 }
 
 #[cfg(test)]
@@ -327,4 +430,53 @@ mod tests {
         let id: i64 = st.store.read().unwrap().query_row("SELECT MAX(id) FROM cmd_history WHERE session='test-rc'", [], |r| r.get(0)).unwrap();
         assert_eq!(row_qualifies_at(&st, id, now), Err(MaxRefRefusal::NotRemoteOwnerSend));
     }
+
+    fn cite_id(id: i64) -> Cite {
+        Cite { row_id: Some(id), session: None, time: None }
+    }
+
+    #[test]
+    fn a_citation_of_another_lanes_typed_row_qualifies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let p = put(&st, pane("test-desk", "make test-alpha a lead", NOW - 30.0));
+        let got = cite_row_at(&st, Some(&cite_id(p)), "test-actor", NOW).unwrap();
+        assert_eq!((got.row_id, got.session.as_str()), (p, "test-desk"));
+        // By session and time: the nearest qualifying row in the window.
+        let by_time = Cite { row_id: None, session: Some("test-desk".into()), time: Some(NOW) };
+        assert_eq!(cite_row_at(&st, Some(&by_time), "test-actor", NOW).unwrap().row_id, p);
+        let mac = put(&st, R("test-mac", ASK, "user", "", "direct", Some("outside"), NOW));
+        assert!(cite_row_at(&st, Some(&cite_id(mac)), "test-actor", NOW).is_ok(), "another lane's Outside send");
+    }
+
+    #[test]
+    fn own_lane_delivered_stale_or_missing_citations_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        assert_eq!(cite_row_at(&st, None, "test-actor", NOW), Err(MaxRefRefusal::Missing));
+        let own = put(&st, pane("test-actor", ASK, NOW));
+        assert_eq!(cite_row_at(&st, Some(&cite_id(own)), "test-actor", NOW), Err(MaxRefRefusal::OwnLane), "own-lane pane row");
+        let own_out = put(&st, R("test-actor", "amux x outside", "user", "", "direct", Some("outside"), NOW));
+        assert_eq!(cite_row_at(&st, Some(&cite_id(own_out)), "test-actor", NOW), Err(MaxRefRefusal::OwnLane), "own-lane Outside");
+        let own_fwd = put(&st, R("test-actor", "amux x forwarded", "user", "", "direct", Some("remote-forwarded"), NOW));
+        assert_eq!(cite_row_at(&st, Some(&cite_id(own_fwd)), "test-actor", NOW), Err(MaxRefRefusal::OwnLane), "own-lane forwarded Remote");
+        let own_remote = put(&st, R("test-actor", "amux x remote", "user", "", "direct", Some("remote"), NOW));
+        assert!(cite_row_at(&st, Some(&cite_id(own_remote)), "test-actor", NOW).is_ok(), "own-lane non-local Remote");
+        let stamped = put(&st, pane("test-desk", &format!("[amux-origin: test-peer] {ASK}"), NOW));
+        assert_eq!(cite_row_at(&st, Some(&cite_id(stamped)), "test-actor", NOW), Err(MaxRefRefusal::NotHumanTyped), "delivered");
+        let old = put(&st, pane("test-desk2", ASK, NOW - MAX_REF_MAX_AGE_S - 1.0));
+        assert_eq!(cite_row_at(&st, Some(&cite_id(old)), "test-actor", NOW), Err(MaxRefRefusal::Stale));
+        let far = Cite { row_id: Some(old), session: None, time: Some(NOW) };
+        assert_eq!(cite_row_at(&st, Some(&far), "test-actor", NOW), Err(MaxRefRefusal::OutsideWindow));
+        assert_eq!(cite_row_at(&st, Some(&cite_id(999_999)), "test-actor", NOW), Err(MaxRefRefusal::NoSuchRow));
+    }
+
+    #[test]
+    fn a_forwarded_remote_send_is_never_approval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let fwd = put(&st, R("test-desk", ASK, "user", "", "direct", Some("remote-forwarded"), NOW));
+        assert_eq!(q(&st, fwd), Err(MaxRefRefusal::NotRemoteOwnerSend));
+    }
+
 }

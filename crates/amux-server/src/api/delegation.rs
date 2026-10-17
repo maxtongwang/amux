@@ -51,6 +51,7 @@ pub const HELD_FOR_MAX: &[(&str, &str)] = &[
     ("env:AMUX_PANE_PROMPT_HISTORY", "the recorder typed grant approvals are read from: turning it off blinds the proof"),
     ("env:AMUX_NEEDS_INPUT_AUTO_MONEY", "the auto-approve spending switch and money cap: paying is Max's move"),
     ("env:AMUX_CARD_MAX_USD", "a card's spending limit: paying is Max's move"),
+    ("env:AMUX_DELEGATION_APPROVAL", "the delegation approval mode (cite or passkey): who may approve a widening change is the owner's call"),
     ("name:mrpopo", "the owner agent's identity: a worker given this name would act as mrpopo"),
     ("name:owner", "reads as the owner in every log and message"),
     ("mrpopo:own-config", "mrpopo widening itself would need no one else's act"),
@@ -211,7 +212,7 @@ pub const SELF_ENV_KEYS: &[&str] = &[
 ];
 
 /// Request fields that carry delegation metadata, never a setting.
-pub(crate) const META_FIELDS: [&str; 1] = ["why"];
+pub(crate) const META_FIELDS: [&str; 2] = ["cite", "why"];
 
 /// Config-body, scope, row and create fields that are not grant rows.
 const FIELDS: &[(&str, KeyClass)] = &[
@@ -693,7 +694,31 @@ pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, target: &Target, 
                     }
                     Err(why) => return Err(forbid("grant_mismatch", &why)),
                 },
-                None => return Err(super::delegation_grants::request(state, &origin, &class.label(), &action.label(), &target.name(), why)),
+                None => match super::delegation_grants::mode() {
+                    // Passkey mode: a pending grant that needs the approval proof.
+                    super::delegation_grants::Mode::Passkey => {
+                        return Err(super::delegation_grants::request(state, &origin, &class.label(), &action.label(), &target.name(), why))
+                    }
+                    // Cite mode (default): a qualifying citation of Max's row
+                    // applies the change now, recorded as a grant.
+                    super::delegation_grants::Mode::Cite => {
+                        let cite: Option<super::max_ref::Cite> = body.and_then(|b| b.get("cite")).filter(|c| !c.is_null())
+                            .and_then(|c| serde_json::from_value(c.clone()).ok());
+                        let cited = match super::max_ref::cite_row(state, cite.as_ref(), &origin) {
+                            Ok(c) => c,
+                            Err(r) => return Err(forbid(r.code(), &format!(
+                                "{} needs a citation of Max's own typed row: cite {{row_id}} or {{session, time}} of a row in a lane other than {origin}'s (own lane: only a send from his phone): {}",
+                                action.label(), r.code()))),
+                        };
+                        match super::delegation_grants::begin_cited(state, &origin, &class.label(), &action.label(), &target.name(), why.clone(), &cited) {
+                            Ok(code) => {
+                                grant = Some(code);
+                                Some(cited.row_id)
+                            }
+                            Err(resp) => return Err(resp),
+                        }
+                    }
+                },
             }
         }
     };
@@ -830,7 +855,7 @@ pub(crate) fn create_body_settings(body: &Value) -> Vec<String> {
         _ => true,
     };
     body.as_object().into_iter().flatten()
-        .filter(|(k, v)| !matches!(k.as_str(), "name" | "tags" | "start" | "worker_type" | "why") && set(v))
+        .filter(|(k, v)| !matches!(k.as_str(), "name" | "tags" | "start" | "worker_type" | "cite" | "why") && set(v))
         .map(|(k, _)| format!("create:{k}"))
         .collect()
 }
@@ -988,7 +1013,8 @@ mod tests {
     #[test]
     fn delegation_held_for_max_is_refused_even_for_mrpopo() {
         for c in [Class::Mrpopo, lead("dev"), Class::SelfWorker, Class::Worker] {
-            for k in ["env:AMUX_CONTRACT_DONE", "env:AMUX_PANE_PROMPT_HISTORY", "env:AMUX_NEEDS_INPUT_AUTO_MONEY", "env:AMUX_NEEDS_INPUT_AUTO_MONEY_CAP", "env:AMUX_CARD_MAX_USD"] {
+            for k in ["env:AMUX_CONTRACT_DONE", "env:AMUX_PANE_PROMPT_HISTORY", "env:AMUX_NEEDS_INPUT_AUTO_MONEY", "env:AMUX_NEEDS_INPUT_AUTO_MONEY_CAP", "env:AMUX_CARD_MAX_USD",
+                "env:AMUX_DELEGATION_APPROVAL", "global:env:AMUX_DELEGATION_APPROVAL"] {
                 assert_eq!(code(decide(&c, &cfg(&[k]), &TEAM)), "held_for_max", "{c:?} {k}");
             }
         }

@@ -202,6 +202,12 @@ pub fn assert_grant_pending(st: StatusCode, v: &Value, ctx: &str) -> String {
     code
 }
 
+/// `body` plus a citation of Messages row `row` (cite mode, the default).
+pub fn cited(mut body: Value, row: i64) -> Value {
+    body["cite"] = json!({"row_id": row});
+    body
+}
+
 static PANE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Env {
@@ -373,6 +379,17 @@ impl Env {
     pub fn grant_status(&self, code: &str) -> String {
         let conn = self.store.read().unwrap();
         conn.query_row("SELECT status FROM _amux_delegation_grants WHERE code=?1", [code], |r| r.get(0)).unwrap_or_default()
+    }
+
+    /// The newest grant's code ("" when none).
+    pub fn latest_grant(&self) -> String {
+        let conn = self.store.read().unwrap();
+        conn.query_row("SELECT code FROM _amux_delegation_grants ORDER BY created_at DESC LIMIT 1", [], |r| r.get(0)).unwrap_or_default()
+    }
+
+    /// Switch the delegation approval mode in this home's global layer.
+    pub fn set_mode(&self, mode: &str) {
+        std::fs::write(self.home().join("amux.env"), format!("AMUX_DELEGATION_APPROVAL=\"{mode}\"\n")).unwrap();
     }
 
     /// Move a grant's expiry into the past.

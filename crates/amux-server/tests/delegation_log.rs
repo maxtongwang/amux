@@ -35,18 +35,23 @@ async fn each_allowed_delegated_change_appends_exactly_one_entry() {
     assert_eq!(entries.len(), 2, "{entries:?}");
     assert_entry_shape(&entries[1], DEV_A, "self", DEV_A);
 
-    // mrpopo's membership change is a grant: requested (logged), then applied
-    // once Max types its code in another lane (approved, the change, applied).
+    // mrpopo's membership change cites Max's row in another lane: it applies
+    // at once as a grant; the change and the grant are both logged.
+    let row = e.seed_pane_prompt(MAX_PANE, &format!("add {DEV_B} to leads"), now_s() - 30.0);
     let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &format!("/api/sessions/{DEV_B}/config"),
-        Some(with_ref(json!({"tags": "dev,leads"}), json!(null), "Max asked for a second lead"))).await;
-    let code = assert_grant_pending(st, &v, "mrpopo membership");
+        Some(cited(with_ref(json!({"tags": "dev,leads"}), json!(null), "Max asked for a second lead"), row))).await;
+    assert_allowed(st, &v, "mrpopo membership with a citation");
+    let code = e.latest_grant();
+    assert_eq!(e.grant_status(&code), "applied");
     let entries = e.log_entries();
-    assert_eq!(entries.len(), 3, "{entries:?}");
-    assert_eq!(entries[2]["action"], json!("grant:requested"), "{}", entries[2]);
-    assert_eq!(entries[2]["grant"], json!(code), "{}", entries[2]);
-    assert_eq!(entries[2]["why"], json!("Max asked for a second lead"), "{}", entries[2]);
-    assert_entry_shape(&entries[2], MRPOPO, "mrpopo", DEV_B);
-    // The approved/applied entries are proven in the lib tests (Remote only).
+    assert_eq!(entries.len(), 4, "{entries:?}");
+    let m = &entries[2];
+    assert_entry_shape(m, MRPOPO, "mrpopo", DEV_B);
+    assert_eq!(m["grant"], json!(code), "{m}");
+    assert_eq!(m["evidence_row"], json!(row), "the cited row is the evidence: {m}");
+    assert_eq!(m["why"], json!("Max asked for a second lead"), "{m}");
+    assert_eq!(entries[3]["action"], json!("grant:applied"), "{}", entries[3]);
+    assert!(entries[3]["after"]["cited_excerpt"].as_str().is_some_and(|x| x.contains("add")), "{}", entries[3]);
 }
 
 #[tokio::test]
