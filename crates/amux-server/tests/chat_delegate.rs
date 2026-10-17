@@ -202,9 +202,20 @@ async fn a_chat_delegate_reads_the_live_worker_without_ever_touching_it() {
 
     // 1b. Attribution: a LANE posting to a Chat tab is that lane, not the owner.
     // An owner send would start the stopped Chat; a lane's is refused instead.
+    // A lane outside the worker's groups is stopped at the group boundary
+    // first (a Chat tab speaks for the owner, so it is not a side door).
     let (code, r) = call(&app, "POST", "/api/sessions/social@chat/send", "some-helper",
         Some(json!({"text": "probe from a helper"}))).await;
+    assert_eq!((code, r["code"].clone()), (403, json!("worker_group_boundary")), "an outside-group lane: {r}");
+    // A lane inside them passes the boundary and is still not the owner.
+    let social_env = std::fs::read_to_string(home.join("sessions/social.env")).unwrap();
+    std::fs::write(home.join("sessions/social.env"), format!("{social_env}CC_TAGS=\"events\"\n")).unwrap();
+    std::fs::write(home.join("sessions/team-helper.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"events\"\n").unwrap();
+    let (code, r) = call(&app, "POST", "/api/sessions/social@chat/send", "team-helper",
+        Some(json!({"text": "probe from a helper"}))).await;
     assert_eq!(code, 409, "a lane's send is not the owner's and cannot start a stopped Chat: {r}");
+    std::fs::remove_file(home.join("sessions/team-helper.env")).unwrap();
+    std::fs::write(home.join("sessions/social.env"), social_env).unwrap();
 
     // 2. The API guard: a delegate identity may read, never change anything.
     let (code, _) = call(&app, "POST", "/api/board", "social@delegate", Some(json!({"title": "x"}))).await;

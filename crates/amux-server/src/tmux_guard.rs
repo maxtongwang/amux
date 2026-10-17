@@ -228,10 +228,13 @@ mod tests {
         };
         let made = tm(&["new-session", "-d", "-s", "amux-guard-probe", "sleep 30"]);
         assert!(made.status.success(), "new-session on the private server: {}", String::from_utf8_lossy(&made.stderr));
-        assert!(tm(&["rename-session", "-t", "=amux-guard-probe", "amux-guard-renamed"]).status.success());
+        // Exact-match targets, named `st` for tests/tmux_target_audit.rs.
+        let st = "=amux-guard-probe";
+        assert!(tm(&["rename-session", "-t", st, "amux-guard-renamed"]).status.success());
         let ls = String::from_utf8_lossy(&tm(&["ls", "-F", "#{session_name}"]).stdout).into_owned();
         assert_eq!(ls.trim(), "amux-guard-renamed", "the private server holds exactly the probe's session");
         kill_server_in(&sock);
-        assert!(!tm(&["has-session", "-t", "=amux-guard-renamed"]).status.success(), "teardown killed the private server");
+        let st = "=amux-guard-renamed";
+        assert!(!tm(&["has-session", "-t", st]).status.success(), "teardown killed the private server");
     }
 }
