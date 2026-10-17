@@ -582,45 +582,83 @@ impl EnvFile {
         out
     }
 
+    /// One line as `load` reads it: `Some((key, value))` for an assignment it
+    /// keeps, `None` for a line it skips. THE env line grammar: `load`,
+    /// [`Self::parse_canonical`] and every guard that judges env text use this,
+    /// so a guard can never see a different file than the reader
+    /// (fix/worker-membership-create, review round 3: a scope guard that
+    /// stripped `export ` and trimmed keys passed `CC_TAGS=leads\nexport
+    /// CC_TAGS=dev` while the reader kept `leads`).
+    fn parse_line(raw: &str) -> Option<(String, String)> {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let (k, v) = line.split_once('=')?;
+        if k.is_empty() || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return None;
+        }
+        let v = v.trim();
+        let (v, was_double_quoted) = if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
+            (&v[1..v.len() - 1], true)
+        } else if v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2 {
+            (&v[1..v.len() - 1], false)
+        } else {
+            (v, false)
+        };
+        // Only a DOUBLE-quoted value was escaped on the way out, and single quotes
+        // in shell do not take escapes at all, so unescaping one would corrupt it.
+        let v = if was_double_quoted { Self::env_unquote(v) } else { v.to_string() };
+        Some((k.to_string(), v))
+    }
+
+    /// Env TEXT as the reader will see it, or why it is not canonical. Canonical
+    /// text is exactly what `load` reads with nothing skipped or shadowed:
+    /// every non-blank, non-comment line is `KEY=value` with a bare key (no
+    /// `export `, no whitespace around it), and no key appears twice. Anything
+    /// else is refused, from the owner too, because a line the reader skips or
+    /// a later duplicate is where a guard and the reader can disagree.
+    pub(crate) fn parse_canonical(text: &str) -> Result<Vec<(String, String)>, String> {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for (n, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = Self::parse_line(raw) else {
+                return Err(format!("line {}: not a KEY=value assignment the env reader keeps (no `export`, no spaces in the key)", n + 1));
+            };
+            if !line.starts_with(&format!("{k}=")) {
+                return Err(format!("line {}: '{k}' has whitespace around its key", n + 1));
+            }
+            if pairs.iter().any(|(pk, _)| *pk == k) {
+                return Err(format!("line {}: '{k}' is assigned twice", n + 1));
+            }
+            if let Some(why) = Self::value_error(&k, &v) {
+                return Err(format!("line {}: {why}", n + 1));
+            }
+            pairs.push((k, v));
+        }
+        Ok(pairs)
+    }
+
+    /// The key/value pairs as read, in file order.
+    pub(crate) fn pairs(&self) -> &[(String, String)] {
+        &self.pairs
+    }
+
     pub(crate) fn load(path: &Path) -> Self {
-        let mut pairs = Vec::new();
+        let mut pairs: Vec<(String, String)> = Vec::new();
         let Ok(text) = std::fs::read_to_string(path) else {
             return Self {
                 pairs,
                 dirty: Vec::new(),
             };
         };
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((k, v)) = line.split_once('=') else {
-                continue;
-            };
-            if k.is_empty() || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-                continue;
-            }
-            let v = v.trim();
-            let (v, was_double_quoted) = if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
-                (&v[1..v.len() - 1], true)
-            } else if v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2 {
-                (&v[1..v.len() - 1], false)
-            } else {
-                (v, false)
-            };
-            // Only a DOUBLE-quoted value was escaped on the way out, and single quotes
-            // in shell do not take escapes at all, so unescaping one would corrupt it.
-            let owned;
-            let v = if was_double_quoted {
-                owned = Self::env_unquote(v);
-                owned.as_str()
-            } else {
-                v
-            };
-            match pairs.iter_mut().find(|(pk, _)| pk == k) {
-                Some((_, pv)) => *pv = v.to_string(),
-                None => pairs.push((k.to_string(), v.to_string())),
+        for (k, v) in text.lines().filter_map(Self::parse_line) {
+            match pairs.iter_mut().find(|(pk, _)| *pk == k) {
+                Some((_, pv)) => *pv = v,
+                None => pairs.push((k, v)),
             }
         }
         Self {
@@ -26618,6 +26656,12 @@ async fn post_dispatch(
     headers: &HeaderMap,
     body: &Value,
 ) -> Response {
+    // The verbs that rewrite who a worker is (its name, its instructions, its
+    // memory) follow the peer-config rule; the rename alias and PATCH config
+    // must not differ.
+    if matches!(action, "rename" | "instructions" | "memory") {
+        if let Some(refusal) = peer_config_refusal(headers, name, action) { return refusal; }
+    }
     match action {
         "transcripts" => match backup_session_jsonl(name, "manual") {
             Some(path) => j200(json!({"ok": true, "path": path})),
@@ -31807,6 +31851,7 @@ pub(crate) async fn report_post(
 // ---------------------------------------------------------------------------
 
 async fn patch_dispatch(state: &AppState, name: &str, action: &str, body: &Value, headers: &HeaderMap) -> Response {
+    if let Some(refusal) = peer_config_refusal(headers, name, action) { return refusal; }
     if let Some(refusal) = membership_patch_refusal(headers, names_messaging_authority(body)) { return refusal; }
     match action {
         "commit-guard" => commit_guard_patch_verb(name, body),
@@ -32897,6 +32942,29 @@ pub(crate) fn worker_origin(headers: &HeaderMap) -> String {
         Ok(name) => name.unwrap_or_default(),
         Err(_) => super::worker_identity::UNVERIFIED_IDENTITY.to_string(),
     }
+}
+
+/// CONFIGURING ANOTHER WORKER IS THE OWNER'S (review round 3, N2/N3). A worker
+/// may change typed settings on itself only: renaming a peer left the renamed
+/// lane with no stored token (trusted without one), and editing a peer's env,
+/// instructions or memory rewrites what that peer is. Leads have no team-config
+/// role in this codebase, so the rule is owner-only. A worker's own Chat tab
+/// (`w@chat`) counts as `w`. Owners and verified members are unaffected.
+pub(crate) fn peer_config_refusal(headers: &HeaderMap, target: &str, what: &str) -> Option<Response> {
+    peer_config_refusal_body(headers, target, what).map(|body| jresp(StatusCode::FORBIDDEN, body))
+}
+
+/// [`peer_config_refusal`]'s decision and 403 body, for a handler whose return
+/// type is not a `Response`.
+pub(crate) fn peer_config_refusal_body(headers: &HeaderMap, target: &str, what: &str) -> Option<Value> {
+    let origin = worker_origin(headers);
+    if origin.is_empty() || origin == target || super::chat_worker::companion_parent(&origin) == Some(target) {
+        return None;
+    }
+    tracing::warn!(origin = %origin, target, what, verdict = "peer_config_owner_only", measured = true,
+        n_considered = 1, "a worker tried to configure another worker");
+    Some(json!({"ok": false, "code": "peer_config_owner_only",
+        "error": format!("'{origin}' may not change {what} of '{target}'; configuring another worker is the owner's")}))
 }
 
 /// The group whose members may create workers (Max, 2026-10-16: "Only leads

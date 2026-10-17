@@ -62,9 +62,10 @@ async fn send(
     send_as(app, Some("replay-test"), method, path, body).await
 }
 
-/// The owner's request (no worker header). Creating a worker is the owner's
-/// (or a lead's) act, and this suite tests journal replay, not authorization,
-/// so its worker creates are made as the owner rather than as `replay-test`.
+/// The owner's request (no worker header). Creating or configuring ANOTHER
+/// worker is the owner's act, and this suite tests journal replay, not
+/// authorization, so its worker create, patch and start are made as the
+/// owner rather than as `replay-test`.
 async fn send_owner(
     app: &axum::Router,
     method: &str,
@@ -123,7 +124,7 @@ async fn write_then_replay_round_trip() {
     .await;
     assert_eq!(st, StatusCode::CREATED, "{w}");
     let wid = w["id"].as_str().unwrap().to_string();
-    let (st, body) = send(
+    let (st, body) = send_owner(
         &r.app,
         "PATCH",
         &format!("/api/workers/{wid}"),
@@ -131,7 +132,7 @@ async fn write_then_replay_round_trip() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    let (st, body) = send(&r.app, "POST", &format!("/api/workers/{wid}/start"), None).await;
+    let (st, body) = send_owner(&r.app, "POST", &format!("/api/workers/{wid}/start"), None).await;
     assert_eq!(st, StatusCode::ACCEPTED, "{body}");
 
     // Board card: create -> desc edit -> status changes (gate acked).

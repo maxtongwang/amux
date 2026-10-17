@@ -188,7 +188,8 @@ pub async fn apply(
             }
         }
         let refusal = if home.join("sessions").join(format!("{name}.env")).exists() {
-            super::session_verbs::membership_refusal_body(&headers, w.get("tags").is_some())
+            super::session_verbs::peer_config_refusal_body(&headers, name, "the worker declaration")
+                .or_else(|| super::session_verbs::membership_refusal_body(&headers, w.get("tags").is_some()))
         } else {
             super::session_verbs::worker_create_refusal_body(
                 &headers,

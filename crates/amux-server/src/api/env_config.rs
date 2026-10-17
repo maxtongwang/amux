@@ -159,8 +159,8 @@ struct WorkerSpec {
 /// An env apply creates workers with groups and had no caller check, so a
 /// worker could mint group members (fix/worker-membership-create). Each worker
 /// the spec CREATES goes through the shared create rule (only leads, only
-/// inside their team); a spec that changes an EXISTING worker's groups goes
-/// through the shared membership rule. A worker may still dry-run a plan.
+/// inside their team); a spec naming an EXISTING worker rewrites its whole env
+/// file and is the owner's. A worker may still dry-run a plan.
 fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Option<Response> {
     if dry {
         return None;
@@ -188,11 +188,13 @@ fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Optio
             continue;
         }
         if sessions.join(format!("{name}.env")).exists() {
-            let wanted: std::collections::BTreeSet<String> =
-                w.groups.iter().map(|g| crate::api::session_verbs::norm_label(g)).filter(|g| !g.is_empty()).collect();
-            let changes = wanted != crate::api::session_verbs::lane_groups(&name);
-            if let Some(r) = crate::api::session_verbs::membership_patch_refusal(headers, changes) {
-                return Some(r);
+            // An apply REWRITES the whole env file, dropping every key the spec
+            // does not name (AMUX_CONTRACT_DONE among them, which switched off
+            // a peer's rule-10 token check: review round 3, N1). That is raw
+            // env, and the owner's, for a worker's own file as much as a peer's.
+            if !origin.is_empty() {
+                return refuse("env_apply_existing_owner_only", format!(
+                    "worker '{origin}' may not rewrite the existing worker '{name}' through an env apply; change typed settings with PATCH /api/sessions/<self>/config"));
             }
         } else if let Some(r) = crate::api::session_verbs::worker_create_refusal(
             headers,

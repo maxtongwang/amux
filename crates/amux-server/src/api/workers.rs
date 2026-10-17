@@ -799,7 +799,25 @@ pub async fn patch_worker(
     headers: axum::http::HeaderMap,
     Json(body): Json<PatchWorkerBody>,
 ) -> Response {
-    if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(&headers, body.group.is_some()) { return refusal; }
+    // The typed/self/owner rule (review round 3, N3): a worker edits only its
+    // own row; `group` and the chat type are messaging authority; the free-form
+    // `environment` map and `permissions` are the owner's.
+    let origin = crate::api::session_verbs::worker_origin(&headers);
+    if !origin.is_empty() && origin != key {
+        let target = match resolve_key(&state, key.clone()).await {
+            Ok(n) => n,
+            Err(r) => return r,
+        };
+        if let Some(refusal) = crate::api::session_verbs::peer_config_refusal(&headers, &target, "the worker row") { return refusal; }
+    }
+    let authority = body.group.is_some() || body.worker_type.as_deref().is_some_and(crate::api::session_verbs::is_chat_type);
+    if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(&headers, authority) { return refusal; }
+    if !origin.is_empty() && (body.environment.is_some() || body.permissions.is_some()) {
+        tracing::warn!(worker = %origin, verdict = "raw_text_owner_only", measured = true, n_considered = 1,
+            "a worker tried to set a worker row's environment or permissions");
+        return err(StatusCode::FORBIDDEN, json!({"ok": false, "code": "raw_text_owner_only",
+            "error": "a worker row's environment and permissions are the owner's to set"}));
+    }
     let display_name = match resolve_name_fields(body.display_name.clone(), body.name.clone()) {
         Ok(n) => n,
         Err(resp) => return *resp,
@@ -2040,6 +2058,7 @@ pub async fn instructions_worker(
     State(state): State<AppState>,
     Path(key): Path<String>,
     method: axum::http::Method,
+    headers: axum::http::HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Response {
     let name = match resolve_key(&state, key).await {
@@ -2049,6 +2068,7 @@ pub async fn instructions_worker(
     if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
         return crate::api::session_verbs::instructions_get_verb(&name);
     }
+    if let Some(refusal) = crate::api::session_verbs::peer_config_refusal(&headers, &name, "instructions") { return refusal; }
     let body = match crate::api::fs::parse_body(&body_bytes) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
@@ -2064,6 +2084,7 @@ pub async fn memory_worker(
     State(state): State<AppState>,
     Path(key): Path<String>,
     method: axum::http::Method,
+    headers: axum::http::HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Response {
     let name = match resolve_key(&state, key).await {
@@ -2073,6 +2094,7 @@ pub async fn memory_worker(
     if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
         return crate::api::session_verbs::memory_get_verb(&name);
     }
+    if let Some(refusal) = crate::api::session_verbs::peer_config_refusal(&headers, &name, "memory") { return refusal; }
     let body = match crate::api::fs::parse_body(&body_bytes) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
@@ -2217,6 +2239,7 @@ pub async fn config_worker(
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
+    if let Some(refusal) = crate::api::session_verbs::peer_config_refusal(&headers, &name, "config") { return refusal; }
     if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(&headers, crate::api::session_verbs::names_messaging_authority(&body)) { return refusal; }
     crate::api::session_verbs::config_patch(&state, &name, &body).await
 }
@@ -2677,12 +2700,60 @@ mod tests {
     const NEEDS_LEAD: &str = "worker_create_requires_lead";
     const OUTSIDE_TEAM: &str = "worker_create_tags_outside_team";
 
-    /// Plain env-file workers in a temp home: `dev-lead` (leads, dev),
-    /// `ops-lead` (leads, ops), `dev-a` (dev), `ops-a` (ops).
+    /// TEST ISOLATION (dev-lead, 2026-10-16, after a review probe renamed a
+    /// LIVE tmux session): a temp AMUX_HOME is not enough, because
+    /// `rename_session` drives tmux and the roster refresh writes
+    /// `$HOME/.claude/...`. For the guard's life: AMUX_HOME is the temp home,
+    /// HOME and CC_HOME are inside it, TMUX/TMUX_PANE are unset and
+    /// TMUX_TMPDIR is private (no live tmux server is reachable), and
+    /// AMUX_API/AMUX_URL point at a dead port. Restored on drop.
+    struct Isolated {
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _home: crate::api::settings::test_env::HomeGuard,
+    }
+
+    impl Drop for Isolated {
+        fn drop(&mut self) {
+            for (k, v) in self.prev.drain(..) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    fn isolated(home: &std::path::Path) -> Isolated {
+        let guard = crate::api::settings::test_env::set_home(home);
+        let (fake_home, tmux) = (home.join("home"), home.join("tmux"));
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::fs::create_dir_all(&tmux).unwrap();
+        let dead = std::ffi::OsString::from("http://127.0.0.1:9");
+        let vars: [(&'static str, Option<std::ffi::OsString>); 7] = [
+            ("HOME", Some(fake_home.into_os_string())),
+            ("CC_HOME", Some(home.as_os_str().to_owned())),
+            ("TMUX", None),
+            ("TMUX_PANE", None),
+            ("TMUX_TMPDIR", Some(tmux.into_os_string())),
+            ("AMUX_API", Some(dead.clone())),
+            ("AMUX_URL", Some(dead)),
+        ];
+        let prev = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
+        for (k, v) in vars {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        Isolated { prev, _home: guard }
+    }
+
+    /// Plain env-file workers in a temp home: `review-dev-lead` (leads, dev),
+    /// `review-ops-lead` (leads, ops), `review-dev-a` (dev), `review-ops-a` (ops).
     fn membership_fleet(home: &std::path::Path) {
         let s = home.join("sessions");
         std::fs::create_dir_all(&s).unwrap();
-        for (n, t) in [("dev-lead", "leads,dev"), ("ops-lead", "leads,ops"), ("dev-a", "dev"), ("ops-a", "ops")] {
+        for (n, t) in [("review-dev-lead", "leads,dev"), ("review-ops-lead", "leads,ops"), ("review-dev-a", "dev"), ("review-ops-a", "ops")] {
             std::fs::write(s.join(format!("{n}.env")), format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{t}\"\n")).unwrap();
         }
     }
@@ -2698,7 +2769,7 @@ mod tests {
     #[tokio::test]
     async fn a_non_lead_worker_cannot_create_any_worker() {
         let home = tempfile::tempdir().unwrap();
-        let _guard = crate::api::settings::test_env::set_home(home.path());
+        let _guard = isolated(home.path());
         membership_fleet(home.path());
         let (app, _db) = app();
         let dir = home.path().join("work");
@@ -2706,7 +2777,7 @@ mod tests {
         for (i, tags) in [json!(["leads"]), json!("dev"), json!([]), Value::Null].into_iter().enumerate() {
             let name = format!("minted-{i}");
             for hdr in ["X-Amux-Session", "X-Amux-Worker"] {
-                let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, &name, tags.clone())), &[(hdr, "dev-a")]).await;
+                let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, &name, tags.clone())), &[(hdr, "review-dev-a")]).await;
                 assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(NEEDS_LEAD)), "{hdr} tags={tags}: {v}");
             }
             assert!(!home.path().join(format!("sessions/{name}.env")).exists(), "refused create wrote {name}");
@@ -2718,12 +2789,12 @@ mod tests {
     #[tokio::test]
     async fn a_lead_creates_only_inside_its_team_and_the_owner_is_unchanged() {
         let home = tempfile::tempdir().unwrap();
-        let _guard = crate::api::settings::test_env::set_home(home.path());
+        let _guard = isolated(home.path());
         membership_fleet(home.path());
         let (app, _db) = app();
         let dir = home.path().join("work");
         std::fs::create_dir_all(&dir).unwrap();
-        let lead = [("X-Amux-Session", "dev-lead")];
+        let lead = [("X-Amux-Session", "review-dev-lead")];
         for (name, tags) in [("dev-new", json!(["dev"])), ("dev-str", json!("DEV")), ("dev-bare", json!([]))] {
             let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, name, tags)), &lead).await;
             assert!(st.is_success(), "lead create {name} in own team: {v}");
@@ -2752,42 +2823,42 @@ mod tests {
     #[tokio::test]
     async fn only_an_exact_self_registration_escapes_the_create_rule() {
         let home = tempfile::tempdir().unwrap();
-        let _guard = crate::api::settings::test_env::set_home(home.path());
+        let _guard = isolated(home.path());
         membership_fleet(home.path());
         let (app, _db) = app();
-        let me = [("X-Amux-Session", "dev-a")];
+        let me = [("X-Amux-Session", "review-dev-a")];
         let dir = home.path().join("work");
         std::fs::create_dir_all(&dir).unwrap();
         // Exact: its own name, no group.
-        let (st, _, v) = send_with(&app, "POST", "/api/workers", Some(json!({"name": "dev-a", "cwd": "/tmp"})), &me).await;
+        let (st, _, v) = send_with(&app, "POST", "/api/workers", Some(json!({"name": "review-dev-a", "cwd": "/tmp"})), &me).await;
         assert_eq!(st, StatusCode::CREATED, "exact self-registration: {v}");
         // A different name is a create.
         let (st, _, v) = send_with(&app, "POST", "/api/workers", Some(json!({"name": "dev-a2", "cwd": "/tmp"})), &me).await;
         assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(NEEDS_LEAD)), "other name: {v}");
         // Its own name but a group field, or tags it does not have: a create.
         let grp = GroupId::from_ulid(ulid::Ulid::new());
-        let (st, _, v) = send_with(&app, "POST", "/api/workers", Some(json!({"name": "dev-a", "cwd": "/tmp", "group": grp.as_str()})), &me).await;
+        let (st, _, v) = send_with(&app, "POST", "/api/workers", Some(json!({"name": "review-dev-a", "cwd": "/tmp", "group": grp.as_str()})), &me).await;
         assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(NEEDS_LEAD)), "self + group: {v}");
         for tags in [json!(["leads"]), json!(["dev", "ops"])] {
-            let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, "dev-a", tags.clone())), &me).await;
+            let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, "review-dev-a", tags.clone())), &me).await;
             assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(NEEDS_LEAD)), "self + {tags}: {v}");
         }
         // Its own name with its existing tags passes the rule and meets the
         // ordinary "already exists" answer, so nothing new is made either way.
-        let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, "dev-a", json!(["dev"]))), &me).await;
+        let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, "review-dev-a", json!(["dev"]))), &me).await;
         assert_eq!(st, StatusCode::CONFLICT, "self with existing tags reaches the existing-session check: {v}");
-        // Rule 10: dev-b is a contract lane with a minted token. Claiming it
+        // Rule 10: review-dev-b is a contract lane with a minted token. Claiming it
         // over a socket without that token is refused before the create rule;
         // with the token the exact self-registration proceeds.
-        std::fs::write(home.path().join("sessions/dev-b.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\nAMUX_CONTRACT_DONE=1\n").unwrap();
-        let token = crate::api::worker_identity::mint(home.path(), "dev-b").expect("rule 10 mints for dev-b");
+        std::fs::write(home.path().join("sessions/review-dev-b.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\nAMUX_CONTRACT_DONE=1\n").unwrap();
+        let token = crate::api::worker_identity::mint(home.path(), "review-dev-b").expect("rule 10 mints for review-dev-b");
         let over_socket = |tok: Option<&str>| {
             let mut b = Request::builder().method("POST").uri("/api/workers")
-                .header(header::CONTENT_TYPE, "application/json").header("X-Amux-Session", "dev-b");
+                .header(header::CONTENT_TYPE, "application/json").header("X-Amux-Session", "review-dev-b");
             if let Some(t) = tok {
                 b = b.header(crate::api::worker_identity::TOKEN_HEADER, t);
             }
-            let mut req = b.body(Body::from(json!({"name": "dev-b", "cwd": "/tmp"}).to_string())).unwrap();
+            let mut req = b.body(Body::from(json!({"name": "review-dev-b", "cwd": "/tmp"}).to_string())).unwrap();
             req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 9))));
             app.clone().oneshot(req)
         };
@@ -2799,7 +2870,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::CREATED, "rule 10 with the lane's token");
     }
 
-    /// One rule-10 contract lane `dev-b` (group dev) with a minted token, and a
+    /// One rule-10 contract lane `review-dev-b` (group dev) with a minted token, and a
     /// request over a socket so rule 10 applies.
     fn socket_request(method: &str, path: &str, body: Value, headers: &[(&str, &str)]) -> Request<Body> {
         let mut b = Request::builder().method(method).uri(path).header(header::CONTENT_TYPE, "application/json");
@@ -2825,25 +2896,25 @@ mod tests {
     #[tokio::test]
     async fn review_b1_one_verified_identity_for_rule_10_and_authorization() {
         let home = tempfile::tempdir().unwrap();
-        let _guard = crate::api::settings::test_env::set_home(home.path());
+        let _guard = isolated(home.path());
         membership_fleet(home.path());
-        std::fs::write(home.path().join("sessions/dev-b.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\nAMUX_CONTRACT_DONE=1\n").unwrap();
-        let token = crate::api::worker_identity::mint(home.path(), "dev-b").expect("rule 10 mints");
+        std::fs::write(home.path().join("sessions/review-dev-b.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\nAMUX_CONTRACT_DONE=1\n").unwrap();
+        let token = crate::api::worker_identity::mint(home.path(), "review-dev-b").expect("rule 10 mints");
         let (app, _db) = app();
         let dir = home.path().join("work");
         std::fs::create_dir_all(&dir).unwrap();
         // P1: own session + own token + X-Amux-Worker naming a lead.
         let tok = crate::api::worker_identity::TOKEN_HEADER;
         let (st, v) = status_and_body(&app, socket_request("POST", "/api/sessions", create_body(&dir, "p1-minted", json!(["dev"])),
-            &[("X-Amux-Session", "dev-b"), (tok, &token), ("X-Amux-Worker", "dev-lead")])).await;
+            &[("X-Amux-Session", "review-dev-b"), (tok, &token), ("X-Amux-Worker", "review-dev-lead")])).await;
         assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_mismatch")), "P1: {v}");
         assert!(!home.path().join("sessions/p1-minted.env").exists());
         // Control: the same lane alone, with its token, is a non-lead.
         let (st, v) = status_and_body(&app, socket_request("POST", "/api/sessions", create_body(&dir, "p1-minted", json!(["dev"])),
-            &[("X-Amux-Session", "dev-b"), (tok, &token)])).await;
+            &[("X-Amux-Session", "review-dev-b"), (tok, &token)])).await;
         assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(NEEDS_LEAD)), "control: {v}");
         // P2: an ill-formed claim that resolved the lead's env by path.
-        for bad in ["../sessions/dev-lead", "..", "dev lead"] {
+        for bad in ["../sessions/review-dev-lead", "..", "dev lead"] {
             let (st, v) = status_and_body(&app, socket_request("POST", "/api/sessions", create_body(&dir, "p2-minted", json!(["dev"])),
                 &[("X-Amux-Session", bad)])).await;
             assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_invalid")), "P2 {bad:?}: {v}");
@@ -2851,14 +2922,14 @@ mod tests {
         assert!(!home.path().join("sessions/p2-minted.env").exists());
         // The rule holds without a socket too (in-process callers).
         let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, "p1b", json!(["dev"]))),
-            &[("X-Amux-Session", "dev-a"), ("X-Amux-Worker", "dev-lead")]).await;
+            &[("X-Amux-Session", "review-dev-a"), ("X-Amux-Worker", "review-dev-lead")]).await;
         assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_mismatch")), "{v}");
         // Same name in both headers, and a Chat-tab identity, are one valid claim.
         let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, "p1c", json!(["dev"]))),
-            &[("X-Amux-Session", "dev-lead"), ("X-Amux-Worker", "dev-lead")]).await;
+            &[("X-Amux-Session", "review-dev-lead"), ("X-Amux-Worker", "review-dev-lead")]).await;
         assert!(st.is_success(), "matching headers: {v}");
         let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, "p1d", json!([]))),
-            &[("X-Amux-Session", "dev-lead@chat")]).await;
+            &[("X-Amux-Session", "review-dev-lead@chat")]).await;
         assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(NEEDS_LEAD)), "a Chat tab is not its lead: {v}");
         // Unit: the shared function.
         let h = |pairs: &[(&'static str, &'static str)]| {
@@ -2882,12 +2953,12 @@ mod tests {
     #[tokio::test]
     async fn review_b2_env_values_cannot_inject_lines() {
         let home = tempfile::tempdir().unwrap();
-        let _guard = crate::api::settings::test_env::set_home(home.path());
+        let _guard = isolated(home.path());
         membership_fleet(home.path());
         let (app, _db) = app();
         let dir = home.path().join("work");
         std::fs::create_dir_all(&dir).unwrap();
-        let lead = [("X-Amux-Session", "dev-lead")];
+        let lead = [("X-Amux-Session", "review-dev-lead")];
         let inj = "x\"\nCC_TAGS=\"leads,ops\"\nCC_WORKER_TYPE=\"chat";
         let mut b = create_body(&dir, "p3-inj", json!(["dev"]));
         b["desc"] = json!(inj);
@@ -2899,20 +2970,20 @@ mod tests {
         assert_eq!(st, StatusCode::BAD_REQUEST, "env/apply: {v}");
         assert!(crate::api::session_verbs::lane_groups("p3-env").is_empty());
         // The owner is held to the same serializer on every writer.
-        let (st, _, v) = send(&app, "PATCH", "/api/sessions/dev-a/config", Some(json!({"desc": "a\nCC_TAGS=leads"}))).await;
+        let (st, _, v) = send(&app, "PATCH", "/api/sessions/review-dev-a/config", Some(json!({"desc": "a\nCC_TAGS=leads"}))).await;
         assert_eq!((st, v["code"].clone()), (StatusCode::BAD_REQUEST, json!("env_value_invalid")), "config: {v}");
         let (st, _, v) = send(&app, "PUT", "/api/scope",
-            Some(json!({"level": "worker", "name": "dev-a", "capability": "env", "value": {"CC_DESC": "a\nCC_TAGS=leads"}}))).await;
+            Some(json!({"level": "worker", "name": "review-dev-a", "capability": "env", "value": {"CC_DESC": "a\nCC_TAGS=leads"}}))).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "scope: {v}");
         let (st, _, v) = send(&app, "PUT", "/api/config/apply",
-            Some(json!({"workers": [{"name": "dev-a", "dir": "/tmp\nCC_TAGS=leads"}]}))).await;
+            Some(json!({"workers": [{"name": "review-dev-a", "dir": "/tmp\nCC_TAGS=leads"}]}))).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "config/apply: {v}");
-        assert_eq!(crate::api::session_verbs::lane_groups("dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
+        assert_eq!(crate::api::session_verbs::lane_groups("review-dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
         // A quote is escaped, not refused, and round-trips.
-        let (st, _, v) = send(&app, "PATCH", "/api/sessions/dev-a/config", Some(json!({"desc": "say \"hi\" $HOME"}))).await;
+        let (st, _, v) = send(&app, "PATCH", "/api/sessions/review-dev-a/config", Some(json!({"desc": "say \"hi\" $HOME"}))).await;
         assert_eq!(st, StatusCode::OK, "{v}");
-        assert_eq!(crate::api::session_verbs::parse_env("dev-a").get("CC_DESC"), Some("say \"hi\" $HOME"));
-        assert_eq!(crate::api::session_verbs::lane_groups("dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
+        assert_eq!(crate::api::session_verbs::parse_env("review-dev-a").get("CC_DESC"), Some("say \"hi\" $HOME"));
+        assert_eq!(crate::api::session_verbs::lane_groups("review-dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
     }
 
     /// Review B3 (probe P4): `/api/env/apply` `files` wrote session env files
@@ -2920,25 +2991,25 @@ mod tests {
     #[tokio::test]
     async fn review_b3_env_apply_files_and_schedules_are_gated() {
         let home = tempfile::tempdir().unwrap();
-        let _guard = crate::api::settings::test_env::set_home(home.path());
+        let _guard = isolated(home.path());
         membership_fleet(home.path());
         let (app, _db) = app();
-        let worker = [("X-Amux-Session", "dev-a")];
+        let worker = [("X-Amux-Session", "review-dev-a")];
         let minted = home.path().join("sessions/p4-minted.env");
         let files = json!({"files": [
             {"path": minted.to_str().unwrap(), "content": "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads,ops\"\n"},
-            {"path": home.path().join("sessions/dev-a.env").to_str().unwrap(), "content": "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev,leads,ops\"\n"},
+            {"path": home.path().join("sessions/review-dev-a.env").to_str().unwrap(), "content": "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev,leads,ops\"\n"},
         ]});
-        for who in [&worker[..], &[("X-Amux-Session", "dev-lead")][..]] {
+        for who in [&worker[..], &[("X-Amux-Session", "review-dev-lead")][..]] {
             let (st, _, v) = send_with(&app, "POST", "/api/env/apply", Some(files.clone()), who).await;
             assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("env_apply_files_owner_only")), "{who:?}: {v}");
         }
         assert!(!minted.exists());
-        assert_eq!(crate::api::session_verbs::lane_groups("dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
+        assert_eq!(crate::api::session_verbs::lane_groups("review-dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
         let sched = |w: &str| json!({"schedules": [{"worker": w, "title": "t", "expr": "daily at 02:00", "enabled": false, "command": "x"}]});
-        let (st, _, v) = send_with(&app, "POST", "/api/env/apply", Some(sched("dev-lead")), &worker).await;
+        let (st, _, v) = send_with(&app, "POST", "/api/env/apply", Some(sched("review-dev-lead")), &worker).await;
         assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("env_apply_schedule_other_worker")), "{v}");
-        let (st, _, v) = send_with(&app, "POST", "/api/env/apply", Some(sched("dev-a")), &worker).await;
+        let (st, _, v) = send_with(&app, "POST", "/api/env/apply", Some(sched("review-dev-a")), &worker).await;
         assert!(st.is_success(), "a worker schedules itself: {v}");
         // Owner control: files still write.
         let owned = home.path().join("owner-file.md");
@@ -2953,15 +3024,15 @@ mod tests {
     #[tokio::test]
     async fn review_b4_type_and_tag_checks_are_case_and_space_insensitive() {
         let home = tempfile::tempdir().unwrap();
-        let _guard = crate::api::settings::test_env::set_home(home.path());
+        let _guard = isolated(home.path());
         membership_fleet(home.path());
         let (app, _db) = app();
         let dir = home.path().join("work");
         std::fs::create_dir_all(&dir).unwrap();
-        let worker = [("X-Amux-Session", "dev-a")];
-        let lead = [("X-Amux-Session", "dev-lead")];
+        let worker = [("X-Amux-Session", "review-dev-a")];
+        let lead = [("X-Amux-Session", "review-dev-lead")];
         for t in ["Chat", "CHAT", " chat "] {
-            let (st, _, v) = send_with(&app, "PATCH", "/api/sessions/dev-a/config", Some(json!({"worker_type": t})), &worker).await;
+            let (st, _, v) = send_with(&app, "PATCH", "/api/sessions/review-dev-a/config", Some(json!({"worker_type": t})), &worker).await;
             assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(MEMBERSHIP_CODE)), "config {t:?}: {v}");
             let mut b = create_body(&dir, "p5-chat", json!(["dev"]));
             b["worker_type"] = json!(t);
@@ -2970,7 +3041,7 @@ mod tests {
             let (st, _, v) = send_with(&app, "POST", "/api/workers", Some(json!({"display_name": "p5-store", "cwd": "/tmp", "worker_type": t})), &lead).await;
             assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(OUTSIDE_TEAM)), "store {t:?}: {v}");
         }
-        assert_eq!(crate::api::worker_exec::worker_type_of("dev-a").as_str(), "coding");
+        assert_eq!(crate::api::worker_exec::worker_type_of("review-dev-a").as_str(), "coding");
         for t in [" Leads ", "LEADS", "Ops"] {
             let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, "p5-tag", json!([t]))), &lead).await;
             assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(OUTSIDE_TEAM)), "lead tag {t:?}: {v}");
@@ -2986,37 +3057,234 @@ mod tests {
         assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
     }
 
+    /// Every file under `home` (excluding the isolated HOME and tmux dirs), by
+    /// content, so "nothing was written" is a byte-level claim.
+    fn snapshot(home: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![home.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p == home.join("home") || p == home.join("tmux") {
+                    continue;
+                }
+                if p.is_dir() {
+                    stack.push(p);
+                } else if let Ok(bytes) = std::fs::read(&p) {
+                    out.insert(p, bytes);
+                }
+            }
+        }
+        out
+    }
+
+    /// Review round 3 blocker (both seats): the scope guard parsed env text
+    /// with its own parser (it stripped `export `, trimmed keys), so
+    /// `CC_TAGS="dev,leads,ops"\nexport CC_TAGS="dev"` passed as "dev" while
+    /// the reader kept leads. Now a worker writes no raw env text at all, the
+    /// owner's text must be canonical, and the guard reads with the reader's
+    /// own grammar.
+    #[tokio::test]
+    async fn review_r3_scope_env_text_cannot_hide_membership() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = isolated(home.path());
+        membership_fleet(home.path());
+        let (app, _db) = app();
+        let worker = [("X-Amux-Session", "review-dev-a")];
+        let scope = |value: Value| json!({"level": "worker", "name": "review-dev-a", "capability": "env", "value": value});
+        let payloads = [
+            "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev,leads,ops\"\nexport CC_TAGS=\"dev\"\n",
+            "CC_TAGS=leads\nCC_TAGS =dev\n",
+            "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\nCC_TAGS=\"leads\"\n",
+        ];
+        for p in payloads {
+            let (st, _, v) = send_with(&app, "PUT", "/api/scope", Some(scope(json!(p))), &worker).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("raw_text_owner_only")), "worker {p:?}: {v}");
+            let (st, _, v) = send(&app, "PUT", "/api/scope", Some(scope(json!(p)))).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::BAD_REQUEST, json!("env_text_noncanonical")), "owner {p:?}: {v}");
+        }
+        assert_eq!(crate::api::session_verbs::lane_groups("review-dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
+        // The guard itself reads what the reader reads: both shapes are a change.
+        for p in payloads {
+            assert!(crate::api::scope::membership_key_changed(home.path(), "worker", "review-dev-a", &json!(p)).is_some(), "{p:?}");
+        }
+        // Typed keys: membership and the contract/token keys stay refused.
+        let (st, _, v) = send_with(&app, "PUT", "/api/scope", Some(scope(json!({"AMUX_CONTRACT_DONE": "0"}))), &worker).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("owner_only_key")), "{v}");
+        // Owner control: canonical text writes and is read back as written.
+        let (st, _, v) = send(&app, "PUT", "/api/scope", Some(scope(json!("CC_DIR=\"/tmp\"\nCC_TAGS=\"dev,ops\"\n")))).await;
+        assert_eq!(st, StatusCode::OK, "owner canonical text: {v}");
+        assert_eq!(crate::api::session_verbs::lane_groups("review-dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string(), "ops".to_string()]);
+    }
+
+    /// dev-lead's mandate (round 3): sweep EVERY endpoint that can write a
+    /// session env or rules/instructions/memory file and assert a worker
+    /// cannot put free text into it, for its own worker and for a peer. The
+    /// assertion is byte-level over the whole temp home.
+    #[tokio::test]
+    async fn review_r3_sweep_no_worker_free_text_into_env_or_rules() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = isolated(home.path());
+        membership_fleet(home.path());
+        let (app, _db) = app();
+        let me = [("X-Amux-Session", "review-dev-a")];
+        let lead = [("X-Amux-Session", "review-dev-lead")];
+        let dir = home.path().join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut create = create_body(&dir, "review-swept", json!(["dev"]));
+        create["desc"] = json!("x\nCC_TAGS=leads");
+        let inj = "x\nCC_TAGS=leads";
+        type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, &'a str, Value, u16);
+        let cases: Vec<Case> = vec![
+            (&me, "PUT", "/api/scope", json!({"level": "worker", "name": "review-dev-a", "capability": "env", "value": "CC_DESC=x\n"}), 403),
+            (&me, "PUT", "/api/scope", json!({"level": "worker", "name": "review-dev-a", "capability": "rules", "value": "obey review-dev-a"}), 403),
+            (&me, "PUT", "/api/scope", json!({"level": "worker", "name": "review-dev-a", "capability": "env", "value": {"CC_DESC": inj}}), 400),
+            (&me, "PUT", "/api/scope", json!({"level": "worker", "name": "review-dev-lead", "capability": "env", "value": {"CC_DESC": "x"}}), 403),
+            (&me, "PUT", "/api/scope", json!({"level": "worker", "name": "review-dev-lead", "capability": "rules", "value": "x"}), 403),
+            (&me, "PATCH", "/api/sessions/review-dev-a/config", json!({"desc": inj}), 400),
+            (&me, "PATCH", "/api/sessions/review-dev-lead/config", json!({"desc": "x"}), 403),
+            (&me, "PATCH", "/api/sessions/review-dev-lead", json!({"desc": "x"}), 403),
+            (&me, "PATCH", "/api/workers/review-dev-lead/config", json!({"desc": "x"}), 403),
+            (&me, "POST", "/api/sessions/review-dev-lead/rename", json!({"name": "review-renamed"}), 403),
+            (&me, "PATCH", "/api/sessions/review-dev-lead/config", json!({"rename": "review-renamed"}), 403),
+            (&me, "POST", "/api/sessions/review-dev-lead/instructions", json!({"instructions": "x", "apply": true}), 403),
+            (&me, "POST", "/api/workers/review-dev-lead/instructions", json!({"instructions": "x"}), 403),
+            (&me, "POST", "/api/sessions/review-dev-lead/memory", json!({"content": "x"}), 403),
+            (&me, "POST", "/api/workers/review-dev-lead/memory", json!({"content": "x"}), 403),
+            (&me, "POST", "/api/env/apply", json!({"workers": [{"name": "review-dev-a", "groups": ["dev"]}]}), 403),
+            (&me, "POST", "/api/env/apply", json!({"workers": [{"name": "review-dev-lead", "groups": ["leads", "dev"]}]}), 403),
+            (&me, "POST", "/api/env/apply", json!({"files": [{"path": home.path().join("sessions/review-dev-a.env").to_str().unwrap(), "content": "CC_TAGS=leads\n"}]}), 403),
+            (&me, "PUT", "/api/config/apply", json!({"workers": [{"name": "review-dev-lead", "flags": "--x"}]}), 403),
+            (&lead, "POST", "/api/sessions", create, 400),
+        ];
+        let before = snapshot(home.path());
+        for (headers, m, path, body, want) in &cases {
+            let (st, _, v) = send_with(&app, m, path, Some(body.clone()), headers).await;
+            assert_eq!(st.as_u16(), *want, "{headers:?} {m} {path} {body}: {v}");
+        }
+        let after = snapshot(home.path());
+        let changed: Vec<_> = after.iter().filter(|(p, b)| before.get(*p) != Some(*b)).map(|(p, _)| p.clone())
+            .chain(before.keys().filter(|p| !after.contains_key(*p)).cloned()).collect();
+        assert!(changed.is_empty(), "refused requests changed files: {changed:?}");
+        // Control: the worker's typed setting on itself still writes.
+        let (st, _, v) = send_with(&app, "PATCH", "/api/sessions/review-dev-a/config", Some(json!({"desc": "typed"})), &me).await;
+        assert_eq!(st, StatusCode::OK, "self typed config: {v}");
+    }
+
+    /// Round 3 N1: env/apply rewrote a peer's whole env file when its groups
+    /// stayed the same, dropping AMUX_CONTRACT_DONE and with it the peer's
+    /// rule-10 token check. A worker may not rewrite any existing worker.
+    #[tokio::test]
+    async fn review_r3_n1_env_apply_cannot_strip_a_peers_contract() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = isolated(home.path());
+        membership_fleet(home.path());
+        std::fs::write(home.path().join("sessions/review-dev-lead.env"),
+            "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads,dev\"\nAMUX_CONTRACT_DONE=1\n").unwrap();
+        crate::api::worker_identity::mint(home.path(), "review-dev-lead").expect("rule 10 mints");
+        let (app, _db) = app();
+        let dir = home.path().join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let impersonate = || socket_request("POST", "/api/sessions", create_body(&dir, "review-n1-minted", json!([])),
+            &[("X-Amux-Session", "review-dev-lead")]);
+        let (st, v) = status_and_body(&app, impersonate()).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_refused")), "control: {v}");
+        let (st, _, v) = send_with(&app, "POST", "/api/env/apply",
+            Some(json!({"workers": [{"name": "review-dev-lead", "groups": ["leads", "dev"], "dir": "/tmp"}]})),
+            &[("X-Amux-Session", "review-dev-a")]).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("env_apply_existing_owner_only")), "{v}");
+        assert_eq!(crate::api::session_verbs::parse_env("review-dev-lead").get("AMUX_CONTRACT_DONE"), Some("1"));
+        let (st, v) = status_and_body(&app, impersonate()).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_refused")), "after: {v}");
+    }
+
+    /// Round 3 N2/N3: renaming or editing another worker (session or store
+    /// row) is the owner's; on its own store row a worker may not set the
+    /// free-form environment or permissions, nor the chat type in any case.
+    #[tokio::test]
+    async fn review_r3_n2_n3_peer_config_and_store_rows_are_the_owners() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = isolated(home.path());
+        membership_fleet(home.path());
+        let (app, _db) = app();
+        let me = [("X-Amux-Session", "review-dev-a")];
+        for (m, path, body) in [
+            ("PATCH", "/api/sessions/review-dev-lead/config", json!({"rename": "review-dev-lead2"})),
+            ("POST", "/api/sessions/review-dev-lead/rename", json!({"name": "review-dev-lead2"})),
+            ("PATCH", "/api/sessions/review-dev-lead/config", json!({"desc": "x"})),
+        ] {
+            let (st, _, v) = send_with(&app, m, path, Some(body), &me).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("peer_config_owner_only")), "{m} {path}: {v}");
+        }
+        assert!(home.path().join("sessions/review-dev-lead.env").exists());
+        assert!(!home.path().join("sessions/review-dev-lead2.env").exists());
+        // A store row.
+        let (st, _, row) = send(&app, "POST", "/api/workers", Some(json!({"display_name": "review-store", "cwd": "/tmp"}))).await;
+        assert_eq!(st, StatusCode::CREATED, "{row}");
+        let id = row["id"].as_str().unwrap().to_string();
+        let path = format!("/api/workers/{id}");
+        let (st, _, v) = send_with(&app, "PATCH", &path, Some(json!({"cwd": "/elsewhere"})), &me).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("peer_config_owner_only")), "peer row: {v}");
+        let own = [("X-Amux-Session", "review-store")];
+        for body in [json!({"environment": {"AMUX_SESSION": "review-dev-lead"}}), json!({"permissions": ["all"]})] {
+            let (st, _, v) = send_with(&app, "PATCH", &path, Some(body.clone()), &own).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("raw_text_owner_only")), "own row {body}: {v}");
+        }
+        let (st, _, v) = send_with(&app, "PATCH", &path, Some(json!({"worker_type": "Chat"})), &own).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(MEMBERSHIP_CODE)), "own row chat: {v}");
+        // Owner control.
+        let (st, _, v) = send(&app, "PATCH", &path, Some(json!({"environment": {"K": "v"}}))).await;
+        assert_eq!(st, StatusCode::OK, "owner sets environment: {v}");
+    }
+
+    /// Round 3 N5: an env apply validates the whole spec before writing: one
+    /// refused value means no worker in the spec is written.
+    #[tokio::test]
+    async fn review_r3_n5_env_apply_validates_the_whole_batch_first() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = isolated(home.path());
+        membership_fleet(home.path());
+        let (app, _db) = app();
+        let (st, _, v) = send(&app, "POST", "/api/env/apply", Some(json!({"workers": [
+            {"name": "review-batch-ok", "groups": ["dev"]},
+            {"name": "review-batch-bad", "desc": "x\nCC_TAGS=leads"},
+        ]}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert!(!home.path().join("sessions/review-batch-ok.env").exists(), "the valid worker was written before the refusal");
+        assert!(!home.path().join("sessions/review-batch-bad.env").exists());
+    }
+
     /// Every other path that makes a worker applies the same create rule,
     /// and every path that changes an existing worker's groups the
     /// membership rule. Each refusal has an allowed control.
     #[tokio::test]
     async fn every_create_and_membership_path_shares_one_rule() {
         let home = tempfile::tempdir().unwrap();
-        let _guard = crate::api::settings::test_env::set_home(home.path());
+        let _guard = isolated(home.path());
         membership_fleet(home.path());
         let (app, _db) = app();
-        let worker = [("X-Amux-Session", "dev-a")];
-        let lead = [("X-Amux-Session", "dev-lead")];
+        let worker = [("X-Amux-Session", "review-dev-a")];
+        let lead = [("X-Amux-Session", "review-dev-lead")];
         let grp = GroupId::from_ulid(ulid::Ulid::new());
         type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, String, Value, &'a str);
         let refused: Vec<Case> = vec![
             (&worker, "POST", "/api/workers".into(), json!({"display_name": "w-plain", "cwd": "/tmp/w"}), NEEDS_LEAD),
             (&lead, "POST", "/api/workers".into(), json!({"display_name": "w-group", "cwd": "/tmp/w", "group": grp.as_str()}), OUTSIDE_TEAM),
             (&lead, "POST", "/api/workers".into(), json!({"display_name": "w-chat", "cwd": "/tmp/w", "worker_type": "chat"}), OUTSIDE_TEAM),
-            (&worker, "POST", "/api/sessions/dev-a/duplicate".into(), json!({"new_name": "self-twin"}), NEEDS_LEAD),
-            (&worker, "POST", "/api/sessions/dev-a/clone".into(), json!({"new_name": "self-clone"}), NEEDS_LEAD),
-            (&lead, "POST", "/api/sessions/ops-a/duplicate".into(), json!({"new_name": "ops-twin"}), OUTSIDE_TEAM),
-            (&lead, "POST", "/api/sessions/dev-lead/duplicate".into(), json!({"new_name": "lead-twin"}), OUTSIDE_TEAM),
+            (&worker, "POST", "/api/sessions/review-dev-a/duplicate".into(), json!({"new_name": "self-twin"}), NEEDS_LEAD),
+            (&worker, "POST", "/api/sessions/review-dev-a/clone".into(), json!({"new_name": "self-clone"}), NEEDS_LEAD),
+            (&lead, "POST", "/api/sessions/review-ops-a/duplicate".into(), json!({"new_name": "ops-twin"}), OUTSIDE_TEAM),
+            (&lead, "POST", "/api/sessions/review-dev-lead/duplicate".into(), json!({"new_name": "lead-twin"}), OUTSIDE_TEAM),
             (&worker, "POST", "/api/env/apply".into(), json!({"workers": [{"name": "env-minted"}]}), NEEDS_LEAD),
             (&lead, "POST", "/api/env/apply".into(), json!({"workers": [{"name": "env-ops", "groups": ["ops"]}]}), OUTSIDE_TEAM),
-            (&lead, "POST", "/api/env/apply".into(), json!({"workers": [{"name": "dev-a", "groups": ["dev", "ops"]}]}), MEMBERSHIP_CODE),
+            (&lead, "POST", "/api/env/apply".into(), json!({"workers": [{"name": "review-dev-a", "groups": ["dev", "ops"]}]}), "env_apply_existing_owner_only"),
             (&worker, "PUT", "/api/config/apply".into(), json!({"workers": [{"name": "iac-minted"}]}), NEEDS_LEAD),
-            (&[("X-Amux-Worker", "dev-lead")], "PUT", "/api/config/apply".into(), json!({"workers": [{"name": "iac-leads", "tags": ["leads"]}]}), OUTSIDE_TEAM),
-            (&lead, "PATCH", "/api/sessions/dev-a/config".into(), json!({"tags": ["dev"]}), MEMBERSHIP_CODE),
-            (&worker, "PATCH", "/api/sessions/dev-a/config".into(), json!({"worker_type": "chat"}), MEMBERSHIP_CODE),
-            (&worker, "PUT", "/api/scope".into(), json!({"level": "worker", "name": "dev-a", "capability": "env", "value": {"CC_TAGS": "dev,leads"}}), MEMBERSHIP_CODE),
-            (&worker, "PUT", "/api/scope".into(), json!({"level": "worker", "name": "dev-a", "capability": "env", "value": "CC_TAGS=leads\n"}), MEMBERSHIP_CODE),
-            (&worker, "PUT", "/api/scope".into(), json!({"level": "worker", "name": "dev-a", "capability": "env", "value": {"CC_WORKER_TYPE": "chat"}}), MEMBERSHIP_CODE),
+            (&[("X-Amux-Worker", "review-dev-lead")], "PUT", "/api/config/apply".into(), json!({"workers": [{"name": "iac-leads", "tags": ["leads"]}]}), OUTSIDE_TEAM),
+            (&lead, "PATCH", "/api/sessions/review-dev-a/config".into(), json!({"tags": ["dev"]}), "peer_config_owner_only"),
+            (&worker, "PATCH", "/api/sessions/review-dev-a/config".into(), json!({"worker_type": "chat"}), MEMBERSHIP_CODE),
+            (&worker, "PUT", "/api/scope".into(), json!({"level": "worker", "name": "review-dev-a", "capability": "env", "value": {"CC_TAGS": "dev,leads"}}), MEMBERSHIP_CODE),
+            (&worker, "PUT", "/api/scope".into(), json!({"level": "worker", "name": "review-dev-a", "capability": "env", "value": "CC_TAGS=leads\n"}), "raw_text_owner_only"),
+            (&worker, "PUT", "/api/scope".into(), json!({"level": "worker", "name": "review-dev-a", "capability": "env", "value": {"CC_WORKER_TYPE": "chat"}}), MEMBERSHIP_CODE),
         ];
         for (headers, m, path, body, code) in &refused {
             let (st, _, v) = send_with(&app, m, path, Some(body.clone()), headers).await;
@@ -3025,23 +3293,23 @@ mod tests {
         for n in ["self-twin", "self-clone", "ops-twin", "lead-twin", "env-minted", "env-ops", "iac-minted", "iac-leads"] {
             assert!(!home.path().join(format!("sessions/{n}.env")).exists(), "{n} was written despite the refusal");
         }
-        assert_eq!(crate::api::session_verbs::lane_groups("dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
+        assert_eq!(crate::api::session_verbs::lane_groups("review-dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
         // Allowed controls: a lead copies a worker inside its team, creates a
         // store worker and env-applies a team worker; a worker writes a
         // non-membership key of its own layer and dry-runs a plan; the owner
         // copies anything.
-        let (st, _, v) = send_with(&app, "POST", "/api/sessions/dev-a/duplicate", Some(json!({"new_name": "dev-twin"})), &lead).await;
+        let (st, _, v) = send_with(&app, "POST", "/api/sessions/review-dev-a/duplicate", Some(json!({"new_name": "dev-twin"})), &lead).await;
         assert_eq!(st, StatusCode::OK, "lead duplicates inside its team: {v}");
         let (st, _, v) = send_with(&app, "POST", "/api/workers", Some(json!({"display_name": "w-lead", "cwd": "/tmp/w"})), &lead).await;
         assert_eq!(st, StatusCode::CREATED, "lead store create: {v}");
         let (st, _, v) = send_with(&app, "POST", "/api/env/apply", Some(json!({"workers": [{"name": "env-dev", "groups": ["dev"]}]})), &lead).await;
         assert!(st.is_success(), "lead env apply in team: {v}");
         let (st, _, v) = send_with(&app, "PUT", "/api/scope",
-            Some(json!({"level": "worker", "name": "dev-a", "capability": "env", "value": {"CC_DESC": "ok"}})), &worker).await;
+            Some(json!({"level": "worker", "name": "review-dev-a", "capability": "env", "value": {"CC_DESC": "ok"}})), &worker).await;
         assert_eq!(st, StatusCode::OK, "own-layer non-membership write: {v}");
         let (st, _, v) = send_with(&app, "POST", "/api/env/apply?dry_run=1", Some(json!({"workers": [{"name": "env-minted", "groups": ["leads"]}]})), &worker).await;
         assert_eq!(st, StatusCode::OK, "worker dry-run: {v}");
-        let (st, _, v) = send(&app, "POST", "/api/sessions/dev-lead/duplicate", Some(json!({"new_name": "lead-twin"}))).await;
+        let (st, _, v) = send(&app, "POST", "/api/sessions/review-dev-lead/duplicate", Some(json!({"new_name": "lead-twin"}))).await;
         assert_eq!(st, StatusCode::OK, "owner duplicate: {v}");
         let (st, _, v) = send(&app, "POST", "/api/workers", Some(json!({"display_name": "w-group", "cwd": "/tmp/w", "group": grp.as_str()}))).await;
         assert_eq!(st, StatusCode::CREATED, "owner create with group: {v}");
