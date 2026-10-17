@@ -11,6 +11,9 @@
 #   default: API-only validation, no real workers spawned
 
 set -euo pipefail
+# Acts on the LIVE server by design: opt in with AMUX_TEST_LIVE=1 (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_require_live
 # `-e` needs the counters below to be ASSIGNMENTS, not `((n++))` (AF-562).
 # `((n++))` yields the counter's OLD value as its exit status, so the first
 # increment from 0 returns 1. As the last statement of `check`, that becomes

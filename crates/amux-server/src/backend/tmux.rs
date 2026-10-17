@@ -310,7 +310,7 @@ impl TmuxBackend {
 
     async fn run(&self, args: &[&str], timeout: Duration) -> Result<std::process::Output> {
         note_tmux_spawn(args);
-        let mut cmd = tokio::process::Command::new(&self.bin);
+        let mut cmd = crate::tmux_guard::tokio_cmd(&self.bin);
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

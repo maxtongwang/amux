@@ -124,12 +124,19 @@ fn the_parse_check_can_actually_fail() {
 /// would pass for reasons that have nothing to do with the CLI.
 fn run_quiet(args: &[&str]) -> (i32, String) {
     let cli = repo_root().join("amux");
+    // A temp HOME and CC_HOME, never the real ~/.amux, and a dead API: with
+    // the real HOME the CLI read the live endpoint.json and fleet state
+    // (scripts/lib/test-isolation.sh has the incident).
+    let home = tempfile::tempdir().expect("temp home");
     let out = Command::new("bash")
         .arg(&cli)
         .args(args)
         .env_clear()
         .env("PATH", "/usr/bin:/bin:/usr/local/bin")
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("HOME", home.path())
+        .env("CC_HOME", home.path().join(".amux"))
+        .env("AMUX_API", "http://127.0.0.1:9")
+        .env("AMUX_URL", "http://127.0.0.1:9")
         .output()
         .unwrap_or_else(|e| panic!("run amux {args:?}: {e}"));
     (

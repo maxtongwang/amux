@@ -1247,7 +1247,8 @@ pub(crate) async fn run_cmd(
     args: &[&str],
     timeout: Duration,
 ) -> Option<std::process::Output> {
-    let mut cmd = tokio::process::Command::new(bin);
+    // tmux goes through the test guard (tmux_guard): never the host server in a test.
+    let mut cmd = if bin == "tmux" { crate::tmux_guard::tokio_tmux() } else { tokio::process::Command::new(bin) };
     cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -23440,7 +23441,7 @@ fn orphan_landing(session: &str, text: &str, queued_at: f64) -> OrphanLanding {
     // Pasted but not submitted: re-queueing would type it twice.
     // Exact-match target, so a sibling `amux-<session>-2` is never read instead.
     let pt = crate::backend::tmux::pane_target(&format!("amux-{session}"));
-    let pane = std::process::Command::new("tmux")
+    let pane = crate::tmux_guard::std_tmux()
         .args(["capture-pane", "-p", "-t", &pt, "-S", "-80"])
         .output()
         .ok()
@@ -24709,6 +24710,13 @@ async fn dispatch(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        // A Chat tab speaks for the owner (chat_speaks_for_owner), so a lane's
+        // send into ANOTHER group's worker's tab was a route across the
+        // boundary with owner reach on the far side. Same rule as a send to
+        // the worker itself.
+        if method == Method::POST {
+            if let Some(refusal) = pane_write_refusal(&headers, &worker, "chat-tab:send") { return refusal; }
+        }
         return super::chat_worker::companion_route(
             &state, &worker, method == Method::POST, &action, receipt, &body, &caller,
         )
@@ -26847,8 +26855,11 @@ async fn post_dispatch(
             )
         }
         "clear" => clear_verb(name).await,
-        "duplicate" => duplicate_verb(state, name, body),
-        "clone" => clone_post(state, name, body).await,
+        "duplicate" => duplicate_verb(state, name, headers, body),
+        "clone" => {
+            if let Some(refusal) = copy_refusal(name, headers) { return refusal; }
+            clone_post(state, name, body).await
+        }
         "archive" => {
             if !session_destructive_allowed(state, headers) {
                 return jresp(
@@ -27252,16 +27263,24 @@ pub(crate) fn no_reply_path_stamp(origin: &str, is_isolated: bool) -> Option<Str
 
 /// A lane's groups, from `CC_TAGS` in its env file.
 pub(crate) fn lane_groups(lane: &str) -> std::collections::BTreeSet<String> {
-    parse_env(lane)
-        .get("CC_TAGS")
+    let env = parse_env(lane);
+    // A project executor's retired fleet-wide `ephemeral` group (driver.rs
+    // `executor_groups`) is not membership: executors configured before that
+    // change still carry it in their env file until their next configure, and
+    // it must not join them to every other project's executors meanwhile.
+    let project_executor = env.get("CC_EPHEMERAL") == Some("1") && env.get("CC_PROJECT").is_some_and(|p| !p.trim().is_empty());
+    env.get("CC_TAGS")
         .map(|v| {
             v.split(',')
                 .map(|t| t.trim().trim_matches('"').to_lowercase())
-                .filter(|t| !t.is_empty())
+                .filter(|t| !t.is_empty() && !(project_executor && t == RETIRED_EXECUTOR_GROUP))
                 .collect()
         })
         .unwrap_or_default()
 }
+
+/// The group every project executor used to share across projects.
+const RETIRED_EXECUTOR_GROUP: &str = "ephemeral";
 
 /// Why a worker-to-worker send is allowed, or `Err(reason)` if it is not.
 ///
@@ -29954,7 +29973,7 @@ pub(crate) async fn refresh_scoped_context(
             continue;
         }
         let st = crate::backend::tmux::session_target(&format!("amux-{w}"));
-        let running = tokio::process::Command::new("tmux")
+        let running = crate::tmux_guard::tokio_tmux()
             .args(["has-session", "-t", &st])
             .status()
             .await
@@ -30117,7 +30136,10 @@ pub(crate) async fn peek_verb(state: &AppState, name: &str, qs: &[(String, Strin
 /// duplicate existing as an env file the worker store cannot see. A second
 /// implementation of that ordering is a second place for it to be wrong, on the
 /// error path, where nobody looks.
-pub(crate) fn duplicate_verb(state: &AppState, name: &str, body: &Value) -> Response {
+pub(crate) fn duplicate_verb(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
+    // A copy inherits the source's groups (env file and store row), so it is a
+    // create with those groups: only a lead, and only inside its own team.
+    if let Some(refusal) = copy_refusal(name, headers) { return refusal; }
     let new_name = body_str(body, "new_name").trim().to_string();
     if new_name.is_empty() {
         return jresp(
@@ -31859,7 +31881,10 @@ pub(crate) async fn report_post(
 // ---------------------------------------------------------------------------
 
 async fn patch_dispatch(state: &AppState, name: &str, action: &str, body: &Value, headers: &HeaderMap) -> Response {
-    if let Some(refusal) = membership_patch_refusal(headers, body.get("tags").is_some()) { return refusal; }
+    if let Some(refusal) = membership_patch_refusal(headers, names_messaging_authority(body)) { return refusal; }
+    if action == "config" {
+        if let Some(refusal) = config_pane_write_refusal(headers, name, body) { return refusal; }
+    }
     match action {
         "commit-guard" => commit_guard_patch_verb(name, body),
         "config" => config_patch(state, name, body).await,
@@ -32912,6 +32937,174 @@ async fn apply_live_config_change(
     }
 }
 
+/// THE membership rule: a worker-originated request may not set or change a
+/// worker's messaging authority. Every path that writes group membership calls
+/// this one predicate, so the rule and its error code have one definition.
+///
+/// Messaging authority is group membership (`CC_TAGS`, `_amux_workers.group`)
+/// plus the two settings that act as membership of every group: the chat
+/// worker type, which speaks for the owner (`chat_speaks_for_owner`), and a
+/// group's open-inbound switch. `membership_named` is the caller's statement
+/// that the request would set one of those.
+///
+/// This governs EXISTING workers: no worker may change any worker's groups,
+/// its own included. Creating a worker is [`worker_create_refusal`]'s rule.
+/// Owners, the dashboard and verified human members are unaffected.
+pub(crate) fn membership_patch_refusal(headers: &HeaderMap, membership_named: bool) -> Option<Response> {
+    membership_refusal_body(headers, membership_named).map(|body| jresp(StatusCode::FORBIDDEN, body))
+}
+
+/// [`membership_patch_refusal`]'s decision and 403 body, for a handler whose
+/// return type is not a `Response`.
+pub(crate) fn membership_refusal_body(headers: &HeaderMap, membership_named: bool) -> Option<Value> {
+    if !membership_named || hdr_worker(headers).is_empty() || super::org::local_member_actor(headers).is_some() { return None; }
+    tracing::warn!(verdict="worker_group_membership_refused", measured=true, n_considered=1,
+        worker = %hdr_worker(headers),
+        "worker cannot widen messaging authority by editing group membership");
+    Some(json!({"ok":false,"code":"worker_group_membership_refused",
+        "error":"Group membership changes require direct owner input."}))
+}
+
+/// The worker this request speaks for, or empty for the owner/dashboard and
+/// verified human members (the same attribution as the membership rule).
+pub(crate) fn worker_origin(headers: &HeaderMap) -> String {
+    if super::org::local_member_actor(headers).is_some() { return String::new(); }
+    hdr_worker(headers)
+}
+
+/// The group boundary for a request that writes into `target`'s pane or turn
+/// without being a message: an interrupt, a typed slash command, a send into
+/// its Chat tab. It is [`cross_group_policy_ok`], the predicate a text send
+/// already runs (fix/group-boundary-keys-ephemeral-register), as a 403: owner,
+/// dashboard, verified members, self and chat-for-owner pass; a worker reaches
+/// only workers it shares a group with, and never an isolated one. `verb`
+/// names the path in the log line so a sweep can count refusals per writer.
+/// The keys/start/instructions/git-push verbs take the same rule through the
+/// attribution follow-up's gate; the two can be unified on one name later.
+pub(crate) fn pane_write_refusal(headers: &HeaderMap, target: &str, verb: &'static str) -> Option<Response> {
+    let origin = worker_origin(headers);
+    let reason = cross_group_policy_ok(&origin, target).err()?;
+    tracing::warn!(origin = %origin, target, verb, verdict = "pane_write_group_boundary",
+        measured = true, n_considered = 1, "a worker tried to write into another group's pane");
+    Some(jresp(StatusCode::FORBIDDEN, json!({"ok": false, "code": "worker_group_boundary", "error": reason, "verb": verb})))
+}
+
+/// Config keys whose change is typed into the RUNNING agent's pane as a slash
+/// command (`/model`, `/effort`, see `apply_live_config_change`).
+const PANE_TYPED_CONFIG_KEYS: [&str; 2] = ["model", "effort"];
+
+/// [`pane_write_refusal`] for a config PATCH that would type into the pane.
+pub(crate) fn config_pane_write_refusal(headers: &HeaderMap, target: &str, body: &Value) -> Option<Response> {
+    if !PANE_TYPED_CONFIG_KEYS.iter().any(|k| body.get(*k).is_some()) { return None; }
+    pane_write_refusal(headers, target, "config:model")
+}
+
+/// The group whose members may create workers (Max, 2026-10-16: "Only leads
+/// can create workers"). Membership of it is the owner's to grant.
+pub(crate) const LEADS_GROUP: &str = "leads";
+
+/// What a worker-originated create asks for.
+pub(crate) struct CreateRequest<'a> {
+    /// The name the request would register, when it names one. Equal to the
+    /// caller's own verified identity it may be SELF-REGISTRATION (below).
+    pub name: Option<&'a str>,
+    /// The new worker's groups (any case; compared lowercased).
+    pub tags: &'a [String],
+    /// Something only the owner may grant at create: the chat worker type
+    /// (it speaks for the owner) or a store `group` id.
+    pub owner_only: Option<&'static str>,
+}
+
+/// THE create rule, for every path that makes a worker: session create, store
+/// create, duplicate/clone and the env/config imports.
+///
+/// - The owner, the dashboard and verified human members: unchanged.
+/// - A worker not in `leads`: refused (`worker_create_requires_lead`), with or
+///   without tags.
+/// - A lead: allowed, giving the new worker only tags drawn from its own team
+///   tags, never `leads` (`worker_create_tags_outside_team`).
+///
+/// SELF-REGISTRATION is not creation: a worker registering a row for its OWN
+/// existing session (`POST /api/workers {"name": <itself>}`) makes no new
+/// worker. It is allowed only when the requested name equals the caller's
+/// verified identity, that session's env file exists, and the request adds no
+/// group: its tags are a subset of the session's existing groups and it sets
+/// nothing owner-only. Anything else is a create and takes the rule above.
+///
+/// "Verified identity" is [`worker_origin`]: the header identity that
+/// `worker_identity::enforce` (rule 10) has already checked against the
+/// lane's token before any handler runs. Process attribution (the separate
+/// `fix/worker-attribution` work) slots in by rewriting that identity before
+/// this point, so this predicate needs no change for it.
+///
+/// Server-internal spawns (project leads/executors) never reach here: their
+/// groups come from owner-configured project policy, not from a request.
+pub(crate) fn worker_create_refusal(headers: &HeaderMap, req: &CreateRequest) -> Option<Response> {
+    worker_create_refusal_body(headers, req).map(|body| jresp(StatusCode::FORBIDDEN, body))
+}
+
+/// [`worker_create_refusal`]'s decision and 403 body, for a handler whose
+/// return type is not a `Response`.
+pub(crate) fn worker_create_refusal_body(headers: &HeaderMap, req: &CreateRequest) -> Option<Value> {
+    let origin = worker_origin(headers);
+    if origin.is_empty() { return None; }
+    let caller = lane_groups(&origin);
+    let adds_no_group = req.owner_only.is_none()
+        && req.tags.iter().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).all(|t| caller.contains(&t));
+    if req.name == Some(origin.as_str()) && adds_no_group && env_path(&origin).exists() {
+        tracing::info!(worker = %origin, verdict = "worker_self_registration", measured = true, n_considered = 1,
+            "a worker registered its own existing session; not a worker creation");
+        return None;
+    }
+    if !caller.contains(LEADS_GROUP) {
+        tracing::warn!(worker = %origin, verdict = "worker_create_requires_lead", measured = true, n_considered = 1,
+            "a worker outside the leads group tried to create a worker");
+        return Some(json!({"ok": false, "code": "worker_create_requires_lead",
+            "error": format!("Only leads can create workers; '{origin}' is not in the '{LEADS_GROUP}' group.")}));
+    }
+    let team: std::collections::BTreeSet<String> = caller.iter().filter(|g| *g != LEADS_GROUP).cloned().collect();
+    let outside: Vec<String> = req.tags.iter().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty() && !team.contains(t)).collect();
+    if outside.is_empty() && req.owner_only.is_none() { return None; }
+    tracing::warn!(worker = %origin, ?outside, owner_only = req.owner_only.unwrap_or(""), ?team,
+        verdict = "worker_create_tags_outside_team", measured = true, n_considered = 1,
+        "a lead tried to create a worker outside its own team");
+    let what = match req.owner_only {
+        Some(o) => format!("{o} is the owner's to grant"),
+        None => format!("tags {outside:?} are outside the lead's team {team:?} ('{LEADS_GROUP}' is the owner's to grant)"),
+    };
+    Some(json!({"ok": false, "code": "worker_create_tags_outside_team",
+        "error": format!("A lead may create workers only inside its own team: {what}."), "team": team}))
+}
+
+/// The groups a create request names, from a `tags` array or a comma string.
+pub(crate) fn tags_of(v: Option<&Value>) -> Vec<String> {
+    match v {
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+        Some(Value::String(s)) => s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect(),
+        _ => vec![],
+    }
+}
+
+/// Whether a request body asks for the chat worker type, which carries the
+/// owner's cross-group reach (see [`membership_patch_refusal`]).
+pub(crate) fn requests_chat_type(body: &Value) -> bool {
+    body.get("worker_type").and_then(Value::as_str).map(str::trim) == Some("chat")
+}
+
+/// Whether a config-style body names messaging authority: a `tags` edit of any
+/// shape (clearing counts, as before) or a switch to the chat worker type.
+pub(crate) fn names_messaging_authority(body: &Value) -> bool {
+    body.get("tags").is_some() || requests_chat_type(body)
+}
+
+/// The create rule for a copy of `source` (duplicate/clone): the copy carries
+/// the source's groups and worker type, so it is a create with those.
+fn copy_refusal(source: &str, headers: &HeaderMap) -> Option<Response> {
+    let tags: Vec<String> = lane_groups(source).into_iter().collect();
+    let chat = crate::api::worker_exec::worker_type_of(source).as_str() == "chat";
+    worker_create_refusal(headers, &CreateRequest { name: None, tags: &tags, owner_only: chat.then_some("the chat worker type") })
+}
+
 /// Every config write drops the cached session list (AMUX-2926).
 ///
 /// A WRAPPER, not a call at each return: `config_patch_inner` returns from a
@@ -32924,14 +33117,6 @@ async fn apply_live_config_change(
 /// several branches write one field and then reject a second. Clearing a cache
 /// that did not need clearing costs one rebuild; NOT clearing one that did is
 /// the bug this fixes.
-pub(crate) fn membership_patch_refusal(headers: &HeaderMap, membership_named: bool) -> Option<Response> {
-    if !membership_named || hdr_worker(headers).is_empty() || super::org::local_member_actor(headers).is_some() { return None; }
-    tracing::warn!(verdict="worker_group_membership_refused", measured=true, n_considered=1,
-        "worker cannot widen messaging authority by editing group membership");
-    Some(jresp(StatusCode::FORBIDDEN,json!({"ok":false,"code":"worker_group_membership_refused",
-        "error":"Group membership changes require direct owner input."})))
-}
-
 pub(crate) async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
     let out = config_patch_inner(state, name, body).await;
     crate::api::sessions_legacy::invalidate_sessions_cache();
@@ -34718,8 +34903,7 @@ mod tests {
 
     #[test]
     fn tmux_shell_setup_keeps_line_and_enter_in_one_command() {
-        use std::process::Command;
-        if Command::new("tmux").arg("-V").output().is_err() {
+        if crate::tmux_guard::std_tmux().arg("-V").output().is_err() {
             eprintln!("tmux unavailable; live shell submission test not measured");
             return;
         }
@@ -34728,7 +34912,7 @@ mod tests {
         struct PrivateServer(std::path::PathBuf);
         impl Drop for PrivateServer {
             fn drop(&mut self) {
-                let _ = Command::new("tmux")
+                let _ = crate::tmux_guard::std_tmux()
                     .arg("-S")
                     .arg(&self.0)
                     .arg("kill-server")
@@ -34736,7 +34920,7 @@ mod tests {
             }
         }
         let _server = PrivateServer(socket.clone());
-        let created = Command::new("tmux")
+        let created = crate::tmux_guard::std_tmux()
             .arg("-S")
             .arg(&socket)
             .args([
@@ -34760,7 +34944,7 @@ mod tests {
                 "printf '%s\\n' {value} >> {}",
                 super::sh_quote(&receipt.to_string_lossy())
             );
-            let out = Command::new("tmux")
+            let out = crate::tmux_guard::std_tmux()
                 .arg("-S")
                 .arg(&socket)
                 .args(super::shell_line_args(&pt, &line))
@@ -34788,13 +34972,12 @@ mod tests {
 
     #[tokio::test]
     async fn startup_shell_receipts_preserve_long_input_and_wait_for_setup() {
-        use std::process::Command;
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let socket = dir.path().join("socket");
         struct PrivateServer(std::path::PathBuf);
         impl Drop for PrivateServer {
             fn drop(&mut self) {
-                let _ = Command::new("tmux")
+                let _ = crate::tmux_guard::std_tmux()
                     .arg("-S")
                     .arg(&self.0)
                     .arg("kill-server")
@@ -34802,7 +34985,7 @@ mod tests {
             }
         }
         let _server = PrivateServer(socket.clone());
-        let created = Command::new("tmux")
+        let created = crate::tmux_guard::std_tmux()
             .arg("-S")
             .arg(&socket)
             .args([
@@ -34825,7 +35008,7 @@ mod tests {
             let socket = socket.clone();
             async move {
                 let target = super::pt("startup-proof");
-                tokio::process::Command::new("tmux")
+                crate::tmux_guard::tokio_tmux()
                     .arg("-S")
                     .arg(socket)
                     .args(super::shell_line_args(&target, &line))
@@ -35008,7 +35191,7 @@ mod tests {
             .await
             .unwrap();
         let pt = super::pt("startup-proof");
-        let pane = Command::new("tmux")
+        let pane = crate::tmux_guard::std_tmux()
             .arg("-S")
             .arg(&socket)
             .args(["capture-pane", "-p", "-t", pt.as_str(), "-S", "-"])
@@ -44022,7 +44205,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         impl Drop for Pane {
             fn drop(&mut self) {
                 let st = session_target(&self.0);
-                let _ = std::process::Command::new("tmux")
+                let _ = crate::tmux_guard::std_tmux()
                     .args(["kill-session", "-t", &st])
                     .output();
             }
@@ -44528,7 +44711,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         // And nothing was created. This is the assertion the incident needed:
         // the test could not tell it had spawned, because from inside every
         // call returned as though it worked.
-        let live = tokio::process::Command::new("tmux")
+        let live = crate::tmux_guard::tokio_tmux()
             .args(["list-sessions", "-F", "#{session_name}"])
             .output()
             .await
@@ -47537,7 +47720,7 @@ mod submission_gate_tests {
         impl Drop for Pane {
             fn drop(&mut self) {
                 let st = session_target(&self.0);
-                let _ = std::process::Command::new("tmux")
+                let _ = crate::tmux_guard::std_tmux()
                     .args(["kill-session", "-t", &st])
                     .output();
             }
@@ -47573,7 +47756,7 @@ with open(sys.argv[3],'ab',buffering=0) as log:
         if key in (b'\r',b'\n'): paint(sys.argv[2])
 "#
         );
-        let output = std::process::Command::new("tmux")
+        let output = crate::tmux_guard::std_tmux()
             .args([
                 "new-session",
                 "-d",
@@ -47631,7 +47814,7 @@ with open(sys.argv[3],'ab',buffering=0) as log:
         impl Drop for Pane {
             fn drop(&mut self) {
                 let stq = session_target(&self.0);
-                let _ = std::process::Command::new("tmux")
+                let _ = crate::tmux_guard::std_tmux()
                     .args(["kill-session", "-t", &stq])
                     .output();
             }
@@ -47649,7 +47832,7 @@ with open(sys.argv[3],'ab',buffering=0) as log:
                 (now_f64() * 1_000_000.0) as u64
             );
             let pane = Pane(tmux_name(&lane));
-            let output = std::process::Command::new("tmux").args([
+            let output = crate::tmux_guard::std_tmux().args([
                 "new-session", "-d", "-s", &pane.0, "-x", "200", "-y", "24",
                 "python3", "-c", "import pathlib,sys,time;print(pathlib.Path(sys.argv[1]).read_text(),flush=True);time.sleep(20)",
                 path.to_str().unwrap(),

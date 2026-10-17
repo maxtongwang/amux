@@ -24,6 +24,9 @@ AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"; [ -n "${REC_PID:-}" ] && kill "$REC_PID" 2>/dev/null || true' EXIT
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source scripts/lib/test-isolation.sh; amux_test_isolate "$TMP" || exit 1
 
 # A recorder, not a mock board: it writes the POST body to a file and answers with
 # the smallest response _board_outcome accepts. Plain HTTP on purpose, because the

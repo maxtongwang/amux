@@ -133,6 +133,7 @@ async fn retained_dead_pane_cannot_remain_idle_in_worker_api() {
             .env_remove("BASH_ENV")
             .env("TMUX_TMPDIR", socket_dir.path())
             .env("AMUX_DEAD_PANE_TEST_CHILD", "1")
+            .env(amux_server::tmux_guard::TEST_ISOLATED_ENV, "1")
             .env("AMUX_REQUIRE_TMUX", "1")
             .output()
             .unwrap();

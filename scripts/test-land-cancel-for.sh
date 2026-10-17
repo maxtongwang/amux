@@ -4,6 +4,9 @@
 # and logs both lanes (mixpeek-override, 2026-10-02: no sanctioned way to pull
 # a stale tip out of a 15-push batch). Runs under a throwaway HOME.
 AM="${1:-$(cd "$(dirname "$0")/.." && pwd)/amux}"; AM="$(cd "$(dirname "$AM")" && pwd)/$(basename "$AM")"; H="$(mktemp -d "${TMPDIR:-/tmp}/cf.XXXXXX")"
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate "$H" || exit 1
 mkdir -p "$H/.amux/locks/land-test.q" "$H/.amux/logs/land" "$H/.amux/locks/detached"
 perl -e 'setpgrp(0,0); exec "sleep", "300"' & W=$!
 sleep 1

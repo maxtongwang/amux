@@ -156,6 +156,38 @@ struct WorkerSpec {
     prompt: String,
 }
 
+/// An env apply creates workers with groups and had no caller check, so a
+/// worker could mint group members (fix/worker-membership-create). Each worker
+/// the spec CREATES goes through the shared create rule (only leads, only
+/// inside their team); a spec that changes an EXISTING worker's groups goes
+/// through the shared membership rule. A worker may still dry-run a plan.
+fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Option<Response> {
+    if dry {
+        return None;
+    }
+    let sessions = crate::config::amux_home().join("sessions");
+    for w in &spec.workers {
+        let name = sanitize(&w.name);
+        if name.is_empty() {
+            continue;
+        }
+        if sessions.join(format!("{name}.env")).exists() {
+            let wanted: std::collections::BTreeSet<String> =
+                w.groups.iter().map(|g| g.trim().to_lowercase()).filter(|g| !g.is_empty()).collect();
+            let changes = wanted != crate::api::session_verbs::lane_groups(&name);
+            if let Some(r) = crate::api::session_verbs::membership_patch_refusal(headers, changes) {
+                return Some(r);
+            }
+        } else if let Some(r) = crate::api::session_verbs::worker_create_refusal(
+            headers,
+            &crate::api::session_verbs::CreateRequest { name: None, tags: &w.groups, owner_only: None },
+        ) {
+            return Some(r);
+        }
+    }
+    None
+}
+
 // ---- GET /api/env/schema ---------------------------------------------------
 
 async fn schema() -> Response {
@@ -213,6 +245,9 @@ async fn apply(
         }
     };
 
+    if let Some(refusal) = worker_apply_refusal(&headers, &spec, dry) {
+        return refusal;
+    }
     let home = crate::config::amux_home();
     let sessions_dir = home.join("sessions");
 

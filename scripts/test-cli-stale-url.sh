@@ -4,6 +4,9 @@
 # logged once; a remote override is left alone (2026-10-05: a reboot race left
 # every lane on 8823 and every CLI verb failed with curl exit 7).
 set -uo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 AM="${1:-$(cd "$(dirname "$0")/.." && pwd)/amux}"
 AM="$(cd "$(dirname "$AM")" && pwd)/$(basename "$AM")"
 H="$(mktemp -d "${TMPDIR:-/tmp}/csu.XXXXXX")"; mkdir -p "$H/.amux/state" "$H/srv/api"

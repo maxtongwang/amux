@@ -161,11 +161,30 @@ pub async fn apply(
 ) -> (StatusCode, Json<Value>) {
     // Writing global/group configuration is the human's, matching
     // /api/scope's own policy: a session may not reshape the whole instance.
-    let actor = headers
-        .get("x-amux-session")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    //
+    // Attribution is the shared rule (X-Amux-Worker canonical, X-Amux-Session
+    // honoured): reading only X-Amux-Session let a worker sending just
+    // X-Amux-Worker apply as the human. Worker declarations hold even under
+    // AMUX_SCOPE_WRITE_AGENTS=1: a NEW worker goes through the shared create
+    // rule (only leads, only inside their team), `tags` on an EXISTING worker
+    // through the shared membership rule.
+    let actor = super::groups::hdr_worker(&headers);
+    let home = super::groups::amux_home();
+    for w in doc.get("workers").and_then(Value::as_array).into_iter().flatten() {
+        let Some(name) = w.get("name").and_then(Value::as_str) else { continue };
+        let refusal = if home.join("sessions").join(format!("{name}.env")).exists() {
+            super::session_verbs::membership_refusal_body(&headers, w.get("tags").is_some())
+        } else {
+            let tags = super::session_verbs::tags_of(w.get("tags"));
+            super::session_verbs::worker_create_refusal_body(
+                &headers,
+                &super::session_verbs::CreateRequest { name: None, tags: &tags, owner_only: None },
+            )
+        };
+        if let Some(body) = refusal {
+            return (StatusCode::FORBIDDEN, Json(body));
+        }
+    }
     if !actor.is_empty() && std::env::var("AMUX_SCOPE_WRITE_AGENTS").ok().as_deref() != Some("1") {
         return (
             StatusCode::FORBIDDEN,

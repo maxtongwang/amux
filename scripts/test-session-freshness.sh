@@ -23,6 +23,10 @@ cd "$(dirname "$0")/.."
 HOOK="$(pwd)/.claude/session-freshness.sh"
 PASS=0; FAIL=0
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+mkdir -p "$TMP/home"
+source scripts/lib/test-isolation.sh; amux_test_isolate "$TMP/home" || exit 1
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 # Pin the default branch instead of inheriting it. The first cut of this file did
 # not, and passed locally (init.defaultBranch=main) while failing 4 assertions in

@@ -221,7 +221,8 @@ pub fn admit_automation(what: &str) -> bool {
 // ---- probes ---------------------------------------------------------------
 
 fn run(program: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(program).args(args).output().ok()?;
+    let mut cmd = if program == "tmux" { crate::tmux_guard::std_tmux() } else { std::process::Command::new(program) };
+    let out = cmd.args(args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 

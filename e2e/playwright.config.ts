@@ -98,6 +98,8 @@ const homes: Record<string, string> = Object.fromEntries(
   TARGETS.map((t) => [t.name, fs.mkdtempSync(path.join(os.tmpdir(), `amux-e2e-${t.name}-`))]),
 );
 for (const home of Object.values(homes)) {
+  // The server's own tmux server lives here (TMUX_TMPDIR below), never the host's.
+  fs.mkdirSync(path.join(home, 'tmux'), { recursive: true });
   fs.writeFileSync(
     path.join(home, 'server.env'),
     `ANTHROPIC_API_KEY=${E2E_ANTHROPIC_KEY}\n`,
@@ -338,6 +340,15 @@ export default defineConfig({
       // The vault's master key goes to a 0600 file in the throwaway home, never
       // into the developer's login Keychain (vault_secrets.rs keystore_is_file).
       AMUX_VAULT_KEYSTORE: 'file',
+      // A PRIVATE tmux server per project: TMUX_TMPDIR under the throwaway
+      // home, and the inherited TMUX/TMUX_PANE blanked (TMUX would override
+      // TMUX_TMPDIR). AMUX_TEST_ISOLATED puts every tmux the server spawns
+      // under its test guard (tmux_guard.rs), which refuses the default
+      // socket. A test renamed the live amux-dev-lead session on 2026-10-16.
+      TMUX_TMPDIR: path.join(homes[t.name], 'tmux'),
+      TMUX: '',
+      TMUX_PANE: '',
+      AMUX_TEST_ISOLATED: '1',
     },
   })),
 });

@@ -8,6 +8,9 @@
 #
 #   scripts/test-connectors-live.sh [--account ethan@mixpeek.com] [--no-send]
 set -euo pipefail
+# Acts on the LIVE server by design: opt in with AMUX_TEST_LIVE=1 (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_require_live
 ACCOUNT=ethan@mixpeek.com
 SEND=1
 while [ $# -gt 0 ]; do

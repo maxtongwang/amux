@@ -827,43 +827,79 @@ cmd_register() {
     *) die "CC_DIR must be absolute, got: $resolved_dir" ;;
   esac
 
-  local file="$CC_SESSIONS/$name.env"
-  # MERGE, do not truncate (AMUX-3117). Re-registering an existing worker used to
-  # `cat >` the file down to CC_NAME/CC_DIR/CC_FLAGS, SILENTLY WIPING every other
-  # CC_* key it does not manage — CC_DESC and CC_TAGS were lost this way, and
-  # re-register is the only path to set flags (the PATCH-flags gap, AMUX-3115), so
-  # the destructive path was on the happy path (gtm-engine, 2026-08-14). Preserve
-  # every existing CC_* assignment except the three this verb owns, verbatim (no
-  # re-parse, so quoting/JSON values survive intact).
-  local preserved=""
-  if [[ -f "$file" ]]; then
-    preserved=$(grep -E '^CC_[A-Za-z0-9_]+=' "$file" 2>/dev/null \
-                | grep -vE '^(CC_NAME|CC_DIR|CC_FLAGS)=' || true)
-    # A flag given now replaces the stored value rather than duplicating it.
-    [[ -n "$wt" ]] && preserved=$(printf '%s\n' "$preserved" | grep -vE '^CC_WORKTREE=' || true)
-    [[ -n "$wt_profile" ]] && preserved=$(printf '%s\n' "$preserved" | grep -vE '^CC_WORKTREE_PROFILE=' || true)
-  fi
-  {
-    echo "# amux session: $name"
-    echo "# registered: $(date -Iseconds)"
-    echo "CC_NAME=\"$name\""
-    echo "CC_DIR=\"$resolved_dir\""
-    echo "CC_FLAGS=\"${CC_FLAGS_STR}\""
-    # A brand-new worker starts with the Board-tab automation off (Ethan,
-    # 2026-10-08); a re-register keeps whatever the worker already had.
-    if [[ -z "$preserved" ]]; then
-      for kv in AMUX_DISPATCH_BACKLOG_WHEN_IDLE=0 CC_AUTO_PICKUP=0 CC_AUTO_CONTINUE=0 CC_STANDING_ORDERS=0 AMUX_COMMAND_LIFECYCLE=0 AMUX_BOARD_FORCE_ADHERENCE=0; do
-        echo "${kv%%=*}=\"${kv#*=}\""
-      done
-    fi
-    [[ -n "$wt" ]] && echo "CC_WORKTREE=\"1\""
-    [[ -n "$wt_profile" ]] && echo "CC_WORKTREE_PROFILE=\"$wt_profile\""
-    [[ -n "$preserved" ]] && printf '%s\n' "$preserved"
-  } > "$file"
+  _register_via_api "$name" "$resolved_dir" "$CC_FLAGS_STR" "$wt" "$wt_profile"
+}
 
-  echo "${GREEN}registered${RESET} ${BOLD}$name${RESET} → $resolved_dir"
-  [[ -n "$preserved" ]] && echo "  ${DIM}preserved: $(printf '%s\n' "$preserved" | sed -E 's/=.*//' | paste -sd, -)${RESET}"
-  [[ -n "$CC_FLAGS_STR" ]] && echo "  flags: $CC_FLAGS_STR"
+# REGISTER THROUGH THE SERVER, NEVER THE FILE.
+#
+# `amux register` and `amux exec` used to write ~/.amux/sessions/<name>.env
+# themselves, so a worker could mint a peer, or rewrite another worker's file,
+# past every server rule: only leads create workers, and only inside their own
+# team (session_verbs::worker_create_refusal). The server is now the only
+# writer:
+#
+#   new name       POST /api/sessions {name, dir, flags, worktree, start:false};
+#                  the server applies the create rule and the new-worker
+#                  defaults (board automation off, NEW_WORKER_AUTOMATION_OFF).
+#   existing name  PUT /api/scope {level:worker, capability:env, value:{...}}:
+#                  a key MERGE, so every key this verb does not own survives
+#                  (AMUX-3117), and only the owner or the worker itself may
+#                  change it.
+#
+# The owner (a terminal with no AMUX_SESSION) is unaffected. A worker gets the
+# server's own refusal and a nonzero exit. An unreachable server is a failure,
+# never a fallback to writing the file.
+_register_via_api() {
+  local name="$1" dir="$2" flags="$3" wt="$4" wt_profile="$5"
+  local api="${AMUX_API:-$(cmd_url)}" who="${AMUX_WORKER:-${AMUX_SESSION:-}}" body out code
+  body=$(python3 -c '
+import json, sys
+name, d, flags, wt, prof = sys.argv[1:6]
+b = {"name": name, "dir": d, "start": False}
+if flags: b["flags"] = flags
+if wt: b["worktree"] = True
+if prof: b["worktree_profile"] = prof
+print(json.dumps(b))' "$name" "$dir" "$flags" "$wt" "$wt_profile") || die "could not build the register request"
+  out=$(_curl -sk -m 30 -w $'\n%{http_code}' -X POST -H 'Content-Type: application/json' \
+        -H "X-Amux-Session: $who" --data-binary "$body" "$api/api/sessions" 2>/dev/null) || out=$'\n000'
+  code="${out##*$'\n'}"; out="${out%$'\n'*}"
+  if [[ "$code" == 409 && "$out" == *"already exists"* ]]; then
+    body=$(python3 -c '
+import json, sys
+name, d, flags, wt, prof = sys.argv[1:6]
+v = {"CC_DIR": d, "CC_FLAGS": flags}
+if wt: v["CC_WORKTREE"] = "1"
+if prof: v["CC_WORKTREE_PROFILE"] = prof
+print(json.dumps({"level": "worker", "name": name, "capability": "env", "value": v}))' \
+      "$name" "$dir" "$flags" "$wt" "$wt_profile") || die "could not build the register request"
+    out=$(_curl -sk -m 30 -w $'\n%{http_code}' -X PUT -H 'Content-Type: application/json' \
+          -H "X-Amux-Session: $who" --data-binary "$body" "$api/api/scope" 2>/dev/null) || out=$'\n000'
+    code="${out##*$'\n'}"; out="${out%$'\n'*}"
+    if [[ "$code" == 2?? ]]; then
+      echo "${GREEN}updated${RESET} ${BOLD}$name${RESET} → $dir"
+      [[ -n "$flags" ]] && echo "  flags: $flags"
+      return 0
+    fi
+  elif [[ "$code" == 2?? ]]; then
+    echo "${GREEN}registered${RESET} ${BOLD}$name${RESET} → $dir"
+    [[ -n "$flags" ]] && echo "  flags: $flags"
+    return 0
+  fi
+  if [[ -z "$code" || "$code" == 000 ]]; then
+    echo "${RED}not registered${RESET}: the amux server at $api did not answer. Workers are" >&2
+    echo "  created and changed only through the server; start it (amux server start) and retry." >&2
+    return 1
+  fi
+  local why
+  why=$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+print(d.get("error") or d.get("message") or json.dumps(d))' 2>/dev/null || true)
+  echo "${RED}not registered${RESET} (HTTP $code): ${why:-$out}" >&2
+  return 1
 }
 
 # amux worktree <name> [show|profiles|widen <profile-or-folder>...|profile <p>]
@@ -1604,15 +1640,9 @@ cmd_exec() {
     *) die "CC_DIR must be absolute, got: $resolved_dir" ;;
   esac
 
-  # Register if not exists, or update
-  local file="$CC_SESSIONS/$name.env"
-  cat > "$file" <<EOF
-# amux session: $name
-# registered: $(date -Iseconds)
-CC_NAME="$name"
-CC_DIR="$resolved_dir"
-CC_FLAGS="${CC_FLAGS_STR}"
-EOF
+  # Register if not exists, or update: through the server, which owns the
+  # session file and the create rule (_register_via_api).
+  _register_via_api "$name" "$resolved_dir" "$CC_FLAGS_STR" "" "" || return 1
 
   # Start
   cmd_start "$name" "${CC_EXTRA_ARGS[@]+"${CC_EXTRA_ARGS[@]}"}"
@@ -1802,9 +1832,7 @@ cmd_send() {
   # Check for --keys flag
   if [[ "${1:-}" == "--keys" ]]; then
     shift
-    is_running "$name" || die "worker '$name' is not running"
-    tmux send-keys -t "=$tname:" "$@"
-    echo "${GREEN}sent keys${RESET} to $name"
+    _send_keys_via_api "$name" "$@"; return $?
   else
     local text="$*"
     [[ -n "$text" ]] || { _send_usage; return 1; }
@@ -1819,6 +1847,30 @@ cmd_send() {
     fi
     _send_via_api "$name" "$text" "$_nb"
   fi
+}
+
+# Raw keys go through the server too (POST /api/sessions/<n>/keys, one call per
+# key, in order). This was `tmux send-keys` straight into the target's pane:
+# no origin, no audit, and no group boundary, so any worker could press y/n/
+# Enter in any other group's worker. The server now decides who may press
+# keys where, and refuses keys outside its allowed set (Enter, Escape, C-c,
+# arrows, y/n...) instead of typing arbitrary text; text is a message (`amux
+# send --stdin`). Stops at the first refusal, printing the server's reason.
+_send_keys_via_api() {
+  local name="$1"; shift
+  [[ $# -gt 0 ]] || die "usage: amux send <worker> --keys <key> [key...]"
+  local api="${AMUX_API:-$(cmd_url)}" who="${AMUX_WORKER:-${AMUX_SESSION:-}}" key body out code
+  for key in "$@"; do
+    body=$(python3 -c 'import json,sys; print(json.dumps({"keys": sys.argv[1]}))' "$key") || die "could not build the keys request"
+    out=$(_curl -sk -m 15 -w $'\n%{http_code}' -X POST -H 'Content-Type: application/json' \
+          -H "X-Amux-Session: $who" --data-binary "$body" "$api/api/sessions/$name/keys" 2>/dev/null) || out=$'\n000'
+    code="${out##*$'\n'}"; out="${out%$'\n'*}"
+    if [[ "$code" != 2?? ]]; then
+      echo "${RED}keys not sent${RESET} to $name (HTTP ${code:-000}, at '$key'): $out" >&2
+      return 1
+    fi
+  done
+  echo "${GREEN}sent keys${RESET} to $name"
 }
 
 # Deliver a message through the server: SERVER-VERIFIED origin stamp

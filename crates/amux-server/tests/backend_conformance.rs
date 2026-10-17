@@ -235,6 +235,9 @@ async fn tmux_backend_conformance() {
         eprintln!("SKIPPED: tmux backend conformance — `tmux` not found on PATH; the tmux backend was NOT tested");
         return;
     }
+    // A private tmux server, never the host fleet's (amux_server::tmux_guard).
+    let tmux_home = tempfile::tempdir().expect("private tmux dir");
+    let _private_tmux = amux_server::tmux_guard::isolate_tests(tmux_home.path());
     run_conformance(&TmuxBackend::new()).await;
 }
 

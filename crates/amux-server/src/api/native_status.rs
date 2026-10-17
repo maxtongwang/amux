@@ -134,7 +134,7 @@ fn tmux_created(name: &str) -> Option<f64> {
     let now = crate::config::now_f64();
     let mut g = CACHE.lock().ok()?;
     if g.as_ref().is_none_or(|(at, _)| now - at > 10.0) {
-        let map = std::process::Command::new("tmux")
+        let map = crate::tmux_guard::std_tmux()
             .args(["list-sessions", "-F", "#{session_name} #{session_created}"])
             .output()
             .ok()

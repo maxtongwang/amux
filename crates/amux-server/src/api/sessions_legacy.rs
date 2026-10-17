@@ -225,7 +225,7 @@ fn capture_pane_bounded(pt: &str, lane: &str) -> Option<String> {
     if fleet_suppressed() {
         return None;
     }
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     // POLICY IN CONFIG, not a constant (ethos D4). A timeout hardcoded here is
     // a ceiling nobody can move when the fleet grows.
     let budget = std::time::Duration::from_secs_f64(env_secs("AMUX_PANE_CAPTURE_TIMEOUT_S", 3.0));
@@ -234,7 +234,7 @@ fn capture_pane_bounded(pt: &str, lane: &str) -> Option<String> {
     // that by NAME. It caught this refactor — the caller does pass a real
     // pane_target(), and renaming the parameter is what keeps the audit able to
     // see that at the call site it inspects.
-    let mut cmd = Command::new("tmux");
+    let mut cmd = crate::tmux_guard::std_tmux();
     cmd.args(["capture-pane", "-t", pt, "-p", "-e", "-S", "-30"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -1241,7 +1241,7 @@ impl FleetSignals {
         // child exits with no timeout; a wedged tmux held this request open for
         // 697s on 2026-08-28. `run_bounded_output` rather than `run_bounded`
         // because the WARN below needs `status` and `stderr`.
-        let mut lsc = std::process::Command::new("tmux");
+        let mut lsc = crate::tmux_guard::std_tmux();
         let format = "#{session_name}:#{session_activity}:#{session_created}:#{window_activity}";
         if let Some(name) = lane {
             let pt = Self::lane_probe_target(name);
@@ -1290,7 +1290,7 @@ impl FleetSignals {
         // worse than the bug it fixes.
         // BOUNDED (AF-301) — was a bare `.output()`.
         let all_panes_dead = {
-            let mut c = std::process::Command::new("tmux");
+            let mut c = crate::tmux_guard::std_tmux();
             if let Some(name) = lane {
                 let pt = Self::lane_probe_target(name);
                 c.args([
@@ -1348,7 +1348,7 @@ impl FleetSignals {
         let mut provider_children_measured = false;
         // BOUNDED (AF-301) — was a bare `.output()`.
         let panes_probe = {
-            let mut c = std::process::Command::new("tmux");
+            let mut c = crate::tmux_guard::std_tmux();
             if let Some(name) = lane {
                 let pt = Self::lane_probe_target(name);
                 c.args([
@@ -4524,6 +4524,35 @@ pub(crate) const NEW_WORKER_AUTOMATION_OFF: [(&str, &str); 6] = [
     ("AMUX_BOARD_FORCE_ADHERENCE", "0"),
 ];
 
+/// The groups a create request asks for, joined as `CC_TAGS` stores them.
+///
+/// ACCEPT tags AS AN ARRAY, which is what the dashboard and API send
+/// (AMUX-3114). Reading only a STRING made `{"tags":["gtm"]}` read "" and
+/// created the worker with NO groups, the same silent drop the PATCH handler
+/// was already fixed for.
+fn create_tags(body: &serde_json::Value) -> Vec<String> {
+    crate::api::session_verbs::tags_of(body.get("tags"))
+}
+
+/// The create-time prompt as it will be delivered. It rides the durable queue
+/// as owner input (it is the first instruction of a create the create rule
+/// already authorized), so a worker-made create (a lead making a team worker)
+/// carries the SAME server-verified `[amux-origin: <lead>]` stamp a send from
+/// that lead carries; otherwise the lead's words reach the new worker as the
+/// owner's. An owner/dashboard create is unstamped. The origin is
+/// `session_verbs::worker_origin`, the attribution the create rule used.
+fn create_prompt_text(headers: &HeaderMap, name: &str, prompt: &str) -> String {
+    let origin = crate::api::session_verbs::worker_origin(headers);
+    match crate::api::session_verbs::origin_stamped(&origin, name, prompt) {
+        Some(stamped) if !prompt.trim().is_empty() => {
+            tracing::info!(session = %name, origin = %origin, verdict = "create_prompt_origin_stamped",
+                measured = true, n_considered = 1, "a worker-created worker's first prompt carries its creator's origin");
+            stamped
+        }
+        _ => prompt.to_string(),
+    }
+}
+
 pub async fn create_session_legacy(
     State(_state): State<AppState>,
     headers: HeaderMap,
@@ -4553,6 +4582,23 @@ pub async fn create_session_legacy(
         )
             .into_response();
     }
+    // ONLY LEADS CREATE WORKERS (fix/worker-membership-create). This endpoint
+    // wrote whatever groups a worker asked for, so any worker could mint a
+    // peer inside any group and message across the boundary through it. The
+    // shared create rule runs before anything (work dir, env file) is written.
+    let tag_list = create_tags(&body);
+    let chat = crate::api::session_verbs::requests_chat_type(&body);
+    if let Some(refusal) = crate::api::session_verbs::worker_create_refusal(
+        &headers,
+        &crate::api::session_verbs::CreateRequest {
+            name: Some(&name),
+            tags: &tag_list,
+            owner_only: chat.then_some("the chat worker type"),
+        },
+    ) {
+        return refusal;
+    }
+    let tags = tag_list.join(",");
     // WORKTREE AT CREATE TIME (AMUX-4911). This returned 501 on the stated
     // grounds that "a worktree create needs `git worktree add` + branch
     // bookkeeping that does not exist here yet". That premise was wrong:
@@ -4743,19 +4789,6 @@ pub async fn create_session_legacy(
     } else if body.get("worktree").and_then(serde_json::Value::as_bool) == Some(false) {
         pairs.push(("CC_WORKTREE", "0".to_string()));
     }
-    // ACCEPT tags AS AN ARRAY, which is what the dashboard and API send
-    // (AMUX-3114). `s("tags")` only matched a STRING, so `{"tags":["gtm"]}` read
-    // "" and the worker was created with NO groups, the same silent drop the
-    // PATCH handler was already fixed for.
-    let tags = match body.get("tags") {
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .filter_map(|x| x.as_str().map(str::trim))
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(","),
-        _ => s("tags"),
-    };
     if !tags.is_empty() {
         pairs.push(("CC_TAGS", tags.clone()));
     }
@@ -4802,7 +4835,7 @@ pub async fn create_session_legacy(
                 false
             }
         });
-    let prompt = s("prompt");
+    let prompt = create_prompt_text(&headers, &name, &s("prompt"));
     if autostart {
         let st = _state.clone();
         let n = name.clone();
