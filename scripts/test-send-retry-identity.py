@@ -31,24 +31,48 @@ _curl() {
     [[ "$previous" == -d ]] && body="$argument"
     previous="$argument"
   done
+  if [[ -z "$body" ]]; then  # GET .../send?msg_id= : the durable receipt
+    echo "${previous##*msg_id=}" >> "$TEST_DIR/receipts"
+    case "$MODE" in
+      slow-accepted) echo '{"ok":true,"accepted":true,"id":"msg-x"}' ;;
+      released) echo '{"ok":true,"accepted":false,"released":true,"delivered":false}' ;;
+      *) return 28 ;;
+    esac
+    return
+  fi
   printf '%s\\n' "$body" >> "$TEST_DIR/requests"
   local count; count=$(wc -l < "$TEST_DIR/requests")
   if [[ "$MODE" == refused ]]; then echo '{"ok":false,"error":"explicit refusal"}'; return; fi
+  # The incident (2026-10-17): one "pending" answer, every other reply too slow.
+  if [[ "$MODE" == slow-accepted || "$MODE" == released ]] && [[ "$count" -eq 2 ]]; then
+    echo '{"ok":false,"submission":"pending","retryable":true}'; return
+  fi
   if [[ "$MODE" == recovered && "$count" -eq 3 ]]; then echo '{"ok":true,"deduped":true,"message":"duplicate retry ignored"}'; return; fi
   return 28
 }
 ''' + function + '\n_send_via_api target "a multiline\nmessage"\n')
-    for mode, expected, attempts in [('outage', 1, 3), ('recovered', 0, 3), ('refused', 1, 1)]:
-        for name in ['requests', 'tmux', 'logs/send-failures.jsonl']:
+    for mode, expected, attempts in [('outage', 1, 3), ('recovered', 0, 3), ('refused', 1, 1),
+                                     ('slow-accepted', 0, None), ('released', 1, None)]:
+        for name in ['requests', 'receipts', 'tmux', 'logs/send-failures.jsonl']:
             (folder / name).unlink(missing_ok=True)
         result = subprocess.run(['bash', str(harness)], env={**os.environ, 'MODE':mode, 'TEST_DIR':temp}, capture_output=True, text=True)
         assert result.returncode == expected, (mode, result.stdout, result.stderr)
         requests = [json.loads(line) for line in (folder / 'requests').read_text().splitlines()]
-        assert len(requests) == attempts, requests
+        assert attempts is None or len(requests) == attempts, requests
         ids = {r.get('msg_id') for r in requests}
         assert len(ids) == 1 and next(iter(ids)), requests
         assert all(r['text'] == 'a multiline\nmessage' for r in requests)
         assert not (folder / 'tmux').exists(), 'Unacknowledged sends must not touch a terminal'
+        receipts = (folder / 'receipts').read_text().split() if (folder / 'receipts').exists() else []
+        if mode in ('slow-accepted', 'released', 'outage'):
+            assert receipts and set(receipts) == ids, (mode, receipts, ids)  # the receipt asked about THIS message
+        if mode == 'slow-accepted':
+            # A send the server accepted is never reported UNCONFIRMED (re-ops-lead's false negative).
+            assert 'durable receipt' in result.stdout and 'UNCONFIRMED' not in result.stderr, (result.stdout, result.stderr)
+            assert len(requests) > 3, 'timeouts after a pending answer keep polling the same ID'
+            assert not (folder / 'logs/send-failures.jsonl').exists()
+        if mode == 'released':
+            assert 'sending again is safe' in result.stderr and 'UNCONFIRMED' not in result.stderr, result.stderr
         if mode == 'outage':
             row = json.loads((folder / 'logs/send-failures.jsonl').read_text())
             assert row['verdict'] == 'send_delivery_unknown' and row['raw_fallback'] is False

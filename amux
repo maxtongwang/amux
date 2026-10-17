@@ -2064,7 +2064,7 @@ PYEOF
   # ~4s. Every attempt carries the same msg_id so a lost reply cannot duplicate delivery.
   # A "pending" answer polls the SAME message ID every 3s for up to ~2 min
   # (AMUX_SEND_PENDING_WAIT_S) instead of counting as a failed try.
-  local _retry=0 _waited=0 _pend_max="${AMUX_SEND_PENDING_WAIT_S:-120}" _transport=0 _pend_prev=""
+  local _retry=0 _waited=0 _pend_max="${AMUX_SEND_PENDING_WAIT_S:-120}" _transport=0 _pend_prev="" _seen_pending="" _rs=0
   while :; do
     _retry=$((_retry + 1))
     _pend_prev=""
@@ -2150,15 +2150,30 @@ PYEOF
       [[ $rc -eq 2 ]] && return 1
       [[ $rc -eq 4 ]] && return 1
       if [[ $rc -eq 3 ]]; then
+        _seen_pending=1
         [[ $_waited -lt $_pend_max ]] && continue
+        _rs=0; _send_settle_by_receipt "$AMUX_API" "$name" "$body" "$_waited" 0 || _rs=$?
+        [[ $_rs -eq 0 ]] && return 0
+        [[ $_rs -eq 1 ]] && return 1
         echo "${RED}UNCONFIRMED${RESET} send to $name: still pending after ${_waited}s under one message ID; the server is delivering it. Check message history before sending again." >&2
         return 1
       fi
     else
       rc=1
+      # The server already holds this message ID (it answered "pending"): a
+      # timed-out poll is the server being slow, not a lost request, so keep
+      # polling the same ID instead of spending the transport budget.
+      if [[ -n "$_seen_pending" ]]; then
+        rc=3
+        [[ $_waited -lt $_pend_max ]] && continue
+        break
+      fi
     fi
     [[ $_transport -ge 2 ]] && break
   done
+  _rs=0; _send_settle_by_receipt "$AMUX_API" "$name" "$body" "$_waited" "$_pend_max" || _rs=$?
+  [[ $_rs -eq 0 ]] && return 0
+  [[ $_rs -eq 1 ]] && return 1
   # A missing response is not proof that the request failed. The server may
   # already have queued it. Retrying with the same msg_id is safe; typing an
   # extra copy directly into the terminal bypasses dedupe and can splice it
@@ -2181,6 +2196,48 @@ print(f"send_delivery_unknown: {row['target']} msg_id={row['msg_id']}", file=__i
 PYEOF
   echo "${RED}UNCONFIRMED${RESET} send to $name: amux did not acknowledge the request after retries. It may already be queued; check message history when the server returns before sending again. No raw terminal paste was attempted." >&2
   return 1
+}
+
+# The durable acceptance receipt for one message ID (GET .../send?msg_id=):
+# accepted | pending | released | unknown. Polls while pending, up to $4 seconds.
+# The answer a slow or dropped reply could not give (2026-10-17: re-ops-lead's
+# send read UNCONFIRMED while the receipt said accepted).
+_await_send_receipt() {
+  local api="$1" name="$2" id="$3" max="${4:-0}" waited=0 resp state
+  while :; do
+    resp=$(_curl -sk -m 5 "$api/api/sessions/$name/send?msg_id=$id" 2>/dev/null) || resp=""
+    state=$(RESP="$resp" python3 -c '
+import json, os
+try:
+    d = json.loads(os.environ["RESP"])
+except Exception:
+    print("unknown"); raise SystemExit
+if d.get("accepted") is True: print("accepted")
+elif d.get("released") is True: print("released")
+elif d.get("ok") is True and d.get("accepted") is False: print("pending")
+else: print("unknown")' 2>/dev/null || echo unknown)
+    [[ "$state" != pending || $waited -ge $max ]] && { echo "$state"; return 0; }
+    sleep 3; waited=$((waited + 3))
+  done
+}
+
+# The verdict line for a send whose reply never settled, read from the receipt.
+# Returns 0 when the receipt proves acceptance, 1 otherwise (printed either way).
+_send_settle_by_receipt() {
+  local api="$1" name="$2" body="$3" waited="$4" max="$5" id state
+  id=$(BODY="$body" python3 -c 'import json,os; print(json.loads(os.environ["BODY"])["msg_id"])')
+  state=$(_await_send_receipt "$api" "$name" "$id" "$max")
+  case "$state" in
+    accepted)
+      echo "sent to $name (origin-stamped; confirmed by the server's durable receipt after ${waited}s — the reply itself was slow)"
+      _flush_unstamped_ledger || true
+      return 0 ;;
+    released)
+      echo "send to $name FAILED: the server released message ID $id without delivering it; sending again is safe" >&2
+      return 1 ;;
+  esac
+  echo "send_receipt: $name msg_id=$id state=$state" >&2
+  return 2
 }
 
 cmd_stop() {
