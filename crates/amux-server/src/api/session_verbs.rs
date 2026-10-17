@@ -9843,8 +9843,10 @@ fn released_text_fate(state: &AppState, name: &str, text: &str) -> ReleasedFate 
         .and_then(|c| {
             let mut st = c
                 .prepare(
+                    // A worker's send is recorded as type 'session', the owner's as 'user':
+                    // either can be the message stuck in the box (review of #9, B1).
                     "SELECT id, text, COALESCE(submit_verdict,'') FROM cmd_history \
-                     WHERE session=?1 AND type='user' AND ts>?2 ORDER BY id DESC LIMIT 32",
+                     WHERE session=?1 AND type IN ('user','session') AND ts>?2 ORDER BY id DESC LIMIT 32",
                 )
                 .ok()?;
             let rows = st
@@ -10563,8 +10565,11 @@ pub(crate) fn composer_owner(raw: &str, typed_prefix: &str, body: &str, pasted: 
     // (`❯ cargo test`) reads from that line on: the tail of what we sent. The
     // box was verified empty before typing and the send lock is held, so a
     // draft that is a tail of ours is ours (the glyph itself is not kept).
-    if draft.chars().count() >= 8 && glyph_tails(&want).any(|tail| tail == draft) {
+    if !draft.is_empty() && glyph_tails(&want).any(|tail| tail == draft) {
         return ComposerOwner::Ours;
+    }
+    if !draft.is_empty() && glyph_tails(&want).any(|tail| tail.starts_with(draft.as_str())) {
+        return ComposerOwner::Rendering;
     }
     ComposerOwner::Foreign(draft)
 }
@@ -10772,13 +10777,14 @@ fn paste_chip_fits(chip: &str, body: &str) -> bool {
     let Some(caps) = re.captures(chip) else {
         return false;
     };
-    let lines = body.trim_end_matches('\n').lines().count();
+    // Exact: a looser size would let an owner's paste of similar length pass
+    // for amux's own (review of #9, N4). Claude's `+M` counts the line breaks.
     if let Some(m) = caps.get(1).and_then(|m| m.as_str().parse::<usize>().ok()) {
-        return lines.abs_diff(m + 1) <= 1;
+        return body.trim_end_matches('\n').matches('\n').count() == m;
     }
     caps.get(2)
         .and_then(|m| m.as_str().parse::<usize>().ok())
-        .is_some_and(|n| body.chars().count().abs_diff(n) <= 2)
+        .is_some_and(|n| body.chars().count() == n || body.trim_end().chars().count() == n)
 }
 
 fn project_execution_composer_owns_text(raw: &str, text: &str) -> bool {
@@ -55549,6 +55555,68 @@ mod composer_guard_tests {
         assert_eq!(held_delivery_matching(&format!("{stamp_sq}[Pastedtext#3+2lines]"), "w", &peer), Some(stamped));
         assert_eq!(held_delivery_matching("yesaddboth[Pastedtext#3+2lines]", "w", &peer), None,
             "a draft in front of the chip is a person's");
+    }
+
+    /// Review of #9 round 2, B1: a worker's stuck send (history type
+    /// 'session') must read as stranded, never released, so the CLI never says
+    /// "safe to resend" for a message sitting in the box.
+    #[tokio::test]
+    async fn a_workers_stuck_send_reads_stranded_not_released() {
+        let (state, _dir) = super::tests::state();
+        let text = "check the lease numbers for space 20 again";
+        for (kind, n) in [("session", "w-peer"), ("user", "w-owner")] {
+            let (k, name, t) = (kind.to_string(), n.to_string(), text.to_string());
+            state.store.write_async(move |c| {
+                ensure_fleet_tables(c)?;
+                c.execute("INSERT INTO cmd_history (text, type, session, ts, origin, submit_verdict) VALUES (?1, ?2, ?3, ?4, '', 'stuck')",
+                    rusqlite::params![t, k, name, now_i64() * 1000])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            }).await.unwrap();
+            assert!(matches!(released_text_fate(&state, n, text), ReleasedFate::StillStuck(_)), "{kind} row must read stuck");
+        }
+    }
+
+    /// Review of #9 round 2, N1: a short tail after a glyph in our own body is
+    /// ours, and a tail still painting is not foreign.
+    #[test]
+    fn a_short_glyph_tail_of_our_own_body_is_ours() {
+        let body = "the output\n\u{276f} ls\nok";
+        assert_eq!(composer_owner(&claude("the output\n  \u{276f} ls\n  ok"), "", body, false), ComposerOwner::Ours);
+        assert_eq!(composer_owner(&claude("the output\n  \u{276f} l"), "", body, false), ComposerOwner::Rendering);
+        assert!(matches!(composer_owner(&claude("the output\n  \u{276f} rm -rf"), "", body, false), ComposerOwner::Foreign(_)));
+    }
+
+    /// Review of #9 round 2, N2: the queue-operation enqueue record matches a
+    /// typed stamp before a paste too.
+    #[test]
+    fn a_queued_typed_stamp_paste_counts_as_submitted() {
+        let sent = format!("{STAMP}\n\nline one\nline two");
+        let rec = json!({"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-10-17T03:00:00.000Z",
+                         "content": format!("{STAMP} <pasted_content id=\"c2e2\">\nline one\nline two\n</pasted_content>")});
+        let since = parse_iso8601("2026-10-17T02:59:59.000Z").unwrap();
+        assert!(submission_records_have(std::slice::from_ref(&rec), &sent, since));
+        assert!(!submission_records_have(&[rec], "something else entirely here", since));
+    }
+
+    /// Review of #9 round 2, N3: the mid-turn retry Enter is ownership-checked.
+    #[test]
+    fn the_mid_turn_retry_enter_is_ownership_checked() {
+        let src = include_str!("session_verbs.rs");
+        let at = src.find("send: mid-turn Enter was not accepted — retrying with a bare Enter").expect("mid-turn retry");
+        let tail = &src[at..at + 1200];
+        let guard = tail.find("composer_owner(&tmux_capture(name, 25).await, typed_prefix.as_deref()").expect("guard");
+        let enter = tail.find("send_key(name, \"Enter\")").expect("enter");
+        assert!(guard < enter, "the guard precedes the retry Enter");
+    }
+
+    /// Review of #9 round 2, N4: a chip matches only the exact size.
+    #[test]
+    fn a_paste_chip_matches_only_its_exact_size() {
+        let three = "line one\nline two\nline three";
+        assert!(paste_chip_fits("[Pastedtext#3+2lines]", three));
+        assert!(!paste_chip_fits("[Pastedtext#3+1lines]", three) && !paste_chip_fits("[Pastedtext#3+3lines]", three));
+        assert!(paste_chip_fits(&format!("[PastedContent{}chars]", three.chars().count()), three));
+        assert!(!paste_chip_fits(&format!("[PastedContent{}chars]", three.chars().count() + 2), three));
     }
 
     /// Review of #9, N1: a stamp that would act as keystrokes stays in the paste.

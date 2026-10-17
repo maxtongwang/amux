@@ -76,14 +76,15 @@ _curl() {
             assert (folder / 'receipt-text').read_text() == 'a multiline\nmessage', (folder / 'receipt-text').read_text()
         if mode == 'stranded':
             # A message still in the input box is never "safe to resend".
-            assert 'Do NOT send it again' in result.stderr and 'sending again is safe' not in result.stderr, result.stderr
+            assert 'Do NOT send it again' in result.stderr and 'safe' not in result.stderr, result.stderr
         if mode == 'slow-accepted':
             # A send the server accepted is never reported UNCONFIRMED (re-ops-lead's false negative).
             assert 'durable receipt' in result.stdout and 'UNCONFIRMED' not in result.stderr, (result.stdout, result.stderr)
             assert len(requests) > 3, 'timeouts after a pending answer keep polling the same ID'
             assert not (folder / 'logs/send-failures.jsonl').exists()
         if mode == 'released':
-            assert 'sending again is safe' in result.stderr and 'UNCONFIRMED' not in result.stderr, result.stderr
+            # A released ID is not proof of non-delivery: never "safe to resend".
+            assert 'Check the worker' in result.stderr and 'safe' not in result.stderr, result.stderr
         if mode == 'outage':
             row = json.loads((folder / 'logs/send-failures.jsonl').read_text())
             assert row['verdict'] == 'send_delivery_unknown' and row['raw_fallback'] is False
