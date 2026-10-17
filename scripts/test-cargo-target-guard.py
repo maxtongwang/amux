@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import queue
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -141,9 +143,9 @@ class CargoReclaimTests(unittest.TestCase):
     def test_direct_test_binary_without_cargo_parent_prevents_deletion(self):
         binary = self.artifacts / 'orphan-test-0123456789abcdef'
         source = self.base / 'test.c'
-        source.write_text('#include <unistd.h>\nint main(void) { sleep(60); return 0; }\n')
+        source.write_text('#include <stdio.h>\nint main(void) { getchar(); return 0; }\n')
         subprocess.run(['cc', str(source), '-o', str(binary)], check=True, capture_output=True)
-        proc = subprocess.Popen([str(binary)])
+        proc = subprocess.Popen([str(binary)], stdin=subprocess.PIPE)
         try:
             active, count = self.measured_active([self.root])
             self.assertIn(str(proc.pid), active)
@@ -152,8 +154,7 @@ class CargoReclaimTests(unittest.TestCase):
                 self.mutate(probe=guard.active_processes)
             self.assertTrue(binary.exists())
         finally:
-            proc.terminate()
-            proc.wait(timeout=10)
+            proc.communicate(b'\n', timeout=10)
         self.mutate()
         self.assertFalse(binary.exists())
 
@@ -214,13 +215,12 @@ class CargoReclaimTests(unittest.TestCase):
                     self.assertFalse(outside.exists())
 
     def test_command_line_mentions_do_not_become_builds(self):
-        proc = subprocess.Popen(['sh', '-c', 'sleep 30 # cargo rustc build'])
+        proc = subprocess.Popen(['sh', '-c', 'read line # cargo rustc build'], stdin=subprocess.PIPE)
         try:
             active, _ = self.measured_active([self.root])
             self.assertNotIn(str(proc.pid), active)
         finally:
-            proc.terminate()
-            proc.wait(timeout=10)
+            proc.communicate(b'\n', timeout=10)
 
     def test_hardened_linux_proc_uses_known_command_identity(self):
         proc = self.base / 'proc' / '1177'
@@ -275,9 +275,9 @@ class CargoReclaimTests(unittest.TestCase):
         """
         binary = self.artifacts / 'daemon-0123456789abcdef'
         source = self.base / 'daemon.c'
-        source.write_text('#include <unistd.h>\nint main(void) { sleep(60); return 0; }\n')
+        source.write_text('#include <stdio.h>\nint main(void) { getchar(); return 0; }\n')
         subprocess.run(['cc', str(source), '-o', str(binary)], check=True, capture_output=True)
-        proc = subprocess.Popen([str(binary)])
+        proc = subprocess.Popen([str(binary)], stdin=subprocess.PIPE)
         try:
             # CONTROL, and the behaviour ATE-92 exists to protect: a brand-new
             # binary under the target IS an in-flight build and still defers.
@@ -300,8 +300,7 @@ class CargoReclaimTests(unittest.TestCase):
                 self.mutate(probe=guard.active_processes)
                 self.assertFalse(self.marker.exists())
         finally:
-            proc.kill()
-            proc.wait()
+            proc.communicate(b'\n', timeout=10)
 
     def test_a_compiler_is_exempt_by_name_however_old_it_is(self):
         """A long compile is still a compile, so age must not reach it.
@@ -312,9 +311,9 @@ class CargoReclaimTests(unittest.TestCase):
         """
         binary = self.artifacts / 'cargo'
         source = self.base / 'slow.c'
-        source.write_text('#include <unistd.h>\nint main(void) { sleep(60); return 0; }\n')
+        source.write_text('#include <stdio.h>\nint main(void) { getchar(); return 0; }\n')
         subprocess.run(['cc', str(source), '-o', str(binary)], check=True, capture_output=True)
-        proc = subprocess.Popen([str(binary)])
+        proc = subprocess.Popen([str(binary)], stdin=subprocess.PIPE)
         try:
             original = guard.STALE_BUILD_AGE_S
             guard.STALE_BUILD_AGE_S = 0
@@ -323,8 +322,7 @@ class CargoReclaimTests(unittest.TestCase):
             self.assertIn(str(proc.pid), active,
                           'a compiler is active by NAME; the age bound must not reach it')
         finally:
-            proc.kill()
-            proc.wait()
+            proc.communicate(b'\n', timeout=10)
 
     def test_consecutive_deferrals_on_one_condition_count_up_and_reset_on_a_new_one(self):
         """AMUX-4944. 243 identical refusals logged exactly like one.
@@ -473,7 +471,7 @@ class SafeCargoReclaimTests(unittest.TestCase):
 
     def setUp(self):
         self.base = Path(tempfile.mkdtemp(prefix='amux-cargo-guard-test.')).resolve()
-        self.addCleanup(lambda: subprocess.run(['rm', '-rf', str(self.base)]))
+        self.addCleanup(shutil.rmtree, self.base)
         self.root = self.base / 'rust-build-target'
         for i in range(3):  # 3 MB of old dependency units over a 2 MB cap
             put(self.root / 'debug' / 'deps' / ('libdep%d-%016x.rlib' % (i, i)), MB, NOW - (5 - i) * DAY)
@@ -520,10 +518,15 @@ class SafeCargoReclaimTests(unittest.TestCase):
 
     def test_a_pending_reclaim_holds_the_wrapper_build_until_it_clears(self):
         """safe-cargo's build waits behind a pending reclaim, then runs."""
-        reclaimer = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.readline()'],
-                                     stdin=subprocess.PIPE, text=True)
-        pending = self.root.parent / ('.' + self.root.name + '.reclaim.pending')
-        pending.write_text(json.dumps({'pid': reclaimer.pid, 'since': time.time(), 'deferral_streak': 3}))
+        pending = guard.pending_path(self.root)
+        reclaimer = subprocess.Popen(
+            [sys.executable, '-c',
+             'import fcntl,sys; f=open(sys.argv[1], "w"); '
+             'fcntl.flock(f, fcntl.LOCK_EX); f.write(sys.argv[2]); f.flush(); '
+             'print("ready", flush=True); sys.stdin.readline(); f.close()',
+             str(pending), json.dumps({'pid': os.getpid(), 'since': time.time(), 'deferral_streak': 3})],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.assertEqual(reclaimer.stdout.readline().strip(), 'ready')
         env = {**self.env, 'AMUX_CARGO_MAX_TARGET_MB': '1024', 'AMUX_CARGO_RECLAIM_POLL_S': '0.05',
                'AMUX_CARGO_RECLAIM_BUILD_WAIT_S': '60'}
         wrapper = subprocess.Popen(['bash', str(SCRIPT.with_name('safe-cargo.sh')), 'check'], env=env,
@@ -535,6 +538,8 @@ class SafeCargoReclaimTests(unittest.TestCase):
         finally:
             reclaimer.communicate('done\n', timeout=10)  # the reclaimer ends; its marker is now inert
         wrapper.wait(timeout=60)
+        err.close()
+        wrapper.stdout.close()
         self.assertEqual(wrapper.returncode, 0, err.rest())
         self.assertIn('cargo_reclaim_pending_ignored', err.rest())
         self.assertEqual(self.runs.read_text().count('run'), 1)
@@ -547,7 +552,15 @@ class Lines:
     def __init__(self, stream):
         self.lines = queue.Queue()
         self.seen = []
-        threading.Thread(target=self._pump, args=(stream,), daemon=True).start()
+        self.stream = stream
+        self.thread = threading.Thread(target=self._pump, args=(stream,), daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.thread.join(timeout=5)
+        if self.thread.is_alive():
+            raise AssertionError('fixture output reader did not finish')
+        self.stream.close()
 
     def _pump(self, stream):
         for line in stream:
@@ -603,6 +616,9 @@ class FixtureBuild:
     def close(self):
         if self.proc.poll() is None:
             self.finish()
+        self.proc.stdin.close()
+        self.out.close()
+        self.err.close()
 
 
 class FakeClock:
@@ -637,7 +653,7 @@ class ReclaimPriorityTests(unittest.TestCase):
         # The guard's temporary-fixture probe seam needs this prefix under tmp, so
         # the host's real cargo/rustc processes cannot defer a fixture reclaim.
         self.base = Path(tempfile.mkdtemp(prefix='amux-cargo-guard-test.')).resolve()
-        self.addCleanup(lambda: subprocess.run(['rm', '-rf', str(self.base)]))
+        self.addCleanup(shutil.rmtree, self.base)
         self.root = self.base / 'rust-build-target'
         self.units = [put(self.root / 'debug' / 'deps' / ('libdep%d-%016x.rlib' % (i, i)), MB, NOW - (5 - i) * DAY)
                       for i in range(3)]
@@ -760,6 +776,259 @@ class ReclaimPriorityTests(unittest.TestCase):
         self.assertEqual(holder.finish(), 0)
         self.assert_untouched()
 
+    def test_timeout_backoff_survives_plain_deferrals(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        self.addCleanup(os.close, fd)
+        clock = FakeClock(NOW)
+        env = dict(AMUX_CARGO_RECLAIM_PRIORITY_AFTER='1',
+                   AMUX_CARGO_RECLAIM_PRIORITY_WAIT_S='2',
+                   AMUX_CARGO_RECLAIM_PRIORITY_BACKOFF_S='10',
+                   AMUX_CARGO_RECLAIM_POLL_S='1')
+        _, first, _ = self.reclaim(clock, **env)
+        self.assertTrue(first['priority'])
+        ended = clock.now
+        for advance in (0, 9):
+            clock.now = ended + advance
+            sleeps = len(clock.sleeps)
+            _, verdict, _ = self.reclaim(clock, **env)
+            self.assertFalse(verdict.get('priority', False))
+            self.assertEqual(verdict['priority_backoff_remaining_s'], 10 - advance)
+            self.assertEqual(len(clock.sleeps), sleeps)
+            self.assertFalse(self.pending().exists())
+        clock.now = ended + 10
+        _, last, _ = self.reclaim(clock, **env)
+        self.assertTrue(last['priority'])
+
+    def test_reused_pid_without_marker_lock_is_stale(self):
+        self.write_marker(os.getpid(), NOW)
+        marker, reason = guard.read_pending(self.root, NOW, 1200)
+        self.assertIsNone(marker)
+        self.assertIn('gone', reason)
+
+    def cli_reclaim(self, **env):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), 'reclaim', '--target', str(self.root)],
+            env={**self.env, 'AMUX_CARGO_RECLAIM_PRIORITY_AFTER': '0', **env},
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+        verdict = json.loads(result.stdout)
+        self.assertEqual(verdict['verdict'], 'cargo_reclaim_deferred')
+        self.assert_untouched()
+        return verdict
+
+    def test_corrupt_cooldown_cli_defers_with_diagnostic(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        self.addCleanup(os.close, fd)
+        path = guard.priority_timeout_path(self.root)
+        for value in (b'interrupted-write', b'\xff', b'nan', b'inf', b'-inf'):
+            with self.subTest(value=value):
+                path.write_bytes(value)
+                verdict = self.cli_reclaim()
+                self.assertIn('priority backoff unmeasured', verdict['reason'])
+                self.assertIn(str(path), verdict['reason'])
+
+    def test_unreadable_cooldown_cli_defers_with_diagnostic(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        self.addCleanup(os.close, fd)
+        # A directory gives a real read error even when the suite runs as root.
+        path = guard.priority_timeout_path(self.root)
+        path.mkdir()
+        verdict = self.cli_reclaim()
+        self.assertIn('priority backoff unmeasured', verdict['reason'])
+        self.assertIn(str(path), verdict['reason'])
+
+    def test_corrupt_streak_cli_resets_and_reports(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        self.addCleanup(os.close, fd)
+        path = guard.streak_path(self.root)
+        reason = self.cli_reclaim()['reason']
+        cases = ['interrupted-write', '[]', 'null', '42']
+        for field in ('count', 'since', 'priority_count'):
+            for value in (None, [], {}, 'bad', float('inf')):
+                cases.append(json.dumps({'reason': reason, field: value}))
+        for value in cases:
+            with self.subTest(value=value):
+                path.write_text(value)
+                verdict = self.cli_reclaim()
+                self.assertEqual(verdict['deferral_streak'], 1)
+
+    def test_unreadable_streak_cli_still_defers(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        self.addCleanup(os.close, fd)
+        guard.streak_path(self.root).mkdir()
+        self.assertEqual(self.cli_reclaim()['deferral_streak'], 1)
+        guard.clear_streak([self.root])  # failed unlink is best effort too
+
+    def test_corrupt_markers_are_ignored_and_clear_is_safe(self):
+        for value in ('broken', '[]', 'null', '{}', '{"since": null}',
+                      '{"since": NaN}', '{"since": Infinity}',
+                      json.dumps({'since': 10 ** 400})):
+            with self.subTest(value=value):
+                self.pending().write_text(value)
+                fd = guard.open_lock(self.pending())
+                try:
+                    marker, reason = guard.read_pending(self.root, NOW, 1200)
+                    self.assertIsNone(marker)
+                    self.assertIn('unreadable', reason)
+                finally:
+                    os.close(fd)
+                guard.clear_pending([self.root])
+
+    def test_unreadable_marker_cli_defers_and_clear_is_safe(self):
+        self.pending().mkdir()
+        marker, reason = guard.read_pending(self.root, NOW, 1200)
+        self.assertIsNone(marker)
+        self.assertIn('unreadable', reason)
+        guard.clear_pending([self.root])
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        self.addCleanup(os.close, fd)
+        self.cli_reclaim(AMUX_CARGO_RECLAIM_PRIORITY_AFTER='1')
+
+    def test_unwritable_cooldown_cli_defers_and_clears_marker(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        self.addCleanup(os.close, fd)
+        path = guard.priority_timeout_path(self.root)
+        path.mkdir()
+        with mock.patch.object(guard, 'priority_backoff', return_value=0):
+            code, verdict, _ = self.reclaim(FakeClock(NOW),
+                AMUX_CARGO_RECLAIM_PRIORITY_AFTER='1', AMUX_CARGO_RECLAIM_PRIORITY_WAIT_S='0')
+        self.assertEqual(code, 75)
+        self.assertEqual(verdict['verdict'], 'cargo_reclaim_deferred')
+        self.assertIn(str(path), verdict['reason'])
+        self.assertFalse(self.pending().exists())
+
+    def test_failed_marker_publication_defers_and_removes_temporary(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        self.addCleanup(os.close, fd)
+        with mock.patch.object(guard.os, 'replace', side_effect=OSError('fixture publish failed')):
+            code, verdict, _ = self.reclaim(FakeClock(NOW),
+                                          AMUX_CARGO_RECLAIM_PRIORITY_AFTER='1')
+        self.assertEqual(code, 75)
+        self.assertEqual(verdict['verdict'], 'cargo_reclaim_deferred')
+        self.assertIn('fixture publish failed', verdict['reason'])
+        self.assertFalse(self.pending().exists())
+        self.assertNotIn(self.pending(), guard._PENDING)
+        self.assertEqual(list(self.base.glob(self.pending().name + '.*')),
+                         [Path(str(self.pending()) + '.lock')])
+        self.assert_untouched()
+
+    def test_peer_cannot_delete_locked_marker_even_with_same_pid(self):
+        self.write_marker(os.getpid(), NOW)
+        fd = guard.open_lock(self.pending())
+        try:
+            guard.clear_pending([self.root])
+            self.assertTrue(self.pending().exists())
+        finally:
+            os.close(fd)
+
+    def test_marker_is_complete_and_locked_before_publication(self):
+        replace = os.replace
+        def publish(source, destination):
+            with open(source) as handle:
+                self.assertEqual(json.load(handle)['pid'], os.getpid())
+                with self.assertRaises(BlockingIOError):
+                    guard.fcntl.flock(handle.fileno(), guard.fcntl.LOCK_EX | guard.fcntl.LOCK_NB)
+            replace(source, destination)
+        try:
+            with mock.patch.object(guard.os, 'replace', side_effect=publish):
+                guard.write_pending([self.root], {}, NOW)
+            marker, ignored = guard.read_pending(self.root, NOW, 1200)
+            self.assertIsNotNone(marker)
+            self.assertIsNone(ignored)
+        finally:
+            guard.clear_pending([self.root])
+
+    def test_publication_preserves_a_live_peers_inode(self):
+        self.write_marker(os.getpid() + 100000, NOW)
+        fd = guard.open_lock(self.pending())
+        before = self.pending().stat().st_ino
+        try:
+            guard.write_pending([self.root], {}, NOW)
+            self.assertEqual(self.pending().stat().st_ino, before)
+            guard.clear_pending([self.root])
+            self.assertEqual(self.pending().stat().st_ino, before)
+        finally:
+            os.close(fd)
+
+    def test_clear_pending_checks_owner_before_deleting(self):
+        self.write_marker(os.getpid() + 100000, NOW)
+        guard.clear_pending([self.root])
+        self.assertTrue(self.pending().exists())
+
+    def test_marker_arriving_during_lease_acquisition_yields(self):
+        clock = FakeClock(NOW)
+        original = guard.open_lock
+        arrived = []
+        def acquire(path, **kwargs):
+            fd = original(path, **kwargs)
+            if path == guard.lease_path(self.root) and not arrived:
+                arrived.append(True)
+                guard.write_pending([self.root], {}, NOW)
+            return fd
+        def drain(_):
+            # The build must have released its lease BEFORE sleeping.
+            os.close(original(guard.lease_path(self.root)))
+            guard.clear_pending([self.root])
+        clock.on_sleep = drain
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(guard, 'time', clock), \
+                mock.patch.object(guard, 'open_lock', side_effect=acquire):
+            fds = guard.acquire_build_leases([self.root])
+        for fd in fds:
+            os.close(fd)
+        guard.clear_pending([self.root])
+        self.assertTrue(clock.sleeps, 'post-lease marker must make the build yield')
+
+    def test_only_contended_deferrals_can_prioritize(self):
+        for error in (guard.Deferred('unmeasured'),
+                      guard.Deferred('active processes', measured=True, considered=1)):
+            with self.subTest(reason=str(error)), \
+                    mock.patch.dict(os.environ, {**self.env, 'AMUX_CARGO_RECLAIM_PRIORITY_AFTER': '1'}), \
+                    mock.patch.object(guard, 'time', FakeClock(NOW)), \
+                    mock.patch.object(guard, 'reclaim', side_effect=error), \
+                    mock.patch.object(guard, 'write_pending') as write:
+                with self.assertRaises(guard.Deferred):
+                    guard.prioritized_reclaim([self.root], 0, 0)
+                write.assert_not_called()
+                self.assertFalse(guard.streak_path(self.root).exists())
+
+    def test_unmeasured_lock_streak_does_not_seed_priority(self):
+        clock = FakeClock(NOW)
+        reason = 'lock busy or unmeasured: same-path'
+        for _ in range(3):
+            with mock.patch.object(guard, 'reclaim', side_effect=guard.Deferred(reason)):
+                self.reclaim(clock)
+        with mock.patch.object(guard, 'reclaim', side_effect=guard.Deferred(reason, contended=True)):
+            _, verdict, _ = self.reclaim(clock)
+        self.assertFalse(verdict.get('priority', False))
+        self.assertEqual(clock.sleeps, [])
+
+    def test_zero_poll_is_usage_error(self):
+        result = subprocess.run([sys.executable, str(SCRIPT), 'run', '--target',
+                                 str(self.root), '--', 'true'], capture_output=True, text=True,
+                                env={**self.env, 'AMUX_CARGO_RECLAIM_POLL_S': '0'})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('AMUX_CARGO_RECLAIM_POLL_S', result.stderr)
+
+    def test_wait_exceeding_marker_age_is_usage_error(self):
+        result = subprocess.run([sys.executable, str(SCRIPT), 'reclaim', '--target',
+                                 str(self.root)], capture_output=True, text=True,
+                                env={**self.env, 'AMUX_CARGO_RECLAIM_PRIORITY_WAIT_S': '1201'})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('AMUX_CARGO_RECLAIM_PRIORITY_WAIT_S', result.stderr)
+
+    def test_refused_exclusive_run_does_not_count_as_reclaim(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        try:
+            result = subprocess.run([sys.executable, str(SCRIPT), 'run', '--exclusive-run',
+                                     '--target', str(self.root), '--', 'true'],
+                                    capture_output=True, text=True, env=self.env)
+        finally:
+            os.close(fd)
+        self.assertEqual(result.returncode, 75)
+        self.assertFalse(guard.streak_path(self.root).exists())
+
     def test_zero_disables_the_priority(self):
         holder = self.build()
         holder.ready()
@@ -793,7 +1062,8 @@ class ReclaimPriorityTests(unittest.TestCase):
         self.pending().write_text(json.dumps({'pid': pid, 'since': since, 'deferral_streak': 3}))
 
     def test_a_fresh_marker_holds_a_new_build_only_up_to_its_bound(self):
-        self.write_marker(os.getpid(), time.time())
+        guard.write_pending([self.root], {}, time.time())
+        self.addCleanup(guard.clear_pending, [self.root])
         started = time.monotonic()
         build = self.build(AMUX_CARGO_RECLAIM_BUILD_WAIT_S='0.5')
         build.err.wait_for('cargo_reclaim_pending:')
@@ -808,19 +1078,21 @@ class ReclaimPriorityTests(unittest.TestCase):
         other = self.base / 'rust-build-target-e2e-head'
         other.mkdir()
         marker = other.parent / ('.' + other.name + '.reclaim.pending')
-        marker.write_text(json.dumps({'pid': os.getpid(), 'since': time.time(), 'deferral_streak': 3}))
+        guard.write_pending([other], {}, time.time())
+        self.addCleanup(guard.clear_pending, [other])
         build = FixtureBuild(self.root, self.env, extra_targets=[other])
         self.builds.append(build)
         build.err.wait_for('cargo_reclaim_pending:')
         for target in (self.root, other):
             os.close(guard.open_lock(guard.lease_path(target)))  # exclusive: no lease is held
-        marker.unlink()
+        guard.clear_pending([other])
         build.ready()
         build.err.wait_for('cargo_reclaim_pending_cleared')
         self.assertEqual(build.finish(), 0)
 
     def test_a_stale_marker_is_ignored(self):
-        self.write_marker(os.getpid(), time.time() - 1200 - 60)
+        guard.write_pending([self.root], {}, time.time() - 1200 - 60)
+        self.addCleanup(guard.clear_pending, [self.root])
         build = self.build()
         build.ready()
         self.assertIn('stale', build.err.wait_for('cargo_reclaim_pending_ignored'))
@@ -841,10 +1113,37 @@ class ReclaimPriorityTests(unittest.TestCase):
         self.assertIn('gone', build.err.wait_for('cargo_reclaim_pending_ignored'))
         self.assertEqual(build.finish(), 0)
 
+    def test_a_sigkilled_reclaimer_leaves_no_block(self):
+        crash = ('import importlib.util, sys, time; from pathlib import Path\n'
+                 'spec = importlib.util.spec_from_file_location("guard", sys.argv[1])\n'
+                 'guard = importlib.util.module_from_spec(spec); spec.loader.exec_module(guard)\n'
+                 'guard.write_pending([Path(sys.argv[2])], {}, time.time())\n'
+                 'print("ready", flush=True); sys.stdin.readline()\n')
+        with subprocess.Popen([sys.executable, '-c', crash, str(SCRIPT), str(self.root)],
+                              env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              text=True) as proc:
+            try:
+                self.assertEqual(proc.stdout.readline().strip(), 'ready')
+                marker, reason = guard.read_pending(self.root, time.time(), 1200)
+                self.assertIsNotNone(marker)
+                self.assertIsNone(reason)
+                proc.kill()  # SIGKILL only this fixture, after locked publication
+                self.assertEqual(proc.wait(timeout=10), -signal.SIGKILL)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=10)
+        self.assertTrue(self.pending().exists(), 'SIGKILL leaves the published marker')
+        build = self.build()
+        build.ready()
+        self.assertIn('gone', build.err.wait_for('cargo_reclaim_pending_ignored'))
+        self.assertEqual(build.finish(), 0)
+
     def test_a_build_nested_in_a_leased_build_does_not_wait_on_its_own_ancestor(self):
         """A test spawning safe-cargo on the same target already runs under a lease;
         making it wait would hold that lease until the reclaimer gave up."""
-        self.write_marker(os.getpid(), time.time())
+        guard.write_pending([self.root], {}, time.time())
+        self.addCleanup(guard.clear_pending, [self.root])
         build = self.build(AMUX_CARGO_GUARD_LEASED=str(self.root))
         build.ready()
         self.assertEqual(build.finish(), 0)

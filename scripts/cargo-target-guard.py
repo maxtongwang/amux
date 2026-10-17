@@ -11,6 +11,7 @@ import contextlib
 import errno
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -52,7 +53,7 @@ def streak_path(target):
     return target.parent / ('.' + target.name + '.reclaim.streak')
 
 
-def bump_streak(targets, reason, now=None):
+def bump_streak(targets, reason, now=None, *, contended=False):
     """Consecutive deferrals for the SAME reason, as a count.
 
     Keyed on the reason text, so a DIFFERENT blocker resets it: a new pid is a
@@ -66,18 +67,30 @@ def bump_streak(targets, reason, now=None):
     now = int(time.time()) if now is None else now
     try:
         previous = json.loads(path.read_text())
-    except (OSError, ValueError):
+        if not isinstance(previous, dict):
+            raise ValueError('expected a streak object')
+        for field in ('count', 'since', 'priority_count'):
+            value = previous.get(field, 0)
+            if type(value) is not int or value < 0:
+                raise ValueError('invalid streak ' + field)
+    except FileNotFoundError:
+        previous = {}
+    except (OSError, ValueError) as error:
+        print('cargo_reclaim_streak_ignored: %s: %s' % (path, error), file=sys.stderr)
         previous = {}
     if previous.get('reason') == reason:
         count = int(previous.get('count', 0)) + 1
         since = int(previous.get('since', now))
     else:
         count, since = 1, now
+    priority_count = (int(previous.get('priority_count', 0)) + 1
+                      if contended and previous.get('reason') == reason else int(contended))
     try:
-        path.write_text(json.dumps({'reason': reason, 'count': count, 'since': since}))
+        path.write_text(json.dumps({'reason': reason, 'count': count, 'since': since,
+                                    'priority_count': priority_count}))
     except OSError:
         pass  # an unwritable streak file must never fail the reclaim itself
-    return {'deferral_streak': count, 'streak_since': since,
+    return {'deferral_streak': count, 'priority_streak': priority_count, 'streak_since': since,
             'wedged': count >= WEDGE_STREAK}
 
 
@@ -115,13 +128,14 @@ def open_lock(path, shared=False, wait=False):
 # writes a pending marker beside the lease and waits, bounded, for the running
 # builds to drain. New builds (`run`) see the fresh marker and wait, bounded,
 # instead of taking a shared lease. Nothing already holding a lease is touched.
-# The marker names its pid and time: a dead pid or an age over PENDING_MAX_AGE_S
-# makes it inert, so a crashed reclaimer cannot block builds past either bound.
+# The marker holds an flock until the wait ends. Process exit releases it even
+# if the pid is reused; the age bound also limits a stuck live reclaimer.
 #
 # Settings are read per call so a caller's environment (and a test) controls them.
 # PRIORITY_AFTER 0 turns the preference off.
 PRIORITY_SETTINGS = {
     'after': ('AMUX_CARGO_RECLAIM_PRIORITY_AFTER', 3),
+    'backoff_s': ('AMUX_CARGO_RECLAIM_PRIORITY_BACKOFF_S', 1800),
     'wait_s': ('AMUX_CARGO_RECLAIM_PRIORITY_WAIT_S', 1800),  # the reclaimer's wait for running builds
     'build_wait_s': ('AMUX_CARGO_RECLAIM_BUILD_WAIT_S', 3600),  # a new build's wait behind the marker
     'max_age_s': ('AMUX_CARGO_RECLAIM_PENDING_MAX_AGE_S', 3600),  # older markers are ignored
@@ -138,8 +152,8 @@ def priority_setting(key):
         value = float(os.environ.get(name, default))
     except ValueError:
         raise Deferred('invalid %s: %r' % (name, os.environ.get(name))) from None
-    if value < 0:
-        raise Deferred('invalid %s: must not be negative' % name)
+    if not math.isfinite(value) or value < 0 or (key == 'poll_s' and value == 0):
+        raise Deferred('invalid %s: must be finite and nonnegative (poll must be positive)' % name)
     return value
 
 
@@ -151,59 +165,135 @@ def pending_path(target):
     return target.parent / ('.' + target.name + '.reclaim.pending')
 
 
+# Held marker descriptors belong to this process, never to a pid read from disk.
+_PENDING = {}
+
+
+@contextlib.contextmanager
+def pending_transaction(target):
+    """Serialize publication and unlink on a stable inode, never the replaced marker."""
+    fd = open_lock(Path(str(pending_path(target)) + '.lock'), wait=True)
+    try:
+        yield
+    finally:
+        os.close(fd)
+
+
+def marker_unlocked(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
 def write_pending(targets, streak, now):
-    """Mark a reclaim pending beside each target's lease, atomically (rename)."""
+    """Publish complete, already-locked markers; never replace a live peer's inode."""
     payload = json.dumps({'pid': os.getpid(), 'since': now,
-                          'deferral_streak': (streak or {}).get('deferral_streak')})
-    for target in targets:
-        path = pending_path(target)
-        fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name + '.')
-        try:
-            with os.fdopen(fd, 'w') as handle:
-                handle.write(payload)
-            os.replace(temporary, path)
-        except BaseException:
-            Path(temporary).unlink(missing_ok=True)
-            raise
+                          'deferral_streak': (streak or {}).get('priority_streak',
+                                                                  (streak or {}).get('deferral_streak'))})
+    try:
+        for target in targets:
+            path = pending_path(target)
+            with pending_transaction(target):
+                try:
+                    with path.open('r') as old:
+                        if not marker_unlocked(old.fileno()):
+                            continue
+                except FileNotFoundError:
+                    pass
+                fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name + '.')
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    os.write(fd, payload.encode())
+                    os.replace(temporary, path)
+                    _PENDING[path] = fd
+                except BaseException:
+                    os.close(fd)
+                    Path(temporary).unlink(missing_ok=True)
+                    raise
+    except BaseException:
+        clear_pending(targets)
+        raise
 
 
 def clear_pending(targets):
-    """Remove the markers this process wrote; a peer reclaimer's stay its own."""
+    """Only the owner may clear; a peer holding the inode lock always wins."""
     for target in targets:
         path = pending_path(target)
+        owned = _PENDING.pop(path, None)
         try:
-            if json.loads(path.read_text()).get('pid') == os.getpid():
-                path.unlink()
+            with pending_transaction(target):
+                with path.open('r') as handle:
+                    # Release our own lifetime lock while holding the publication
+                    # mutex, then require the same LOCK_NB proof as any peer.
+                    if owned is not None:
+                        os.close(owned)
+                        owned = None
+                    if not marker_unlocked(handle.fileno()):
+                        continue
+                    if json.load(handle).get('pid') == os.getpid():
+                        path.unlink()
         except (OSError, ValueError, AttributeError):
             pass
-
-
-def pid_alive(pid):
-    try:
-        os.kill(pid, 0)  # signal 0: an existence probe, nothing is delivered
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+        finally:
+            if owned is not None:
+                os.close(owned)
 
 
 def read_pending(target, now, max_age_s):
-    """(marker, None) for a marker that holds builds back, else (None, why it does not)."""
+    """A marker is live only while its inode is locked, regardless of pid reuse."""
     path = pending_path(target)
     try:
-        marker = json.loads(path.read_text())
-        pid, since = int(marker['pid']), float(marker['since'])
+        with pending_transaction(target):
+            with path.open('r') as handle:
+                marker = json.load(handle)
+                since = float(marker['since'])
+                if not math.isfinite(since):
+                    raise ValueError('marker timestamp must be finite')
+                if marker_unlocked(handle.fileno()):
+                    path.unlink()
+                    return None, 'reclaimer lock of %s is gone' % path
+                age = now - since
+                if abs(age) > max_age_s:
+                    return None, 'stale %s: age %ds is beyond %ds' % (path, age, max_age_s)
+                return marker, None
     except FileNotFoundError:
         return None, None
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, OverflowError) as error:
         return None, 'unreadable %s: %s' % (path, error)
-    age = now - since
-    if abs(age) > max_age_s:
-        return None, 'stale %s: age %ds is beyond %ds' % (path, age, max_age_s)
-    if pid <= 0 or not pid_alive(pid):
-        return None, 'reclaimer pid %d of %s is gone' % (pid, path)
-    return marker, None
+
+
+def priority_timeout_path(target):
+    return target.parent / ('.' + target.name + '.reclaim.timeout')
+
+
+def priority_backoff(targets, backoff_s):
+    remaining = 0
+    for target in targets:
+        path = priority_timeout_path(target)
+        try:
+            ended = float(path.read_text())
+            if not math.isfinite(ended):
+                raise ValueError('cooldown timestamp must be finite')
+            remaining = max(remaining, ended + backoff_s - time.time())
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as error:
+            raise Deferred('priority backoff unmeasured: ' + str(path)) from error
+    return max(0, remaining)
+
+
+def record_priority_timeout(targets):
+    for target in targets:
+        path = priority_timeout_path(target)
+        fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name + '.')
+        try:
+            with os.fdopen(fd, 'w') as handle:
+                handle.write(str(time.time()))
+            os.replace(temporary, path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
 
 
 def acquire_build_leases(targets):
@@ -604,16 +694,20 @@ def prioritized_reclaim(targets, max_bytes, to_bytes, *, process_probe=active_pr
     except Deferred as error:
         if not error.contended:
             raise
-        error.streak = streak = bump_streak(targets, str(error), now=int(time.time()))
+        error.streak = streak = bump_streak(targets, str(error), now=int(time.time()), contended=True)
+        remaining = priority_backoff(targets, priority_setting('backoff_s'))
+        if remaining:
+            error.priority = {'priority': False, 'priority_backoff_remaining_s': round(remaining, 3)}
+            raise
         nested = inherited_leases() & set(targets)
-        if after <= 0 or not streak or streak['deferral_streak'] < after or nested:
+        if after <= 0 or not streak or streak['priority_streak'] < after or nested:
             raise
     wait_s, poll_s = priority_setting('wait_s'), priority_setting('poll_s')
     started = time.time()
     write_pending(targets, streak, started)
     print('cargo_reclaim_priority: %d consecutive deferrals on a held lock; marked %s pending, '
           'new builds wait; waiting up to %ds for running builds to finish'
-          % (streak['deferral_streak'], ', '.join(str(pending_path(t)) for t in targets), wait_s),
+          % (streak['priority_streak'], ', '.join(str(pending_path(t)) for t in targets), wait_s),
           file=sys.stderr)
     try:
         while True:
@@ -625,10 +719,14 @@ def prioritized_reclaim(targets, max_bytes, to_bytes, *, process_probe=active_pr
                     time.sleep(min(poll_s, wait_s - waited))
                     continue
                 error.streak = streak
-                error.priority = {'priority': True, 'waited_s': round(waited, 3)}
+                record_priority_timeout(targets)
+                print('cargo_reclaim_priority_timeout: backing off for %ss'
+                      % priority_setting('backoff_s'), file=sys.stderr)
+                error.priority = {'priority': True, 'waited_s': round(waited, 3),
+                                  'priority_backoff_remaining_s': priority_setting('backoff_s')}
                 raise
             return {**result, 'priority': True, 'waited_s': round(time.time() - started, 3),
-                    'pending_streak': streak['deferral_streak']}
+                    'pending_streak': streak['priority_streak']}
     finally:
         clear_pending(targets)
 
@@ -704,6 +802,12 @@ def main():
     args = parser.parse_args(argsv)
     targets = sorted(set(Path(root).resolve() for root in args.target))
     try:
+        settings = {key: priority_setting(key) for key in PRIORITY_SETTINGS}
+        if settings['wait_s'] > settings['max_age_s']:
+            parser.error('AMUX_CARGO_RECLAIM_PRIORITY_WAIT_S must not exceed AMUX_CARGO_RECLAIM_PENDING_MAX_AGE_S')
+    except Deferred as error:
+        parser.error(str(error))
+    try:
         if args.action == 'run':
             if not command:
                 raise Deferred('no build command')
@@ -740,7 +844,8 @@ def main():
         payload = {'verdict': 'cargo_reclaim_deferred', 'measured': getattr(error, 'measured', False),
                    'n_considered': getattr(error, 'considered', 0), 'reason': str(error)}
         # A prioritized reclaim already counted this invocation's deferral.
-        streak = error.streak if hasattr(error, 'streak') else bump_streak(targets, str(error))
+        streak = (getattr(error, 'streak', None) if args.action == 'run' or hasattr(error, 'streak')
+                  else bump_streak(targets, str(error)))
         payload.update(streak or {})
         payload.update(getattr(error, 'priority', None) or {})
         print(json.dumps(payload))
