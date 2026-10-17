@@ -133,6 +133,11 @@ class WorkerTmuxGuardTests(unittest.TestCase):
     def test_nested_kill_refused(self):
         self.assert_refused('run-shell', 'tmux kill-server')
         self.assert_refused('if-shell', 'true', 'kill-session -t x')
+        self.assert_refused('run', 'tmux kill-server')
+        self.assert_refused('new-window', '-d', 'tmux kill-server')
+        self.assert_refused('split-window', 'tmux kill-ses -t x')
+        self.assert_refused('bind-key', 'X', 'kill-server')
+        self.assert_refused('confirm-before', 'kill-server')
 
     # --- pass-throughs ---------------------------------------------------------------
     def test_kill_on_other_socket_passes_with_exact_argv(self):
@@ -148,6 +153,14 @@ class WorkerTmuxGuardTests(unittest.TestCase):
         self.assert_passed('list-sessions', ';', 'list-windows')
         self.assert_passed('kill-window', '-t', 'x')
         self.assert_passed()
+        self.assertEqual(self.log_lines(), [])
+
+    def test_data_arguments_mentioning_a_kill_pass_through(self):
+        # Messages, buffers, typed text and names are data tmux never runs.
+        self.assert_passed('display-message', '-p', 'Never run kill-server')
+        self.assert_passed('set-buffer', 'Never run kill-server')
+        self.assert_passed('send-keys', '-l', 'Explain kill-server')
+        self.assert_passed('new-window', '-d', '-n', 'kill-server', 'sleep 3')
         self.assertEqual(self.log_lines(), [])
 
     def test_escaped_semicolon_is_not_a_separator(self):

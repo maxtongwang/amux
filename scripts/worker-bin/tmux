@@ -153,11 +153,29 @@ fi
 
 [ "$have_K" -eq 1 ] && refuse "-K"
 
+# Commands whose arguments tmux RUNS (a shell command, or a nested tmux command): only these
+# have their argument text scanned, so a kill cannot ride inside if-shell, run-shell, a new
+# window's shell command or a key binding. Every other argument is data (a message, a buffer,
+# send-keys text, a window name) and passes untouched. Aliases and unique prefixes included.
+runs_its_arguments() {
+  local w="$1" name
+  case "$w" in
+    run|if|confirm|bind|new|neww|splitw|respawnp|respawnw|pipep|popup|menu) return 0 ;;
+  esac
+  [ "${#w}" -ge 3 ] || return 1
+  for name in run-shell if-shell confirm-before bind-key command-prompt display-menu display-popup \
+              set-hook new-session new-window split-window respawn-pane respawn-window pipe-pane; do
+    case "$name" in "$w"*) return 0 ;; esac
+  done
+  return 1
+}
+
 # --- command chain -----------------------------------------------------------------
 # Commands separate on an argument ";" (shell \;) or one ending in an unescaped ";".
-# The first word of each command is its name; every other argument is scanned too,
-# so if-shell/run-shell/confirm-before/bind-key cannot carry a kill to the server.
+# The first word of each command is its name and is always checked.
 expect_name=1
+runs=0
+skip_value=0
 i=$cmd_start
 while [ "$i" -lt "$n" ]; do
   a="${ARGV[$i]}"
@@ -174,13 +192,23 @@ while [ "$i" -lt "$n" ]; do
   if [ "$expect_name" -eq 1 ]; then
     first="${a%%[[:space:]]*}"
     is_protected_word "$first" && refuse "$first"
+    runs=0
+    skip_value=0
+    runs_its_arguments "$first" && runs=1
     expect_name=0
+  elif [ "$runs" -eq 1 ] && [ "$skip_value" -eq 1 ]; then
+    skip_value=0                    # the value of a flag (-n name, -t target, -c dir): data
+  elif [ "$runs" -eq 1 ] && [[ "$a" =~ ^-[A-Za-z]+$ ]]; then
+    # A flag; when its last letter takes a value and the value is the next word, skip that word.
+    case "${a: -1}" in [cenFstxywhTlpNIk]) skip_value=1 ;; esac
+  elif [ "$runs" -eq 1 ]; then
+    # Nested command text: split on whitespace, quotes, braces and ";".
+    words="$(printf '%s' "$a" | tr "\"'{}();\\\\\t\n" '          ')"
+    for w in $words; do
+      is_protected_word "$w" && refuse "$w (inside: $a)"
+    done
   fi
-  # Nested command text: split on whitespace, quotes, braces and ";".
-  words="$(printf '%s' "$a" | tr "\"'{}();\\\\\t\n" '          ')"
-  for w in $words; do
-    is_protected_word "$w" && refuse "$w (inside: $a)"
-  done
+
   [ "$sep_after" -eq 1 ] && expect_name=1
 done
 
