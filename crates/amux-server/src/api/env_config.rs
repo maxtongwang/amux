@@ -181,6 +181,18 @@ fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Optio
         return refuse("env_apply_schedule_other_worker",
             format!("worker '{origin}' may schedule only itself, not '{}'", s.worker.trim()));
     }
+    // CARDS land on a worker's board and are dispatched to it: a worker may seed
+    // only its own board, as `amux board add` allows (ai-config #159).
+    if let Some(c) = spec.cards.iter().find(|c| !origin.is_empty() && c.worker.trim() != origin) {
+        return refuse("env_apply_card_other_worker",
+            format!("worker '{origin}' may add cards only to its own board, not '{}'", c.worker.trim()));
+    }
+    // GROUPS set a team's department and goal, which every member's context
+    // reads: the owner's configuration (ai-config #159).
+    if !origin.is_empty() && !spec.groups.is_empty() {
+        return refuse("env_apply_groups_owner_only",
+            format!("worker '{origin}' may not configure groups through an env apply; that is the owner's"));
+    }
     let sessions = crate::config::amux_home().join("sessions");
     for w in &spec.workers {
         let name = sanitize(&w.name);
@@ -268,7 +280,7 @@ async fn apply(
     }
     // Who is applying: a worker (process-attributed headers) or the owner. A
     // worker's messages and creation prompts are ITS input, never the owner's.
-    let origin = super::session_verbs::request_worker_origin(&headers);
+    let origin = super::session_verbs::worker_origin(&headers);
     let home = crate::config::amux_home();
     let sessions_dir = home.join("sessions");
 
