@@ -2749,7 +2749,8 @@ mod tests {
         let worker = [("X-Amux-Session", "dev-a")];
         let lead = [("X-Amux-Session", "dev-lead")];
         let grp = GroupId::from_ulid(ulid::Ulid::new());
-        let refused: Vec<(&[(&str, &str)], &str, String, Value, &str)> = vec![
+        type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, String, Value, &'a str);
+        let refused: Vec<Case> = vec![
             (&worker, "POST", "/api/workers".into(), json!({"display_name": "w-plain", "cwd": "/tmp/w"}), NEEDS_LEAD),
             (&lead, "POST", "/api/workers".into(), json!({"display_name": "w-group", "cwd": "/tmp/w", "group": grp.as_str()}), OUTSIDE_TEAM),
             (&lead, "POST", "/api/workers".into(), json!({"display_name": "w-chat", "cwd": "/tmp/w", "worker_type": "chat"}), OUTSIDE_TEAM),
