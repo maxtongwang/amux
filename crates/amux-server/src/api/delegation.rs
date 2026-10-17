@@ -46,7 +46,7 @@ use super::session_verbs::LEADS_GROUP;
 /// rest are one line each, with the reason, so changing one is a one-line
 /// edit. `env:` entries are key prefixes, `name:` entries reserved worker
 /// names, `mrpopo:own-config` mrpopo changing its own settings.
-pub(crate) const HELD_FOR_MAX: &[(&str, &str)] = &[
+pub const HELD_FOR_MAX: &[(&str, &str)] = &[
     ("env:AMUX_CONTRACT_", "the rule-10 token-check switch: turning it off un-verifies a worker's identity"),
     ("env:AMUX_PANE_PROMPT_HISTORY", "the recorder max_ref's evidence comes from: turning it off blinds the proof"),
     ("env:AMUX_NEEDS_INPUT_AUTO_MONEY", "the auto-approve spending switch and money cap: paying is Max's move"),
@@ -137,7 +137,7 @@ impl Action {
 }
 
 /// Phrases a max_ref text must contain (case-insensitive, word boundary).
-pub(crate) type Terms = &'static [&'static str];
+pub type Terms = &'static [&'static str];
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Decision {
@@ -166,29 +166,29 @@ pub(crate) enum KeyClass {
     OwnerOnly,
 }
 
-pub(crate) const T_YOLO: Terms = &["yolo", "permission bypass", "bypass permissions", "skip permissions", "dangerously-skip-permissions"];
-pub(crate) const T_EMAIL: Terms = &["external email", "outside email"];
-pub(crate) const T_ISOLATED: Terms = &["isolated", "isolation", "isolate"];
-pub(crate) const T_AUTO_CONTINUE: Terms = &["auto-continue", "auto continue", "autocontinue"];
-pub(crate) const T_NEEDS_INPUT: Terms = &["auto-approve", "auto approve", "auto-approval", "auto approval", "outbound approval"];
-pub(crate) const T_BROWSER: Terms = &["browser profile", "browser profiles"];
-pub(crate) const T_APPROVAL: Terms = &["approval type", "approval types"];
-pub(crate) const T_GATES: Terms = &["gate", "gates"];
-pub(crate) const T_CONNECTORS: Terms = &["connector", "connectors"];
-pub(crate) const T_PERMISSIONS: Terms = &["permission", "permissions"];
-pub(crate) const T_MAKE_LEAD: Terms = &["make lead", "make a lead", "a lead", "lead"];
-pub(crate) const T_LEADS: Terms = &["leads", "lead"];
-pub(crate) const T_RULES: Terms = &["rule", "rules"];
-pub(crate) const T_ROUTING: Terms = &["routing", "route", "open inbound", "inbound", "cross-group", "send allow"];
-pub(crate) const T_GROUP_CONFIG: Terms = &["goal", "department", "kpi", "kpis", "group config"];
-pub(crate) const T_COMMIT_GUARD: Terms = &["commit guard", "commit-guard"];
-pub(crate) const T_TASK_GUARD: Terms = &["task guard", "task-guard"];
-pub(crate) const T_DEFAULT_MODEL: Terms = &["default model", "default-model"];
-pub(crate) const T_APPLY: Terms = &["config apply", "apply"];
+pub const T_YOLO: Terms = &["yolo", "permission bypass", "bypass permissions", "skip permissions", "dangerously-skip-permissions"];
+pub const T_EMAIL: Terms = &["external email", "outside email"];
+pub const T_ISOLATED: Terms = &["isolated", "isolation", "isolate"];
+pub const T_AUTO_CONTINUE: Terms = &["auto-continue", "auto continue", "autocontinue"];
+pub const T_NEEDS_INPUT: Terms = &["auto-approve", "auto approve", "auto-approval", "auto approval", "outbound approval"];
+pub const T_BROWSER: Terms = &["browser profile", "browser profiles"];
+pub const T_APPROVAL: Terms = &["approval type", "approval types"];
+pub const T_GATES: Terms = &["gate", "gates"];
+pub const T_CONNECTORS: Terms = &["connector", "connectors"];
+pub const T_PERMISSIONS: Terms = &["permission", "permissions"];
+pub const T_MAKE_LEAD: Terms = &["make lead", "make a lead", "a lead", "lead"];
+pub const T_LEADS: Terms = &["leads", "lead"];
+pub const T_RULES: Terms = &["rule", "rules"];
+pub const T_ROUTING: Terms = &["routing", "route", "open inbound", "inbound", "cross-group", "send allow"];
+pub const T_GROUP_CONFIG: Terms = &["goal", "department", "kpi", "kpis", "group config"];
+pub const T_COMMIT_GUARD: Terms = &["commit guard", "commit-guard"];
+pub const T_TASK_GUARD: Terms = &["task guard", "task-guard"];
+pub const T_DEFAULT_MODEL: Terms = &["default model", "default-model"];
+pub const T_APPLY: Terms = &["config apply", "apply"];
 
 /// Mrpopo's rows: each previously owner-only setting with the phrases Max's
 /// instruction must contain. Explicit; there is no "mrpopo may do anything".
-pub(crate) const MAXREF_ROWS: &[(&str, Terms)] = &[
+pub const MAXREF_ROWS: &[(&str, Terms)] = &[
     ("toggle_yolo", T_YOLO),
     ("env:CC_FLAGS", T_YOLO),
     ("create:yolo", T_YOLO),
@@ -218,7 +218,7 @@ pub(crate) const MAXREF_ROWS: &[(&str, Terms)] = &[
 
 /// Env keys a worker may set on itself (H4: an explicit list, not "anything
 /// not privileged"). Display and runtime-choice keys only.
-pub(crate) const SELF_ENV_KEYS: &[&str] = &[
+pub const SELF_ENV_KEYS: &[&str] = &[
     "CC_MODEL", "CC_EFFORT", "CC_DESC", "CC_DIR", "CC_PINNED", "CC_BRANCH", "CC_PROVIDER", "CC_WORKTREE_PROFILE", "CC_MCP",
 ];
 
@@ -690,6 +690,10 @@ pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, target: &Target, 
             let mut row = None;
             for t in &terms {
                 match super::max_ref::verify_max_ref_terms(state, max_ref.as_ref(), &names, t, crate::config::now_f64()) {
+                    Ok(ev) if !super::max_ref::max_ref_session_allowed(&origin, &ev) => {
+                        return Err(forbid("max_ref_own_lane", &format!(
+                            "max_ref cites a row typed in '{}', the actor's own lane; a lane can mint its own pane rows, so only another lane's typed row or an owner send verified from outside counts", ev.session)));
+                    }
                     Ok(ev) => row = Some(ev.row_id),
                     Err(r) => {
                         let error = format!("{} needs proof of Max's instruction: max_ref {{session, time}} pointing at a message Max typed that names {} and one of {:?}: {}",
@@ -795,6 +799,26 @@ pub(crate) async fn guarded_config_patch(state: &AppState, headers: &HeaderMap, 
         g.commit(state, b, a);
     }
     resp
+}
+
+/// An untagged create by a lead gets the lead's team tag (its first team):
+/// a lead's worker always lands inside its team, never untagged.
+pub(crate) fn lead_default_tags(headers: &HeaderMap, tags: Vec<String>) -> Vec<String> {
+    if !tags.is_empty() {
+        return tags;
+    }
+    let origin = verified_origin(headers);
+    if origin.is_empty() || origin == MRPOPO {
+        return tags;
+    }
+    match lead_teams(&origin).and_then(|t| t.into_iter().next()) {
+        Some(team) => {
+            tracing::info!(actor = %origin, team = %team, verdict = "lead_create_auto_tagged", measured = true, n_considered = 1,
+                "an untagged create by a lead was given the lead's team tag");
+            vec![team]
+        }
+        None => tags,
+    }
 }
 
 /// The settings a `POST /api/sessions` body writes besides name and tags:

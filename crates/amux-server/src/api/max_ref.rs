@@ -52,6 +52,20 @@ pub(crate) struct MaxRefEvidence {
     pub ts: f64,
     /// At most [`EXCERPT_CHARS`] characters of the row's text.
     pub excerpt: String,
+    /// Which human shape the row has.
+    pub source: HumanSource,
+}
+
+/// Whether evidence found in `ev.session` may authorize `actor` (dev-lead's
+/// proposed rule, pending a ruling; one function so a change is one line).
+/// Any process in a lane can post its own UserPromptSubmit observation to
+/// `/api/sessions/<own lane>/report` and so mint a pane row there; a pane row
+/// therefore counts only when the cited session is NOT the actor's own lane.
+/// An own-lane citation counts only for an owner send whose process verdict
+/// was Outside/Remote, which no lane process can produce.
+pub(crate) fn max_ref_session_allowed(actor: &str, ev: &MaxRefEvidence) -> bool {
+    let own = ev.session == actor || super::chat_worker::companion_parent(actor) == Some(ev.session.as_str());
+    !own || ev.source == HumanSource::OwnerSend
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,7 +118,7 @@ const EXCERPT_CHARS: usize = 200;
 /// Bounds every query; a lane writes a few rows a minute.
 const ROW_LIMIT: i64 = 500;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum HumanSource {
     Pane,
     OwnerSend,
@@ -289,7 +303,8 @@ fn verify(state: &AppState, r: Option<&MaxRef>, targets: &[&str], terms: Option<
     }
     typed.sort_by(|a, b| (a.ts - r.time).abs().total_cmp(&(b.ts - r.time).abs()));
     let row = typed.into_iter().next().ok_or(MaxRefRefusal::DoesNotNameSetting)?;
-    Ok(MaxRefEvidence { row_id: row.id, session: row.session, ts: row.ts, excerpt: row.text.chars().take(EXCERPT_CHARS).collect() })
+    let source = row.source.unwrap_or(HumanSource::Pane);
+    Ok(MaxRefEvidence { row_id: row.id, session: row.session, ts: row.ts, excerpt: row.text.chars().take(EXCERPT_CHARS).collect(), source })
 }
 
 #[cfg(test)]
@@ -346,7 +361,7 @@ mod tests {
         let st = state(tmp.path());
         let id = put(&st, pane("test-lead", ASK, NOW - 100.0));
         let ev = verify_max_ref(&st, Some(&mref("test-lead", NOW - 60.0)), &["test-alpha"], NOW).unwrap();
-        assert_eq!(ev, MaxRefEvidence { row_id: id, session: "test-lead".into(), ts: NOW - 100.0, excerpt: ASK.into() });
+        assert_eq!(ev, MaxRefEvidence { row_id: id, session: "test-lead".into(), ts: NOW - 100.0, excerpt: ASK.into(), source: HumanSource::Pane });
         let long = "test-alpha ".repeat(40);
         put(&st, pane("test-long", &long, NOW));
         let ev = verify_max_ref(&st, Some(&mref("test-long", NOW)), &["test-alpha"], NOW).unwrap();
@@ -594,4 +609,14 @@ mod tests {
         ]);
         assert!(all.iter().all(|r| !r.message().is_empty()));
     }
+
+    #[test]
+    fn max_ref_own_lane_pane_row_refused_owner_send_and_other_lane_accepted() {
+        let ev = |session: &str, source| MaxRefEvidence { row_id: 1, session: session.into(), ts: NOW, excerpt: String::new(), source };
+        assert!(!max_ref_session_allowed("test-actor", &ev("test-actor", HumanSource::Pane)), "own-lane pane row");
+        assert!(!max_ref_session_allowed("test-actor@chat", &ev("test-actor", HumanSource::Pane)), "own lane via its Chat tab");
+        assert!(max_ref_session_allowed("test-actor", &ev("test-actor", HumanSource::OwnerSend)), "own-lane Outside owner send");
+        assert!(max_ref_session_allowed("test-actor", &ev("test-other", HumanSource::Pane)), "other-lane pane row");
+    }
+
 }

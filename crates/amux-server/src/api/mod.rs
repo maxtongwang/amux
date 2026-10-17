@@ -152,7 +152,7 @@ pub mod workers;
 mod worker_messaging;
 mod mention_grants;
 pub mod workers_deadletters;
-pub(crate) mod delegation;
+pub mod delegation;
 
 use crate::db::SharedStore;
 use axum::Router;

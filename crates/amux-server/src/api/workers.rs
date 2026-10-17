@@ -498,6 +498,12 @@ pub struct CreateWorkerBody {
     /// ACW-2: `coding` (default) or `chat`; see `amux_core::worker_type`.
     #[serde(default)]
     pub worker_type: Option<String>,
+    /// Delegation proof of Max's instruction (ai-config #160); not stored.
+    #[serde(default)]
+    pub max_ref: Option<Value>,
+    /// Why a delegated change was made, for the delegated-change log.
+    #[serde(default)]
+    pub why: Option<String>,
 }
 
 /// AF-651 (gh#202): `backend` was accepted as any string and answered
@@ -782,6 +788,12 @@ pub struct PatchWorkerBody {
     /// applies if the entity is still at this version; otherwise 409.
     #[serde(default)]
     pub expect_version: Option<u64>,
+    /// Delegation proof of Max's instruction (ai-config #160); not stored.
+    #[serde(default)]
+    pub max_ref: Option<Value>,
+    /// Why a delegated change was made, for the delegated-change log.
+    #[serde(default)]
+    pub why: Option<String>,
 }
 
 enum PatchOutcome {
@@ -836,7 +848,8 @@ pub async fn patch_worker(
             ("provider", body.provider.is_some()), ("model", body.model.is_some()), ("backend", body.backend.is_some()),
             ("worker_type", body.worker_type.is_some()), ("group", body.group.is_some())];
         let action = crate::api::delegation::Action::SetConfig { keys: fields.iter().filter(|(_, on)| *on).map(|(k, _)| format!("row:{k}")).collect() };
-        match crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Worker(target.clone()), &action, None) {
+        let meta = json!({"max_ref": body.max_ref, "why": body.why});
+        match crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Worker(target.clone()), &action, Some(&meta)) {
             Ok(g) => g.map(|g| (g, target)),
             Err(r) => return r,
         }

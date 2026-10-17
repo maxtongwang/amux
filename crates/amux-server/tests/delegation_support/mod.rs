@@ -49,7 +49,7 @@ pub const LOG_REL: &str = "audit/delegated-changes.jsonl";
 /// The column piece (b) records #7's attribution verdict in, on the message
 /// row of an owner dashboard/CLI send. NOT FIXED BY THE SPEC: (b) owns it, and
 /// this is the one place to change if it lands under another name.
-pub const ATTRIBUTION_COLUMN: &str = "attribution";
+pub const ATTRIBUTION_COLUMN: &str = "process_origin";
 
 /// Every max_ref refusal code the spec defines.
 pub const MAX_REF_CODES: [&str; 8] = [

@@ -4545,7 +4545,7 @@ pub async fn create_session_legacy(
     let resp = create_session_legacy_inner(state.clone(), headers.clone(), body.clone()).await;
     // A worker's create passed the delegation table: log it (ai-config #160).
     if resp.status().is_success() {
-        let tags = create_tags(&body).unwrap_or_default();
+        let tags = crate::api::delegation::lead_default_tags(&headers, create_tags(&body).unwrap_or_default());
         let action = crate::api::delegation::Action::CreateWorker {
             tags: tags.clone(), settings: crate::api::delegation::create_body_settings(&body), owner_only: None };
         crate::api::delegation::record_allowed(&state, &headers, &crate::api::delegation::Target::NewWorker, &action,
@@ -4583,7 +4583,7 @@ async fn create_session_legacy_inner(_state: AppState, headers: HeaderMap, body:
     // peer inside any group and message across the boundary through it. The
     // shared create rule runs before anything (work dir, env file) is written.
     let tag_list = match create_tags(&body) {
-        Ok(t) => t,
+        Ok(t) => crate::api::delegation::lead_default_tags(&headers, t),
         Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
     };
     let chat = crate::api::session_verbs::requests_chat_type(&body);
