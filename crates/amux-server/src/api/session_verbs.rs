@@ -23915,6 +23915,19 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             // selection or send task text while the picker is transitioning.
             continue;
         }
+        // Any other worker's hook trust dialog is the owner's to answer: it
+        // reads as input-required below; say why, once an hour (DMIW-1).
+        if cfg.get("CC_PROVIDER") == Some("codex")
+            && crate::backend::adapter::provider_picker_reason(&strip_ansi(&pane), "codex")
+                == Some("hook_trust_prompt")
+            && crate::log_dedupe::first_this_bucket(
+                &format!("hook-trust-owner:{name}"),
+                crate::log_dedupe::hour_bucket(now_i64() as f64),
+            )
+        {
+            tracing::warn!(session=%name,measured=true,n_considered=1,verdict="hook_trust_prompt_needs_owner",
+                "codex hook review is waiting for the owner; trust the hooks once in /hooks");
+        }
 
         if let (Some(project), Some(repo)) = (cfg.get("CC_PROJECT"), cfg.get("CC_DIR")) {
             let checkout = crate::project_execution::checkout::load(&home(), project);
@@ -48694,6 +48707,27 @@ mod composer_state_tests {
             Some(true)
         );
         assert!(!pane_is_at_boundary(&working));
+    }
+
+    /// The codex-cli 0.163 launch dialog for an untrusted hook (DMIW-1). It
+    /// is the owner's decision: the lane reads as waiting, which the sweep
+    /// stamps input-required, and it is never a delivery boundary. amux
+    /// answers it only for project workers, and only with the option that
+    /// grants no trust.
+    const LIVE_CODEX_HOOK_REVIEW: &str = "  \u{1b}[1mHooks need review\u{1b}[0m\n  \u{1b}[38;5;3m1 hook is new or changed.\u{1b}[39m\n  \u{1b}[2mHooks can run outside the sandbox after you trust them.\u{1b}[0m\n\u{1b}[1;7m\u{203a} 1. Review hooks\n\u{1b}[0m  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n  \u{1b}[1menter\u{1b}[0;2m confirm \u{b7} \u{1b}[0;1mesc\u{1b}[0;2m skip\n";
+
+    #[test]
+    fn the_codex_hook_review_dialog_waits_for_the_owner() {
+        assert_eq!(detect_claude_status(LIVE_CODEX_HOOK_REVIEW), "waiting");
+        assert!(!pane_is_at_boundary(LIVE_CODEX_HOOK_REVIEW));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker.env");
+        std::fs::write(&path, "CC_PROVIDER=codex\n").unwrap();
+        let mut cfg = EnvFile::load(&path);
+        assert_eq!(project_hook_review_key(&cfg, LIVE_CODEX_HOOK_REVIEW), None);
+        cfg.set("CC_PROJECT", "p");
+        // Option 1 is highlighted; amux types 3, never Enter on a trust option.
+        assert_eq!(project_hook_review_key(&cfg, LIVE_CODEX_HOOK_REVIEW), Some("3"));
     }
 }
 

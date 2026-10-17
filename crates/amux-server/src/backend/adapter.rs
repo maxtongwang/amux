@@ -1133,6 +1133,7 @@ pub(crate) fn provider_picker_reason(clean: &str, provider: &str) -> Option<&'st
         && !tail.contains("press enter to confirm")
         && !tail.contains("enter to select")
         && !tail.contains("esc to cancel")
+        && !tail.contains("enter confirm \u{b7} esc skip")
     {
         return None;
     }
@@ -1229,6 +1230,10 @@ fn codex_model_bar(line: &str) -> bool {
         && (location == "~" || location.starts_with("~/") || location.starts_with('/'))
 }
 
+fn codex_shortcut_hint_row(line: &str) -> bool {
+    line.trim_start().starts_with("? for shortcuts")
+}
+
 fn codex_active_status_line(line: &str) -> bool {
     let low = line.trim().to_ascii_lowercase();
     low.starts_with("• working (")
@@ -1281,8 +1286,13 @@ fn codex_structured_active_line_clean(clean: &str) -> Option<Option<&str>> {
     // Provider identity must be the CURRENT footer, not a Codex-looking frame
     // pasted into another provider's prompt. The model/path bar is Codex's
     // final non-empty row and its prompt glyph is `›` (not Claude's `❯`).
-    let model_i = tail
-        .len()
+    // Before its first turn Codex paints a `? for shortcuts` hint row below
+    // the model bar; it is chrome, not a different frame (DMIW-1).
+    let footer_end = match tail.last() {
+        Some(last) if codex_shortcut_hint_row(last) => tail.len() - 1,
+        _ => tail.len(),
+    };
+    let model_i = footer_end
         .checked_sub(1)
         .filter(|i| codex_model_bar(tail[*i]))?;
     let prompt_i = tail[..model_i].iter().rposition(|s| s.starts_with('›'))?;
