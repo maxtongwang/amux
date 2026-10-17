@@ -32,8 +32,14 @@ _curl() {
     previous="$argument"
   done
   if [[ -z "$body" ]]; then  # GET .../send?msg_id= : the durable receipt
-    echo "${previous##*msg_id=}" >> "$TEST_DIR/receipts"
+    local a id= text=
+    for a in "$@"; do
+      case "$a" in msg_id=*) id="${a#msg_id=}" ;; text=*) text="${a#text=}" ;; esac
+    done
+    echo "$id" >> "$TEST_DIR/receipts"
+    printf '%s' "$text" > "$TEST_DIR/receipt-text"
     case "$MODE" in
+      stranded) echo '{"ok":true,"accepted":false,"stranded":true,"delivered":"unknown"}' ;;
       slow-accepted) echo '{"ok":true,"accepted":true,"id":"msg-x"}' ;;
       released) echo '{"ok":true,"accepted":false,"released":true,"delivered":false}' ;;
       *) return 28 ;;
@@ -44,7 +50,7 @@ _curl() {
   local count; count=$(wc -l < "$TEST_DIR/requests")
   if [[ "$MODE" == refused ]]; then echo '{"ok":false,"error":"explicit refusal"}'; return; fi
   # The incident (2026-10-17): one "pending" answer, every other reply too slow.
-  if [[ "$MODE" == slow-accepted || "$MODE" == released ]] && [[ "$count" -eq 2 ]]; then
+  if [[ "$MODE" == slow-accepted || "$MODE" == released || "$MODE" == stranded ]] && [[ "$count" -eq 2 ]]; then
     echo '{"ok":false,"submission":"pending","retryable":true}'; return
   fi
   if [[ "$MODE" == recovered && "$count" -eq 3 ]]; then echo '{"ok":true,"deduped":true,"message":"duplicate retry ignored"}'; return; fi
@@ -52,8 +58,8 @@ _curl() {
 }
 ''' + function + '\n_send_via_api target "a multiline\nmessage"\n')
     for mode, expected, attempts in [('outage', 1, 3), ('recovered', 0, 3), ('refused', 1, 1),
-                                     ('slow-accepted', 0, None), ('released', 1, None)]:
-        for name in ['requests', 'receipts', 'tmux', 'logs/send-failures.jsonl']:
+                                     ('slow-accepted', 0, None), ('released', 1, None), ('stranded', 1, None)]:
+        for name in ['requests', 'receipts', 'receipt-text', 'tmux', 'logs/send-failures.jsonl']:
             (folder / name).unlink(missing_ok=True)
         result = subprocess.run(['bash', str(harness)], env={**os.environ, 'MODE':mode, 'TEST_DIR':temp}, capture_output=True, text=True)
         assert result.returncode == expected, (mode, result.stdout, result.stderr)
@@ -64,8 +70,13 @@ _curl() {
         assert all(r['text'] == 'a multiline\nmessage' for r in requests)
         assert not (folder / 'tmux').exists(), 'Unacknowledged sends must not touch a terminal'
         receipts = (folder / 'receipts').read_text().split() if (folder / 'receipts').exists() else []
-        if mode in ('slow-accepted', 'released', 'outage'):
+        if mode in ('slow-accepted', 'released', 'stranded', 'outage'):
             assert receipts and set(receipts) == ids, (mode, receipts, ids)  # the receipt asked about THIS message
+            # ...and carried its text, so the server can say "stranded" rather than "released".
+            assert (folder / 'receipt-text').read_text() == 'a multiline\nmessage', (folder / 'receipt-text').read_text()
+        if mode == 'stranded':
+            # A message still in the input box is never "safe to resend".
+            assert 'Do NOT send it again' in result.stderr and 'sending again is safe' not in result.stderr, result.stderr
         if mode == 'slow-accepted':
             # A send the server accepted is never reported UNCONFIRMED (re-ops-lead's false negative).
             assert 'durable receipt' in result.stdout and 'UNCONFIRMED' not in result.stderr, (result.stdout, result.stderr)

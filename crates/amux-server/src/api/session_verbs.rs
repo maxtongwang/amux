@@ -10558,7 +10558,24 @@ pub(crate) fn composer_owner(raw: &str, typed_prefix: &str, body: &str, pasted: 
     if want.starts_with(draft.as_str()) {
         return ComposerOwner::Rendering;
     }
+    // OUR OWN TEXT CAN HOLD A PROMPT GLYPH. `composer_state` takes the last
+    // line starting with `❯`/`›` as the prompt, so a body quoting shell output
+    // (`❯ cargo test`) reads from that line on: the tail of what we sent. The
+    // box was verified empty before typing and the send lock is held, so a
+    // draft that is a tail of ours is ours (the glyph itself is not kept).
+    if draft.chars().count() >= 8 && glyph_tails(&want).any(|tail| tail == draft) {
+        return ComposerOwner::Ours;
+    }
     ComposerOwner::Foreign(draft)
+}
+
+/// What `composer_state` reports when it starts reading at each prompt glyph
+/// inside `squashed`: the text after that glyph.
+fn glyph_tails(squashed: &str) -> impl Iterator<Item = &str> {
+    squashed
+        .char_indices()
+        .filter(|(_, c)| matches!(c, '\u{276f}' | '\u{203a}'))
+        .map(move |(at, c)| &squashed[at + c.len_utf8()..])
 }
 
 /// What a send may do to the composer before it clears and types, decided
@@ -10600,7 +10617,10 @@ pub(crate) fn origin_stamp_split(text: &str) -> Option<(String, String)> {
         .filter_map(|t| text.find(t).map(|at| at + t.len()))
         .min()?;
     let stamp = text[..end].trim_end();
-    if stamp.contains(['\n', '\r']) {
+    // Typed text is keystrokes: a control character would act as a key (Esc,
+    // C-c, C-u, Tab, Enter) and `@` opens the file picker. Such a stamp stays
+    // inert inside the paste.
+    if stamp.chars().any(|c| c.is_control() || c == '@') {
         return None;
     }
     Some((format!("{stamp} "), text[end..].to_string()))
@@ -10720,12 +10740,45 @@ fn amux_delivered_text(state: &AppState, name: &str, draft: &str) -> bool {
 
 /// Pure core of [`held_amux_delivery`]: `rows` are `(text, origin)`.
 pub(crate) fn held_delivery_matching(draft: &str, name: &str, rows: &[(String, String)]) -> Option<String> {
-    rows.iter().find_map(|(text, origin)| {
+    let exact = rows.iter().find_map(|(text, origin)| {
         let stamped = origin_stamped(origin, name, text);
         std::iter::once(text.clone())
             .chain(stamped)
             .find(|t| composer_holds_this_delivery(draft, t))
+    });
+    // A COLLAPSED PASTE HIDES ITS TEXT (AMUX-5463: 5 of 8 stuck messages read
+    // as a chip). The chip still carries its size: Claude's `+M lines` (the
+    // lines after the first) or Codex's `N chars`. The newest unsubmitted row
+    // of that size, behind the same typed prefix, is the one in the box.
+    exact.or_else(|| {
+        rows.iter().find_map(|(text, origin)| {
+            let sent = origin_stamped(origin, name, text).unwrap_or_else(|| text.clone());
+            let (prefix, body) = delivery_parts(&sent);
+            let prefix_sq: String = prefix.split_whitespace().collect();
+            let chip = draft.strip_prefix(prefix_sq.as_str())?;
+            paste_chip_fits(chip, &body).then_some(sent)
+        })
     })
+}
+
+/// Whether a lone paste chip (squashed) could be `body`: its line or char
+/// count agrees within the provider's rounding.
+fn paste_chip_fits(chip: &str, body: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)^\[pasted(?:text#\d+\+(\d+)lines?|content(\d+)chars)\]$").expect("paste chip size regex")
+    });
+    let Some(caps) = re.captures(chip) else {
+        return false;
+    };
+    let lines = body.trim_end_matches('\n').lines().count();
+    if let Some(m) = caps.get(1).and_then(|m| m.as_str().parse::<usize>().ok()) {
+        return lines.abs_diff(m + 1) <= 1;
+    }
+    caps.get(2)
+        .and_then(|m| m.as_str().parse::<usize>().ok())
+        .is_some_and(|n| body.chars().count().abs_diff(n) <= 2)
 }
 
 fn project_execution_composer_owns_text(raw: &str, text: &str) -> bool {
@@ -11511,9 +11564,9 @@ fn submission_records_have(records: &[Value], text: &str, since: f64) -> bool {
             && records.iter().any(|record| {
                 record["type"].as_str() == Some("queue-operation")
                     && record["operation"].as_str() == Some("enqueue")
-                    && record["content"]
-                        .as_str()
-                        .is_some_and(|content| content.trim() == text.trim())
+                    && record["content"].as_str().is_some_and(|content| {
+                        content.trim() == text.trim() || transcript_squash(content) == transcript_squash(text)
+                    })
                     && record["timestamp"]
                         .as_str()
                         .and_then(parse_iso8601)
@@ -11586,7 +11639,24 @@ pub(crate) fn muse_intent_in_tail(tail: &str, needle: &str) -> bool {
 /// Guarding with a length bound prevents that: 200 chars of overhead covers
 /// any plausible timestamp/author prefix while rejecting unrelated messages.
 pub(crate) fn jsonl_content_matches(content: &str, needle: &str) -> bool {
-    content.contains(needle) && content.len() <= needle.len() + 200
+    if content.contains(needle) && content.len() <= needle.len() + 200 {
+        return true;
+    }
+    // A TYPED PREFIX BEFORE A PASTE (the origin stamp, a slash command) is
+    // recorded as `<prefix> <pasted_content id=..>body</pasted_content>`, so
+    // the sent `<stamp>\n\n<body>` is not a substring of it. Compare with the
+    // paste wrapper removed and whitespace dropped, under the same length bound.
+    let (c, n) = (transcript_squash(content), transcript_squash(needle));
+    !n.is_empty() && c.contains(&n) && c.len() <= n.len() + 200
+}
+
+/// Transcript text with Claude Code's `<pasted_content ...>` wrapper tags
+/// removed and all whitespace dropped: what was typed plus what was pasted.
+fn transcript_squash(s: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"</?pasted_content[^>]*>").expect("paste wrapper regex"));
+    re.replace_all(s, "").split_whitespace().collect()
 }
 
 /// The evidence scan itself, over already-parsed records — pure so it can be
@@ -14207,6 +14277,15 @@ async fn send_text_inner_bound(
             session = %name,
             "send: mid-turn Enter was not accepted — retrying with a bare Enter (keystroke delivery failure)"
         );
+        // Only onto our own text, like every other Enter on this path.
+        if let ComposerOwner::Foreign(foreign) =
+            composer_owner(&tmux_capture(name, 25).await, typed_prefix.as_deref().unwrap_or(""), &staged, use_paste)
+        {
+            tracing::warn!(session = %name, chars = foreign.chars().count(), measured = true, n_considered = 1,
+                verdict = "retry_enter_foreign_composer_text",
+                "the composer holds text this send did not type; mid-turn retry Enter not pressed");
+            return send_outcome(Submission::Stuck, generating, true);
+        }
         send_key(name, "Enter").await;
         let (second, _) = verify_submitted(name, &text, sent_at, false).await;
         if second == Submission::Stuck {
@@ -28537,9 +28616,11 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
         if let Some(quote) = owner_relay_quote(&origin, name) {
             tracing::info!(session = name, relay = %origin, verdict = "owner_relay_via_chat_companion",
                 "a Chat-tab companion relayed the owner's instruction; delivered with owner origin");
+            // A stamp quoted inside the relayed body is a quote, as in origin_stamped.
+            let body = text.replace("[amux-origin:", "[quoted amux-origin:");
             text = format!(
                 "[amux-origin: the owner, relayed by {origin} (this worker's Chat tab) from the owner's message \"{quote}\". \
-                 Server-verified: the owner started the companion turn that sent this.]\n\n{text}"
+                 Server-verified: the owner started the companion turn that sent this.]\n\n{body}"
             );
             origin = String::new();
         } else if let Some(stamped) = origin_stamped(&origin, name, &text) {
@@ -55413,6 +55494,71 @@ mod composer_guard_tests {
         let verify = &src[src.find("async fn verify_submitted(").unwrap()..];
         let retry = verify.find("verdict = \"retry_enter_foreign_composer_text\"").expect("retry guard");
         assert!(verify[retry..retry + 600].contains("send_key(name, \"Enter\")"), "the retry Enter is guarded");
+    }
+
+    /// Review of #9, B2: a typed stamp before a paste must still be found in the
+    /// transcript, or every stamped peer paste loses its durable evidence.
+    #[test]
+    fn a_typed_stamp_before_a_paste_still_matches_the_transcript() {
+        let sent = format!("{STAMP}\n\nline one\nline two\nline three");
+        for recorded in [
+            format!("{STAMP} <pasted_content id=\"c2e2\">\nline one\nline two\nline three\n</pasted_content>"),
+            format!("{STAMP} line one\nline two\nline three"),
+            sent.clone(),
+        ] {
+            assert!(jsonl_content_matches(&recorded, &sent), "{recorded:?}");
+        }
+        assert!(!jsonl_content_matches(&format!("{STAMP} <pasted_content id=\"c2e2\">something else</pasted_content>"), &sent),
+            "a different body is not this message");
+        assert!(!jsonl_content_matches(&format!("{} {sent}", "x".repeat(400)), &sent), "the length bound still holds");
+    }
+
+    /// Review of #9, B3: our own body may quote a prompt glyph (shell output);
+    /// the composer then reads from that line, and it is still ours.
+    #[test]
+    fn our_own_body_with_a_prompt_glyph_line_is_still_ours() {
+        let prefix = format!("{STAMP} ");
+        let body = "here is the output\n\u{276f} cargo test\nok";
+        for frame in [
+            claude(&format!("{STAMP} here is the output\n  \u{276f} cargo test\n  ok")),
+            codex(&format!("{STAMP} here is the output\n  \u{203a} cargo test\n  ok")),
+        ] {
+            let read = composer_state(&frame);
+            assert!(read.typed().is_some_and(|d| d.starts_with("cargotest")), "control: the glyph line is read as the prompt {read:?}");
+            let body = if frame.contains('\u{203a}') { body.replace('\u{276f}', "\u{203a}") } else { body.to_string() };
+            assert_eq!(composer_owner(&frame, &prefix, &body, false), ComposerOwner::Ours);
+        }
+        // A glyph line that is NOT a tail of ours stays foreign.
+        assert!(matches!(composer_owner(&claude("yes add both\n  \u{276f} add altuva too"), &prefix, body, false),
+            ComposerOwner::Foreign(_)));
+    }
+
+    /// Review of #9, B4: amux's own held message shown as a chip is recognised
+    /// by its size, so the next send clears it as before instead of stalling.
+    #[test]
+    fn amux_own_held_paste_chip_is_recognised_by_its_size() {
+        let three = "line one\nline two\nline three".to_string();
+        let rows = vec![(three.clone(), String::new()), ("one line only".to_string(), String::new())];
+        assert_eq!(held_delivery_matching("[Pastedtext#3+2lines]", "w", &rows), Some(three.clone()));
+        assert_eq!(held_delivery_matching("[Pastedtext#3+9lines]", "w", &rows), None, "a chip of another size is not ours");
+        let codex_chip = format!("[PastedContent{}chars]", three.chars().count());
+        assert_eq!(held_delivery_matching(&codex_chip, "w", &rows), Some(three.clone()));
+        let peer = vec![(three.clone(), "re-ops-lead".to_string())];
+        let stamped = origin_stamped("re-ops-lead", "w", &three).unwrap();
+        let stamp_sq: String = origin_stamp_split(&stamped).unwrap().0.split_whitespace().collect();
+        assert_eq!(held_delivery_matching(&format!("{stamp_sq}[Pastedtext#3+2lines]"), "w", &peer), Some(stamped));
+        assert_eq!(held_delivery_matching("yesaddboth[Pastedtext#3+2lines]", "w", &peer), None,
+            "a draft in front of the chip is a person's");
+    }
+
+    /// Review of #9, N1: a stamp that would act as keystrokes stays in the paste.
+    #[test]
+    fn a_stamp_with_keys_in_it_is_never_typed() {
+        for origin in ["lead@host", "lead\u{1b}x", "lead\tx"] {
+            let sent = origin_stamped(origin, "w", "body").unwrap();
+            assert_eq!(origin_stamp_split(&sent), None, "{origin:?}");
+        }
+        assert!(origin_stamp_split(&origin_stamped("re-ops-lead", "w", "body").unwrap()).is_some(), "control");
     }
 
     /// The three other Enter/clear paths the review of #5 found.

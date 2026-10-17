@@ -2203,9 +2203,13 @@ PYEOF
 # The answer a slow or dropped reply could not give (2026-10-17: re-ops-lead's
 # send read UNCONFIRMED while the receipt said accepted).
 _await_send_receipt() {
-  local api="$1" name="$2" id="$3" max="${4:-0}" waited=0 resp state
+  local api="$1" name="$2" id="$3" max="${4:-0}" text="${5:-}" waited=0 resp state
   while :; do
-    resp=$(_curl -sk -m 5 "$api/api/sessions/$name/send?msg_id=$id" 2>/dev/null) || resp=""
+    # The text goes too: without it the server cannot tell a released ID from
+    # a message still sitting in the worker's input box ("stranded"), and
+    # answers "released" for both (AMUX-5463).
+    resp=$(_curl -sk -m 5 -G --data-urlencode "msg_id=$id" --data-urlencode "text=$text" \
+      "$api/api/sessions/$name/send" 2>/dev/null) || resp=""
     state=$(RESP="$resp" python3 -c '
 import json, os
 try:
@@ -2213,6 +2217,8 @@ try:
 except Exception:
     print("unknown"); raise SystemExit
 if d.get("accepted") is True: print("accepted")
+elif d.get("stranded") is True: print("stranded")
+elif d.get("expired") is True: print("unknown")
 elif d.get("released") is True: print("released")
 elif d.get("ok") is True and d.get("accepted") is False: print("pending")
 else: print("unknown")' 2>/dev/null || echo unknown)
@@ -2224,9 +2230,10 @@ else: print("unknown")' 2>/dev/null || echo unknown)
 # The verdict line for a send whose reply never settled, read from the receipt.
 # Returns 0 when the receipt proves acceptance, 1 otherwise (printed either way).
 _send_settle_by_receipt() {
-  local api="$1" name="$2" body="$3" waited="$4" max="$5" id state
+  local api="$1" name="$2" body="$3" waited="$4" max="$5" id text state
   id=$(BODY="$body" python3 -c 'import json,os; print(json.loads(os.environ["BODY"])["msg_id"])')
-  state=$(_await_send_receipt "$api" "$name" "$id" "$max")
+  text=$(BODY="$body" python3 -c 'import json,os,sys; sys.stdout.write(json.loads(os.environ["BODY"])["text"])')
+  state=$(_await_send_receipt "$api" "$name" "$id" "$max" "$text")
   case "$state" in
     accepted)
       echo "sent to $name (origin-stamped; confirmed by the server's durable receipt after ${waited}s — the reply itself was slow)"
@@ -2234,6 +2241,9 @@ _send_settle_by_receipt() {
       return 0 ;;
     released)
       echo "send to $name FAILED: the server released message ID $id without delivering it; sending again is safe" >&2
+      return 1 ;;
+    stranded)
+      echo "${RED}UNCONFIRMED${RESET} send to $name: the message is still in the worker's input box, not submitted. Do NOT send it again; it goes in when that box is submitted." >&2
       return 1 ;;
   esac
   echo "send_receipt: $name msg_id=$id state=$state" >&2
