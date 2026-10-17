@@ -130,21 +130,53 @@ struct OsResolver;
 impl PeerResolver for OsResolver {
     fn resolve(&self, peer: SocketAddr) -> Origin {
         let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
-        decide(peer, os::socket_owners(peer), pane_map, &os::ppid_of)
+        decide(peer, socket_owners_checked(peer), || pane_map(false), || pane_map(true), &os::ppid_of)
     }
 }
+
+type OwnerCache = Mutex<HashMap<SocketAddr, (Instant, Vec<u32>)>>;
+
+/// The pids holding the client end of `peer`, memoised per connection so a
+/// keep-alive connection does not rescan every process per request. A memo is
+/// used only after re-checking that each remembered pid STILL holds a socket
+/// with that local end (a cheap per-pid check): a port the first holder closed
+/// and another process reused is rescanned, never inherited.
+fn socket_owners_checked(peer: SocketAddr) -> Result<Vec<u32>, os::LookupError> {
+    static CACHE: OnceLock<OwnerCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let memo = cache.lock().ok().and_then(|c| c.get(&peer).filter(|(at, _)| at.elapsed() < OWNER_TTL).map(|(_, o)| o.clone()));
+    if let Some(owners) = memo {
+        if !owners.is_empty() && owners.iter().all(|&pid| os::holds(pid, peer)) {
+            return Ok(owners);
+        }
+    }
+    let owners = os::socket_owners(peer)?;
+    if let Ok(mut c) = cache.lock() {
+        if c.len() > 4096 {
+            c.retain(|_, (at, _)| at.elapsed() < OWNER_TTL);
+        }
+        c.insert(peer, (Instant::now(), owners.clone()));
+    }
+    Ok(owners)
+}
+
+const OWNER_TTL: Duration = Duration::from_secs(30);
 
 /// The resolver's decision from its three lookups, separated so a failed
 /// lookup is tested through the same code the server runs.
 ///
 /// FAIL CLOSED. Outside (and with it owner authority) is granted only on
-/// positive proof: the owning processes' whole ancestry was read AND the pane
-/// inventory was read successfully AND no ancestor is a worker pane. Any
-/// inventory failure, whatever tmux printed, is IdentityUnavailable.
+/// positive proof: the owning processes' whole ancestry was read AND a pane
+/// inventory read NOW (not a cached one: review round 3, a worker pane started
+/// after the cached read would be absent from it) succeeded AND no ancestor is
+/// a worker pane. Any inventory failure, whatever tmux printed, is
+/// IdentityUnavailable. A cached inventory may only CONFIRM a worker; its
+/// absence proves nothing.
 fn decide(
     peer: SocketAddr,
     owners: Result<Vec<u32>, os::LookupError>,
-    panes: impl FnOnce() -> Result<HashMap<u32, String>, String>,
+    cached_panes: impl FnOnce() -> Result<HashMap<u32, String>, String>,
+    fresh_panes: impl FnOnce() -> Result<HashMap<u32, String>, String>,
     ppid_of: &dyn Fn(u32) -> Option<u32>,
 ) -> Origin {
     let owners = match owners {
@@ -157,7 +189,12 @@ fn decide(
     if owners.is_empty() && !peer.ip().is_loopback() {
         return Origin::Remote;
     }
-    match panes() {
+    if let Ok(panes) = cached_panes() {
+        if let worker @ Origin::Worker(_) = classify(&owners, &panes, ppid_of) {
+            return worker;
+        }
+    }
+    match fresh_panes() {
         Ok(panes) => classify(&owners, &panes, ppid_of),
         Err(why) => {
             tracing::warn!(%peer, why = %why, verdict = "process_attribution_pane_inventory_failed",
@@ -170,13 +207,13 @@ fn decide(
 
 type PaneCache = Mutex<Option<(Instant, HashMap<u32, String>)>>;
 
-/// `pane shell pid -> tmux session name`, cached briefly: one `tmux` spawn per
-/// window, not per request. Only a successful inventory is cached; a failure
-/// is returned as an error every time so it can never stand in for "no panes".
-fn pane_map() -> Result<HashMap<u32, String>, String> {
+/// `pane shell pid -> tmux session name`. `fresh` always runs tmux (an owner
+/// verdict needs it); otherwise a successful read under 2s old is reused, which
+/// can only confirm a worker. A failure is never cached and never "no panes".
+fn pane_map(fresh: bool) -> Result<HashMap<u32, String>, String> {
     static CACHE: OnceLock<PaneCache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
-    if let Ok(g) = cache.lock() {
+    if let (false, Ok(g)) = (fresh, cache.lock()) {
         if let Some((at, map)) = g.as_ref() {
             if at.elapsed() < Duration::from_secs(2) {
                 return Ok(map.clone());
@@ -241,36 +278,15 @@ fn resolver_slot() -> &'static RwLock<Shared> {
     SLOT.get_or_init(|| RwLock::new(Arc::new(OsResolver)))
 }
 
-type OriginCache = Mutex<HashMap<SocketAddr, (Instant, Origin)>>;
-
-/// Per-connection memo: a keep-alive connection keeps its client port for its
-/// life, so one lookup serves its requests. Short TTL bounds port reuse.
-fn origin_cache() -> &'static OriginCache {
-    static CACHE: OnceLock<OriginCache> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-const ORIGIN_TTL: Duration = Duration::from_secs(3);
-
+/// Resolve on every request: an Origin is never memoised, because an owner
+/// verdict must rest on a fresh inventory (the OS resolver memoises only the
+/// socket's holders, re-checked per use, and the cached inventory confirms
+/// only workers).
 async fn resolve_cached(peer: SocketAddr) -> Origin {
-    if let Ok(c) = origin_cache().lock() {
-        if let Some((at, o)) = c.get(&peer) {
-            if at.elapsed() < ORIGIN_TTL {
-                return o.clone();
-            }
-        }
-    }
     let resolver = resolver_slot().read().map(|r| r.clone()).unwrap_or_else(|p| p.into_inner().clone());
-    let origin = tokio::task::spawn_blocking(move || resolver.resolve(peer))
+    tokio::task::spawn_blocking(move || resolver.resolve(peer))
         .await
-        .unwrap_or_else(|e| Origin::Unattributed(format!("resolver task failed: {e}")));
-    if let Ok(mut c) = origin_cache().lock() {
-        if c.len() > 4096 {
-            c.retain(|_, (at, _)| at.elapsed() < ORIGIN_TTL);
-        }
-        c.insert(peer, (Instant::now(), origin.clone()));
-    }
-    origin
+        .unwrap_or_else(|e| Origin::Unattributed(format!("resolver task failed: {e}")))
 }
 
 /// The claimed worker identity, as every handler reads it.
@@ -379,7 +395,7 @@ pub(crate) mod test_support {
     static SERIAL: Mutex<()> = Mutex::new(());
 
     /// Install a fake resolver for the guard's life; tests that use it run
-    /// one at a time and clear the per-connection memo on both edges.
+    /// one at a time.
     pub(crate) struct ResolverGuard {
         _serial: std::sync::MutexGuard<'static, ()>,
     }
@@ -389,9 +405,6 @@ pub(crate) mod test_support {
             if let Ok(mut s) = resolver_slot().write() {
                 *s = Arc::new(OsResolver);
             }
-            if let Ok(mut c) = origin_cache().lock() {
-                c.clear();
-            }
         }
     }
 
@@ -399,9 +412,6 @@ pub(crate) mod test_support {
         let serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         if let Ok(mut s) = resolver_slot().write() {
             *s = r;
-        }
-        if let Ok(mut c) = origin_cache().lock() {
-            c.clear();
         }
         ResolverGuard { _serial: serial }
     }
@@ -430,9 +440,9 @@ pub(crate) mod os {
     }
 
     #[cfg(target_os = "macos")]
-    pub(super) use super::macos::{ppid_of, socket_owners};
+    pub(super) use super::macos::{holds, ppid_of, socket_owners};
     #[cfg(target_os = "linux")]
-    pub(super) use super::linux::{ppid_of, socket_owners};
+    pub(super) use super::linux::{holds, ppid_of, socket_owners};
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub(super) fn socket_owners(_peer: SocketAddr) -> Result<Vec<u32>, LookupError> {
@@ -441,6 +451,10 @@ pub(crate) mod os {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub(super) fn ppid_of(_pid: u32) -> Option<u32> {
         None
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(super) fn holds(_pid: u32, _peer: SocketAddr) -> bool {
+        false
     }
 }
 
@@ -642,6 +656,11 @@ mod macos {
         Ok(owners)
     }
 
+    /// Whether `pid` still holds a socket whose local end is `peer`.
+    pub(crate) fn holds(pid: u32, peer: SocketAddr) -> bool {
+        socket_fds(pid as i32).into_iter().any(|fd| local_end(pid as i32, fd) == Some(peer))
+    }
+
     pub(crate) fn ppid_of(pid: u32) -> Option<u32> {
         // SAFETY: zeroed POD; the kernel writes exactly one proc_bsdinfo.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -712,6 +731,15 @@ mod linux {
             }
         }
         Ok(owners)
+    }
+
+    /// Whether `pid` still holds the socket whose local end is `peer`.
+    pub(crate) fn holds(pid: u32, peer: SocketAddr) -> bool {
+        let Ok(Some(inode)) = inode_for(peer) else { return false };
+        let want = format!("socket:[{inode}]");
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .map(|fds| fds.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l.as_os_str() == want.as_str())))
+            .unwrap_or(false)
     }
 
     pub(crate) fn ppid_of(pid: u32) -> Option<u32> {
@@ -952,7 +980,7 @@ mod tests {
                 50 => Some(1),
                 _ => None,
             };
-            decide(peer, Ok(vec![101]), || self.0.clone(), &chain)
+            decide(peer, Ok(vec![101]), || self.0.clone(), || self.0.clone(), &chain)
         }
     }
 
@@ -1034,6 +1062,60 @@ mod tests {
         }
         assert!(panes_from_output(false, "", "lost server\n").is_err());
         assert!(panes_from_output(false, "", "").is_err(), "a silent failure is an error, not an empty fleet");
+    }
+
+    /// Review round 3: a worker pane that starts after the cached inventory
+    /// was read is absent from it. Absence in a cached read must not grant the
+    /// owner; the verdict comes from a fresh read, which finds the pane.
+    struct StaleInventory;
+
+    impl PeerResolver for StaleInventory {
+        fn resolve(&self, peer: SocketAddr) -> Origin {
+            let chain = |pid: u32| match pid {
+                101 => Some(100),
+                100 => Some(50),
+                50 => Some(1),
+                _ => None,
+            };
+            decide(peer, Ok(vec![101]), || Ok(HashMap::new()), || Ok(HashMap::from([(100, "amux-caller".to_string())])), &chain)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_cached_inventory_never_grants_owner_to_a_new_worker() {
+        let (state, dir, guard) = fixture();
+        let _h = crate::api::settings::test_env::set_home(dir.path());
+        drop(guard);
+        let _r = test_support::set_resolver(Arc::new(StaleInventory));
+        for _ in 0..2 {
+            // Twice: no verdict is memoised between requests either.
+            let (st, v) = post(&app(state.clone()), OWNER, &[]).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "it is caller: {v}");
+        }
+        assert!(queued_senders(&state).is_empty());
+        // And a fresh read that fails is identity unavailable even when the
+        // cached read (stale, empty) would have said outside.
+        let chain = |pid: u32| match pid { 101 => Some(1), _ => None };
+        let o = decide("127.0.0.1:1".parse().unwrap(), Ok(vec![101]), || Ok(HashMap::new()), || Err("tmux gone".into()), &chain);
+        assert!(matches!(o, Origin::IdentityUnavailable(_)), "{o:?}");
+    }
+
+    /// A remembered socket holder is reused only while it still holds that
+    /// exact socket; a closed connection's port is not inherited.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_remembered_socket_holder_is_rechecked() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server_side, peer) = listener.accept().unwrap();
+        let me = std::process::id();
+        assert!(os::holds(me, peer), "this process holds its open client socket");
+        assert_eq!(socket_owners_checked(peer).ok(), Some(vec![me]));
+        drop(client);
+        drop(server_side);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!os::holds(me, peer), "a closed socket is no longer held");
+        assert!(matches!(socket_owners_checked(peer), Ok(v) if v.is_empty()), "the memo is not inherited");
     }
 
     /// The proof header is server-set only: a client cannot assert it.
