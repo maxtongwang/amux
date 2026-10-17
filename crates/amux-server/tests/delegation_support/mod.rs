@@ -33,6 +33,9 @@ use tower::ServiceExt;
 /// The owner agent's worker name (docs: agents/owner.md). Only ever created in
 /// the temp home.
 pub const MRPOPO: &str = "mrpopo";
+/// A pane Max types into that is not the actor's own lane: own-lane pane rows are
+/// refused (`max_ref_session_allowed`), so max_ref evidence is seeded here.
+pub const MAX_PANE: &str = "review-max-desk";
 pub const DEV_LEAD: &str = "review-dev-lead";
 /// A second lead of team dev: a PEER lead of DEV_LEAD.
 pub const DEV_LEAD2: &str = "review-dev-lead2";

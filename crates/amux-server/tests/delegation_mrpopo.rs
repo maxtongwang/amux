@@ -171,8 +171,8 @@ async fn each_delegable_class_needs_a_specific_max_ref() {
         if (st.as_u16(), v["code"].as_str()) != (403, Some("max_ref_missing")) {
             failures.push(format!("{}: without max_ref expected 403 max_ref_missing, got {st} {v}", c.name));
         }
-        e.seed_pane_prompt(MRPOPO, &c.unspecific, t - 120.0);
-        let (st, v) = e.call(Who::Worker(MRPOPO), c.method, &c.path, Some(with_ref(c.body.clone(), max_ref(MRPOPO, t - 120.0), "Max asked"))).await;
+        e.seed_pane_prompt(MAX_PANE, &c.unspecific, t - 120.0);
+        let (st, v) = e.call(Who::Worker(MRPOPO), c.method, &c.path, Some(with_ref(c.body.clone(), max_ref(MAX_PANE, t - 120.0), "Max asked"))).await;
         if (st.as_u16(), v["code"].as_str()) != (403, Some("max_ref_does_not_name_setting")) {
             failures.push(format!("{}: unspecific max_ref expected 403 max_ref_does_not_name_setting, got {st} {v}", c.name));
         }
@@ -183,8 +183,8 @@ async fn each_delegable_class_needs_a_specific_max_ref() {
             failures.push(format!("{}: a refused leg was logged", c.name));
         }
 
-        e.seed_pane_prompt(MRPOPO, &c.specific, t);
-        let (st, v) = e.call(Who::Worker(MRPOPO), c.method, &c.path, Some(with_ref(c.body.clone(), max_ref(MRPOPO, t), "Max asked"))).await;
+        e.seed_pane_prompt(MAX_PANE, &c.specific, t);
+        let (st, v) = e.call(Who::Worker(MRPOPO), c.method, &c.path, Some(with_ref(c.body.clone(), max_ref(MAX_PANE, t), "Max asked"))).await;
         if !st.is_success() {
             failures.push(format!("{}: specific max_ref expected 2xx, got {st} {v}", c.name));
         } else if e.log_entries().len() != 1 {
@@ -198,11 +198,11 @@ async fn each_delegable_class_needs_a_specific_max_ref() {
 async fn target_and_setting_must_be_in_the_same_typed_row() {
     let e = setup().await;
     let t = now_s() - 60.0;
-    e.seed_pane_prompt(MRPOPO, &format!("about {DEV_A}"), t);
-    e.seed_pane_prompt(MRPOPO, "turn on yolo", t + 5.0);
+    e.seed_pane_prompt(MAX_PANE, &format!("about {DEV_A}"), t);
+    e.seed_pane_prompt(MAX_PANE, "turn on yolo", t + 5.0);
     for at in [t, t + 5.0] {
         let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &format!("/api/sessions/{DEV_A}/config"),
-            Some(with_ref(json!({"toggle_yolo": true}), max_ref(MRPOPO, at), "Max asked"))).await;
+            Some(with_ref(json!({"toggle_yolo": true}), max_ref(MAX_PANE, at), "Max asked"))).await;
         assert_refused(st, &v, &format!("target and setting split across rows (cited {at})"));
         assert!(v["code"].as_str().is_some_and(|c| c.starts_with("max_ref_")), "{v}");
     }
@@ -214,9 +214,9 @@ async fn setting_phrases_match_on_word_boundaries() {
     let e = setup().await;
     let t = now_s() - 60.0;
     // "misleading" contains "lead" but does not ask to make a lead.
-    e.seed_pane_prompt(MRPOPO, &format!("the {DEV_A} report is misleading"), t);
+    e.seed_pane_prompt(MAX_PANE, &format!("the {DEV_A} report is misleading"), t);
     let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope",
-        Some(with_ref(scope_body("worker", DEV_A, "env", json!({"CC_TAGS": "dev,leads", "CC_ORCHESTRATOR": "1"})), max_ref(MRPOPO, t), "Max asked"))).await;
+        Some(with_ref(scope_body("worker", DEV_A, "env", json!({"CC_TAGS": "dev,leads", "CC_ORCHESTRATOR": "1"})), max_ref(MAX_PANE, t), "Max asked"))).await;
     assert_code(st, &v, "max_ref_does_not_name_setting", "'misleading' is not 'make lead'");
     assert!(!e.env_text(DEV_A).contains("CC_ORCHESTRATOR"));
 }
@@ -246,9 +246,9 @@ async fn hands_only_changes_are_refused_even_with_a_specific_max_ref() {
     let mut failures = Vec::new();
     for (i, (name, method, path, body, text)) in cases.into_iter().enumerate() {
         let at = t - i as f64;
-        e.seed_pane_prompt(MRPOPO, &text, at);
+        e.seed_pane_prompt(MAX_PANE, &text, at);
         let before = e.snapshot();
-        let (st, v) = e.call(Who::Worker(MRPOPO), method, &path, Some(with_ref(body, max_ref(MRPOPO, at), "Max asked"))).await;
+        let (st, v) = e.call(Who::Worker(MRPOPO), method, &path, Some(with_ref(body, max_ref(MAX_PANE, at), "Max asked"))).await;
         let code = v["code"].as_str().unwrap_or("");
         if st.as_u16() != 403 || v["ok"] != json!(false) || code.is_empty() || MAX_REF_CODES.contains(&code) {
             failures.push(format!("{name}: expected a non-max_ref 403, got {st} {v}"));

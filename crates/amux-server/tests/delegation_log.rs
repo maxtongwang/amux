@@ -36,15 +36,15 @@ async fn each_allowed_delegated_change_appends_exactly_one_entry() {
     assert_entry_shape(&entries[1], DEV_A, "self", DEV_A);
 
     let t = now_s() - 60.0;
-    let row = e.seed_pane_prompt(MRPOPO, &format!("add {DEV_B} to leads"), t);
+    let row = e.seed_pane_prompt(MAX_PANE, &format!("add {DEV_B} to leads"), t);
     let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &format!("/api/sessions/{DEV_B}/config"),
-        Some(with_ref(json!({"tags": "dev,leads"}), max_ref(MRPOPO, t), "Max asked for a second lead"))).await;
+        Some(with_ref(json!({"tags": "dev,leads"}), max_ref(MAX_PANE, t), "Max asked for a second lead"))).await;
     assert_allowed(st, &v, "mrpopo membership");
     let entries = e.log_entries();
     assert_eq!(entries.len(), 3, "{entries:?}");
     let m = &entries[2];
     assert_entry_shape(m, MRPOPO, "mrpopo", DEV_B);
-    assert_eq!(m["max_ref"]["session"], json!(MRPOPO), "{m}");
+    assert_eq!(m["max_ref"]["session"], json!(MAX_PANE), "{m}");
     assert!(m["max_ref"]["time"].as_f64().is_some_and(|x| (x - t).abs() < 0.01), "{m}");
     assert_eq!(m["evidence_row"], json!(row), "{m}");
     assert_eq!(m["why"], json!("Max asked for a second lead"), "{m}");
