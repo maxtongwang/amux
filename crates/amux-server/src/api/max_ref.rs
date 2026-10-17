@@ -15,11 +15,11 @@
 //!   too when the provider reports it through the same hook: it is a real user
 //!   turn with no amux stamp and no amux delivery behind it.
 //! - OWNER SEND: `type='user'`, `delivery` `direct` or `queued`, and
-//!   `process_origin` `outside` or `remote` (migration 0123): the dashboard on
+//!   `process_origin` `outside` or `remote` (migration 0124): the dashboard on
 //!   the Mac or the phone over the tailnet, proven by process attribution
 //!   (`process_identity`), not by a header the client chose. A CLI or API send
 //!   from any worker pane records no verdict, and neither does any row written
-//!   before 0123, so neither ever qualifies.
+//!   before 0124, so neither ever qualifies.
 //!
 //! Every candidate then passes [`is_amux_delivery`], which refuses an `[amux`
 //! stamp, provider-injected text, and any text matching what amux delivered to
