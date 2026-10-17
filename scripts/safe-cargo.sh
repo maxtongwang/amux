@@ -96,7 +96,9 @@ case "$_throttle_max" in
   ''|*[!0-9]*|0) echo 'cargo_budget_refused: AMUX_CARGO_MAX_CONCURRENT must be positive' >&2; exit 75 ;;
 esac
 [ "$_throttle_max" -gt 0 ] || { echo 'cargo_budget_refused: concurrency must be positive' >&2; exit 75; }
-_throttle_dir="$HOME/.amux/cargo-throttle"
+# Under AMUX_HOME, like every other amux state dir: a test that sets AMUX_HOME to
+# a fixture must not queue behind the host's real builds for a slot (DMIW-7).
+_throttle_dir="${AMUX_HOME:-$HOME/.amux}/cargo-throttle"
 mkdir -p "$_throttle_dir" 2>/dev/null || true
 _throttle_slot=""
 _throttle_announced=0
@@ -138,7 +140,7 @@ done
 # silent no-op forever -- confirmed live in testing before this shipped, the
 # exact bug this comment is here to stop someone re-introducing.
 echo $$ > "$_throttle_slot.pid" 2>/dev/null || true
-_throttle_release() { rm -f "${_SC_SOURCE_SNAPSHOT:-}"; rmdir "$_throttle_slot" 2>/dev/null || true; rm -f "$_throttle_slot.pid" 2>/dev/null || true; }
+_throttle_release() { rm -f "${_SC_SOURCE_SNAPSHOT:-}" "${_SC_VERDICT:-}"; rmdir "$_throttle_slot" 2>/dev/null || true; rm -f "$_throttle_slot.pid" 2>/dev/null || true; }
 trap '_throttle_release' EXIT
 
 _receipt=""
@@ -156,6 +158,10 @@ _target_guard="$(cd "$(dirname "$0")" && pwd)/cargo-target-guard.py"
 _budget="$(cd "$(dirname "$0")" && pwd)/cargo-budget.py"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}"
 _guard_cmd=(python3 "$_target_guard" run --target "$CARGO_TARGET_DIR")
+# The budget writes a pre-start refusal's reason here (cargo-budget.py
+# write_verdict); stderr carries the build's own output and is not a channel.
+_SC_VERDICT=$(mktemp) || _SC_VERDICT=""
+export AMUX_CARGO_BUDGET_VERDICT="$_SC_VERDICT"
 if [ "${1:-}" = "clean" ]; then _guard_cmd+=(--exclusive-run); fi
 # Cargo's explicit --target-dir wins over the environment. Lease both roots.
 _next_target=0
@@ -178,6 +184,7 @@ if [ -d /run/systemd/system ]; then
        --setenv=CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}"
        --setenv=PATH="$PATH"
        --setenv=HOME="$HOME"
+       --setenv=AMUX_CARGO_BUDGET_VERDICT="$AMUX_CARGO_BUDGET_VERDICT"
        -- "${_guard_cmd[@]}" -- python3 "$_budget" -- cargo "$@")
 else
   echo "safe-cargo.sh: no systemd on this host — running cargo directly." \
@@ -190,6 +197,35 @@ fi
 # would replace this process before it could.
 rc=0
 "${CMD[@]}" || rc=$?
+
+# RECLAIM, THEN RETRY ONCE (DMIW-7). The budget used to refuse an over-cap target
+# and stop there: refusing a build never shrinks the cache, so every lane failed
+# with 75 until a human cleared debug/ (60 GB, disk at 99%, 2026-10-16). Now a
+# refusal on size or free space runs the guard's reclaim under its exclusive
+# lease (this build's shared lease ended with the refused run): incremental/
+# first, then the least recently used dependency units, down to
+# AMUX_CARGO_RECLAIM_TO_GB; deploy/ and release/ are never touched. The build
+# is retried once only when the reclaim reached its goal; a deferral (another
+# build holds the lease or is running) or too little freed keeps the refusal.
+_reason=""
+if [ "$rc" -eq 75 ] && [ -s "${_SC_VERDICT:-}" ]; then
+  _reason=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("reason",""))' "$_SC_VERDICT" 2>/dev/null || true)
+fi
+if [ "$_reason" = target_size ] || [ "$_reason" = disk_reserve ]; then
+  _to_gb="${AMUX_CARGO_RECLAIM_TO_GB:-25}"
+  _reclaim_cmd=(python3 "$_target_guard" reclaim --max-gb "$_to_gb" --to-gb "$_to_gb")
+  for _t in "${_guard_cmd[@]:4}"; do [ "$_t" = --target ] || [ "$_t" = --exclusive-run ] || _reclaim_cmd+=(--target "$_t"); done
+  _reclaimed=$("${_reclaim_cmd[@]}" 2>/dev/null) || true
+  echo "safe-cargo.sh: budget refused ($_reason); reclaim: ${_reclaimed:-<no output>}" >&2
+  if printf '%s' "$_reclaimed" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("verdict") in ("cargo_reclaimed","cargo_reclaim_not_needed") and d.get("after_bytes",1) <= d.get("to_bytes",0) else 1)' 2>/dev/null; then
+    : > "$_SC_VERDICT"
+    echo "safe-cargo.sh: cargo_reclaimed; retrying the build once" >&2
+    rc=0
+    "${CMD[@]}" || rc=$?
+  else
+    echo "safe-cargo.sh: reclaim deferred or freed too little; the refusal stands (exit 75)" >&2
+  fi
+fi
 if [ -n "$_receipt" ]; then
   "$_receipt" "$rc" "$@"
 fi

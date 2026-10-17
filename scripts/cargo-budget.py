@@ -61,6 +61,25 @@ def emit(event, **fields):
     print(json.dumps(dict(event=event, **fields)), file=sys.stderr, flush=True)
 
 
+def write_verdict(**fields):
+    """Hand a pre-start refusal's reason to safe-cargo (DMIW-7), which can reclaim and
+    retry once. stderr carries the build's own output, so it is not the channel."""
+    path = os.environ.get('AMUX_CARGO_BUDGET_VERDICT')
+    if path:
+        try:
+            Path(path).write_text(json.dumps(fields))
+        except OSError:
+            pass  # without the file safe-cargo simply does not retry; the refusal stands
+
+
+def max_target_bytes():
+    """AMUX_CARGO_MAX_TARGET_MB, when set, so a test can exceed the cap with a few
+    megabytes instead of tens of gigabytes; otherwise AMUX_CARGO_MAX_TARGET_GB."""
+    if os.environ.get('AMUX_CARGO_MAX_TARGET_MB'):
+        return positive('AMUX_CARGO_MAX_TARGET_MB', 1) * 1024**2
+    return positive('AMUX_CARGO_MAX_TARGET_GB', 40) * 1024**3
+
+
 def positive(name, default):
     value = int(os.environ.get(name, default))
     if value <= 0:
@@ -278,9 +297,12 @@ def supervise(command, targets, *, max_rss, max_seconds, max_target, min_free,
         # the distinction is the whole fix, and collapsing it would retire the
         # budget rather than repair it.
         if size > max_target or free < min_free:
+            reason = 'target_size' if size > max_target else 'disk_reserve'
             emit('cargo_budget_refused', measured=True, target_bytes=size, free_bytes=free,
                  total_bytes=total, profile=profile, dominant=dominant(), by_profile=profiles,
-                 reason='target_size' if size > max_target else 'disk_reserve')
+                 reason=reason)
+            write_verdict(event='cargo_budget_refused', reason=reason, target_bytes=size,
+                          free_bytes=free, max_target_bytes=max_target)
             return 75
     emit('cargo_budget_started', max_rss_bytes=max_rss, max_seconds=max_seconds,
          max_target_bytes=max_target, min_free_bytes=min_free,
@@ -389,7 +411,7 @@ def main():
         return supervise(command, targets, profile=profile_dir(command),
                          max_rss=positive('AMUX_CARGO_MAX_RSS_MB', 12288) * 1024**2,
                          max_seconds=positive('AMUX_CARGO_MAX_SECONDS', 3600),
-                         max_target=positive('AMUX_CARGO_MAX_TARGET_GB', 40) * 1024**3,
+                         max_target=max_target_bytes(),
                          min_free=positive('AMUX_CARGO_MIN_FREE_GB', 4) * 1024**3)
     except (OSError, ValueError) as error:
         emit('cargo_budget_refused', measured=False, reason=str(error))

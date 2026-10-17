@@ -112,6 +112,15 @@ export AMUX_NO_SELF_ADOPT=1
 # not turn monitoring into a silent absence.
 export AMUX_ISOLATED=1
 
+# BUILT THROUGH safe-cargo, then exec'd (DMIW-7). This was `exec cargo run`, the
+# one build path in the repo that skipped the wrapper: no budget, no reclaim on an
+# over-cap target, no concurrency slot. The target dir is unchanged (AMUX-2961
+# below); only the build goes through the sanctioned path.
+serve_built() {
+  "$REPO/scripts/safe-cargo.sh" build -p amux-server || exit $?
+  exec "$CARGO_TARGET_DIR/debug/amux-server"
+}
+
 dirty="$(git -C "$REPO" status --porcelain -- crates/ Cargo.toml Cargo.lock 2>/dev/null || true)"
 
 # CI builds the server ONCE per run (rust.yml `server-bin`) and hands every
@@ -125,7 +134,7 @@ fi
 if [ "${AMUX_E2E_WORKING_TREE:-0}" = "1" ]; then
   echo "[e2e] SOURCE: the WORKING TREE at $REPO — NOT committed HEAD (AMUX_E2E_WORKING_TREE=1)."
   echo "[e2e] A peer mid-edit in this shared checkout can fail this run; that is the trade you asked for."
-  exec cargo run -p amux-server
+  serve_built
 fi
 
 if [ -n "$dirty" ]; then
@@ -252,4 +261,4 @@ else
   echo "[e2e] SOURCE: the WORKING TREE at $REPO — NOT committed HEAD."
 fi
 
-exec cargo run -p amux-server
+serve_built

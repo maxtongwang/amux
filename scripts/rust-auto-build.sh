@@ -620,14 +620,50 @@ fi
       echo "== WARN cargo_reclaim_deferred DEFERRED path=$candidate $result; retry after builds finish."
     fi
   }
+  # RECLAIM, NOT WIPE (DMIW-7). Over the threshold this used to clear ALL of
+  # debug/, so every lane's next check or test rebuilt the world cold. The guard's
+  # reclaim clears incremental/ first, then the least recently used dependency
+  # units, only down to AMUX_CARGO_RECLAIM_TO_GB (25), under the same lease, locks
+  # and process probe; deploy/ and release/ are protected. It measures the
+  # reclaimable profiles itself, so this tick needs no separate du.
   DEBUG_DIR="$HOME/.amux/rust-build-target/debug"
   if [ -d "$DEBUG_DIR" ]; then
-    DEBUG_GB=$(du -sk "$DEBUG_DIR" 2>/dev/null | awk '{print int($1/1048576)}')
-    if [ "${DEBUG_GB:-0}" -gt "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-32}" ]; then
-      echo "== DEBUG ARTIFACTS: ${DEBUG_GB:-?}GB in $DEBUG_DIR. Clearing eligible artifacts only after the Cargo safety guard permits it."
-      reclaim_target "$HOME/.amux/rust-build-target" "$DEBUG_DIR"
+    if [ -n "${AMUX_BUILD_PEER_PIDS_OVERRIDE:-}" ]; then
+      echo "== WARN cargo_reclaim_deferred DEFERRED: peer build(s) in flight (pid $AMUX_BUILD_PEER_PIDS_OVERRIDE); retry after builds finish."
+    else
+      reclaim_cmd=(python3 "$REPO/scripts/cargo-target-guard.py" reclaim --target "$HOME/.amux/rust-build-target"
+                   --max-gb "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-32}" --to-gb "${AMUX_CARGO_RECLAIM_TO_GB:-25}")
+      if result=$("${reclaim_cmd[@]}"); then
+        case "$result" in *cargo_reclaimed*) echo "== DEBUG ARTIFACTS over ${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-32}GB: Clearing incremental and least recently used units: cargo_reclaim_result $result" ;; esac
+      else
+        echo "== WARN cargo_reclaim_deferred DEFERRED target=$HOME/.amux/rust-build-target $result; retry after builds finish."
+      fi
     fi
   fi
+
+  # NIGHTLY SWEEP (DMIW-7): once a day after AMUX_CARGO_SWEEP_HOUR (03), remove
+  # incremental sessions and dependency units nobody has used for 2 days, from the
+  # shared target and the e2e HEAD target. A deferral leaves the day unstamped, so
+  # the next idle tick retries.
+  SWEEP_STAMP="$HOME/.amux/cargo-sweep.stamp"
+  if [ "$(date +%H)" -ge "${AMUX_CARGO_SWEEP_HOUR:-03}" ] && [ "$(cat "$SWEEP_STAMP" 2>/dev/null)" != "$(date +%F)" ]; then
+    sweep_cmd=(python3 "$REPO/scripts/cargo-target-guard.py" sweep)
+    for cand in "$HOME/.amux/rust-build-target" "$HOME/.amux/rust-build-target-e2e-head"; do
+      [ -d "$cand" ] && sweep_cmd+=(--target "$cand")
+    done
+    if [ "${#sweep_cmd[@]}" -gt 3 ]; then
+      if result=$("${sweep_cmd[@]}"); then
+        echo "== cargo_sweep_result $result"
+        date +%F > "$SWEEP_STAMP"
+      else
+        echo "== WARN cargo_sweep_deferred DEFERRED $result; retry on a later tick."
+      fi
+    fi
+  fi
+
+  # DISK ALARM (DMIW-7): the leads below AMUX_DISK_ALARM_LEADS_GB (50) free, plus a
+  # push to the owner below AMUX_DISK_ALARM_OWNER_GB (20). Deduped in its own state.
+  python3 "$REPO/scripts/disk-alarm.py" "$HOME" || echo "== WARN disk_alarm_failed exit=$?"
 
   FREE_GB=$(df -Pk "$HOME" | awk 'NR==2{print int($4/1048576)}')
   if [ "${FREE_GB:-999}" -lt "${AMUX_BUILD_MIN_FREE_GB:-25}" ]; then

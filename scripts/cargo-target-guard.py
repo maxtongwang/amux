@@ -354,22 +354,30 @@ def last_used(path):
     return newest
 
 
+# Where one compiled unit leaves its outputs inside a profile. A unit is removed
+# from all of them together, so no half-unit is left for Cargo to trip over: a
+# missing output makes Cargo rebuild that unit, which is the intended cost.
+UNIT_DIRS = ('deps', 'build', '.fingerprint', 'examples')
+
+
 def reclaimable_profiles(target):
     if not target.is_dir():
         return []
     return sorted(p for p in target.iterdir()
                   if p.is_dir() and not p.is_symlink() and not p.name.startswith('.')
-                  and p.name not in PROTECTED_PROFILES and (p / 'deps').is_dir() | (p / 'incremental').is_dir())
+                  and p.name not in PROTECTED_PROFILES
+                  and any((p / d).is_dir() for d in (*UNIT_DIRS, 'incremental')))
 
 
 def dep_units(profiles):
-    """{(profile, unit key): [paths]} for every output under <profile>/deps."""
+    """{(profile, unit key): [paths]} for every compiled unit's outputs in a profile."""
     units = {}
     for profile in profiles:
-        deps = profile / 'deps'
-        if deps.is_dir():
-            for entry in deps.iterdir():
-                units.setdefault((profile, unit_key(entry.name)), []).append(entry)
+        for sub in UNIT_DIRS:
+            folder = profile / sub
+            if folder.is_dir() and not folder.is_symlink():
+                for entry in folder.iterdir():
+                    units.setdefault((profile, unit_key(entry.name)), []).append(entry)
     return units
 
 
@@ -378,7 +386,7 @@ def remove(path, locks):
         clear_preserving_locks(path, locks)
 
 
-def reclaim(targets, max_bytes, to_bytes, *, now=None, process_probe=active_processes):
+def reclaim(targets, max_bytes, to_bytes, *, process_probe=active_processes):
     """Over max_bytes of reclaimable profiles: clear incremental/ first, then the
     least recently used dependency units, until at or under to_bytes."""
     with exclusive(targets, process_probe) as (locks, considered):
@@ -467,6 +475,7 @@ def main():
     parser.add_argument('--to-gb', type=float, default=float(os.environ.get('AMUX_CARGO_RECLAIM_TO_GB', 25)),
                         help='reclaim: stop at or under this')
     parser.add_argument('--idle-s', type=int, default=SWEEP_IDLE_S, help='sweep: unused for this long')
+    parser.add_argument('--now', type=float, help='sweep: the current time (a test clock)')
     # Parse command separately: argparse REMAINDER would swallow guard options.
     argsv = sys.argv[1:]
     command = []
@@ -490,7 +499,7 @@ def main():
         if args.action in ('reclaim', 'sweep'):
             probe = test_probe(targets, []) or active_processes
             result = (reclaim(targets, int(args.max_gb * GB), int(args.to_gb * GB), process_probe=probe)
-                      if args.action == 'reclaim' else sweep(targets, args.idle_s, process_probe=probe))
+                      if args.action == 'reclaim' else sweep(targets, args.idle_s, now=args.now, process_probe=probe))
             clear_streak(targets)
             print(json.dumps(result))
             return 0
