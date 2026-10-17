@@ -2813,6 +2813,7 @@ pub async fn run_scheduler(
             // orphan (a manual shell run is a different subsystem too, and
             // shares this same block).
             let s = crate::api::session_verbs::reconcile_orphaned_steering_claims(conn)?;
+            let r = crate::api::session_verbs::repair_transcript_inferred_receipts(conn)?;
             if s > 0 {
                 tracing::warn!(
                     orphaned_steering_claims = s,
@@ -2821,7 +2822,7 @@ pub async fn run_scheduler(
                 );
             }
             Ok(WriteOutcome {
-                applied: n > 0 || c > 0 || s > 0,
+                applied: n > 0 || c > 0 || s > 0 || r > 0,
                 events: vec![],
             })
         })

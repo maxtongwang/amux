@@ -23976,6 +23976,25 @@ fn mark_transcript_inferred_delivery(conn: &rusqlite::Connection, queue_id: &str
     Ok(())
 }
 
+/// Backfill inference markers left by older builds without overriding an
+/// acceptance already decided by message ID. Called in the startup transaction.
+pub(crate) fn repair_transcript_inferred_receipts(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<usize> {
+    let marked = conn.execute(
+        "UPDATE cmd_history SET reconciled_at=?1 WHERE reconciled_at IS NULL \
+         AND EXISTS(SELECT 1 FROM steering_history h \
+                    WHERE h.id=cmd_history.queue_id AND h.outcome=?2) \
+         AND NOT EXISTS(SELECT 1 FROM send_dedup d \
+                        WHERE d.session=cmd_history.session AND d.msg_id=cmd_history.msg_id \
+                        AND d.receipt_id IS NOT NULL)",
+        rusqlite::params![now_i64() * 1000, TRANSCRIPT_INFERRED_OUTCOME],
+    )?;
+    tracing::info!(verdict = "transcript_inferred_rows_marked", measured = true,
+        n_considered = marked, "startup repaired historical transcript-inferred receipt markers");
+    Ok(marked)
+}
+
 pub fn reconcile_orphaned_steering_claims(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
     reconcile_orphaned_steering_claims_with(conn, orphan_landing)
 }
@@ -43963,6 +43982,85 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
              AND msg_id='inferred-id' AND receipt_id IS NOT NULL", [], |r| r.get(0),
         ).unwrap();
         assert_eq!(accepted, 0, "receipt resolution must not persist acceptance");
+    }
+
+    #[tokio::test]
+    async fn startup_repairs_old_transcript_inference_without_overriding_receipts() {
+        let (state, _dir) = state();
+        let before_ms = now_i64() * 1000;
+        state.store.write_async(move |conn| {
+            // state() installs the real schema and receipt triggers. Inserting
+            // history after linking reproduces the old build's confirmed row.
+            for (msg_id, outcome, marker) in [
+                ("missing-reservation", TRANSCRIPT_INFERRED_OUTCOME, None),
+                ("unreceipted", TRANSCRIPT_INFERRED_OUTCOME, None),
+                ("receipted", TRANSCRIPT_INFERRED_OUTCOME, None),
+                ("id-delivered", "sent: delivered by queue ID", None),
+                ("already-marked", TRANSCRIPT_INFERRED_OUTCOME, Some(1234_i64)),
+            ] {
+                conn.execute(
+                    "INSERT INTO cmd_history(text,type,session,ts,delivery,queue_id,msg_id,reconciled_at) \
+                     VALUES('old delivery','user','upgrade-inferred',?1,'queued',?2,?2,?3)",
+                    rusqlite::params![before_ms, msg_id, marker],
+                )?;
+                conn.execute(
+                    "INSERT INTO steering_history(id,session,text,queued_at,delivered_at,outcome) \
+                     VALUES(?1,'upgrade-inferred','old delivery',?2,?2,?3)",
+                    rusqlite::params![msg_id, now_f64(), outcome],
+                )?;
+            }
+            conn.execute(
+                "INSERT INTO send_dedup(session,msg_id,ts,receipt_id) VALUES \
+                 ('upgrade-inferred','unreceipted',?1,NULL), \
+                 ('upgrade-inferred','receipted',?1,'authoritative-id')",
+                [now_i64()],
+            )?;
+            let old_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM cmd_history WHERE session='upgrade-inferred' \
+                 AND submit_verdict='confirmed' AND delivered_at IS NOT NULL AND reconciled_at IS NULL",
+                [], |r| r.get(0),
+            )?;
+            assert_eq!(old_rows, 4, "exercise the migrated trigger's old-style confirmations");
+            assert_eq!(repair_transcript_inferred_receipts(conn)?, 2);
+            // Removing AND reconciled_at IS NULL makes this rerun count nonzero
+            // and overwrites the preexisting marker checked below.
+            assert_eq!(repair_transcript_inferred_receipts(conn)?, 0);
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+
+        for msg_id in ["missing-reservation", "unreceipted"] {
+            let at: Option<i64> = state.store.read().unwrap().query_row(
+                "SELECT reconciled_at FROM cmd_history WHERE session='upgrade-inferred' AND msg_id=?1",
+                [msg_id], |r| r.get(0),
+            ).unwrap();
+            // Removing SET reconciled_at=?1 (leaving it unchanged) makes both
+            // this timestamp assertion and the accepted=false assertion red.
+            assert!(at.is_some_and(|at| (before_ms..=now_i64() * 1000).contains(&at)),
+                "upgrade repair must mark inference in milliseconds: {msg_id}: {at:?}");
+            let response = send_receipt_resolving(&state, "upgrade-inferred", msg_id, "").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let value: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap(),
+            ).unwrap();
+            assert_eq!(value["accepted"], false, "historical inference is not a receipt: {value}");
+        }
+        for (msg_id, expected) in [("receipted", None), ("id-delivered", None), ("already-marked", Some(1234_i64))] {
+            let at: Option<i64> = state.store.read().unwrap().query_row(
+                "SELECT reconciled_at FROM cmd_history WHERE session='upgrade-inferred' AND msg_id=?1",
+                [msg_id], |r| r.get(0),
+            ).unwrap();
+            // Removing the NOT EXISTS send_dedup clause marks "receipted";
+            // removing h.outcome=?2 marks "id-delivered".
+            assert_eq!(at, expected, "preserve authoritative and unrelated rows: {msg_id}");
+        }
+        let response = send_receipt_resolving(&state, "upgrade-inferred", "receipted", "").await;
+        let value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap(),
+        ).unwrap();
+        // Removing the resolver's `if receipted { return base; }` branch
+        // loses this authoritative ID and synthesizes a different receipt.
+        assert_eq!(value["accepted"], true, "ID-based acceptance survives upgrade: {value}");
+        assert_eq!(value["id"], "authoritative-id", "preserve the original receipt: {value}");
     }
 
     #[tokio::test]
