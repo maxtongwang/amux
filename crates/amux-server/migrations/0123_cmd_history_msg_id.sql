@@ -1,0 +1,15 @@
+-- 0123_cmd_history_msg_id.sql: the send's message ID on its history row.
+--
+-- A send's receipt is decided ONLY by its unique message ID (dev-lead
+-- 2026-10-17, after three review rounds of PR #9 each found a receipt hole in
+-- text or time-window matching). The send handler writes the request's msg_id
+-- onto the row it records; the receipt read matches that column and nothing
+-- else. NULL on every existing row: a row without an ID never confirms a send.
+--
+-- reconciled_at is set when a row's delivery was inferred from its TEXT (a
+-- matching submitted prompt, or a queue drain that could not find the row by
+-- its queue ID). It keeps the Messages tab's view, and the receipt read treats
+-- such a row as undelivered, since the text may be another send's.
+-- ADDCOL: cmd_history msg_id TEXT
+-- ADDCOL: cmd_history reconciled_at INTEGER
+CREATE INDEX IF NOT EXISTS idx_cmd_history_session_msg_id ON cmd_history(session, msg_id);
