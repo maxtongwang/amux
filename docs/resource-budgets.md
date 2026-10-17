@@ -90,8 +90,30 @@ full mode and CI. `python3 scripts/test-cargo-budget.py` exercises real disposab
 memory-heavy child processes, timeouts, signal forwarding, target growth,
 low-space refusal, unmeasured probes, wrapper defaults, peer survival, and
 unchanged-source retry backoff. `scripts/test-cargo-target-guard.py` exercises
-target leases and safe idle reclaim. Rust coverage additionally protects an
-arbitrarily named target holding a live lease.
+target leases and safe idle reclaim, including writer preference for a starved
+reclaim: back-to-back builds, stale and orphaned pending markers, and its bounds.
+Rust coverage additionally protects an arbitrarily named target holding a live lease.
 
 Validation results and final deployed identity are recorded in the accompanying
 resource validation report; these tests do not certify unrelated lifecycle UX.
+
+## Reclaim writer preference
+
+Builds hold the target lease shared, and flock gives a waiting exclusive reclaim
+no priority, so overlapping builds could defer it indefinitely while the budget
+refused every new build. After consecutive busy-lease deferrals, the reclaim
+writes `.<target>.reclaim.pending` beside the lease (pid, time, streak) and waits
+for running builds. New `cargo-target-guard.py run` builds wait behind a fresh
+marker; running builds are never interrupted. The verdict adds `priority`,
+`waited_s` and `pending_streak`; builds log `cargo_reclaim_pending*` lines.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AMUX_CARGO_RECLAIM_PRIORITY_AFTER` | 3 | Busy deferrals before the reclaim takes priority; 0 disables |
+| `AMUX_CARGO_RECLAIM_PRIORITY_WAIT_S` | 1800 | Reclaimer's wait for running builds before deferring |
+| `AMUX_CARGO_RECLAIM_BUILD_WAIT_S` | 3600 | New build's wait behind a marker before leasing anyway |
+| `AMUX_CARGO_RECLAIM_PENDING_MAX_AGE_S` | 3600 | Older markers, or ones whose pid is gone, are ignored |
+| `AMUX_CARGO_RECLAIM_POLL_S` | 2 | Poll interval for both waits |
+
+A build nested inside a leased build of the same target (listed in
+`AMUX_CARGO_GUARD_LEASED`) neither waits nor makes a reclaim wait for its ancestor.
