@@ -27,13 +27,13 @@ export default defineConfig({
   retries: 0,
   projects: base.projects!.map((project, index) => ({
     ...project, workers: 1, // serialize every mutation within this project
-    use: { ...project.use, baseURL: `https://localhost:${firstPort + index * 10}` },
+    use: { ...project.use, baseURL: `https://127.0.0.1:${firstPort + index * 10}` },
   })),
   webServer: (base.webServer as any[]).map((server, index) => ({
     ...server,
     command: `bash ${path.join(__dirname, 'serve.sh')}`,
-    url: `https://localhost:${firstPort + index * 10}/health`,
-    env: { ...server.env, AMUX_LIFECYCLE_BROWSER_TTL_S: process.env.AMUX_LIFECYCLE_BROWSER_TTL_S || '', AMUX_RS_PORT: String(firstPort + index * 10), TMUX_TMPDIR: socketRoot() },
+    url: `https://127.0.0.1:${firstPort + index * 10}/health`,
+    env: { ...server.env, AMUX_BIND: '127.0.0.1', AMUX_LIFECYCLE_BROWSER_TTL_S: process.env.AMUX_LIFECYCLE_BROWSER_TTL_S || '', AMUX_RS_PORT: String(firstPort + index * 10), TMUX_TMPDIR: socketRoot() },
   })).filter((_, index) => !selected.length || selected.includes(base.projects![index].name!)),
   outputDir: path.join(output, 'browser-artifacts'),
   reporter: [

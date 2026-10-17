@@ -4,11 +4,13 @@ set -euo pipefail
 test -x "$AMUX_LIFECYCLE_BINARY"
 for key in ${!AMUX_@}; do
   case "$key" in
-    AMUX_HOME|AMUX_RS_PORT|AMUX_RS_NO_LOOPBACK_BYPASS|AMUX_LIFECYCLE_BROWSER_TTL_S|AMUX_LIFECYCLE_BINARY|AMUX_LIFECYCLE_ASSET_MANIFEST|AMUX_LIFECYCLE_OUTPUT) ;;
+    AMUX_HOME|AMUX_BIND|AMUX_RS_PORT|AMUX_RS_NO_LOOPBACK_BYPASS|AMUX_LIFECYCLE_BROWSER_TTL_S|AMUX_LIFECYCLE_BINARY|AMUX_LIFECYCLE_ASSET_MANIFEST|AMUX_LIFECYCLE_OUTPUT) ;;
     *) unset "$key" ;;
   esac
 done
 unset TMUX TMUX_PANE
+# Unsigned fixture servers must never request incoming LAN connections on macOS.
+export AMUX_BIND=127.0.0.1
 export AMUX_ISOLATED=1 AMUX_NO_SELF_ADOPT=1
 if [[ -n "${AMUX_LIFECYCLE_BROWSER_TTL_S:-}" ]]; then
   # Global isolation suppresses the reaper too. Opt in only that job using

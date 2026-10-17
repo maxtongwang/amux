@@ -16,7 +16,7 @@ test('the complete browser population is covered', () => {
 for (const target of TARGETS) {
   test(`${target.name} preserves device settings and common use keys`, () => {
     const project = buildProject(target);
-    const origin = `https://localhost:${target.port}`;
+    const origin = `https://127.0.0.1:${target.port}`;
     assert.equal(project.name, target.name);
     for (const [key, value] of Object.entries(target.use)) {
       assert.deepEqual(project.use[key], value, `${target.name}: lost device key ${key}`);

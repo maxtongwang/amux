@@ -10,7 +10,7 @@ try:
     for _ in range(120):
         if server.poll() is not None:raise RuntimeError('isolated server exited: '+str(server.returncode))
         try:
-            with urllib.request.urlopen(f'https://localhost:{a.port}/health',context=ssl._create_unverified_context(),timeout=1) as r:health=json.load(r)
+            with urllib.request.urlopen(f'https://127.0.0.1:{a.port}/health',context=ssl._create_unverified_context(),timeout=1) as r:health=json.load(r)
             if health['pid']==server.pid:break
         except Exception:pass
         time.sleep(.25)
@@ -21,7 +21,7 @@ try:
         server.poll()  # Reap the initial process while UI exercises server restart.
         time.sleep(.25)
     try:
-        with urllib.request.urlopen(f'https://localhost:{a.port}/health',context=ssl._create_unverified_context(),timeout=2) as r:final_health=json.load(r)
+        with urllib.request.urlopen(f'https://127.0.0.1:{a.port}/health',context=ssl._create_unverified_context(),timeout=2) as r:final_health=json.load(r)
         (out/'health-end.json').write_text(json.dumps(final_health,indent=2))
     except Exception as e:(out/'health-end.json').write_text(json.dumps({'error':str(e)}))
     raise SystemExit(result.returncode)

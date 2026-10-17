@@ -30,7 +30,7 @@ export function buildProject(t) {
       ...t.use,
       // Retain failure traces on iOS; other projects keep the default recording policy.
       trace: t.name === 'ios-safari' ? 'retain-on-failure' : 'off',
-      baseURL: `https://localhost:${t.port}`,
+      baseURL: `https://127.0.0.1:${t.port}`,
       // WALKTHROUGH OFF BY DEFAULT, like the config service-worker policy (AMUX-4986/4987). `_wtMaybeStart` opens it 1500ms after
       // load when `sessions.length === 0`, which is the NORMAL state of every CI
       // project's isolated server, and `#wt-tooltip` then eats the click until
@@ -39,7 +39,7 @@ export function buildProject(t) {
       storageState: {
         cookies: [],
         origins: [{
-          origin: `https://localhost:${t.port}`,
+          origin: `https://127.0.0.1:${t.port}`,
           localStorage: [{ name: 'amux_walkthrough_done', value: '1' }],
         }],
       },
