@@ -14,6 +14,9 @@ import time
 import unittest
 from unittest.mock import patch
 
+# Never inherit a live fleet endpoint, including in BuildRetryTests.
+os.environ['AMUX_URL'] = 'http://127.0.0.1:1'
+
 ROOT = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('budget', ROOT / 'cargo-budget.py')
 budget = importlib.util.module_from_spec(spec)

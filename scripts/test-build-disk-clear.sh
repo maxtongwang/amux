@@ -19,7 +19,7 @@ SCRIPT="$(pwd)/scripts/rust-auto-build.sh"
 SELF="$(pwd)/scripts/test-build-disk-clear.sh"
 PASS=0; FAIL=0
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/amux-cargo-guard-test.XXXXXX");
-export AMUX_CARGO_GUARD_TEST_FIXTURE="$TMP"; trap 'rm -rf "$TMP"' EXIT
+export AMUX_CARGO_GUARD_TEST_FIXTURE="$TMP"; trap 'rm -rf "${TMP:?}"' EXIT
 # AF-675: an abort under `set -euo pipefail` used to print NOTHING before this
 # -- the only signal was the ABSENCE of the summary line at the bottom, which
 # is exactly the symptom that made the original AMUX-134 outage hard to read
@@ -322,9 +322,8 @@ else
   out9=$(HOME="$h" AMUX_RS_BUILD_LOG="$h/build.log" AMUX_BUILD_MIN_FREE_GB=0 \
     AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB=0 AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB=-1 \
     AMUX_CARGO_GUARD_TEST_FIXTURE= AMUX_RS_DISK_CLEAR_ONLY=1 bash "$SCRIPT" >/dev/null 2>&1; cat "$h/build.log" 2>/dev/null)
-  # A successfully killed decoy makes `wait` report its signal status. That is
-  # expected cleanup, not a harness failure under `set -e`.
-  kill "$DECOY" 2>/dev/null; wait "$DECOY" 2>/dev/null || true
+  # Let the short-lived fixture exit naturally; no process signals are needed.
+  wait "$DECOY" 2>/dev/null || true
   # PROVE THE PROBE RAN before believing its negative (ethos rule 4). This cell
   # asserted only the ABSENCE of "DEFERRED", and a script that died before
   # reaching the decision produces exactly that log. It did: the first cut of
