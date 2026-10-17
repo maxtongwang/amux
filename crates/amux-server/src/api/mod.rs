@@ -78,6 +78,7 @@ pub mod map;
 pub mod mcp;
 pub mod mdai;
 pub mod measured;
+pub(crate) mod max_ref;
 pub mod needs_input;
 pub mod needs_input_auto;
 pub mod memories;
@@ -152,7 +153,6 @@ mod worker_messaging;
 mod mention_grants;
 pub mod workers_deadletters;
 pub(crate) mod delegation;
-pub(crate) mod max_ref;
 
 use crate::db::SharedStore;
 use axum::Router;
