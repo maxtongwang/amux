@@ -701,6 +701,10 @@ jobs:
       # server test while bypassing all of them.
       - name: CLI register, exec and keys go through the server
         run: ./scripts/test-cli-register-through-server.sh
+      # The shared hermetic environment every CLI test sources: it must pin
+      # HOME/CC_HOME/AMUX_HOME and refuse the real home or a reachable endpoint.
+      - name: CLI test isolation refuses the live home
+        run: ./scripts/test-test-isolation.sh
       # AMUX-4705: a piped brief splits into a one-line title and a body. Its
       # own step because the failure is silent: the card is created, exit 0, and
       # the title is a paragraph.

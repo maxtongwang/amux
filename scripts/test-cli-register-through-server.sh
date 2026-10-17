@@ -26,15 +26,11 @@ TMP=$(mktemp -d); [ -n "${KEEP:-}" ] && echo "TMP=$TMP"
 trap '[ -z "${KEEP:-}" ] && rm -rf "$TMP"; [ -n "${REC_PID:-}" ] && kill "$REC_PID" 2>/dev/null || true' EXIT
 mkdir -p "$TMP/.amux/sessions" "$TMP/bin" "$TMP/work"
 
-# HERMETIC, OR IT TALKS TO THE LIVE SERVER. The CLI reads CC_HOME before HOME
-# and heals a loopback AMUX_API to $CC_HOME/endpoint.json's canonical_url, so a
-# run inside a lane (CC_HOME=~/.amux exported) sent every request below to the
-# real server and created real workers (found writing this cell, 2026-10-16).
-# Pin CC_HOME into the temp home, drop every lane identity and tmux handle,
-# and refuse to run if the CLI could still resolve a real endpoint.
-export HOME="$TMP" CC_HOME="$TMP/.amux"
-unset AMUX_SESSION AMUX_WORKER AMUX_WORKER_TOKEN TMUX TMUX_PANE AMUX_HOME 2>/dev/null || true
-[ ! -e "$CC_HOME/endpoint.json" ] || { echo "FAIL: refusing to run with an endpoint.json in $CC_HOME"; exit 1; }
+# HERMETIC, OR IT TALKS TO THE LIVE SERVER: a first draft of this cell pinned
+# only HOME and created workers on the live fleet (scripts/lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source scripts/lib/test-isolation.sh
+amux_test_isolate "$TMP" || exit 1
 
 # A tmux that records instead of acting, so a raw pane write is observable.
 cat > "$TMP/bin/tmux" <<SH
@@ -109,7 +105,7 @@ done
 
 export AMUX_API="http://127.0.0.1:$PORT" AMUX_URL="http://127.0.0.1:$PORT"
 export PATH="$TMP/bin:$PATH"
-unset AMUX_SESSION AMUX_WORKER AMUX_WORKER_TOKEN TMUX 2>/dev/null || true
+amux_test_assert_isolated || exit 1
 
 check() { if [ "$2" = "1" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); echo "  FAIL  $1"; fi; }
 # Did the recorder see a request matching a python predicate over r?
