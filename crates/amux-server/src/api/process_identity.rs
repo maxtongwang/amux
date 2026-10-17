@@ -189,15 +189,22 @@ fn pane_map() -> Result<HashMap<u32, String>, String> {
     Ok(map)
 }
 
-/// A `tmux list-panes` result as an inventory. No running server is an
-/// authoritative empty inventory (no pane exists, so no worker does); any other
-/// failure is an error, never an empty map.
+/// A `tmux list-panes` result as an inventory. Only tmux reporting that no
+/// server runs is an authoritative empty inventory; any other failure is an
+/// error, never an empty map.
 fn panes_from_output(ok: bool, stdout: &str, stderr: &str) -> Result<HashMap<u32, String>, String> {
     if ok {
         return Ok(parse_panes(stdout));
     }
+    // Absence is established only when the socket is not there: tmux says "no
+    // server running", or (tmux 3.6a, measured) "error connecting to <socket>
+    // (No such file or directory)". The backend launches every worker on this
+    // same default socket, so no socket means no worker pane. Any other
+    // connection error (review round 2: "Permission denied" can hide a running
+    // server; "Connection refused") is a FAILED lookup and an error.
     let err = stderr.trim();
-    if err.starts_with("no server running") || err.starts_with("error connecting to") {
+    let socket_missing = err.starts_with("error connecting to") && err.ends_with("(No such file or directory)");
+    if err.starts_with("no server running") || socket_missing {
         return Ok(HashMap::new());
     }
     Err(if err.is_empty() { "tmux list-panes failed with no message".into() } else { err.chars().take(200).collect() })
@@ -932,11 +939,48 @@ mod tests {
         assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "listed: it is caller: {v}");
     }
 
+    /// Review round 2: the parser's verdict on real tmux diagnostics, carried
+    /// through the shipped middleware. Only "no server running" may read as an
+    /// empty inventory; a connection error must refuse.
+    #[tokio::test]
+    async fn tmux_connection_errors_refuse_through_the_middleware() {
+        let (state, dir, guard) = fixture();
+        let _h = crate::api::settings::test_env::set_home(dir.path());
+        drop(guard);
+        for stderr in [
+            "error connecting to /tmp/tmux-501/default (Permission denied)",
+            "error connecting to /tmp/tmux-501/default (Connection refused)",
+            "lost server",
+            "",
+        ] {
+            let inv = panes_from_output(false, "", stderr);
+            let r = test_support::set_resolver(Arc::new(InventoryResolver(inv)));
+            let (st, v) = post(&app(state.clone()), OWNER, &[]).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_origin_unattributed")), "{stderr:?}: {v}");
+            drop(r);
+        }
+        assert!(queued_senders(&state).is_empty(), "no diagnostic lets a worker through as the owner");
+        // The one authoritative absence: no tmux server means no worker pane,
+        // so a readable chain with no pane is outside.
+        let r = test_support::set_resolver(Arc::new(InventoryResolver(panes_from_output(false, "", "no server running on /tmp/tmux-501/default"))));
+        let (st, v) = post(&app(state.clone()), OWNER, &[]).await;
+        assert!(st != StatusCode::FORBIDDEN || v["code"] != json!("worker_origin_unattributed"), "no server: {v}");
+        drop(r);
+    }
+
     #[test]
     fn tmux_output_is_an_inventory_only_when_it_succeeded_or_no_server_runs() {
         assert_eq!(panes_from_output(true, "7 amux-a\n", "").unwrap().get(&7).map(String::as_str), Some("amux-a"));
         assert!(panes_from_output(false, "", "no server running on /tmp/tmux-501/default\n").unwrap().is_empty());
-        assert!(panes_from_output(false, "", "error connecting to /tmp/tmux-501/default (No such file or directory)").unwrap().is_empty());
+        assert!(panes_from_output(false, "", "error connecting to /tmp/tmux-501/default (No such file or directory)\n").unwrap().is_empty(),
+            "no socket: tmux 3.6a's no-server message");
+        for denied in [
+            "error connecting to /tmp/tmux-501/default (Permission denied)",
+            "error connecting to /tmp/tmux-501/default (Connection refused)",
+            "error connecting to /tmp/tmux-501/default (No such file or directory) and more",
+        ] {
+            assert!(panes_from_output(false, "", denied).is_err(), "a failed connection proves nothing: {denied}");
+        }
         assert!(panes_from_output(false, "", "lost server\n").is_err());
         assert!(panes_from_output(false, "", "").is_err(), "a silent failure is an error, not an empty fleet");
     }
