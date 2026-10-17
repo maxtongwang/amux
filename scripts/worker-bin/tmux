@@ -207,7 +207,9 @@ while [ "$i" -lt "$n" ]; do
     [ "$names" -eq 1 ] && case "${a: -1}" in n|s) skip_value=1 ;; esac
   elif [ "$runs" -eq 1 ]; then
     # Nested command text: split on whitespace, quotes, braces and ";".
-    words="$(printf '%s' "$a" | tr "\"'{}();\\\\\t\n" '          ')"
+    # Shell operators split words too, so `kill-server>/dev/null`, `|`, `&&`, `$(...)` and backticks
+    # cannot glue a kill to its neighbour (run-shell and friends run this text through /bin/sh).
+    words="$(printf '%s' "$a" | tr "\"'{}();\\\\\t\n<>|&\`\$=,!" '                   ')"
     for w in $words; do
       is_protected_word "$w" && refuse "$w (inside: $a)"
     done

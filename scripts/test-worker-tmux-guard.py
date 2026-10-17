@@ -146,6 +146,10 @@ class WorkerTmuxGuardTests(unittest.TestCase):
         self.assert_refused('bind-key', '-n', 'X', 'kill-server')
         self.assert_refused('run-shell', '-b', 'tmux kill-server')
         self.assert_refused('new-session', '-d', '-s', 'probe', 'tmux kill-server')
+        # Shell operators glued to the kill word (run-shell runs its text through /bin/sh).
+        for cmd in ('/opt/homebrew/bin/tmux kill-server>/dev/null', 'tmux kill-server|cat', 'tmux kill-server&&true',
+                    'tmux kill-session -t x;true', 'x=$(tmux kill-server)', 'echo `tmux kill-pane`', 'tmux kill-server 2>&1'):
+            self.assert_refused('run-shell', cmd)
 
     # --- pass-throughs ---------------------------------------------------------------
     def test_kill_on_other_socket_passes_with_exact_argv(self):
