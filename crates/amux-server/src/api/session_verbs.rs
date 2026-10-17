@@ -6679,6 +6679,8 @@ pub(crate) fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Resu
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN queue_id TEXT", []);
     // Migration 0088 carries the same ADDCOL for migrated DBs (F8(e)).
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN repeat_of INTEGER", []);
+    // Migration 0123: the send's message ID, the only key its receipt reads.
+    let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN msg_id TEXT", []);
     // Dead-lettered vs delivered must be distinguishable in history
     // (AMUX-3110; migration 0024 carries the same ADDCOL for migrated DBs,
     // this covers a DB bootstrapped through this legacy path).
@@ -9464,41 +9466,8 @@ fn send_receipt(state: &AppState, name: &str, msg_id: &str) -> Response {
     response
 }
 
-fn text_sha256(text: &str) -> String {
-    use sha2::Digest;
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(64);
-    for b in sha2::Sha256::digest(text.as_bytes()) {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
 
-/// Records what a reservation is FOR (AMUX-4594), so a later stranded check
-/// compares the transcript against the text that was reserved rather than
-/// whatever a caller claims.
-async fn send_dedup_note_text(state: &AppState, name: &str, msg_id: &str, text: &str) {
-    if msg_id.is_empty() {
-        return;
-    }
-    let (session, identity, sha) = (name.to_string(), msg_id.to_string(), text_sha256(text));
-    let _ = state
-        .store
-        .write_async(move |conn| {
-            conn.execute(
-                "UPDATE send_dedup SET text_sha=?1 WHERE session=?2 AND msg_id=?3 AND receipt_id IS NULL",
-                rusqlite::params![sha, session, identity],
-            )?;
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-        })
-        .await;
-}
 
-/// Longest text the stranded check will judge. Claude Code stores a pasted or
-/// multi-line prompt in a different shape than it was sent, so a miss on one
-/// could not be told from non-delivery, and releasing on that guess could
-/// deliver twice.
-const STRANDED_TEXT_MAX: usize = 800;
 
 /// Age after which a reservation no evidence can settle stops being "pending".
 /// A lane transcript tail cannot reach back this far, and a reservation from
@@ -9515,101 +9484,10 @@ fn stranded_expire_secs() -> i64 {
         .unwrap_or(86_400)
 }
 
-/// Whether a Claude transcript holds a user prompt that is exactly `text` (or
-/// `text` after an amux origin stamp), dated at or after `since` (unix seconds,
-/// the requested clock skew). `None` when the answer cannot be trusted: the file is
-/// unreadable, or the part read starts after `since`, which covers both a file
-/// too large for the tail read and a conversation that began after the
-/// reservation (the prompt could be in an older transcript).
-fn transcript_has_prompt_since(path: &std::path::Path, text: &str, since: i64, clock_skew_s: i64) -> Option<bool> {
-    use std::io::{Read, Seek, SeekFrom};
-    const TAIL: u64 = 16 * 1024 * 1024;
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let start = len.saturating_sub(TAIL);
-    f.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let hay = String::from_utf8_lossy(&buf);
-    let needle = serde_json::to_string(text).ok()?;
-    let needle = needle.trim_matches('"');
-    let stamped = format!("\n\n{text}");
-    let mut earliest: Option<i64> = None;
-    let mut found = false;
-    // A tail read can begin mid-line; the first partial line is skipped.
-    for line in hay.lines().skip(usize::from(start > 0)) {
-        let at_of = |v: &Value| {
-            v["timestamp"]
-                .as_str()
-                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                .map(|t| t.timestamp())
-        };
-        if earliest.is_none() && line.contains("\"timestamp\"") {
-            if let Ok(v) = serde_json::from_str::<Value>(line) {
-                earliest = at_of(&v);
-            }
-        }
-        if found || !line.contains(needle) || !line.contains("\"type\":\"user\"") {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(content) = v["message"]["content"].as_str() else {
-            continue;
-        };
-        if v["type"] == "user"
-            && (content == text || content.ends_with(&stamped))
-            && at_of(&v).map_or(clock_skew_s > 0, |t| t >= since - clock_skew_s)
-        {
-            found = true;
-        }
-    }
-    if found {
-        return Some(true);
-    }
-    match earliest {
-        Some(t) if t <= since => Some(false),
-        _ => None,
-    }
-}
 
 // Codex rollout recovery is positive-only: absence in a bounded/rotated log
 // cannot authorize a second delivery. Ignore assistant/tool text and require a
 // timestamp so an old occurrence cannot confirm a new message.
-fn codex_receipt_evidence(path: &Path, text: &str, since: i64) -> Option<bool> {
-    for v in iter_jsonl_tail(path, 16 * 1024 * 1024) {
-        let at = v["timestamp"]
-            .as_str()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|s| s.timestamp());
-        if !at.is_some_and(|at| at >= since) {
-            continue;
-        }
-        let payload = &v["payload"];
-        let content = if v["type"] == "event_msg" && payload["type"] == "user_message" {
-            payload["message"].as_str().map(str::to_owned)
-        } else if v["type"] == "response_item"
-            && payload["type"] == "message"
-            && payload["role"] == "user"
-        {
-            payload["content"].as_array().map(|parts| {
-                parts
-                    .iter()
-                    .filter(|part| part["type"] == "input_text")
-                    .filter_map(|part| part["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-        } else {
-            None
-        };
-        if content.as_deref() == Some(text) {
-            return Some(true);
-        }
-    }
-    None
-}
 
 fn stranded_answer(body: Value) -> Response {
     let mut response = j200(body);
@@ -9642,221 +9520,140 @@ async fn send_receipt_resolving(
     state: &AppState,
     name: &str,
     msg_id: &str,
-    text: &str,
+    _text: &str,
 ) -> Response {
+    // A RECEIPT IS DECIDED ONLY BY ITS MESSAGE ID (dev-lead 2026-10-17). Three
+    // review rounds of PR #9 each found a hole in matching by text or by time
+    // window: a receipt asked without text, a stuck row of another type, an
+    // EARLIER identical message settling a later one. So nothing here reads
+    // text or a transcript any more. Two facts carry the ID: the reservation
+    // (send_dedup) and the history row the send wrote with it (migration 0123).
+    // A row without this ID never confirms anything; no evidence reads
+    // pending, then expired, never "delivered". `text` is accepted for old
+    // clients and ignored.
     let base = send_receipt(state, name, msg_id);
-    // A FORGOTTEN RESERVATION IS NOT PROOF OF NON-DELIVERY (AMUX-5463). A send
-    // that ended stuck releases its reservation, so the sender's recheck read
-    // "released" and re-sent: for MSG-72522 that would have typed the owner's
-    // message into `random` a second time after a later Enter had already
-    // submitted it. Before answering "released", consult the history row the
-    // stuck send left (reconciled by the provider's UserPromptSubmit).
-    if base.status() == StatusCode::OK && !text.is_empty() && !send_dedup_reserved(state, name, msg_id) {
-        match released_text_fate(state, name, text) {
-            ReleasedFate::Delivered(row) => {
+    let receipted = state.store.read().ok().is_some_and(|c| {
+        c.query_row(
+            "SELECT receipt_id IS NOT NULL FROM send_dedup WHERE session=?1 AND msg_id=?2",
+            rusqlite::params![name, msg_id],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    });
+    if receipted {
+        return base;
+    }
+    if let Some(fate) = history_fate_by_msg_id(state, name, msg_id) {
+        return match fate {
+            HistoryFate::Delivered(row) => {
                 let id = format!("reconciled-{msg_id}");
-                let (s, m, rid) = (name.to_string(), msg_id.to_string(), id.clone());
-                let _ = state
-                    .store
-                    .write_async(move |conn| {
-                        conn.execute(
-                            "INSERT INTO send_dedup (session,msg_id,ts,receipt_id) VALUES (?1,?2,?3,?4) \
-                             ON CONFLICT(session,msg_id) DO UPDATE SET receipt_id=excluded.receipt_id",
-                            rusqlite::params![s, m, now_i64(), rid],
-                        )?;
-                        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-                    })
-                    .await;
-                tracing::warn!(target: "amux::message_acceptance", session = name, history_row = row,
-                    verdict = "released_receipt_reconciled", measured = true, n_considered = 1,
-                    "a released message identity matches a delivered history row; answered accepted so it is never re-sent");
-                return stranded_answer(json!({"ok": true, "accepted": true, "reconciled": true, "id": id, "msg_id": msg_id}));
+                send_dedup_accept(state, name, msg_id, &id).await;
+                tracing::info!(target: "amux::message_acceptance", session = name, history_row = row,
+                    verdict = "receipt_from_history_msg_id", measured = true, n_considered = 1,
+                    "the history row carrying this message ID records it delivered");
+                stranded_answer(json!({"ok": true, "accepted": true, "reconciled": true, "id": id, "msg_id": msg_id}))
             }
-            ReleasedFate::StillStuck(row) => {
+            HistoryFate::InTheBox(row) => {
                 tracing::warn!(target: "amux::message_acceptance", session = name, history_row = row,
-                    verdict = "released_receipt_still_stuck", measured = true, n_considered = 1,
-                    "a released message identity matches a message still stuck in the composer; not released for a resend");
-                return stranded_answer(json!({
+                    verdict = "receipt_history_not_submitted", measured = true, n_considered = 1,
+                    "the history row carrying this message ID records it typed but not submitted");
+                stranded_answer(json!({
                     "ok": true, "accepted": false, "stranded": true, "delivered": "unknown", "msg_id": msg_id,
-                    "next": "the text is still in the worker's input box; retry this receipt read, never a new send",
-                }));
+                    "next": "the message may still be in the worker's input box; never a new send",
+                }))
             }
-            ReleasedFate::Unknown => {}
-        }
+            HistoryFate::Waiting(row) => {
+                tracing::info!(target: "amux::message_acceptance", session = name, history_row = row,
+                    verdict = "receipt_history_queued", measured = true, n_considered = 1,
+                    "the history row carrying this message ID is queued and not yet delivered");
+                stranded_answer(json!({
+                    "ok": true, "accepted": false, "queued": true, "delivered": false, "msg_id": msg_id,
+                    "next": "queued for the worker; retry this receipt read, never a new send",
+                }))
+            }
+        };
     }
     if base.status() != StatusCode::ACCEPTED {
+        // No reservation and no history row with this ID: nothing was recorded
+        // as submitted. `released` says exactly that and nothing more.
         return base;
     }
-    let row = (|| -> rusqlite::Result<(i64, Option<String>)> {
-        let conn = state
-            .store
-            .read()
-            .map_err(|_| rusqlite::Error::InvalidQuery)?;
-        conn.query_row(
-            "SELECT ts, text_sha FROM send_dedup WHERE session=?1 AND msg_id=?2 AND receipt_id IS NULL",
+    let reserved_ts = state.store.read().ok().and_then(|c| {
+        c.query_row(
+            "SELECT ts FROM send_dedup WHERE session=?1 AND msg_id=?2 AND receipt_id IS NULL",
             rusqlite::params![name, msg_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get::<_, i64>(0),
         )
-    })();
-    // No row (an ID never reserved) or a schema without text_sha yet: the plain
-    // receipt answer is already the truth.
-    let Ok((ts, text_sha)) = row else { return base };
-    if send_is_in_flight(name, msg_id) {
-        return base;
-    }
-    let aged = now_i64().saturating_sub(ts) > 120;
-    // A restarted process has no live owner. Exact positive evidence is safe
-    // now; lack of evidence must not authorize a replay sooner than before.
-    if !aged && text_sha.as_deref() != Some(text_sha256(text).as_str()) {
-        return base;
-    }
-    let judgeable = !text.is_empty()
-        && text.len() <= STRANDED_TEXT_MAX
-        && !text.contains('\n')
-        && text_sha
-            .as_deref()
-            .is_none_or(|sha| sha == text_sha256(text));
-    // Rollout discovery and bounded transcript reads are filesystem work;
-    // keep receipt recovery off the async executor during reconnect bursts.
-    let (worker, prompt) = (name.to_owned(), text.to_owned());
-    let evidence = tokio::task::spawn_blocking(move || {
-        let codex = matches!(
-            provider_of(&parse_env(&worker)).as_str(),
-            "codex" | "ollama"
-        );
-        if codex
-            && !prompt.is_empty()
-            && prompt.len() <= 2000
-            && text_sha.as_deref() == Some(text_sha256(&prompt).as_str())
-        {
-            codex_rollout_path(&worker)
-                .map(|path| (codex_receipt_evidence(&path, &prompt, ts), path))
-        } else if !codex && judgeable {
-            session_jsonl_path(&worker)
-                .map(|path| (transcript_has_prompt_since(&path, &prompt, ts, if aged { 60 } else { 0 }), path))
-        } else {
-            None
-        }
-    })
-    .await
-    .unwrap_or(None);
-    match evidence {
-        Some((Some(true), path)) => {
-            let id = format!("reconciled-{msg_id}");
-            send_dedup_accept(state, name, msg_id, &id).await;
-            tracing::warn!(
-                target: "amux::message_acceptance", session = name, verdict = "stranded_reservation_reconciled",
-                measured = true, n_considered = 1, transcript = %path.display(), early_recovery = !aged,
-                "a stranded reservation's text is in the lane transcript; recorded its receipt (AMUX-4594)"
-            );
-            stranded_answer(
-                json!({"ok": true, "accepted": true, "reconciled": true, "id": id, "msg_id": msg_id}),
-            )
-        }
-        Some((Some(false), path)) if aged => {
-            send_dedup_forget(state, name, msg_id).await;
-            tracing::warn!(
-                target: "amux::message_acceptance", session = name, verdict = "stranded_reservation_released",
-                measured = true, n_considered = 1, transcript = %path.display(),
-                "a stranded reservation's text never reached the lane transcript; released it so the sender can send once (AMUX-4594)"
-            );
-            stranded_answer(json!({
-                "ok": true, "accepted": false, "released": true, "delivered": false, "msg_id": msg_id,
-                "evidence": format!("no prompt matching the text after the reservation in {}", path.display()),
-            }))
-        }
-        _ if !aged => base,
-        _ if now_i64().saturating_sub(ts) > stranded_expire_secs() => {
+        .ok()
+    });
+    match reserved_ts {
+        Some(ts) if !send_is_in_flight(name, msg_id) && now_i64().saturating_sub(ts) > stranded_expire_secs() => {
             tracing::warn!(
                 target: "amux::message_acceptance", session = name, verdict = "stranded_reservation_expired",
-                measured = false, n_considered = 1, judgeable, age_s = now_i64().saturating_sub(ts),
-                "a stranded reservation outlived every source of evidence; answered expired so the sender stops rechecking (never resent)"
+                measured = false, n_considered = 1, age_s = now_i64().saturating_sub(ts),
+                "a reservation with no history row outlived its window; answered expired so the sender stops rechecking (never resent)"
             );
             stranded_answer(json!({
                 "ok": true, "accepted": false, "expired": true, "delivered": "unknown", "msg_id": msg_id,
                 "next": "stop rechecking; delivery was never confirmed and this identity must not be resent",
             }))
         }
-        _ => {
-            tracing::warn!(
-                target: "amux::message_acceptance", session = name, verdict = "stranded_reservation_unknown",
-                measured = false, n_considered = 1, judgeable,
-                "a stranded reservation cannot be settled from a transcript; kept, and the sender is told (AMUX-4594)"
-            );
-            stranded_answer(json!({
-                "ok": true, "accepted": false, "stranded": true, "delivered": "unknown", "msg_id": msg_id,
-                "next": "receipt recovery remains pending; retry this receipt read, never a new message identity",
-            }))
-        }
+        _ => base,
     }
 }
 
-/// Whether a message identity still has a reservation row (any state).
-fn send_dedup_reserved(state: &AppState, name: &str, msg_id: &str) -> bool {
-    state.store.read().ok().is_some_and(|c| {
-        c.query_row(
-            "SELECT 1 FROM send_dedup WHERE session=?1 AND msg_id=?2",
-            rusqlite::params![name, msg_id],
-            |_| Ok(()),
-        )
-        .is_ok()
-    })
-}
-
+/// What the history row carrying THIS message ID records. Pure over the row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReleasedFate {
-    /// A recent owner row with this exact text is confirmed delivered.
+pub(crate) enum HistoryFate {
     Delivered(i64),
-    /// A recent owner row with this exact text is still recorded stuck.
-    StillStuck(i64),
-    /// No history evidence either way.
-    Unknown,
+    InTheBox(i64),
+    Waiting(i64),
 }
 
-/// Pure over recent `(id, text, submit_verdict)` rows, newest first. Only
-/// texts of 16+ characters are judged, so a short repeated "continue" never
-/// borrows another message's receipt.
-pub(crate) fn released_fate_from(text: &str, rows: &[(i64, String, String)]) -> ReleasedFate {
-    let norm = super::pane_prompts::normalize(text);
-    if norm.chars().count() < 16 {
-        return ReleasedFate::Unknown;
+pub(crate) fn history_fate_of(row: i64, delivery: &str, verdict: &str, delivered: bool) -> HistoryFate {
+    match (delivery, verdict) {
+        (_, "confirmed" | "retried") => HistoryFate::Delivered(row),
+        ("queued", _) if delivered => HistoryFate::Delivered(row),
+        ("queued", _) => HistoryFate::Waiting(row),
+        // stuck, unverified, deferred, or no verdict recorded: the text may be
+        // in the box and was never proven submitted.
+        _ => HistoryFate::InTheBox(row),
     }
-    for (id, t, verdict) in rows {
-        if super::pane_prompts::normalize(t) != norm {
-            continue;
-        }
-        return match verdict.as_str() {
-            "confirmed" => ReleasedFate::Delivered(*id),
-            "stuck" => ReleasedFate::StillStuck(*id),
-            _ => continue,
-        };
-    }
-    ReleasedFate::Unknown
 }
 
-fn released_text_fate(state: &AppState, name: &str, text: &str) -> ReleasedFate {
-    let since_ms = (now_i64() - 6 * 3600) * 1000;
-    let rows: Vec<(i64, String, String)> = state
+fn history_fate_by_msg_id(state: &AppState, name: &str, msg_id: &str) -> Option<HistoryFate> {
+    if msg_id.is_empty() {
+        return None;
+    }
+    let c = state.store.read().ok()?;
+    c.query_row(
+        "SELECT id, COALESCE(delivery,''), COALESCE(submit_verdict,''), delivered_at IS NOT NULL \
+         FROM cmd_history WHERE session=?1 AND msg_id=?2 ORDER BY id DESC LIMIT 1",
+        rusqlite::params![name, msg_id],
+        |r| Ok(history_fate_of(r.get(0)?, &r.get::<_, String>(1)?, &r.get::<_, String>(2)?, r.get(3)?)),
+    )
+    .ok()
+}
+
+/// Write the send's message ID onto the history row it just recorded, so its
+/// receipt can be read by ID alone (migration 0123).
+async fn note_history_msg_id(state: &AppState, row_id: i64, msg_id: &str) {
+    if row_id <= 0 || msg_id.is_empty() {
+        return;
+    }
+    let id = msg_id.to_string();
+    let _ = state
         .store
-        .read()
-        .ok()
-        .and_then(|c| {
-            let mut st = c
-                .prepare(
-                    // A worker's send is recorded as type 'session', the owner's as 'user':
-                    // either can be the message stuck in the box (review of #9, B1).
-                    "SELECT id, text, COALESCE(submit_verdict,'') FROM cmd_history \
-                     WHERE session=?1 AND type IN ('user','session') AND ts>?2 ORDER BY id DESC LIMIT 32",
-                )
-                .ok()?;
-            let rows = st
-                .query_map(rusqlite::params![name, since_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .ok()?;
-            Some(rows.flatten().collect())
+        .write_async(move |conn| {
+            conn.execute("UPDATE cmd_history SET msg_id=?1 WHERE id=?2 AND msg_id IS NULL", rusqlite::params![id, row_id])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         })
-        .unwrap_or_default();
-    released_fate_from(text, &rows)
+        .await;
 }
+
+
+
+
 
 /// Recent `cmd_history` rows recorded as stuck whose text is the prompt the
 /// provider just reported submitted. Pure over the candidate rows.
@@ -9865,10 +9662,15 @@ pub(crate) fn stuck_rows_matching(prompt: &str, candidates: &[(i64, String)]) ->
     if norm.chars().count() < 8 {
         return vec![];
     }
+    // ONE SUBMITTED PROMPT SETTLES ONE ROW. Two identical messages stuck
+    // or queued for the same lane are two sends; a single submission must not
+    // confirm both (dev-lead 2026-10-17: each send gets only its own receipt).
+    // Candidates are newest first; the newest match is the one in the box.
     candidates
         .iter()
         .filter(|(_, text)| super::pane_prompts::same_text(&norm, &super::pane_prompts::normalize(text)))
         .map(|(id, _)| *id)
+        .take(1)
         .collect()
 }
 
@@ -10780,7 +10582,8 @@ fn paste_chip_fits(chip: &str, body: &str) -> bool {
     // Exact: a looser size would let an owner's paste of similar length pass
     // for amux's own (review of #9, N4). Claude's `+M` counts the line breaks.
     if let Some(m) = caps.get(1).and_then(|m| m.as_str().parse::<usize>().ok()) {
-        return body.trim_end_matches('\n').matches('\n').count() == m;
+        // Claude Code 2.1.302 counts every line break, a trailing one included.
+        return body.matches('\n').count() == m || body.trim_end_matches('\n').matches('\n').count() == m;
     }
     caps.get(2)
         .and_then(|m| m.as_str().parse::<usize>().ok())
@@ -28567,7 +28370,6 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
     if let Some(response) = send_dedup_gate(state, name, &msg_id).await {
         return response;
     }
-    send_dedup_note_text(state, name, &msg_id, &body_str(body, "text")).await;
     if text.trim().starts_with("/compact") {
         let n = name.to_string();
         crate::db::interactions::spawn_blocking(move || backup_session_jsonl(&n, "pre_compact"));
@@ -28958,6 +28760,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             let row_id =
                 cmd_hist_record_with_id(state, name, &orig_text, "user", author, skip_board, meta)
                     .await;
+            note_history_msg_id(state, row_id, &msg_id).await;
             if let Some(id) = queue_id.as_deref() {
                 link_queued_message(state, name, row_id, id).await;
             }
@@ -28982,6 +28785,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                 state, name, &orig_text, "session", &origin, skip_board, meta,
             )
             .await;
+            note_history_msg_id(state, row_id, &msg_id).await;
             if let Some(id) = queue_id.as_deref() {
                 link_queued_message(state, name, row_id, id).await;
             }
@@ -28992,6 +28796,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                 state, name, &orig_text, "session", &origin, skip_board, meta,
             )
             .await;
+            note_history_msg_id(state, row_id, &msg_id).await;
             if let Some(id) = queue_id.as_deref() {
                 link_queued_message(state, name, row_id, id).await;
             }
@@ -29045,25 +28850,21 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
                 let author = member_actor.as_deref().unwrap_or(email);
-                cmd_hist_record_full(state, name, &orig_text, "user", author, skip_board, meta)
-                    .await;
+                let row_id = cmd_hist_record_with_id(state, name, &orig_text, "user", author, skip_board, meta).await;
+                note_history_msg_id(state, row_id, &msg_id).await;
             } else if !origin.is_empty() && origin == name {
                 // Same gap on the failure side (AMUX-5030): a self-send that
                 // did NOT submit also left no row, so there was nothing to find
                 // afterwards on either outcome.
-                cmd_hist_record_full(
-                    state, name, &orig_text, "session", &origin, skip_board, meta,
-                )
-                .await;
+                let row_id = cmd_hist_record_with_id(state, name, &orig_text, "session", &origin, skip_board, meta).await;
+                note_history_msg_id(state, row_id, &msg_id).await;
             } else if !origin.is_empty() && origin != name {
                 // skip_board, not `false` (AMUX-4555). A PEER send is the shape
                 // this bug was reported from: mixpeek-orchestrator's every-4h
                 // accountability check sends --no-board to ~40 lanes and this
                 // branch dropped the flag before the capture could see it.
-                cmd_hist_record_full(
-                    state, name, &orig_text, "session", &origin, skip_board, meta,
-                )
-                .await;
+                let row_id = cmd_hist_record_with_id(state, name, &orig_text, "session", &origin, skip_board, meta).await;
+                note_history_msg_id(state, row_id, &msg_id).await;
             }
         }
         if !msg_id.is_empty() {
@@ -43275,40 +43076,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         );
     }
 
-    #[test]
-    fn fresh_receipt_proof_requires_a_prompt_timestamp_after_reservation() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("conversation.jsonl");
-        let row = |stamp: Option<i64>| json!({"type":"user","timestamp":stamp.map(|t| chrono::DateTime::from_timestamp(t,0).unwrap().to_rfc3339()),"message":{"content":"repeat"}}).to_string();
-        std::fs::write(&path, row(Some(99))).unwrap();
-        assert_eq!(transcript_has_prompt_since(&path, "repeat", 100, 0), Some(false));
-        std::fs::write(&path, row(None)).unwrap();
-        assert_eq!(transcript_has_prompt_since(&path, "repeat", 100, 0), None);
-        std::fs::write(&path, row(Some(100))).unwrap();
-        assert_eq!(transcript_has_prompt_since(&path, "repeat", 100, 0), Some(true));
-    }
 
-    #[test]
-    fn codex_receipt_evidence_requires_recent_exact_user_text() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rollout.jsonl");
-        let stamp = chrono::DateTime::from_timestamp(200, 0)
-            .unwrap()
-            .to_rfc3339();
-        let row = |kind: &str, role: &str| {
-            json!({"timestamp":stamp,"type":kind,
-            "payload":{"type":"message","role":role,"content":[{"type":"input_text","text":"first\nsecond"}]}}).to_string()
-        };
-        std::fs::write(&path, row("response_item", "assistant")).unwrap();
-        assert_eq!(codex_receipt_evidence(&path, "first\nsecond", 100), None);
-        std::fs::write(&path, row("response_item", "user")).unwrap();
-        assert_eq!(
-            codex_receipt_evidence(&path, "first\nsecond", 100),
-            Some(true)
-        );
-        assert_eq!(codex_receipt_evidence(&path, "first\nsecond", 201), None);
-        assert_eq!(codex_receipt_evidence(&path, "first", 100), None);
-    }
 
     #[test]
     fn message_acceptance_unverified_paste_is_not_a_receipt() {
@@ -43389,183 +43157,75 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         );
     }
 
-    /// AMUX-4594. A reservation no live send owns resolves from the transcript:
-    /// a receipt when the text landed, a release when it did not, "unknown" when
-    /// amux cannot tell, and nothing at all while a live send still holds it.
+    /// A RECEIPT IS DECIDED ONLY BY ITS MESSAGE ID (dev-lead 2026-10-17, after
+    /// three review rounds each found a text/time-window receipt hole). The
+    /// history row carrying the ID decides; a row with the same text and
+    /// another ID never does; no evidence reads pending, then expired.
     #[tokio::test]
-    async fn a_stranded_reservation_resolves_from_the_lane_transcript() {
-        let dir = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(dir.path());
-        // claude_home() reads HOME; the guard restores the whole environment.
-        std::env::set_var("HOME", dir.path());
-        std::fs::create_dir_all(sessions_dir()).unwrap();
-        let wd = dir.path().join("work");
-        std::fs::create_dir_all(&wd).unwrap();
-        let name = "stranded-fixture";
-        std::fs::write(env_path(name), format!("CC_DIR={}\n", wd.display())).unwrap();
-        let project = claude_home()
-            .join("projects")
-            .join(project_name(&wd.to_string_lossy()));
-        std::fs::create_dir_all(&project).unwrap();
-        let (state, _store_dir) = state();
-        let old = now_i64() - 3600;
-        let stamp = |secs: i64| {
-            chrono::DateTime::from_timestamp(secs, 0)
-                .unwrap()
-                .to_rfc3339()
-        };
-        std::fs::write(
-            project.join("conv.jsonl"),
-            format!(
-                "{}\n{}\n",
-                json!({"type":"user","message":{"role":"user","content":"[02:00 PM] earlier"},"timestamp": stamp(old - 600)}),
-                json!({"type":"user","message":{"role":"user","content":"[03:17 PM] landed"},"timestamp": stamp(old + 5)}),
-            ),
-        )
-        .unwrap();
-        for id in ["landed-id", "lost-id", "unchecked-id", "hashed-id"] {
-            assert!(send_dedup_gate(&state, name, id).await.is_none());
-        }
-        send_dedup_note_text(&state, name, "hashed-id", "[03:17 PM] what was reserved").await;
-        state
-            .store
-            .write_async(move |conn| {
-                conn.execute("UPDATE send_dedup SET ts=?1", [old])?;
-                Ok(crate::db::WriteOutcome {
-                    applied: true,
-                    events: vec![],
-                })
-            })
-            .await
-            .unwrap();
+    async fn receipts_are_decided_by_message_id_only() {
+        let (state, _dir) = state();
+        let name = "receipt-id-fixture";
         async fn read(r: Response) -> (StatusCode, Value) {
             let status = r.status();
-            (
-                status,
-                serde_json::from_slice(
-                    &axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap(),
-                )
-                .unwrap(),
-            )
+            (status, serde_json::from_slice(&axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap()).unwrap())
         }
-        let (_, v) =
-            read(send_receipt_resolving(&state, name, "landed-id", "[03:17 PM] landed").await)
-                .await;
-        assert_eq!(
-            (v["accepted"].clone(), v["reconciled"].clone()),
-            (json!(true), json!(true)),
-            "{v}"
-        );
-        let (_, v) =
-            read(send_receipt_resolving(&state, name, "lost-id", "[03:17 PM] never typed").await)
-                .await;
-        assert_eq!(v["released"], true, "{v}");
-        assert!(
-            send_dedup_gate(&state, name, "lost-id").await.is_none(),
-            "released: the same ID can be sent once"
-        );
-        let (_, v) = read(send_receipt_resolving(&state, name, "unchecked-id", "").await).await;
-        assert_eq!(v["delivered"], "unknown", "no text, no verdict: {v}");
-        assert!(v.get("expired").is_none(), "an hour is not expired: {v}");
-        // A reservation older than any evidence ends: expired, never released.
-        assert!(send_dedup_gate(&state, name, "ancient-id").await.is_none());
+        let row = |state: &AppState, msg_id: &'static str, kind: &'static str, delivery: &'static str,
+                   verdict: Option<&'static str>, delivered: bool| {
+            let st = state.store.clone();
+            async move {
+                st.write_async(move |c| {
+                    ensure_fleet_tables(c)?;
+                    c.execute("INSERT INTO cmd_history (text, type, session, ts, origin, delivery, submit_verdict, delivered_at, msg_id) \
+                               VALUES ('the same text', ?1, ?2, ?3, '', ?4, ?5, ?6, ?7)",
+                        rusqlite::params![kind, name, now_i64() * 1000, delivery, verdict,
+                                          delivered.then(|| now_i64() * 1000), msg_id])?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                }).await.unwrap();
+            }
+        };
+        for id in ["a", "b", "queued", "queued-done", "pending", "ancient"] {
+            assert!(send_dedup_gate(&state, name, id).await.is_none());
+            send_dedup_forget(&state, name, id).await;
+        }
+        // TWO CONCURRENT SENDS, IDENTICAL TEXT: each gets only its own receipt.
+        row(&state, "a", "session", "direct", Some("confirmed"), true).await;
+        row(&state, "b", "session", "direct", Some("stuck"), false).await;
+        let (_, va) = read(send_receipt_resolving(&state, name, "a", "the same text").await).await;
+        let (_, vb) = read(send_receipt_resolving(&state, name, "b", "the same text").await).await;
+        assert_eq!(va["accepted"], true, "a's own row says delivered: {va}");
+        assert_eq!((vb["accepted"].clone(), vb["stranded"].clone()), (json!(false), json!(true)),
+            "b's own row says not submitted; a's delivered twin does not settle it: {vb}");
+        // Queued rows: waiting until their receipt stamps delivered_at.
+        row(&state, "queued", "user", "queued", None, false).await;
+        row(&state, "queued-done", "user", "queued", None, true).await;
+        let (_, v) = read(send_receipt_resolving(&state, name, "queued", "").await).await;
+        assert_eq!((v["queued"].clone(), v["accepted"].clone()), (json!(true), json!(false)), "{v}");
+        let (_, v) = read(send_receipt_resolving(&state, name, "queued-done", "").await).await;
+        assert_eq!(v["accepted"], true, "{v}");
+        // No row with this ID: an identical-text delivered row elsewhere settles nothing.
+        let (_, v) = read(send_receipt_resolving(&state, name, "pending", "the same text").await).await;
+        assert_eq!((v["accepted"].clone(), v["released"].clone()), (json!(false), json!(true)),
+            "no record of this ID being submitted: {v}");
+        // A live reservation with no row stays pending; an ancient one expires, never released.
+        assert!(send_dedup_gate(&state, name, "live").await.is_none());
+        let (status, v) = read(send_receipt_resolving(&state, name, "live", "the same text").await).await;
+        assert_eq!((status, v["accepted"].clone()), (StatusCode::ACCEPTED, json!(false)), "{v}");
+        assert!(send_dedup_gate(&state, name, "ancient").await.is_none());
         let ancient = now_i64() - 2 * 86_400;
-        state
-            .store
-            .write_async(move |conn| {
-                conn.execute("UPDATE send_dedup SET ts=?1 WHERE msg_id='ancient-id'", [ancient])?;
-                Ok(crate::db::WriteOutcome {
-                    applied: true,
-                    events: vec![],
-                })
-            })
-            .await
-            .unwrap();
-        let (_, v) = read(send_receipt_resolving(&state, name, "ancient-id", "").await).await;
-        assert_eq!(
-            (v["expired"].clone(), v["delivered"].clone(), v.get("released").is_none()),
-            (json!(true), json!("unknown"), true),
-            "{v}"
-        );
-        assert!(
-            send_dedup_gate(&state, name, "ancient-id").await.is_some(),
-            "expired must keep the identity reserved so it is never resent"
-        );
-        let (_, v) =
-            read(send_receipt_resolving(&state, name, "hashed-id", "[03:17 PM] never typed").await)
-                .await;
-        assert_eq!(
-            v["delivered"], "unknown",
-            "a text that is not what was reserved cannot release it: {v}"
-        );
-        let still: i64 = state
-            .store
-            .read()
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM send_dedup WHERE session=?1 AND msg_id='hashed-id'",
-                [name],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(still, 1);
-        // A killed server can have typed the prompt but not written its
-        // receipt. A recent reservation must recover from exact Codex proof.
-        let codex_name = "fresh-codex-receipt";
-        std::fs::write(env_path(codex_name), "CC_PROVIDER=codex\n").unwrap();
-        update_meta(
-            codex_name,
-            &[("codex_session_id", json!("fresh-receipt-rollout"))],
-        );
-        let rollout_dir = dir.path().join(".codex/sessions");
-        std::fs::create_dir_all(&rollout_dir).unwrap();
-        let prompt = "fresh restart proof";
-        std::fs::write(rollout_dir.join("rollout-fresh-receipt-rollout.jsonl"),
-            json!({"timestamp":stamp(now_i64()),"type":"response_item",
-                "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":prompt}]}}).to_string()).unwrap();
-        for id in ["fresh", "missing", "live"] {
-            assert!(send_dedup_gate(&state, codex_name, id).await.is_none());
-            send_dedup_note_text(&state, codex_name, id, prompt).await;
+        state.store.write_async(move |c| {
+            c.execute("UPDATE send_dedup SET ts=?1 WHERE msg_id='ancient'", [ancient])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        let (_, v) = read(send_receipt_resolving(&state, name, "ancient", "").await).await;
+        assert_eq!((v["expired"].clone(), v["delivered"].clone()), (json!(true), json!("unknown")), "{v}");
+        assert!(send_dedup_gate(&state, name, "ancient").await.is_some(), "expired keeps the identity reserved");
+        // The receipt path reads no text and no transcript.
+        let src = include_str!("session_verbs.rs");
+        let body = &src[src.find("async fn send_receipt_resolving(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        for banned in ["jsonl", "transcript_has", "codex_receipt", "text_sha", "released_text_fate", "same_text"] {
+            assert!(!body.contains(banned), "the receipt path must not use {banned}");
         }
-        let (status, value) =
-            read(send_receipt_resolving(&state, codex_name, "fresh", prompt).await).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            value["reconciled"], true,
-            "exact proof must not wait two minutes: {value}"
-        );
-        send_dedup_note_text(&state, codex_name, "missing", "not delivered").await;
-        let (status, value) =
-            read(send_receipt_resolving(&state, codex_name, "missing", "not delivered").await)
-                .await;
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert!(
-            value.get("released").is_none(),
-            "absence cannot authorize early duplicate delivery: {value}"
-        );
-        let fresh_owner = InFlightSend::enter(codex_name, "live");
-        let (status, _) =
-            read(send_receipt_resolving(&state, codex_name, "live", prompt).await).await;
-        assert_eq!(
-            status,
-            StatusCode::ACCEPTED,
-            "a live handler still owns its result"
-        );
-        drop(fresh_owner);
-        let _flight = InFlightSend::enter(name, "unchecked-id");
-        let (status, v) = read(
-            send_receipt_resolving(&state, name, "unchecked-id", "[03:17 PM] never typed").await,
-        )
-        .await;
-        assert_eq!(
-            (status, v["accepted"].clone()),
-            (StatusCode::ACCEPTED, json!(false)),
-            "a live send owns it: {v}"
-        );
-        assert!(
-            v.get("released").is_none() && v.get("stranded").is_none(),
-            "{v}"
-        );
     }
 
     /// AMUX-4589. The client leaves while the send is parked on the lane lock,
@@ -48944,6 +48604,9 @@ mod composer_state_tests {
         let submitted = "[06:21 PM] all right so we have recordings for our workout growth. I just did 1210 eight of shoulder press dumbbells";
         assert_eq!(stuck_rows_matching(submitted, &rows), vec![72522]);
         assert!(stuck_rows_matching("yes", &rows).is_empty(), "a short prompt never reconciles");
+        let twins = vec![(8, "the identical stuck message text".to_string()), (7, "the identical stuck message text".to_string())];
+        assert_eq!(stuck_rows_matching("the identical stuck message text", &twins), vec![8],
+            "one submission settles one of two identical sends, the newest");
         assert!(stuck_rows_matching("a different message that is long enough", &rows).is_empty());
     }
 
@@ -48962,27 +48625,21 @@ mod composer_state_tests {
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
             .unwrap();
-        assert_eq!(reconcile_stuck_on_submit(&st, "boot", text).await, 2);
-        let c = st.store.read().unwrap();
-        let delivered: Vec<(i64, bool)> = c
-            .prepare("SELECT id, delivered_at IS NOT NULL FROM cmd_history WHERE session='boot' ORDER BY id").unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().flatten().collect();
-        assert_eq!(delivered, vec![(1, true), (2, true), (3, false)]);
+        // ONE SUBMISSION SETTLES ONE SEND (dev-lead 2026-10-17): two identical
+        // queued messages are two sends, so each provider submission marks
+        // one row, newest first, and the second submission marks the other.
+        let delivered = |st: &AppState| -> Vec<(i64, bool)> {
+            let c = st.store.read().unwrap();
+            let mut q = c.prepare("SELECT id, delivered_at IS NOT NULL FROM cmd_history WHERE session='boot' ORDER BY id").unwrap();
+            let rows: Vec<(i64, bool)> = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().flatten().collect();
+            rows
+        };
+        assert_eq!(reconcile_stuck_on_submit(&st, "boot", text).await, 1);
+        assert_eq!(delivered(&st), vec![(1, false), (2, true), (3, false)]);
+        assert_eq!(reconcile_stuck_on_submit(&st, "boot", text).await, 1);
+        assert_eq!(delivered(&st), vec![(1, true), (2, true), (3, false)]);
     }
 
-    /// A released message identity is never answered "released" (which makes the
-    /// sender re-send) when history shows the text was delivered or is still
-    /// sitting in the composer.
-    #[test]
-    fn a_released_identity_reads_the_history_before_inviting_a_resend() {
-        let text = "And then the other day, I did three Max dead lift 155";
-        let rows = |v: &str| vec![(9, text.to_string(), v.to_string())];
-        assert_eq!(released_fate_from(text, &rows("confirmed")), ReleasedFate::Delivered(9));
-        assert_eq!(released_fate_from(text, &rows("stuck")), ReleasedFate::StillStuck(9));
-        assert_eq!(released_fate_from(text, &rows("")), ReleasedFate::Unknown);
-        assert_eq!(released_fate_from("continue", &[(9, "continue".into(), "confirmed".into())]), ReleasedFate::Unknown);
-        assert_eq!(released_fate_from(text, &[]), ReleasedFate::Unknown);
-    }
 
     /// The stuck-composer sweep must never press Enter on an owner's draft
     /// (2026-10-17: three of Max's unsent drafts were submitted by the
@@ -55557,24 +55214,6 @@ mod composer_guard_tests {
             "a draft in front of the chip is a person's");
     }
 
-    /// Review of #9 round 2, B1: a worker's stuck send (history type
-    /// 'session') must read as stranded, never released, so the CLI never says
-    /// "safe to resend" for a message sitting in the box.
-    #[tokio::test]
-    async fn a_workers_stuck_send_reads_stranded_not_released() {
-        let (state, _dir) = super::tests::state();
-        let text = "check the lease numbers for space 20 again";
-        for (kind, n) in [("session", "w-peer"), ("user", "w-owner")] {
-            let (k, name, t) = (kind.to_string(), n.to_string(), text.to_string());
-            state.store.write_async(move |c| {
-                ensure_fleet_tables(c)?;
-                c.execute("INSERT INTO cmd_history (text, type, session, ts, origin, submit_verdict) VALUES (?1, ?2, ?3, ?4, '', 'stuck')",
-                    rusqlite::params![t, k, name, now_i64() * 1000])?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-            }).await.unwrap();
-            assert!(matches!(released_text_fate(&state, n, text), ReleasedFate::StillStuck(_)), "{kind} row must read stuck");
-        }
-    }
 
     /// Review of #9 round 2, N1: a short tail after a glyph in our own body is
     /// ours, and a tail still painting is not foreign.
