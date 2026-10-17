@@ -138,6 +138,14 @@ class WorkerTmuxGuardTests(unittest.TestCase):
         self.assert_refused('split-window', 'tmux kill-ses -t x')
         self.assert_refused('bind-key', 'X', 'kill-server')
         self.assert_refused('confirm-before', 'kill-server')
+        # Boolean flags must not hide the shell command that follows them.
+        self.assert_refused('new-window', '-k', '/opt/homebrew/bin/tmux kill-server')
+        self.assert_refused('respawn-pane', '-k', '/opt/homebrew/bin/tmux kill-server')
+        self.assert_refused('new-window', '-dk', 'tmux kill-server')
+        self.assert_refused('split-window', '-h', 'tmux kill-server')
+        self.assert_refused('bind-key', '-n', 'X', 'kill-server')
+        self.assert_refused('run-shell', '-b', 'tmux kill-server')
+        self.assert_refused('new-session', '-d', '-s', 'probe', 'tmux kill-server')
 
     # --- pass-throughs ---------------------------------------------------------------
     def test_kill_on_other_socket_passes_with_exact_argv(self):
