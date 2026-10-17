@@ -48668,6 +48668,33 @@ mod composer_state_tests {
             );
         }
     }
+    /// codex-cli 0.163 before its first turn, captured 2026-10-16 (DMIW-1).
+    /// Until the owner types, Codex paints a `? for shortcuts` hint row BELOW
+    /// the model bar, so the model bar is not the final row. A fresh Codex
+    /// worker therefore never read as at a boundary, and peer messages queued
+    /// for it waited for a human keystroke.
+    const LIVE_CODEX_FIRST_TURN: &str = "\u{1b}[1m\u{203a}\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  \u{1b}[38;2;246;226;183mGPT-6.1-Sol medium\u{1b}[39m \u{b7} \u{1b}[38;2;171;223;167m~/GitHub/amux\u{1b}[39m\n  \u{1b}[1m?\u{1b}[0m for shortcuts    \u{26a0} \u{1b}[38;2;196;167;103m1 warning\u{1b}[39m \u{b7} \u{1b}[1mf2\u{1b}[0m to view\n";
+
+    #[test]
+    fn a_fresh_codex_composer_with_its_shortcut_hint_is_a_boundary() {
+        assert_eq!(
+            crate::backend::adapter::codex_pane_generation_state(LIVE_CODEX_FIRST_TURN),
+            Some(false)
+        );
+        assert_eq!(composer_state(LIVE_CODEX_FIRST_TURN).typed(), None);
+        assert!(pane_is_at_boundary(LIVE_CODEX_FIRST_TURN));
+        // A live turn above the same footer still holds delivery.
+        let working = LIVE_CODEX_FIRST_TURN.replacen(
+            "\u{1b}[1m\u{203a}",
+            "\u{2022} Working (3s \u{2022} esc to interrupt)\n\u{1b}[1m\u{203a}",
+            1,
+        );
+        assert_eq!(
+            crate::backend::adapter::codex_pane_generation_state(&working),
+            Some(true)
+        );
+        assert!(!pane_is_at_boundary(&working));
+    }
 }
 
 // ---------------------------------------------------------------------------

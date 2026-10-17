@@ -1643,6 +1643,19 @@ gemini-2.5-pro";
         assert_eq!(provider_picker_reason(&format!("{pane}\n›"), "codex"), None);
     }
 
+    /// codex-cli 0.163's launch dialog for an untrusted hook, captured
+    /// 2026-10-16 (DMIW-1). Its footer reads `enter confirm · esc skip`, none
+    /// of the older footers, so a worker sitting on it read as unknown rather
+    /// than waiting on the owner.
+    #[test]
+    fn codex_launch_hook_review_dialog_is_a_hook_trust_prompt() {
+        let pane = "  \u{1b}[1mHooks need review\u{1b}[0m\n  \u{1b}[38;5;3m1 hook is new or changed.\u{1b}[39m\n  \u{1b}[2mHooks can run outside the sandbox after you trust them.\u{1b}[0m\n\u{1b}[1;7m\u{203a} 1. Review hooks\n\u{1b}[0m  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n  \u{1b}[1menter\u{1b}[0;2m confirm \u{b7} \u{1b}[0;1mesc\u{1b}[0;2m skip\n";
+        assert_eq!(
+            provider_picker_reason(&strip_ansi(pane), "codex"),
+            Some("hook_trust_prompt")
+        );
+    }
+
     #[test]
     fn strip_ansi_leaves_plain_text_alone() {
         let plain = "❯ ordinary text · with unicode ⏺ and $dollars";
