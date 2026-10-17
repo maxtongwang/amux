@@ -236,6 +236,23 @@ ScheduleWakeup, or one delay sized to the job. (AF-396)
 
 ## Deploy
 
+### Stable macOS Signing
+
+The macOS auto-builder signs each staged `amux-server-rs` with the local
+`amux local code signing` certificate and identifier `com.amux.server-rs` before
+activation. `bash scripts/codesign-identity.sh --owner-provision` prints the
+one-time owner step and exits 3. Builders and tests only use disposable
+keychains. The builder never provisions an identity itself.
+
+Until the identity exists, the builder emits
+`verdict=codesign_identity_missing` once per build and continues adopting the
+ad-hoc binary. After it exists, any signing or verification failure emits
+`verdict=codesign_refused` and preserves the installed image. The
+`server.stable_codesign_identity` invariant reports the installed image's
+certificate and identifier; it is unmeasured off macOS. A temporary-keychain
+smoke test is `bash scripts/test-codesign-identity.sh`; its plan check runs
+before any keychain command.
+
 **Before `git push origin main`:**
 ```bash
 git fetch origin

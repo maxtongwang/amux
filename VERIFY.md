@@ -139,6 +139,24 @@ WITHOUT `-w`, which prints the item's attributes and never the key.
 
 ## A deployed server change
 
+### macOS code signing
+
+```bash
+set -o pipefail
+amux-isolated env DRY_RUN=1 bash scripts/test-codesign-identity.sh |
+  amux-isolated bash scripts/test-codesign-identity.sh --check-plan
+amux-isolated bash scripts/test-codesign-identity.sh
+```
+
+Pass: `PASS: signing plan contains expected commands and no forbidden operation`,
+then `PASS: two builds share a designated requirement; verification refusal
+preserves the live image`. The test creates
+and deletes temporary keychains and never signs or replaces the installed
+server. On Linux it reports
+`SKIP`, which is not signing evidence. The runtime invariant
+`server.stable_codesign_identity` reports the installed server's signer and
+identifier separately.
+
 A fix in `git log` is not live until the running binary carries it.
 
 ```bash

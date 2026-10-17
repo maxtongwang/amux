@@ -12,6 +12,16 @@ on:
   pull_request:
 
 jobs:
+  macos-codesign:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stable local signing and adoption refusal
+        run: |
+          set -o pipefail
+          DRY_RUN=1 bash scripts/test-codesign-identity.sh | bash scripts/test-codesign-identity.sh --check-plan
+          bash scripts/test-codesign-identity.sh
   checks:
     runs-on: ubuntu-latest
     timeout-minutes: 10
