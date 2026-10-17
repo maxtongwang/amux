@@ -194,13 +194,17 @@ while [ "$i" -lt "$n" ]; do
     is_protected_word "$first" && refuse "$first"
     runs=0
     skip_value=0
+    names=0
     runs_its_arguments "$first" && runs=1
+    case "$first" in new|neww|new-*) names=1 ;; esac
     expect_name=0
   elif [ "$runs" -eq 1 ] && [ "$skip_value" -eq 1 ]; then
     skip_value=0                    # the value of a flag (-n name, -t target, -c dir): data
   elif [ "$runs" -eq 1 ] && [[ "$a" =~ ^-[A-Za-z]+$ ]]; then
-    # A flag; when its last letter takes a value and the value is the next word, skip that word.
-    case "${a: -1}" in [cenFstxywhTlpNIk]) skip_value=1 ;; esac
+    # Only the NAME of a new session or window (-n / -s) is skipped as data. Every other word is
+    # scanned: guessing option arity per command once let `new-window -k 'tmux kill-server'`
+    # through (-k takes no value), and over-refusing a word is safe where under-refusing is not.
+    [ "$names" -eq 1 ] && case "${a: -1}" in n|s) skip_value=1 ;; esac
   elif [ "$runs" -eq 1 ]; then
     # Nested command text: split on whitespace, quotes, braces and ";".
     words="$(printf '%s' "$a" | tr "\"'{}();\\\\\t\n" '          ')"
