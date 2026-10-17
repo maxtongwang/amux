@@ -94,7 +94,7 @@ fn classes() -> Vec<Class> {
             method: "PUT",
             path: "/api/scope".into(),
             body: scope_body("worker", DEV_A, "gates", json!({"review": true})),
-            specific: format!("turn on the review gate for {DEV_A}"),
+            specific: format!("set the gates config for {DEV_A}: review on"),
             unspecific: vague.clone(),
         },
         Class {
@@ -102,7 +102,7 @@ fn classes() -> Vec<Class> {
             method: "PUT",
             path: "/api/scope".into(),
             body: scope_body("worker", DEV_A, "connectors", json!({"google-gmail": true})),
-            specific: format!("enable the gmail connector for {DEV_A}"),
+            specific: format!("enable gmail in the connectors for {DEV_A}"),
             unspecific: vague.clone(),
         },
         Class {
@@ -146,12 +146,14 @@ fn classes() -> Vec<Class> {
             unspecific: "go ahead with what we discussed".into(),
         },
         Class {
+            // The real mutating route for browser-profile access is the
+            // worker's scope env key (GET /api/browser/profiles is read-only).
             name: "browser profiles",
-            method: "POST",
-            path: "/api/browser/profiles".into(),
-            body: json!({"name": "review-profile"}),
-            specific: "add browser profile review-profile".into(),
-            unspecific: "review-profile: go ahead with what we discussed".into(),
+            method: "PUT",
+            path: "/api/scope".into(),
+            body: scope_body("worker", DEV_A, "env", json!({"AMUX_BROWSER_PROFILES_ALLOW": "review-profile"})),
+            specific: format!("allow browser profile review-profile for {DEV_A}"),
+            unspecific: vague.clone(),
         },
     ]
 }

@@ -611,9 +611,12 @@ pub async fn create_worker(
     } else {
         None
     };
+    // A store create names no tags; a lead's gets its team tag (settled:
+    // untagged lead creates get T), so the create rule sees T.
+    let lead_tags = crate::api::delegation::lead_default_tags(&headers, vec![]);
     if let Some(refusal) = crate::api::session_verbs::worker_create_refusal(
         &headers,
-        &crate::api::session_verbs::CreateRequest { name: requested, tags: &[], owner_only, settings: [
+        &crate::api::session_verbs::CreateRequest { name: requested, tags: &lead_tags, owner_only, settings: [
             ("row:cwd", body.cwd.is_some()), ("row:provider", body.provider.is_some()), ("row:model", body.model.is_some()),
             ("row:backend", body.backend.is_some()), ("row:environment", body.environment.is_some()), ("row:permissions", body.permissions.is_some()),
         ].iter().filter(|(_, on)| *on).map(|(k, _)| k.to_string()).collect() },
@@ -621,7 +624,7 @@ pub async fn create_worker(
         return refusal;
     }
     let summary = json!({"name": requested, "cwd": body.cwd, "provider": body.provider, "model": body.model});
-    let action = crate::api::delegation::Action::CreateWorker { tags: vec![], settings: vec![], owner_only: None };
+    let action = crate::api::delegation::Action::CreateWorker { tags: lead_tags.clone(), settings: vec![], owner_only: None };
     let st = state.0.clone();
     let out = create_worker_inner(state, Json(body)).await;
     crate::api::sessions_legacy::invalidate_sessions_cache();

@@ -118,11 +118,12 @@ fn cases(e: &Env) -> Vec<Case> {
             needs_ref: false,
         },
         Case {
+            // A worker renames itself; a lead's rename waits for amux #3.
             name: "rename",
             method: "POST",
             path: format!("/api/sessions/{DEV_B}/rename"),
             refused: json!({"name": "review-dev-b-renamed"}),
-            allowed_as: DEV_LEAD,
+            allowed_as: DEV_B,
             allowed: json!({"name": "review-dev-b-renamed"}),
             needs_ref: false,
         },
