@@ -18074,9 +18074,26 @@ pub(crate) async fn dispose_verified_worker_terminal(name: &str) {
     kill_tmux_session(name).await;
 }
 
+/// A duplicated env file is a different worker: strip the source's
+/// incarnation so the copy can never carry the source's rename aliases. On
+/// failure the copy is removed (the caller answers 500, nothing half-made).
+fn copied_env_is_a_new_incarnation(copy: &Path) -> bool {
+    match super::rename_identity::strip_incarnation(copy) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(path = %copy.display(), error = %e, verdict = "duplicate_incarnation_strip_failed",
+                measured = true, n_considered = 1, "a duplicated worker's env kept its source's incarnation; removed");
+            let _ = std::fs::remove_file(copy);
+            false
+        }
+    }
+}
+
 /// Release the per-name identity state of a deleted worker: its rule-10
-/// launch-token hash, its scheduled-run token dir, and any rename record
-/// redirecting its name. Each removal failure other than "absent" is logged.
+/// launch-token hash, its scheduled-run token dir, and its incarnation's
+/// rename records (`rename_identity::release`; reads the env file, so call it
+/// before the env file is removed). Each removal failure other than "absent"
+/// is logged.
 fn release_name_state(name: &str) {
     let h = home();
     let hash = super::worker_identity::hash_path(&h, name);
@@ -18094,7 +18111,7 @@ fn release_name_state(name: &str) {
                 "a deleted worker's token material could not be removed; a rename into this name replaces it"),
         }
     }
-    super::rename_identity::forget_logged(&h, name);
+    super::rename_identity::release(&h, name);
 }
 
 /// py:25055 archive_session — scrollback→log, stop, kill tmux, CC_ARCHIVED=1,
@@ -30568,7 +30585,7 @@ pub(crate) fn duplicate_verb(state: &AppState, name: &str, headers: &HeaderMap, 
             json!({"error": format!("session '{new_name}' already exists")}),
         );
     }
-    if std::fs::copy(env_path(name), &new_file).is_err() {
+    if std::fs::copy(env_path(name), &new_file).is_err() || !copied_env_is_a_new_incarnation(&new_file) {
         return jresp(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({"error": "copy failed"}),
@@ -30687,7 +30704,7 @@ async fn clone_post(state: &AppState, name: &str, body: &Value) -> Response {
             json!({"error": format!("session '{new_name}' already exists")}),
         );
     }
-    if std::fs::copy(env_path(name), &new_file).is_err() {
+    if std::fs::copy(env_path(name), &new_file).is_err() || !copied_env_is_a_new_incarnation(&new_file) {
         return jresp(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({"error": "copy failed"}),
@@ -30967,15 +30984,15 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
     // probe leaves no tmux corpse — Python's delete relies on the archived
     // reaper for that, which this origin does not run.
     kill_tmux_session(name).await;
+    // Token material is keyed by name and rename records by the worker's
+    // incarnation (read from the env file, so this runs before it goes): a
+    // leftover hash is what a later worker taking this name would be checked
+    // against, and leftover records would keep this worker's aliases alive.
+    release_name_state(name);
     let _ = std::fs::remove_file(env_path(name));
     let _ = std::fs::remove_file(mem_file(name));
     let _ = std::fs::remove_file(meta_path(name));
     let _ = std::fs::remove_file(log_path(name));
-    // Token material and rename records are keyed by name, so a deleted
-    // worker's must go with it: a leftover hash is what a later worker taking
-    // this name (by create or rename) would be checked against, and a
-    // leftover record would redirect this name to an earlier holder.
-    release_name_state(name);
     // The registry just shrank; drop the cached fleet list so no reader is
     // served a ghost of this worker for the next TTL (AMUX-2960 — the same
     // hole create_session_legacy had on the grow side).
@@ -32868,7 +32885,11 @@ async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response
     //     and rename_identity resolves that claim to this one. A failure here
     //     does not undo the rename; it is reported and logged, because without
     //     the record the worker's sends are attributed to a dead name.
-    match super::rename_identity::record(&home(), name, &new_name) {
+    // Bound to the worker's incarnation (assigned on its first rename), so the
+    // alias can never attach to a different worker later holding `new_name`.
+    match super::rename_identity::ensure_incarnation(&home(), &new_name)
+        .and_then(|inc| super::rename_identity::record(&home(), name, &new_name, &inc))
+    {
         Ok(()) => steps.push("rename-record: written".into()),
         Err(e) => {
             tracing::warn!(old = name, new = %new_name, error = %e, verdict = "rename_record_failed",
@@ -46225,20 +46246,27 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         // Control: while z holds the name, both old names resolve to it.
         assert_eq!(header_as("review-x").await, "review-z");
         assert_eq!(crate::api::board::callback_target(home.path(), "review-y".into()), "review-z");
+        // Codex on 99054a99: a different worker q takes the freed review-y.
+        rename_fixture_env("review-q", "CC_NAME=\"review-q\"\nCC_TAGS=dev\nCC_AUTO_START=0\n");
+        let (st, v) = call(&app, "PATCH", "/api/sessions/review-q/config", Some(json!({"rename": "review-y"}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(header_as("review-x").await, "review-z", "x still reaches z past the live new y");
 
         let mut headers = HeaderMap::new();
         headers.insert("x-amux-ui-token", ui_token(&state).parse().unwrap());
         assert_eq!(delete_post(&state, "review-z", &headers).await.status(), StatusCode::OK);
-        // An unrelated worker takes the name.
+        // q, now the live review-y, keeps its alias through both consumers.
+        assert_eq!(header_as("review-q").await, "review-y", "deleting z must not drop q's alias");
+        assert_eq!(crate::api::board::callback_target(home.path(), "review-q".into()), "review-y");
+        // An unrelated worker takes the name z.
         rename_fixture_env("review-z", "CC_NAME=\"review-z\"\nCC_TAGS=other\nCC_AUTO_START=0\n");
-        for old in ["review-x", "review-y"] {
-            assert_eq!(header_as(old).await, old, "{old}'s header must not attach to the new review-z");
-            assert_eq!(
-                crate::api::board::callback_target(home.path(), old.into()),
-                old,
-                "{old}'s callbacks must not go to the new review-z"
-            );
-        }
+        assert_eq!(header_as("review-x").await, "review-x", "x's header must not attach to the new review-z");
+        assert_eq!(
+            crate::api::board::callback_target(home.path(), "review-x".into()),
+            "review-x",
+            "x's callbacks must not go to the new review-z"
+        );
+        assert_eq!(header_as("review-q").await, "review-y");
     }
 
     /// dev-lead: renaming a running Claude worker through the API delivers
