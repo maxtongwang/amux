@@ -22,6 +22,8 @@ STUB
   chmod +x "$TMP/bin/$tool"
 done
 export PATH="$TMP/bin:$PATH"
+# Explicit failures: bash 3.2 (macOS /bin/bash) does not exit on a false [[ ]] under set -e.
+fail() { echo "FAIL: $*" >&2; exit 1; }
 for isolated in 0 1 true yes; do
   cat > "$CC_HOME/sessions/rc-worker.env" <<ENV
 CC_DIR="$TMP"
@@ -29,12 +31,12 @@ CC_PROVIDER="claude"
 CC_ISOLATED="$isolated"
 ENV
   output="$(bash "$ROOT/amux" start rc-worker --dry-run)"
-  [[ "$output" == *"--name rc-worker"* ]]
+  [[ "$output" == *"--name rc-worker"* ]] || fail "CC_ISOLATED=$isolated: no --name: $output"
   if [[ "$isolated" == 0 ]]; then
-    [[ "$output" == *"--remote-control rc-worker"* ]]
+    [[ "$output" == *"--remote-control rc-worker"* ]] || fail "no --remote-control: $output"
   else
-    [[ "$output" != *"--remote-control"* ]]
+    [[ "$output" != *"--remote-control"* ]] || fail "isolated worker got --remote-control: $output"
   fi
 done
-[[ ! -e "$AMUX_HOME/forbidden" ]]
+[[ ! -e "$AMUX_HOME/forbidden" ]] || fail "the preview reached tmux or curl"
 echo "PASS: Claude launch preview names Remote Control and respects isolation"

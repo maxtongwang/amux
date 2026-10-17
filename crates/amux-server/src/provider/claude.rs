@@ -42,15 +42,6 @@
 //! word, never a response body or a `reqwest::Error`'s `Display` (which
 //! renders the request URL).
 
-/// Identity for every interactive Claude launch; raw workers keep only their name.
-pub(crate) fn interactive_identity_args(name: &str, isolated: bool) -> Vec<String> {
-    let mut args = vec!["--name".into(), name.into()];
-    if !isolated {
-        args.extend(["--remote-control".into(), name.into()]);
-    }
-    args
-}
-
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -61,6 +52,15 @@ use amux_core::provider::{
 use async_trait::async_trait;
 
 use super::{PromptMode, ProviderAdapter};
+
+/// Identity for every interactive Claude launch; raw workers keep only their name.
+pub(crate) fn interactive_identity_args(name: &str, isolated: bool) -> Vec<String> {
+    let mut args = vec!["--name".into(), name.into()];
+    if !isolated {
+        args.extend(["--remote-control".into(), name.into()]);
+    }
+    args
+}
 mod usage_cache;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
