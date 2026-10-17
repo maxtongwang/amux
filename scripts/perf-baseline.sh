@@ -30,12 +30,12 @@ trap 'kill "$SERVER_PID" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 # instrument tracks, and it moves the numbers ONCE, on the record here.
 sqlite3 "file:${LIVE_DB}?mode=ro" "VACUUM INTO '$WORK/amux.db'"
 
-AMUX_HOME="$WORK" AMUX_DB="$WORK/amux.db" AMUX_RS_PORT=$PORT \
+AMUX_HOME="$WORK" AMUX_DB="$WORK/amux.db" AMUX_BIND=127.0.0.1 AMUX_RS_PORT=$PORT \
   "${AMUX_RS_BIN:-./target/release/amux-server}" >"$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 
 for _ in $(seq 1 60); do
-  curl -sk --max-time 2 "https://localhost:$PORT/health" >/dev/null 2>&1 && break
+  curl -sk --max-time 2 "https://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
   sleep 0.5
 done
 
@@ -76,11 +76,11 @@ print(f'"{n}_avg_ms": {sum(v)//len(v)}, "{n}_median_ms": {s[(len(s)+1)//2-1]}, "
 PY
 }
 ENDPOINTS=(
-  "dashboard|https://localhost:$PORT/|"
-  "health|https://localhost:$PORT/health|"
-  "board|https://localhost:$PORT/api/board|auth"
-  "board_full|https://localhost:$PORT/api/board?done_limit=0|auth"
-  "workers|https://localhost:$PORT/api/workers|auth"
+  "dashboard|https://127.0.0.1:$PORT/|"
+  "health|https://127.0.0.1:$PORT/health|"
+  "board|https://127.0.0.1:$PORT/api/board|auth"
+  "board_full|https://127.0.0.1:$PORT/api/board?done_limit=0|auth"
+  "workers|https://127.0.0.1:$PORT/api/workers|auth"
 )
 first=$(( PERF_SAMPLES < PERF_RSS_AFTER ? PERF_SAMPLES : PERF_RSS_AFTER ))
 for e in "${ENDPOINTS[@]}"; do IFS='|' read -r n u a <<<"$e"; sample "$n" "$u" "$a" "$first"; done
@@ -111,7 +111,7 @@ if [ "$rest" -gt 0 ]; then
   for e in "${ENDPOINTS[@]}"; do IFS='|' read -r n u a <<<"$e"; sample "$n" "$u" "$a" "$rest"; done
 fi
 M1=$(summarize dashboard); M2=$(summarize health); M3=$(summarize board); M4=$(summarize board_full); M5=$(summarize workers)
-BOARD_BYTES=$(curl -sk -H "Authorization: Bearer $TOKEN" "https://localhost:$PORT/api/board" | wc -c | tr -d ' ')
+BOARD_BYTES=$(curl -sk -H "Authorization: Bearer $TOKEN" "https://127.0.0.1:$PORT/api/board" | wc -c | tr -d ' ')
 
 echo "{ $M1, $M2, $M3, $M4, $M5, \"rss_mb\": $RSS_MB, \"dirty_mb\": ${DIRTY_MB:-null}, \"board_default_bytes\": $BOARD_BYTES }"
 

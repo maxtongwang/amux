@@ -1,3 +1,4 @@
+// Lifecycle offline transport — proxy only the private loopback HTTPS server.
 import { createServer } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { test as base } from '../fixtures';
@@ -11,8 +12,8 @@ type OfflineTransport = {origin:string; setConnected:(connected:boolean) => void
 export const test = base.extend<{}, { offlineTransport: OfflineTransport }>({
   offlineTransport: [async ({}, use, info) => {
     const upstream = new URL(String(info.project.use.baseURL));
-    if (upstream.protocol !== 'https:' || upstream.hostname !== 'localhost') {
-      throw new Error('Offline fixture only proxies the lifecycle HTTPS localhost server');
+    if (upstream.protocol !== 'https:' || !['localhost', '127.0.0.1'].includes(upstream.hostname)) {
+      throw new Error('Offline fixture only proxies the lifecycle HTTPS loopback server');
     }
     let connected = true;
     const active = new Set<() => void>();

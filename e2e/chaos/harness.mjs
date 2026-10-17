@@ -44,7 +44,7 @@ export async function startAmux({ binary, env: extra = {}, root } = {}) {
   const log = path.join(root, 'fake-claude.log');
   const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('AMUX_') && !['TMUX', 'TMUX_PANE'].includes(k)));
   Object.assign(env, {
-    HOME: userHome, AMUX_HOME: home, AMUX_RS_PORT: String(port), TMUX_TMPDIR: tmuxDir,
+    HOME: userHome, AMUX_HOME: home, AMUX_BIND: '127.0.0.1', AMUX_RS_PORT: String(port), TMUX_TMPDIR: tmuxDir,
     AMUX_ISOLATED: '1', AMUX_NO_SELF_ADOPT: '1',
     // AMUX-4724 refuses spawns from a temp AMUX_HOME because a test usually
     // shares the REAL tmux server. This one does not: TMUX_TMPDIR above is a
@@ -56,7 +56,9 @@ export async function startAmux({ binary, env: extra = {}, root } = {}) {
     GIT_AUTHOR_NAME: 'chaos', GIT_AUTHOR_EMAIL: 'chaos@example.invalid',
     GIT_COMMITTER_NAME: 'chaos', GIT_COMMITTER_EMAIL: 'chaos@example.invalid',
   }, extra);
-  let base = `https://localhost:${port}`;
+  // Fixture callers can tune behavior, but cannot expose an unsigned server to LAN.
+  env.AMUX_BIND = '127.0.0.1';
+  let base = `https://127.0.0.1:${port}`;
   const serverLog = path.join(root, 'server.log');
   let proc = null;
   const up = async () => {
@@ -95,7 +97,7 @@ export async function startAmux({ binary, env: extra = {}, root } = {}) {
     try { await up(); break; } catch (e) {
       await down();
       if (attempt >= 3) throw e;
-      port = await freePort(); base = `https://localhost:${port}`;
+      port = await freePort(); base = `https://127.0.0.1:${port}`;
       env.AMUX_RS_PORT = String(port);
     }
   }

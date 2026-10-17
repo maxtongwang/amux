@@ -64,15 +64,15 @@ else
 fi
 
 echo "== booting $BIN on :$PORT"
-AMUX_HOME="$WORK" AMUX_DB="$WORK/amux.db" AMUX_RS_PORT=$PORT \
+AMUX_HOME="$WORK" AMUX_DB="$WORK/amux.db" AMUX_BIND=127.0.0.1 AMUX_RS_PORT=$PORT \
   "$BIN" >"$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 
 for _ in $(seq 1 60); do
-  curl -sk --max-time 2 "https://localhost:$PORT/health" >/dev/null 2>&1 && break
+  curl -sk --max-time 2 "https://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
   sleep 0.5
 done
-if ! curl -sk --max-time 2 "https://localhost:$PORT/health" >/dev/null 2>&1; then
+if ! curl -sk --max-time 2 "https://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
   echo "FAIL: server never answered /health"; sed -n '1,80p' "$WORK/server.log"; exit 1
 fi
 TOKEN=$(cat "$WORK/auth-token" 2>/dev/null || echo "")
@@ -81,7 +81,7 @@ TOKEN=$(cat "$WORK/auth-token" 2>/dev/null || echo "")
 # anyone saves amux-server.py / rebuilds, and a restart's symptoms are
 # indistinguishable from the leak being hunted. Measuring across two different
 # binaries is how a wrong conclusion arrives already corroborated.
-build_hash() { curl -sk --max-time 5 "https://localhost:$PORT/health" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("build",""))' 2>/dev/null || echo ""; }
+build_hash() { curl -sk --max-time 5 "https://127.0.0.1:$PORT/health" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("build",""))' 2>/dev/null || echo ""; }
 BUILD0="$(build_hash)"
 
 sample() { # -> "rss_kb fd_count"
@@ -99,11 +99,11 @@ sample() { # -> "rss_kb fd_count"
 
 drive() {
   while :; do
-    curl -sk -o /dev/null --max-time 5 "https://localhost:$PORT/health"
-    curl -sk -o /dev/null --max-time 5 -H "Authorization: Bearer $TOKEN" "https://localhost:$PORT/api/board"
-    curl -sk -o /dev/null --max-time 5 -H "Authorization: Bearer $TOKEN" "https://localhost:$PORT/api/workers"
-    curl -sk -o /dev/null --max-time 5 -H "Authorization: Bearer $TOKEN" "https://localhost:$PORT/api/search?q=the&limit=20"
-    curl -sk -o /dev/null --max-time 5 "https://localhost:$PORT/"
+    curl -sk -o /dev/null --max-time 5 "https://127.0.0.1:$PORT/health"
+    curl -sk -o /dev/null --max-time 5 -H "Authorization: Bearer $TOKEN" "https://127.0.0.1:$PORT/api/board"
+    curl -sk -o /dev/null --max-time 5 -H "Authorization: Bearer $TOKEN" "https://127.0.0.1:$PORT/api/workers"
+    curl -sk -o /dev/null --max-time 5 -H "Authorization: Bearer $TOKEN" "https://127.0.0.1:$PORT/api/search?q=the&limit=20"
+    curl -sk -o /dev/null --max-time 5 "https://127.0.0.1:$PORT/"
   done
 }
 

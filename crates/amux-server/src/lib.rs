@@ -341,6 +341,13 @@ async fn async_main() {
             .init(),
     }
 
+    let bind_ip = cfg.bind_ip().unwrap_or_else(|error| {
+        tracing::error!(%error, measured = true, n_considered = 1,
+            verdict = "invalid_bind_address", "server configuration rejected");
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+
     let running_build = build_hash();
     tracing::info!(port = cfg.port, db = %cfg.db_path.display(), pid = std::process::id(),
         commit = env!("AMUX_BUILD_COMMIT_FULL"), build = %running_build,
@@ -1139,7 +1146,7 @@ async fn async_main() {
     // reappears in code, scripts or e2e.
     legacy_port::publish_endpoint(&cfg.amux_home, cfg.port, None);
 
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port));
+    let addr = std::net::SocketAddr::new(bind_ip, cfg.port);
     // HOW LONG AFTER `record_boot` DID WE ACTUALLY START SERVING (AMUX-3647).
     //
     // The card proposed a `ready_at` COLUMN on `_amux_request_log` so the
@@ -1164,16 +1171,24 @@ async fn async_main() {
     }
     // Inherited from the previous image on a self-adoption, so the port never
     // closes across a rebuild; bound fresh on a cold start.
-    let (listener, listener_source) =
-        listener_handoff::adopt_or_bind(addr).expect("bind listener");
-    tracing::info!(%addr, listener_source, verdict = if listener_source == "inherited" {
+    let (listener, listener_source) = listener_handoff::adopt_or_bind(addr).unwrap_or_else(|error| {
+        tracing::error!(%addr, %error, measured = true, n_considered = 1,
+            verdict = "listener_bind_failed", "cannot bind server listener; check AMUX_BIND and AMUX_RS_PORT");
+        std::process::exit(1);
+    });
+    tracing::info!(addr = %listener.local_addr().expect("bound listener address"),
+        measured = true, n_considered = 1, listener_source, verdict = if listener_source == "inherited" {
         "listener_inherited"
     } else {
         "listener_bound"
     }, "listening (https, plain-http redirected)");
     let acceptor = tls::RedirectingAcceptor::new(
         axum_server::tls_rustls::RustlsAcceptor::new(rustls_cfg),
-        format!("localhost:{}", cfg.port),
+        if bind_ip.is_unspecified() {
+            format!("localhost:{}", cfg.port)
+        } else {
+            addr.to_string()
+        },
     );
     axum_server::from_tcp(listener)
         .acceptor(acceptor)

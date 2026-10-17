@@ -17,7 +17,7 @@
 //! server spawns never inherit the listening socket. The successor adopts only
 //! when `AMUX_LISTEN_PID` is its own pid (exec keeps the pid; a child that
 //! inherited the env does not) and the fd is a TCP stream socket on the
-//! configured port. Anything else is logged and the server binds normally.
+//! configured address. Anything else is logged and the server binds normally.
 
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -31,7 +31,7 @@ static LISTENER_FD: OnceLock<RawFd> = OnceLock::new();
 /// The inherited listener when the previous image handed one over, else a
 /// fresh bind. The second value names which, for the boot log.
 pub fn adopt_or_bind(addr: SocketAddr) -> std::io::Result<(TcpListener, &'static str)> {
-    let (listener, source) = match adopt(addr.port()) {
+    let (listener, source) = match adopt(addr) {
         Some(listener) => (listener, "inherited"),
         None => (TcpListener::bind(addr)?, "bound"),
     };
@@ -62,14 +62,16 @@ pub fn exec_failed() {
     }
 }
 
-fn adopt(port: u16) -> Option<TcpListener> {
+fn adopt(addr: SocketAddr) -> Option<TcpListener> {
     let raw = std::env::var(FD_ENV).ok()?;
     let reject = |reason: &str| {
         tracing::warn!(
             verdict = "listener_handoff_rejected",
+            measured = true,
+            n_considered = 1,
             reason,
             fd = %raw,
-            port,
+            %addr,
             "listener handoff not adopted; binding a fresh listener (clients see a refused-connect gap this boot)"
         );
     };
@@ -90,17 +92,24 @@ fn adopt(port: u16) -> Option<TcpListener> {
     // pid match means the previous image of THIS process handed it over, so
     // nothing else owns it.
     let listener = unsafe { TcpListener::from_raw_fd(fd) };
+    match validate_inherited_listener(listener, addr) {
+        Ok(listener) => Some(listener),
+        Err(reason) => {
+            reject(reason);
+            None
+        }
+    }
+}
+
+fn validate_inherited_listener(
+    listener: TcpListener,
+    addr: SocketAddr,
+) -> Result<TcpListener, &'static str> {
     match listener.local_addr() {
-        Ok(local) if local.port() == port => Some(listener),
-        Ok(_) => {
-            // Ours, but on the wrong port: drop (close) it and bind afresh.
-            reject("fd listens on a different port");
-            None
-        }
-        Err(_) => {
-            reject("fd has no local address");
-            None
-        }
+        Ok(local) if local == addr => Ok(listener),
+        // Drop (close) a mismatched inherited socket before binding afresh.
+        Ok(_) => Err("fd listens on a different address"),
+        Err(_) => Err("fd has no local address"),
     }
 }
 
@@ -146,6 +155,23 @@ mod tests {
 
     fn cloexec(fd: RawFd) -> bool {
         unsafe { libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0 }
+    }
+
+    #[test]
+    fn handoff_requires_the_configured_ip_as_well_as_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = validate_inherited_listener(listener, addr).unwrap();
+        let other_ip = SocketAddr::new("127.0.0.2".parse().unwrap(), addr.port());
+        assert_eq!(
+            validate_inherited_listener(listener, other_ip).unwrap_err(),
+            "fd listens on a different address"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let other_port = SocketAddr::new(addr.ip(), 0);
+        assert!(validate_inherited_listener(listener, other_port).is_err());
     }
 
     #[test]

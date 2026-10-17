@@ -34,7 +34,7 @@ def check(base, expected, timeout=60):
 if __name__ == '__main__':
     port = os.environ['AMUX_RS_PORT']
     expected = json.loads(Path(os.environ['AMUX_LIFECYCLE_ASSET_MANIFEST']).read_text())
-    result = check('https://localhost:' + port, expected)
+    result = check('https://127.0.0.1:' + port, expected)
     output = Path(os.environ['AMUX_LIFECYCLE_OUTPUT']) / ('asset-provenance-' + port + '.json')
     output.write_text(json.dumps(result, indent=2) + '\n')
     print('[lifecycle] ' + result['verdict'] + ': ' + str(output), flush=True)

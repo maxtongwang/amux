@@ -265,6 +265,12 @@ impl ServerConfig {
         Self::load(amux_home(), &process_env)
     }
 
+    /// Resolve the network interface after the normal process/file overlay.
+    /// Keep errors explicit: a typo must never expose a loopback-only server.
+    pub fn bind_ip(&self) -> Result<std::net::IpAddr, String> {
+        parse_bind_ip(self.env.get("AMUX_BIND").map(String::as_str))
+    }
+
     pub fn tls_dir(&self) -> PathBuf {
         self.amux_home.join("tls")
     }
@@ -277,6 +283,58 @@ impl ServerConfig {
     /// old build; nothing reads it anymore.
     pub fn auth_token_path(&self) -> PathBuf {
         self.amux_home.join("auth_token")
+    }
+}
+
+/// Production wildcard default: intentional allow-list site for no_wildcard_bind.
+fn parse_bind_ip(value: Option<&str>) -> Result<std::net::IpAddr, String> {
+    match value {
+        None => Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+        Some(value) => value.parse().map_err(|_| {
+            "AMUX_BIND must be an IPv4 or IPv6 address without a port; use a loopback IP for local tests or unset AMUX_BIND for the production default".to_string()
+        }),
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+
+    #[test]
+    fn bind_default_and_both_loopback_families() {
+        assert_eq!(
+            parse_bind_ip(None).unwrap(),
+            std::net::Ipv4Addr::UNSPECIFIED
+        );
+        for ip in ["127.0.0.1", "::1"] {
+            assert_eq!(
+                parse_bind_ip(Some(ip)).unwrap(),
+                ip.parse::<std::net::IpAddr>().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_bind_is_an_actionable_error_without_echoing_input() {
+        for value in ["garbage", "", "localhost", "127.0.0.1:18823", "[::1]"] {
+            let error = parse_bind_ip(Some(value)).unwrap_err();
+            assert!(error.contains("AMUX_BIND must be an IPv4 or IPv6 address without a port"));
+        }
+    }
+
+    #[test]
+    fn bind_reads_the_resolved_config_not_the_process_environment() {
+        let mut cfg = ServerConfig {
+            amux_home: PathBuf::new(),
+            port: DEFAULT_PORT,
+            db_path: PathBuf::new(),
+            env: BTreeMap::new(),
+        };
+        assert_eq!(cfg.bind_ip().unwrap(), std::net::Ipv4Addr::UNSPECIFIED);
+        cfg.env.insert("AMUX_BIND".into(), "::1".into());
+        assert_eq!(cfg.bind_ip().unwrap(), std::net::Ipv6Addr::LOCALHOST);
+        cfg.env.insert("AMUX_BIND".into(), "invalid".into());
+        assert!(cfg.bind_ip().is_err());
     }
 }
 
