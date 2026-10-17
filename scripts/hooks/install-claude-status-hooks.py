@@ -243,7 +243,8 @@ def main() -> int:
     parser.add_argument(
         "--settings",
         type=Path,
-        default=Path.home() / ".claude" / "settings.json",
+        default=None,
+        help="native hook file (default: ~/.claude/settings.json, or $CODEX_HOME/hooks.json for --provider codex)",
     )
     parser.add_argument("--hook-path", default="$HOME/.amux/hook-report.sh")
     parser.add_argument(
@@ -267,6 +268,13 @@ def main() -> int:
         help="wire canonical events even when the installed handler cannot answer them",
     )
     args = parser.parse_args()
+    if args.settings is None:
+        # Resolved after --provider: a Codex run defaulting to Claude's settings would replace Claude's
+        # managed report hooks with the Codex set and drop its Notification producer (PR #6 review).
+        if args.provider == "codex":
+            args.settings = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "hooks.json"
+        else:
+            args.settings = Path.home() / ".claude" / "settings.json"
 
     # REFUSE BEFORE WRITING. The failure this prevents is not a missing hook,
     # it is a wired hook backed by a handler that answers every notification

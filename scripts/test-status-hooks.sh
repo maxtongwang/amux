@@ -597,4 +597,18 @@ grep -q "Claude transcripts only" "$TMP/codex-ask.err"
 [ ! -e "$TMP/codex-ask.json" ] || { echo "FAIL a refused codex install still wrote hooks.json" >&2; exit 1; }
 echo "ok   codex: the ask guard is refused with its reason and nothing is written"
 
+# Review finding (PR #6): with --provider codex and no --settings, the default destination must be Codex's
+# hooks.json (CODEX_HOME honoured), and Claude's settings must be left exactly as they were.
+for codex_home_mode in default custom; do
+  FAKE_HOME="$TMP/home-$codex_home_mode"; mkdir -p "$FAKE_HOME/.claude"
+  printf '%s\n' '{"hooks":{"Notification":[{"hooks":[{"type":"command","command":"bash \"$HOME/.amux/hook-report.sh\" blocked notification-hook"}]}]}}' > "$FAKE_HOME/.claude/settings.json"
+  cp "$FAKE_HOME/.claude/settings.json" "$TMP/claude-before.json"
+  if [ "$codex_home_mode" = custom ]; then want="$TMP/custom-codex/hooks.json"; ch="$TMP/custom-codex"; else want="$FAKE_HOME/.codex/hooks.json"; ch=""; fi
+  env HOME="$FAKE_HOME" ${ch:+CODEX_HOME="$ch"} /usr/bin/python3 scripts/hooks/install-claude-status-hooks.py --provider codex >/dev/null
+  cmp -s "$FAKE_HOME/.claude/settings.json" "$TMP/claude-before.json" || { echo "FAIL --provider codex rewrote Claude's settings ($codex_home_mode)" >&2; exit 1; }
+  [ -f "$want" ] || { echo "FAIL --provider codex did not write $want" >&2; exit 1; }
+  /usr/bin/python3 -c 'import json,sys; h=json.load(open(sys.argv[1]))["hooks"]; assert "SubagentStart" in h and "Notification" not in h' "$want"
+done
+echo "ok   codex: with no --settings the default is Codex's hooks.json (CODEX_HOME honoured); Claude settings untouched"
+
 echo "ok   all shipped status-hook durability regressions passed"
