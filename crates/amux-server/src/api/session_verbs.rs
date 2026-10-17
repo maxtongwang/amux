@@ -6679,6 +6679,8 @@ pub(crate) fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Resu
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN queue_id TEXT", []);
     // Migration 0088 carries the same ADDCOL for migrated DBs (F8(e)).
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN repeat_of INTEGER", []);
+    // Migration 0123 carries the same ADDCOL for migrated DBs (ai-config#160).
+    let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN process_origin TEXT", []);
     // Dead-lettered vs delivered must be distinguishable in history
     // (AMUX-3110; migration 0024 carries the same ADDCOL for migrated DBs,
     // this covers a DB bootstrapped through this legacy path).
@@ -6973,6 +6975,12 @@ pub(crate) struct DeliveryMeta<'a> {
     /// The earlier owner message this one repeats (F8(e), migration 0088).
     /// None for everything that is not a detected repeat.
     pub repeat_of: Option<i64>,
+    /// The process-attribution verdict of the request that sent an OWNER
+    /// message (`outside` or `remote`, from `process_identity`), migration
+    /// 0123. `max_ref` accepts an owner send as the owner's own words only on
+    /// one of those two. None on every other row: peer, member, schedule,
+    /// pane, and every row written before 0123.
+    pub process_origin: Option<&'a str>,
 }
 
 impl DeliveryMeta<'_> {
@@ -6983,6 +6991,7 @@ impl DeliveryMeta<'_> {
             submit_verdict: Some("accepted"),
             client_meta: None,
             repeat_of: None,
+            process_origin: None,
         }
     }
     /// A send handed straight to a live lane, with nothing to verify.
@@ -7017,6 +7026,7 @@ impl DeliveryMeta<'_> {
             submit_verdict: None,
             client_meta: None,
             repeat_of: None,
+            process_origin: None,
         }
     }
 }
@@ -7741,6 +7751,11 @@ pub(crate) async fn cmd_hist_record_with_id(
     let submit_verdict = meta.submit_verdict.map(|v| v.to_string());
     let queued_at_ms = meta.queued_at_ms;
     let repeat_of = meta.repeat_of;
+    // Only the two owner verdicts are stored; anything else is not evidence.
+    let process_origin = meta
+        .process_origin
+        .filter(|v| matches!(*v, "outside" | "remote"))
+        .map(str::to_string);
     // Bounded, and only if it parses as a JSON OBJECT. This lands in a column
     // the Messages tab renders and the Ask panel feeds to a model, so a client
     // must not be able to write a megabyte of arbitrary text into it, nor a
@@ -7888,12 +7903,12 @@ pub(crate) async fn cmd_hist_record_with_id(
                 dup_prior_ts_w.store(pts, std::sync::atomic::Ordering::SeqCst);
             }
             conn.execute(
-                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, repeat_of) \
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, repeat_of, process_origin) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rusqlite::params![
                     text, ctype, session, now_ms, origin,
                     delivery, queued_at_ms, delivered_at_ms, submit_verdict, capture_pending,
-                    client_meta, repeat_of
+                    client_meta, repeat_of, process_origin
                 ],
             )?;
             let row_id = conn.last_insert_rowid();
@@ -28536,6 +28551,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             // invent a sender context for a machine.
             client_meta: None,
             repeat_of,
+            process_origin: None,
         };
         if record_history {
             let email = headers
@@ -28543,8 +28559,19 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             let author = member_actor.as_deref().unwrap_or(email);
+            // The process verdict, recorded only for the OWNER's own send: no
+            // member actor and no worker identity (a worker pane's request
+            // carries its worker header after attribution, whatever it sent).
+            let process_origin = if member_actor.is_none() && hdr_worker(headers).trim().is_empty() {
+                headers
+                    .get(super::process_identity::PROCESS_ORIGIN_HEADER)
+                    .and_then(|v| v.to_str().ok())
+            } else {
+                None
+            };
             let meta = DeliveryMeta {
                 client_meta: client_meta_raw.as_deref(),
+                process_origin,
                 ..meta
             };
             let row_id =
@@ -28630,6 +28657,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                 submit_verdict: Some(verdict),
                 client_meta: None,
                 repeat_of,
+                process_origin: None,
             };
             if record_history {
                 let email = headers
@@ -38848,6 +38876,7 @@ mod tests {
                 submit_verdict: Some("stuck"),
                 client_meta: None,
                 repeat_of: None,
+                process_origin: None,
             },
         )
         .await;
@@ -38903,6 +38932,7 @@ mod tests {
                 submit_verdict: Some("stuck"),
                 client_meta: None,
                 repeat_of: None,
+                process_origin: None,
             },
         )
         .await;
@@ -39038,6 +39068,7 @@ mod tests {
                 submit_verdict: Some("retried"),
                 client_meta: None,
                 repeat_of: None,
+                process_origin: None,
             },
         )
         .await;
@@ -40243,6 +40274,7 @@ mod tests {
                     submit_verdict: Some("confirmed"),
                     client_meta: None,
                     repeat_of: None,
+                    process_origin: None,
                 },
             )
             .await;
@@ -40367,6 +40399,7 @@ mod tests {
                 submit_verdict: Some("confirmed"),
                 client_meta: None,
                 repeat_of: None,
+                process_origin: None,
             },
         )
         .await;
@@ -40395,6 +40428,7 @@ mod tests {
                 submit_verdict: Some("confirmed"),
                 client_meta: None,
                 repeat_of: None,
+                process_origin: None,
             },
         )
         .await;

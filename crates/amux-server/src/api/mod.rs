@@ -77,6 +77,7 @@ pub mod map;
 pub mod mcp;
 pub mod mdai;
 pub mod measured;
+pub(crate) mod max_ref;
 pub mod needs_input;
 pub mod needs_input_auto;
 pub mod memories;
