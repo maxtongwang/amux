@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import queue
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -522,7 +523,7 @@ class SafeCargoReclaimTests(unittest.TestCase):
             [sys.executable, '-c',
              'import fcntl,sys; f=open(sys.argv[1], "w"); '
              'fcntl.flock(f, fcntl.LOCK_EX); f.write(sys.argv[2]); f.flush(); '
-             'print("ready", flush=True); sys.stdin.readline()',
+             'print("ready", flush=True); sys.stdin.readline(); f.close()',
              str(pending), json.dumps({'pid': os.getpid(), 'since': time.time(), 'deferral_streak': 3})],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.assertEqual(reclaimer.stdout.readline().strip(), 'ready')
@@ -537,6 +538,8 @@ class SafeCargoReclaimTests(unittest.TestCase):
         finally:
             reclaimer.communicate('done\n', timeout=10)  # the reclaimer ends; its marker is now inert
         wrapper.wait(timeout=60)
+        err.close()
+        wrapper.stdout.close()
         self.assertEqual(wrapper.returncode, 0, err.rest())
         self.assertIn('cargo_reclaim_pending_ignored', err.rest())
         self.assertEqual(self.runs.read_text().count('run'), 1)
@@ -549,7 +552,15 @@ class Lines:
     def __init__(self, stream):
         self.lines = queue.Queue()
         self.seen = []
-        threading.Thread(target=self._pump, args=(stream,), daemon=True).start()
+        self.stream = stream
+        self.thread = threading.Thread(target=self._pump, args=(stream,), daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.thread.join(timeout=5)
+        if self.thread.is_alive():
+            raise AssertionError('fixture output reader did not finish')
+        self.stream.close()
 
     def _pump(self, stream):
         for line in stream:
@@ -605,6 +616,9 @@ class FixtureBuild:
     def close(self):
         if self.proc.poll() is None:
             self.finish()
+        self.proc.stdin.close()
+        self.out.close()
+        self.err.close()
 
 
 class FakeClock:
@@ -790,6 +804,114 @@ class ReclaimPriorityTests(unittest.TestCase):
         marker, reason = guard.read_pending(self.root, NOW, 1200)
         self.assertIsNone(marker)
         self.assertIn('gone', reason)
+
+    def cli_reclaim(self, **env):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), 'reclaim', '--target', str(self.root)],
+            env={**self.env, 'AMUX_CARGO_RECLAIM_PRIORITY_AFTER': '0', **env},
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+        verdict = json.loads(result.stdout)
+        self.assertEqual(verdict['verdict'], 'cargo_reclaim_deferred')
+        self.assert_untouched()
+        return verdict
+
+    def test_corrupt_cooldown_cli_defers_with_diagnostic(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        self.addCleanup(os.close, fd)
+        path = guard.priority_timeout_path(self.root)
+        for value in (b'interrupted-write', b'\xff', b'nan', b'inf', b'-inf'):
+            with self.subTest(value=value):
+                path.write_bytes(value)
+                verdict = self.cli_reclaim()
+                self.assertIn('priority backoff unmeasured', verdict['reason'])
+                self.assertIn(str(path), verdict['reason'])
+
+    def test_unreadable_cooldown_cli_defers_with_diagnostic(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        self.addCleanup(os.close, fd)
+        # A directory gives a real read error even when the suite runs as root.
+        path = guard.priority_timeout_path(self.root)
+        path.mkdir()
+        verdict = self.cli_reclaim()
+        self.assertIn('priority backoff unmeasured', verdict['reason'])
+        self.assertIn(str(path), verdict['reason'])
+
+    def test_corrupt_streak_cli_resets_and_reports(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        self.addCleanup(os.close, fd)
+        path = guard.streak_path(self.root)
+        reason = self.cli_reclaim()['reason']
+        cases = ['interrupted-write', '[]', 'null', '42']
+        for field in ('count', 'since', 'priority_count'):
+            for value in (None, [], {}, 'bad', float('inf')):
+                cases.append(json.dumps({'reason': reason, field: value}))
+        for value in cases:
+            with self.subTest(value=value):
+                path.write_text(value)
+                verdict = self.cli_reclaim()
+                self.assertEqual(verdict['deferral_streak'], 1)
+
+    def test_unreadable_streak_cli_still_defers(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        self.addCleanup(os.close, fd)
+        guard.streak_path(self.root).mkdir()
+        self.assertEqual(self.cli_reclaim()['deferral_streak'], 1)
+        guard.clear_streak([self.root])  # failed unlink is best effort too
+
+    def test_corrupt_markers_are_ignored_and_clear_is_safe(self):
+        for value in ('broken', '[]', 'null', '{}', '{"since": null}',
+                      '{"since": NaN}', '{"since": Infinity}',
+                      json.dumps({'since': 10 ** 400})):
+            with self.subTest(value=value):
+                self.pending().write_text(value)
+                fd = guard.open_lock(self.pending())
+                try:
+                    marker, reason = guard.read_pending(self.root, NOW, 1200)
+                    self.assertIsNone(marker)
+                    self.assertIn('unreadable', reason)
+                finally:
+                    os.close(fd)
+                guard.clear_pending([self.root])
+
+    def test_unreadable_marker_cli_defers_and_clear_is_safe(self):
+        self.pending().mkdir()
+        marker, reason = guard.read_pending(self.root, NOW, 1200)
+        self.assertIsNone(marker)
+        self.assertIn('unreadable', reason)
+        guard.clear_pending([self.root])
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        self.addCleanup(os.close, fd)
+        self.cli_reclaim(AMUX_CARGO_RECLAIM_PRIORITY_AFTER='1')
+
+    def test_unwritable_cooldown_cli_defers_and_clears_marker(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        self.addCleanup(os.close, fd)
+        path = guard.priority_timeout_path(self.root)
+        path.mkdir()
+        with mock.patch.object(guard, 'priority_backoff', return_value=0):
+            code, verdict, _ = self.reclaim(FakeClock(NOW),
+                AMUX_CARGO_RECLAIM_PRIORITY_AFTER='1', AMUX_CARGO_RECLAIM_PRIORITY_WAIT_S='0')
+        self.assertEqual(code, 75)
+        self.assertEqual(verdict['verdict'], 'cargo_reclaim_deferred')
+        self.assertIn(str(path), verdict['reason'])
+        self.assertFalse(self.pending().exists())
+
+    def test_failed_marker_publication_defers_and_removes_temporary(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        self.addCleanup(os.close, fd)
+        with mock.patch.object(guard.os, 'replace', side_effect=OSError('fixture publish failed')):
+            code, verdict, _ = self.reclaim(FakeClock(NOW),
+                                          AMUX_CARGO_RECLAIM_PRIORITY_AFTER='1')
+        self.assertEqual(code, 75)
+        self.assertEqual(verdict['verdict'], 'cargo_reclaim_deferred')
+        self.assertIn('fixture publish failed', verdict['reason'])
+        self.assertFalse(self.pending().exists())
+        self.assertNotIn(self.pending(), guard._PENDING)
+        self.assertEqual(list(self.base.glob(self.pending().name + '.*')),
+                         [Path(str(self.pending()) + '.lock')])
+        self.assert_untouched()
 
     def test_peer_cannot_delete_locked_marker_even_with_same_pid(self):
         self.write_marker(os.getpid(), NOW)
@@ -986,6 +1108,32 @@ class ReclaimPriorityTests(unittest.TestCase):
         died = subprocess.run([sys.executable, '-c', crash, str(SCRIPT), str(self.root)], env=self.env)
         self.assertEqual(died.returncode, 9)
         self.assertTrue(self.pending().exists(), 'the crash left its marker behind')
+        build = self.build()
+        build.ready()
+        self.assertIn('gone', build.err.wait_for('cargo_reclaim_pending_ignored'))
+        self.assertEqual(build.finish(), 0)
+
+    def test_a_sigkilled_reclaimer_leaves_no_block(self):
+        crash = ('import importlib.util, sys, time; from pathlib import Path\n'
+                 'spec = importlib.util.spec_from_file_location("guard", sys.argv[1])\n'
+                 'guard = importlib.util.module_from_spec(spec); spec.loader.exec_module(guard)\n'
+                 'guard.write_pending([Path(sys.argv[2])], {}, time.time())\n'
+                 'print("ready", flush=True); sys.stdin.readline()\n')
+        with subprocess.Popen([sys.executable, '-c', crash, str(SCRIPT), str(self.root)],
+                              env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              text=True) as proc:
+            try:
+                self.assertEqual(proc.stdout.readline().strip(), 'ready')
+                marker, reason = guard.read_pending(self.root, time.time(), 1200)
+                self.assertIsNotNone(marker)
+                self.assertIsNone(reason)
+                proc.kill()  # SIGKILL only this fixture, after locked publication
+                self.assertEqual(proc.wait(timeout=10), -signal.SIGKILL)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=10)
+        self.assertTrue(self.pending().exists(), 'SIGKILL leaves the published marker')
         build = self.build()
         build.ready()
         self.assertIn('gone', build.err.wait_for('cargo_reclaim_pending_ignored'))

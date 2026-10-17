@@ -67,7 +67,16 @@ def bump_streak(targets, reason, now=None, *, contended=False):
     now = int(time.time()) if now is None else now
     try:
         previous = json.loads(path.read_text())
-    except (OSError, ValueError):
+        if not isinstance(previous, dict):
+            raise ValueError('expected a streak object')
+        for field in ('count', 'since', 'priority_count'):
+            value = previous.get(field, 0)
+            if type(value) is not int or value < 0:
+                raise ValueError('invalid streak ' + field)
+    except FileNotFoundError:
+        previous = {}
+    except (OSError, ValueError) as error:
+        print('cargo_reclaim_streak_ignored: %s: %s' % (path, error), file=sys.stderr)
         previous = {}
     if previous.get('reason') == reason:
         count = int(previous.get('count', 0)) + 1
@@ -240,6 +249,8 @@ def read_pending(target, now, max_age_s):
             with path.open('r') as handle:
                 marker = json.load(handle)
                 since = float(marker['since'])
+                if not math.isfinite(since):
+                    raise ValueError('marker timestamp must be finite')
                 if marker_unlocked(handle.fileno()):
                     path.unlink()
                     return None, 'reclaimer lock of %s is gone' % path
@@ -249,7 +260,7 @@ def read_pending(target, now, max_age_s):
                 return marker, None
     except FileNotFoundError:
         return None, None
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, OverflowError) as error:
         return None, 'unreadable %s: %s' % (path, error)
 
 
@@ -260,8 +271,11 @@ def priority_timeout_path(target):
 def priority_backoff(targets, backoff_s):
     remaining = 0
     for target in targets:
+        path = priority_timeout_path(target)
         try:
-            ended = float(priority_timeout_path(target).read_text())
+            ended = float(path.read_text())
+            if not math.isfinite(ended):
+                raise ValueError('cooldown timestamp must be finite')
             remaining = max(remaining, ended + backoff_s - time.time())
         except FileNotFoundError:
             pass
