@@ -141,7 +141,7 @@ fn classify(down_from: f64, machine_boot_at: Option<f64>) -> Option<DowntimeCaus
 /// both and takes whichever arm its kernel provides, so the single-codebase
 /// rule is intact — there is no `if IS_CLOUD` hiding in this.
 #[cfg(target_os = "macos")]
-fn machine_boot_at() -> Option<f64> {
+pub(crate) fn machine_boot_at() -> Option<f64> {
     let mut tv = libc::timeval {
         tv_sec: 0,
         tv_usec: 0,
@@ -171,7 +171,7 @@ fn machine_boot_at() -> Option<f64> {
 /// subtraction drifts with every clock adjustment — the wrong property for a
 /// value being compared against a stored wall-clock timestamp.
 #[cfg(not(target_os = "macos"))]
-fn machine_boot_at() -> Option<f64> {
+pub(crate) fn machine_boot_at() -> Option<f64> {
     let stat = std::fs::read_to_string("/proc/stat").ok()?;
     stat.lines()
         .find_map(|l| l.strip_prefix("btime "))
