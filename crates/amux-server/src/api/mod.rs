@@ -41,6 +41,8 @@ pub mod connectors;
 pub mod criteria;
 pub mod crm;
 pub mod deleted_substrate;
+pub(crate) mod delegation_log;
+pub(crate) mod delegation_grants;
 pub mod dependency_audit;
 pub mod dictation;
 pub mod email;
@@ -77,6 +79,7 @@ pub mod map;
 pub mod mcp;
 pub mod mdai;
 pub mod measured;
+pub(crate) mod max_ref;
 pub mod needs_input;
 pub mod needs_input_auto;
 pub mod memories;
@@ -150,6 +153,7 @@ pub mod workers;
 mod worker_messaging;
 mod mention_grants;
 pub mod workers_deadletters;
+pub mod delegation;
 
 use crate::db::SharedStore;
 use axum::Router;
@@ -366,6 +370,10 @@ pub fn router_with_connector_transport(
         .merge(land_queue::routes())
         .merge(vault::routes())
         .merge(vault_secrets::routes())
+        // ai-config#160: the delegated-change log (read-only; no edit or delete route).
+        .merge(delegation_log::routes())
+        // ai-config#160: structured grants (pending widening changes Max approves).
+        .merge(delegation_grants::routes())
         .merge(chatgpt_app::routes())
         .merge(chat_delegate::routes())
         .merge(self_update::routes())
@@ -539,6 +547,9 @@ pub fn router_with_connector_transport(
         // Contract rule 10 (AH-387): a claimed worker identity carries that
         // worker's minted token. Inside require_bearer, so it sees only
         // admitted requests.
+        // Inside rule 10: buffer a delegable mutating request so a change that
+        // needs Max's approval can be stored as an exact grant (ai-config #160).
+        .layer(axum::middleware::from_fn(delegation_grants::capture))
         .layer(axum::middleware::from_fn(worker_identity::enforce))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

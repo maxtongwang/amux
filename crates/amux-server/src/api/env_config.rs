@@ -156,6 +156,13 @@ struct WorkerSpec {
     prompt: String,
 }
 
+/// The settings an env-spec worker create writes besides name and groups,
+/// for the delegation table (design review B3).
+fn env_spec_settings(w: &WorkerSpec) -> Vec<String> {
+    [("dir", &w.dir), ("desc", &w.desc), ("model", &w.model), ("provider", &w.provider), ("prompt", &w.prompt)]
+        .iter().filter(|(_, v)| !v.is_empty()).map(|(k, _)| format!("create:{k}")).collect()
+}
+
 /// An env apply creates workers with groups and had no caller check, so a
 /// worker could mint group members (fix/worker-membership-create). Each worker
 /// the spec CREATES goes through the shared create rule (only leads, only
@@ -181,6 +188,29 @@ fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Optio
         return refuse("env_apply_schedule_other_worker",
             format!("worker '{origin}' may schedule only itself, not '{}'", s.worker.trim()));
     }
+    // Group config and the instance sections go through the delegation table
+    // like their own endpoints (ai-config #160, review B3): group config is a
+    // lead's own team or mrpopo through a grant (PATCH /api/groups/<g>/config);
+    // cards, messages, columns and global are owner-only here.
+    if !origin.is_empty() {
+        use crate::api::delegation::{refusal_value, Action, Target};
+        for g in &spec.groups {
+            let group = crate::api::session_verbs::norm_label(&g.name);
+            if let Some(body) = refusal_value(headers, &Target::Group(group.clone()), &Action::SetGroupConfig { group }) {
+                return Some((StatusCode::FORBIDDEN, Json(body)).into_response());
+            }
+        }
+        for (section, present) in [("cards", !spec.cards.is_empty()), ("messages", !spec.messages.is_empty()),
+            ("columns", !spec.columns.is_empty()), ("global", spec.global.is_some())] {
+            if !present {
+                continue;
+            }
+            let action = Action::SetConfig { keys: vec![format!("env-apply:{section}")] };
+            if let Some(body) = refusal_value(headers, &Target::Settings(vec![section.to_string()]), &action) {
+                return Some((StatusCode::FORBIDDEN, Json(body)).into_response());
+            }
+        }
+    }
     let sessions = crate::config::amux_home().join("sessions");
     for w in &spec.workers {
         let name = sanitize(&w.name);
@@ -198,7 +228,7 @@ fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Optio
             }
         } else if let Some(r) = crate::api::session_verbs::worker_create_refusal(
             headers,
-            &crate::api::session_verbs::CreateRequest { name: None, tags: &w.groups, owner_only: None },
+            &crate::api::session_verbs::CreateRequest { name: Some(&name), tags: &w.groups, owner_only: None, settings: env_spec_settings(w) },
         ) {
             return Some(r);
         }
@@ -239,6 +269,41 @@ struct ApplyQ {
 }
 
 async fn apply(
+    State(state): State<AppState>,
+    Query(q): Query<ApplyQ>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    // Plan the delegated creates up front (decided by worker_apply_refusal),
+    // log each only once the apply wrote it.
+    let dry = q.dry_run != 0;
+    let sessions = crate::config::amux_home().join("sessions");
+    let planned: Vec<(String, crate::api::delegation::Grant, Vec<String>)> = if dry {
+        vec![]
+    } else {
+        let raw = String::from_utf8_lossy(&body);
+        let spec: Option<EnvSpec> = serde_json::from_str(&raw).ok().or_else(|| serde_yaml::from_str(&raw).ok());
+        spec.map(|spec| spec.workers.iter().filter_map(|w| {
+            let name = sanitize(&w.name);
+            if name.is_empty() || sessions.join(format!("{name}.env")).exists() {
+                return None;
+            }
+            let action = crate::api::delegation::Action::CreateWorker { tags: w.groups.clone(), settings: env_spec_settings(w), owner_only: None };
+            crate::api::delegation::grant_if_allowed(&headers, &crate::api::delegation::Target::NewWorker, &action).map(|g| (name, g, w.groups.clone()))
+        }).collect()).unwrap_or_default()
+    };
+    let resp = apply_inner(State(state.clone()), Query(q), headers, body).await;
+    if resp.status().is_success() {
+        for (name, g, groups) in planned {
+            if sessions.join(format!("{name}.env")).exists() {
+                g.commit(&state, Value::Null, json!({"name": name, "tags": groups, "via": "env/apply"}));
+            }
+        }
+    }
+    resp
+}
+
+async fn apply_inner(
     State(state): State<AppState>,
     Query(q): Query<ApplyQ>,
     headers: HeaderMap,

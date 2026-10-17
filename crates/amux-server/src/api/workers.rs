@@ -498,6 +498,9 @@ pub struct CreateWorkerBody {
     /// ACW-2: `coding` (default) or `chat`; see `amux_core::worker_type`.
     #[serde(default)]
     pub worker_type: Option<String>,
+    /// Why a delegated change was made, for the delegated-change log.
+    #[serde(default)]
+    pub why: Option<String>,
 }
 
 /// AF-651 (gh#202): `backend` was accepted as any string and answered
@@ -605,14 +608,36 @@ pub async fn create_worker(
     } else {
         None
     };
+    // A store create names no tags; a lead's gets its team tag (settled:
+    // untagged lead creates get T), so the create rule sees T.
+    let lead_tags = crate::api::delegation::lead_default_tags(&headers, vec![]);
     if let Some(refusal) = crate::api::session_verbs::worker_create_refusal(
         &headers,
-        &crate::api::session_verbs::CreateRequest { name: requested, tags: &[], owner_only },
+        &crate::api::session_verbs::CreateRequest { name: requested, tags: &lead_tags, owner_only, settings: [
+            ("row:cwd", body.cwd.is_some()), ("row:provider", body.provider.is_some()), ("row:model", body.model.is_some()),
+            ("row:backend", body.backend.is_some()), ("row:environment", body.environment.is_some()), ("row:permissions", body.permissions.is_some()),
+        ].iter().filter(|(_, on)| *on).map(|(k, _)| k.to_string()).collect() },
     ) {
         return refusal;
     }
+    let requested_name: Option<String> = requested.map(str::to_string);
+    let summary = json!({"name": requested, "cwd": body.cwd, "provider": body.provider, "model": body.model});
+    let action = crate::api::delegation::Action::CreateWorker { tags: lead_tags.clone(), settings: vec![], owner_only: None };
+    let st = state.0.clone();
     let out = create_worker_inner(state, Json(body)).await;
     crate::api::sessions_legacy::invalidate_sessions_cache();
+    if out.status().is_success() {
+        // A store create has no tag field: the lead's team tag is written to
+        // the worker's session env, where every group reader looks.
+        if let (Some(team), Some(name)) = (lead_tags.first(), requested_name.as_deref()) {
+            let path = crate::api::session_verbs::env_path(name);
+            if let Err(e) = crate::api::session_verbs::EnvFile::merge_plain(&path, &[("CC_TAGS".to_string(), Some(team.clone()))]) {
+                tracing::warn!(worker = %name, team = %team, error = %e, verdict = "lead_create_tag_unwritten", measured = true, n_considered = 1,
+                    "a lead's store-created worker could not be given its team tag");
+            }
+        }
+        crate::api::delegation::record_allowed(&st, &headers, &crate::api::delegation::Target::NewWorker, &action, Value::Null, summary);
+    }
     out
 }
 
@@ -773,6 +798,9 @@ pub struct PatchWorkerBody {
     /// applies if the entity is still at this version; otherwise 409.
     #[serde(default)]
     pub expect_version: Option<u64>,
+    /// Why a delegated change was made, for the delegated-change log.
+    #[serde(default)]
+    pub why: Option<String>,
 }
 
 enum PatchOutcome {
@@ -803,21 +831,51 @@ pub async fn patch_worker(
     // own row; `group` and the chat type are messaging authority; the free-form
     // `environment` map and `permissions` are the owner's.
     let origin = crate::api::session_verbs::worker_origin(&headers);
-    if !origin.is_empty() && origin != key {
-        let target = match resolve_key(&state, key.clone()).await {
-            Ok(n) => n,
-            Err(r) => return r,
-        };
-        if let Some(refusal) = crate::api::session_verbs::peer_config_refusal(&headers, &target, "the worker row") { return refusal; }
-    }
-    let authority = body.group.is_some() || body.worker_type.as_deref().is_some_and(crate::api::session_verbs::is_chat_type);
-    if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(&headers, authority) { return refusal; }
     if !origin.is_empty() && (body.environment.is_some() || body.permissions.is_some()) {
         tracing::warn!(worker = %origin, verdict = "raw_text_owner_only", measured = true, n_considered = 1,
             "a worker tried to set a worker row's environment or permissions");
         return err(StatusCode::FORBIDDEN, json!({"ok": false, "code": "raw_text_owner_only",
             "error": "a worker row's environment and permissions are the owner's to set"}));
     }
+    // Every other row field goes through the delegation table (ai-config #160).
+    let grant = if origin.is_empty() {
+        None
+    } else {
+        let target = match resolve_key(&state, key.clone()).await {
+            Ok(n) => n,
+            Err(r) => return r,
+        };
+        // Every field in the body is judged; one refused field refuses the
+        // request (design review M15). A row rename to a reserved name is the
+        // owner's (H11).
+        for n in [body.display_name.as_deref(), body.name.as_deref()].into_iter().flatten() {
+            if let Some(r) = crate::api::delegation::reserved_name_refusal(&headers, n) { return r; }
+        }
+        let fields = [("display_name", body.display_name.is_some()), ("name", body.name.is_some()), ("cwd", body.cwd.is_some()),
+            ("provider", body.provider.is_some()), ("model", body.model.is_some()), ("backend", body.backend.is_some()),
+            ("worker_type", body.worker_type.is_some()), ("group", body.group.is_some())];
+        let action = crate::api::delegation::Action::SetConfig { keys: fields.iter().filter(|(_, on)| *on).map(|(k, _)| format!("row:{k}")).collect() };
+        let meta = json!({"why": body.why});
+        match crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Worker(target.clone()), &action, Some(&meta)) {
+            Ok(g) => g.map(|g| (g, target)),
+            Err(r) => return r,
+        }
+    };
+    let summary = json!({"display_name": body.display_name, "name": body.name, "cwd": body.cwd, "provider": body.provider,
+        "model": body.model, "backend": body.backend, "worker_type": body.worker_type, "group": body.group});
+    let key = grant.as_ref().map(|(_, n)| n.clone()).unwrap_or(key);
+    let resp = patch_worker_inner(State(state.clone()), Path(key), body).await;
+    if let Some((g, target)) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(&state, json!({"name": target}), summary);
+    }
+    resp
+}
+
+async fn patch_worker_inner(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    body: PatchWorkerBody,
+) -> Response {
     let display_name = match resolve_name_fields(body.display_name.clone(), body.name.clone()) {
         Ok(n) => n,
         Err(resp) => return *resp,
@@ -1122,7 +1180,14 @@ pub async fn start_worker(
     State(state): State<AppState>,
     admission: Option<Extension<AdmissionOverride>>,
     Path(key): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
+    let (start_grant, key) = match lifecycle_gate_key(&state, &headers, &key, "start").await { Ok(g) => g, Err(r) => return r };
+    if let Some(g) = start_grant {
+        let name = key.clone();
+        let resp = Box::pin(start_worker(State(state.clone()), admission, Path(key), axum::http::HeaderMap::new())).await;
+        return lifecycle_done(&state, Some(g), &name, "start", resp);
+    }
     // Lifecycle refusal is independent of host capacity and must remain stable.
     match state
         .store
@@ -1297,7 +1362,31 @@ pub async fn start_worker(
 
 /// POST /api/workers/{id}/stop — worker -> Stopped; the live session row (if
 /// any) is ended as Killed. Stopping a stopped worker is an honest no-op.
-pub async fn stop_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+pub async fn stop_worker(State(state): State<AppState>, Path(key): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    // Stop goes through the delegation table (ai-config #160): a worker stops
+    // itself, a lead a worker in its team; every other worker is refused.
+    let grant = if crate::api::session_verbs::worker_origin(&headers).is_empty() {
+        None
+    } else {
+        let name = match resolve_key(&state, key.clone()).await {
+            Ok(n) => n,
+            Err(r) => return r,
+        };
+        match crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Worker(name.clone()),
+            &crate::api::delegation::Action::StopWorker, None) {
+            Ok(g) => g.map(|g| (g, name)),
+            Err(r) => return r,
+        }
+    };
+    let key = grant.as_ref().map(|(_, n)| n.clone()).unwrap_or(key);
+    let resp = stop_worker_inner(&state, key).await;
+    if let Some((g, name)) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(&state, json!({"name": name}), json!({"stopping": true}));
+    }
+    resp
+}
+
+async fn stop_worker_inner(state: &AppState, key: String) -> Response {
     let slot: Arc<Mutex<Option<StepOutcome>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
     let key_w = key.clone();
@@ -1360,7 +1449,7 @@ pub async fn stop_worker(State(state): State<AppState>, Path(key): Path<String>)
             Some(StepOutcome::NotFound)
         );
         if is_not_found && crate::api::session_verbs::lane_env_exists(&key) {
-            return match crate::api::session_verbs::stop_for_pause(&state, &key).await {
+            return match crate::api::session_verbs::stop_for_pause(state, &key).await {
                 Ok(()) => (
                     StatusCode::OK,
                     Json(json!({ "applied": true, "state": "stopped", "worker_id": key })),
@@ -1509,16 +1598,34 @@ pub(crate) fn lifecycle_lock(name: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-pub async fn pause_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
-    change_pause(state, key, true, None).await
+pub async fn pause_worker(State(state): State<AppState>, Path(key): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    let (grant, key) = match lifecycle_gate_key(&state, &headers, &key, "pause").await { Ok(g) => g, Err(r) => return r };
+    let resp = change_pause(state.clone(), key.clone(), true, None).await;
+    lifecycle_done(&state, grant, &key, "pause", resp)
 }
 
 pub async fn resume_worker(
     State(state): State<AppState>,
     admission: Option<Extension<AdmissionOverride>>,
     Path(key): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
-    change_pause(state, key, false, admission).await
+    let (grant, key) = match lifecycle_gate_key(&state, &headers, &key, "resume").await { Ok(g) => g, Err(r) => return r };
+    let resp = change_pause(state.clone(), key.clone(), false, admission).await;
+    lifecycle_done(&state, grant, &key, "resume", resp)
+}
+
+/// [`lifecycle_gate`] for a store key; the owner skips the lookup. Returns
+/// the grant and the RESOLVED name, which the verb then acts on (N14). The
+/// inner stop/start calls run with no worker headers: authorized here.
+#[allow(clippy::result_large_err)] // the refusal IS the handler's response; it is returned as-is
+async fn lifecycle_gate_key(state: &AppState, headers: &axum::http::HeaderMap, key: &str, verb: &str)
+    -> Result<(Option<crate::api::delegation::Grant>, String), Response> {
+    if crate::api::session_verbs::worker_origin(headers).is_empty() {
+        return Ok((None, key.to_string()));
+    }
+    let name = resolve_key(state, key.to_string()).await?;
+    Ok((lifecycle_gate(state, headers, &name, verb)?, name))
 }
 
 /// `admission` only matters on Resume, which starts the worker through
@@ -1659,7 +1766,7 @@ async fn change_pause(
         } else if paused {
             let row = row.as_ref().unwrap();
             // End the durable session first so bootstrap cannot re-adopt it.
-            let response = stop_worker(State(state.clone()), Path(row.id.clone())).await;
+            let response = stop_worker(State(state.clone()), Path(row.id.clone()), axum::http::HeaderMap::new()).await;
             anyhow::ensure!(
                 response.status().is_success(),
                 "could not end worker session"
@@ -1692,7 +1799,7 @@ async fn change_pause(
             );
             Ok(json!({"running":false,"session":"stopped"}))
         } else {
-            let response = start_worker(State(state.clone()), admission, Path(key.clone())).await;
+            let response = start_worker(State(state.clone()), admission, Path(key.clone()), axum::http::HeaderMap::new()).await;
             if !response.status().is_success() {
                 let bytes = axum::body::to_bytes(response.into_body(), 65536).await?;
                 let body: Value = serde_json::from_slice(&bytes)?;
@@ -2068,12 +2175,20 @@ pub async fn instructions_worker(
     if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
         return crate::api::session_verbs::instructions_get_verb(&name);
     }
-    if let Some(refusal) = crate::api::session_verbs::peer_config_refusal(&headers, &name, "instructions") { return refusal; }
     let body = match crate::api::fs::parse_body(&body_bytes) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
-    crate::api::session_verbs::instructions_post_verb(&state, &name, &body).await
+    let grant = match crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Worker(name.clone()),
+        &crate::api::delegation::Action::SetConfig { keys: vec!["instructions".into()] }, Some(&body)) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    let resp = crate::api::session_verbs::instructions_post_verb(&state, &name, &body).await;
+    if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(&state, json!({"name": name}), json!({"updated": "instructions"}));
+    }
+    resp
 }
 
 /// `GET|POST /api/workers/{id}/memory` — the worker's memory file.
@@ -2094,12 +2209,20 @@ pub async fn memory_worker(
     if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
         return crate::api::session_verbs::memory_get_verb(&name);
     }
-    if let Some(refusal) = crate::api::session_verbs::peer_config_refusal(&headers, &name, "memory") { return refusal; }
     let body = match crate::api::fs::parse_body(&body_bytes) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
-    crate::api::session_verbs::memory_post_verb(&name, &body)
+    let grant = match crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Worker(name.clone()),
+        &crate::api::delegation::Action::SetConfig { keys: vec!["memory".into()] }, Some(&body)) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    let resp = crate::api::session_verbs::memory_post_verb(&name, &body);
+    if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(&state, json!({"name": name}), json!({"updated": "memory"}));
+    }
+    resp
 }
 
 /// The read sub-verbs of the git group: `commits`, `commit-detail`, `diff`.
@@ -2239,9 +2362,8 @@ pub async fn config_worker(
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
-    if let Some(refusal) = crate::api::session_verbs::peer_config_refusal(&headers, &name, "config") { return refusal; }
-    if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(&headers, crate::api::session_verbs::names_messaging_authority(&body)) { return refusal; }
-    crate::api::session_verbs::config_patch(&state, &name, &body).await
+    // The same gate and log as PATCH /api/sessions/<w>/config (ai-config #160).
+    crate::api::delegation::guarded_config_patch(&state, &headers, &name, &body).await
 }
 
 /// `ANY /api/workers/{id}/share` — the share family, whose method split is its
@@ -2326,17 +2448,41 @@ pub async fn wake_worker(State(state): State<AppState>, Path(key): Path<String>)
 }
 
 /// `POST /api/workers/{id}/reset`
-pub async fn reset_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+pub async fn reset_worker(State(state): State<AppState>, Path(key): Path<String>, headers: axum::http::HeaderMap) -> Response {
     match resolve_key(&state, key).await {
-        Ok(name) => crate::api::session_verbs::reset_verb(&state, &name).await,
+        Ok(name) => {
+            let grant = match lifecycle_gate(&state, &headers, &name, "reset") { Ok(g) => g, Err(r) => return r };
+            let resp = crate::api::session_verbs::reset_verb(&state, &name).await;
+            lifecycle_done(&state, grant, &name, "reset", resp)
+        }
         Err(r) => r,
     }
 }
 
+/// Lifecycle verbs on another worker go through the delegation table
+/// (ai-config #160): self, or a lead for a non-lead worker in its team.
+#[allow(clippy::result_large_err)] // the refusal IS the handler's response; it is returned as-is
+fn lifecycle_gate(state: &AppState, headers: &axum::http::HeaderMap, name: &str, verb: &str) -> Result<Option<crate::api::delegation::Grant>, Response> {
+    let action = crate::api::delegation::Action::Lifecycle { verb: verb.to_string() };
+    crate::api::delegation::authorize(state, headers, &crate::api::delegation::Target::Worker(name.to_string()), &action, None)
+}
+
+/// Log a lifecycle verb's grant only once the verb succeeded (review H3).
+fn lifecycle_done(state: &AppState, grant: Option<crate::api::delegation::Grant>, name: &str, verb: &str, resp: Response) -> Response {
+    if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(state, json!({"name": name}), json!({"lifecycle": verb}));
+    }
+    resp
+}
+
 /// `POST /api/workers/{id}/clear`
-pub async fn clear_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+pub async fn clear_worker(State(state): State<AppState>, Path(key): Path<String>, headers: axum::http::HeaderMap) -> Response {
     match resolve_key(&state, key).await {
-        Ok(name) => crate::api::session_verbs::clear_verb(&name).await,
+        Ok(name) => {
+            let grant = match lifecycle_gate(&state, &headers, &name, "clear") { Ok(g) => g, Err(r) => return r };
+            let resp = crate::api::session_verbs::clear_verb(&name).await;
+            lifecycle_done(&state, grant, &name, "clear", resp)
+        }
         Err(r) => r,
     }
 }
@@ -2364,6 +2510,7 @@ pub async fn resize_worker(
 pub async fn keys_worker(
     State(state): State<AppState>,
     Path(key): Path<String>,
+    headers: axum::http::HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Response {
     let name = match resolve_key(&state, key).await {
@@ -2374,7 +2521,17 @@ pub async fn keys_worker(
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
-    crate::api::session_verbs::keys_verb(&name, &body).await
+    // Keys into a pane: a worker's own pane only (ai-config #160).
+    let grant = match crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Worker(name.clone()),
+        &crate::api::delegation::Action::SetConfig { keys: vec!["keys".into()] }, Some(&body)) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    let resp = crate::api::session_verbs::keys_verb(&name, &body).await;
+    if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(&state, json!({"name": name}), json!({"keys": body.get("keys")}));
+    }
+    resp
 }
 
 /// `POST /api/workers/{id}/duplicate` — copy a worker's env file and register
@@ -2754,7 +2911,9 @@ mod tests {
         let s = home.join("sessions");
         std::fs::create_dir_all(&s).unwrap();
         for (n, t) in [("review-dev-lead", "leads,dev"), ("review-ops-lead", "leads,ops"), ("review-dev-a", "dev"), ("review-ops-a", "ops")] {
-            std::fs::write(s.join(format!("{n}.env")), format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{t}\"\n")).unwrap();
+            // A lead is CC_ORCHESTRATOR=1 plus `leads` (ai-config #160).
+            let orch = if t.starts_with("leads") { "CC_ORCHESTRATOR=\"1\"\n" } else { "" };
+            std::fs::write(s.join(format!("{n}.env")), format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{t}\"\n{orch}")).unwrap();
         }
     }
 
@@ -3104,13 +3263,17 @@ mod tests {
             assert_eq!((st, v["code"].clone()), (StatusCode::BAD_REQUEST, json!("env_text_noncanonical")), "owner {p:?}: {v}");
         }
         assert_eq!(crate::api::session_verbs::lane_groups("review-dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
-        // The guard itself reads what the reader reads: both shapes are a change.
+        // The delegation input reads what the reader reads: every shape is a
+        // tags change or non-canonical text, and the table refuses both.
         for p in payloads {
-            assert!(crate::api::scope::membership_key_changed(home.path(), "worker", "review-dev-a", &json!(p)).is_some(), "{p:?}");
+            let keys = crate::api::scope::env_keys_changed(home.path(), "worker", "review-dev-a", &json!(p));
+            assert!(keys.iter().any(|k| k == "CC_TAGS" || k.starts_with("(non-canonical")), "{p:?}: {keys:?}");
         }
-        // Typed keys: membership and the contract/token keys stay refused.
+        // Typed keys: membership stays refused, the contract switch is hands-only.
+        let (st, _, v) = send_with(&app, "PUT", "/api/scope", Some(scope(json!({"CC_TAGS": "dev,leads"}))), &worker).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_membership_refused")), "{v}");
         let (st, _, v) = send_with(&app, "PUT", "/api/scope", Some(scope(json!({"AMUX_CONTRACT_DONE": "0"}))), &worker).await;
-        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("owner_only_key")), "{v}");
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("held_for_max")), "{v}");
         // Owner control: canonical text writes and is read back as written.
         let (st, _, v) = send(&app, "PUT", "/api/scope", Some(scope(json!("CC_DIR=\"/tmp\"\nCC_TAGS=\"dev,ops\"\n")))).await;
         assert_eq!(st, StatusCode::OK, "owner canonical text: {v}");

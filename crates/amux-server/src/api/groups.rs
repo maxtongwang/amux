@@ -436,6 +436,7 @@ async fn group_config(state: AppState, name: String, req: Request) -> Response {
             }
         }
         Method::PATCH => {
+            let headers = req.headers().clone();
             let bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
                 Ok(b) => b,
                 Err(e) => return j(500, json!({"error": e.to_string()})),
@@ -447,6 +448,20 @@ async fn group_config(state: AppState, name: String, req: Request) -> Response {
                     Ok(v) => v,
                     Err(e) => return j(500, json!({"error": e.to_string()})),
                 }
+            };
+            // Group configuration goes through the delegation table (ai-config
+            // #160): a lead's own team, mrpopo through a grant Max approves. A group
+            // nobody wears and nobody configured yet is a group CREATE.
+            let exists = scan_session_tags(&amux_home()).iter().any(|(_, tags)| tags.iter().any(|t| t == &name))
+                || state.store.read().ok().is_some_and(|c| c.query_row("SELECT 1 FROM group_config WHERE name=?1", [&name], |_| Ok(())).is_ok());
+            let action = if exists {
+                crate::api::delegation::Action::SetGroupConfig { group: crate::api::session_verbs::norm_label(&name) }
+            } else {
+                crate::api::delegation::Action::CreateGroup { group: name.clone() }
+            };
+            let grant = match crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Group(name.clone()), &action, Some(&body)) {
+                Ok(g) => g,
+                Err(r) => return r,
             };
             use rusqlite::types::Value as Sql;
             let department = bind_scalar(body.get("department"), Sql::Text(String::new()));
@@ -490,6 +505,9 @@ async fn group_config(state: AppState, name: String, req: Request) -> Response {
                     })
                 })
                 .await;
+            if let (Some(g), Ok(_)) = (grant.as_ref(), result.as_ref()) {
+                g.commit(&state, Value::Null, body.clone());
+            }
             match result {
                 Ok(_) => j(200, json!({"ok": true, "name": name})),
                 Err(e) => j(500, json!({"error": e.to_string()})),

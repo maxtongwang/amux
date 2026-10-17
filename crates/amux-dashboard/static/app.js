@@ -47494,6 +47494,55 @@ async function loadSpendAttribution() {
     box.innerHTML = '';
   }
 }
+// ai-config#160: the delegated-change log (GET /api/delegation/log), listed in
+// Settings > Workers with the vault audit list's classes. Read-only: the server
+// has no route that edits or deletes an entry.
+// ai-config#160: pending structured grants with Approve / Deny. Approve
+// applies the exact stored change once; the server accepts it only from the
+// owner over a Remote-verified connection and says so when it refuses.
+async function _delegationGrantsLoad() {
+  const box = document.getElementById('delegation-grants-list');
+  if (!box) return;
+  try {
+    const r = await fetch(API + '/api/delegation/grants', { headers: _authHeaders() });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { box.innerHTML = '<p class="ui-error" role="alert">' + esc(d.error || ('HTTP ' + r.status)) + '</p>'; return; }
+    const pending = (d.grants || []).filter(g => g.status === 'pending');
+    box.innerHTML = pending.length ? '<ol class="vault-audit">' + pending.map(g => '<li><span class="vault-audit-ev">' + esc(g.code) + '</span>'
+      + '<span class="vault-audit-what">' + esc(g.sentence || '') + '</span>'
+      + '<button class="btn" onclick="_delegationGrantDecide(' + "'" + esc(g.code) + "'" + ',\'approve\')">Approve</button> '
+      + '<button class="btn" onclick="_delegationGrantDecide(' + "'" + esc(g.code) + "'" + ',\'deny\')">Deny</button></li>').join('') + '</ol>'
+      : '<p class="ui-help">No pending grants.</p>';
+  } catch (err) { box.innerHTML = '<p class="ui-error" role="alert">Could not load pending grants</p>'; }
+}
+async function _delegationGrantDecide(code, verb) {
+  try {
+    const r = await fetch(API + '/api/delegation/grants/' + encodeURIComponent(code) + '/' + verb, { method: 'POST', headers: _authHeaders() });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) showToast(d.error || ('HTTP ' + r.status));
+  } catch (err) { showToast('Could not ' + verb + ' grant ' + code); }
+  _delegationGrantsLoad();
+  _delegationLogLoad();
+}
+async function _delegationLogLoad() {
+  _delegationGrantsLoad();
+  const box = document.getElementById('delegation-log-list');
+  if (!box) return;
+  try {
+    const r = await fetch(API + '/api/delegation/log?limit=100', { headers: _authHeaders() });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { box.innerHTML = '<p class="ui-error" role="alert">' + esc(d.error || d.why_unmeasured || ('HTTP ' + r.status)) + '</p>'; return; }
+    const e = d.entries || [];
+    const hands = (d.hands_only || []).map(h => '<li><b>' + esc(h.what) + '</b>: ' + esc(h.why) + '</li>').join('');
+    box.innerHTML = (hands ? '<p class="ui-help">Never delegated, always yours:</p><ul class="ui-help">' + hands + '</ul>' : '')
+      + '<p class="ui-help">Showing ' + e.length + ' of ' + esc(String(d.n_considered ?? 0)) + '.</p>'
+      + (e.length ? '<ol class="vault-audit">' + e.map(x => '<li><span class="vault-audit-ev">' + esc(x.action || '') + '</span>'
+        + '<span class="vault-audit-what"><b>' + esc(x.actor || '') + '</b> <span class="ui-help">' + esc(x.class || '') + '</span> → ' + esc(x.target || '')
+        + (x.why ? ' · ' + esc(x.why) : '') + (x.grant ? ' · <span class="ui-help">grant ' + esc(x.grant) + '</span>' : '') + '</span>'
+        + '<time class="ui-help" title="' + esc(new Date((x.ts || 0) * 1000).toLocaleString()) + '">' + esc(timeAgo(x.ts)) + '</time></li>').join('') + '</ol>'
+        : '<p class="ui-help">Nothing delegated yet.</p>');
+  } catch (err) { box.innerHTML = '<p class="ui-error" role="alert">Could not load the delegated-change log</p>'; }
+}
 // AMUX-5270: standing approvals. Answers the owner already gave, which the
 // server applies to worker escalations instead of paging him (two such pages
 // on 2026-09-27 were for asks he had approved the day before). Revoke sends NO

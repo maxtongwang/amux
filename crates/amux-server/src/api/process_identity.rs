@@ -78,6 +78,12 @@ use std::time::{Duration, Instant};
 /// Internal proof header: set only by [`attribute`], stripped from every
 /// inbound request first, so a client cannot assert it.
 pub(crate) const PROCESS_WORKER_HEADER: &str = "x-amux-process-worker";
+/// Internal verdict header (ai-config#160): `outside`, `remote` or `worker`,
+/// set only by [`attribute`] and stripped from every inbound request first.
+/// The send path records it on the owner's Messages row so `max_ref::row_qualifies` can tell
+/// a send the owner's own browser or phone made from one a worker made with
+/// the owner token. Absent means unproven, never the owner.
+pub(crate) const PROCESS_ORIGIN_HEADER: &str = "x-amux-process-origin";
 
 /// The server's own end of an accepted connection, stamped on every request by
 /// the TLS acceptor (tls.rs). With the peer from ConnectInfo it names the exact
@@ -665,6 +671,7 @@ fn claimed(req: &Request) -> String {
 /// identity.
 pub async fn attribute(mut req: Request, next: Next) -> Response {
     req.headers_mut().remove(PROCESS_WORKER_HEADER);
+    req.headers_mut().remove(PROCESS_ORIGIN_HEADER);
     let Some(peer) = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0) else {
         // In-process calls (the server acting for a lane) have no socket.
         return next.run(req).await;
@@ -707,6 +714,7 @@ pub async fn attribute(mut req: Request, next: Next) -> Response {
                 h.insert("x-amux-worker", v.clone());
                 h.insert("x-amux-session", v.clone());
                 h.insert(PROCESS_WORKER_HEADER, v);
+                h.insert(PROCESS_ORIGIN_HEADER, HeaderValue::from_static("worker"));
             }
             super::org::strip_member_headers(req.headers_mut());
             next.run(req).await
@@ -751,7 +759,14 @@ pub async fn attribute(mut req: Request, next: Next) -> Response {
             });
             next.run(req).await
         }
-        Origin::Outside | Origin::Remote => next.run(req).await,
+        Origin::Outside => {
+            req.headers_mut().insert(PROCESS_ORIGIN_HEADER, HeaderValue::from_static("outside"));
+            next.run(req).await
+        }
+        Origin::Remote => {
+            req.headers_mut().insert(PROCESS_ORIGIN_HEADER, HeaderValue::from_static("remote"));
+            next.run(req).await
+        }
     }
 }
 
@@ -1934,6 +1949,39 @@ mod tests {
         let res = router.clone().oneshot(req).await.unwrap();
         let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"", "an owner request cannot claim process proof");
+    }
+
+    /// The verdict header is server-set only, and says what the resolver
+    /// decided: a forged `outside` from a worker pane reads `worker`, and a
+    /// forged one with no socket (an in-process call) reads nothing.
+    #[tokio::test]
+    async fn the_process_verdict_header_is_server_set_and_names_the_verdict() {
+        let (_state, dir, _r) = fixture();
+        let _h = crate::api::settings::test_env::set_home(dir.path());
+        drop(_r);
+        async fn echo(headers: axum::http::HeaderMap) -> String {
+            headers.get(PROCESS_ORIGIN_HEADER).and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
+        }
+        let router = axum::Router::new().route("/api/echo", axum::routing::get(echo)).layer(axum::middleware::from_fn(attribute));
+        let by_port = test_support::ByPort(HashMap::from([
+            (40001, Origin::Outside),
+            (40002, Origin::Remote),
+            (40003, Origin::Worker("test-peer".into())),
+            (40004, Origin::Unattributed("x".into())),
+        ]));
+        let _g = test_support::set_resolver(Arc::new(by_port));
+        for (port, want) in [(40001u16, "outside"), (40002, "remote"), (40003, "worker"), (40004, "")] {
+            let mut req = HttpRequest::builder().uri("/api/echo").header(PROCESS_ORIGIN_HEADER, "outside")
+                .header("x-amux-worker", "test-claim").body(Body::empty()).unwrap();
+            req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], port))));
+            let res = router.clone().oneshot(req).await.unwrap();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(String::from_utf8_lossy(&body), want, "port {port}");
+        }
+        let req = HttpRequest::builder().uri("/api/echo").header(PROCESS_ORIGIN_HEADER, "remote").body(Body::empty()).unwrap();
+        let res = router.clone().oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"", "an in-process call carries no verdict");
     }
 
     #[cfg(target_os = "linux")]
