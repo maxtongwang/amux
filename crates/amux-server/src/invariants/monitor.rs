@@ -551,6 +551,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // advertising hooks=true. This joins them so the next divergence
     // self-announces instead of a lying capability report.
     out.extend(provider_launch_check());
+    out.extend(claude_remote_control_check().await);
 
     tm.mark(&out, "8. provider launch agrees with its adapter");
     // -- 10. host memory + kernel-panic tripwire (AMUX-3397): the 08-19
@@ -2696,6 +2697,125 @@ async fn served_commit_check() -> Vec<InvariantResult> {
         "",
         checks::deploy_lag_threshold_s(),
     )
+}
+
+/// Join running lanes to their Claude process, then inspect only bridge PIDs.
+/// A failed observation is unknown even when another source appears healthy.
+async fn claude_remote_control_check() -> Vec<InvariantResult> {
+    use crate::api::session_verbs::{
+        all_lane_names, env_flag_on, is_running, parse_env, provider_of, run_cmd,
+    };
+    let mut workers = Vec::new();
+    for name in all_lane_names() {
+        let cfg = parse_env(&name);
+        if provider_of(&cfg) == "claude"
+            && !env_flag_on(cfg.get("CC_ISOLATED"))
+            && is_running(&name).await
+        {
+            workers.push(checks::ClaudeRemoteControl {
+                worker: name,
+                pid: None,
+                argv_has_flag: false,
+                bridge_entry: false,
+            });
+        }
+    }
+    let timeout = std::time::Duration::from_secs(5);
+    let Some(ps) = run_cmd("ps", &["-axww", "-o", "pid=,ppid=,comm=,args="], timeout)
+        .await
+        .filter(|out| out.status.success())
+    else {
+        return checks::claude_remote_control_on(&workers, Some("ps unavailable"));
+    };
+    let Some(panes) = run_cmd(
+        "tmux",
+        &["list-panes", "-a", "-F", "#{session_name} #{pane_pid}"],
+        timeout,
+    )
+    .await
+    .filter(|out| out.status.success()) else {
+        return checks::claude_remote_control_on(&workers, Some("pane inventory unavailable"));
+    };
+    let config = std::env::var_os("HOME")
+        .and_then(|home| std::fs::read(std::path::PathBuf::from(home).join(".claude.json")).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let Some(config) = config.filter(|v| v.is_object()) else {
+        return checks::claude_remote_control_on(
+            &workers,
+            Some("Claude config unreadable or invalid"),
+        );
+    };
+    let bridges = match config.get("replBridgePlaceholders") {
+        None => Vec::new(),
+        Some(serde_json::Value::Object(entries)) => entries.values().collect::<Vec<_>>(),
+        Some(serde_json::Value::Array(entries)) => entries.iter().collect::<Vec<_>>(),
+        _ => return checks::claude_remote_control_on(&workers, Some("bridge entries invalid")),
+    };
+    let bridge_pids: std::collections::HashSet<u64> = bridges
+        .iter()
+        .filter_map(|entry| entry.get("pid").and_then(serde_json::Value::as_u64))
+        .collect();
+    let text = String::from_utf8_lossy(&ps.stdout);
+    let mut processes = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let mut fields = line.split_whitespace();
+        let row = fields
+            .next()
+            .and_then(|v| v.parse::<u32>().ok())
+            .zip(fields.next().and_then(|v| v.parse::<u32>().ok()))
+            .zip(fields.next());
+        let Some(((pid, parent), command)) = row else {
+            return checks::claude_remote_control_on(&workers, Some("ps output invalid"));
+        };
+        let claude = std::path::Path::new(command)
+            .file_name()
+            .is_some_and(|name| name == "claude");
+        let flag =
+            fields.any(|arg| arg == "--remote-control" || arg.starts_with("--remote-control="));
+        processes.push((pid, parent, claude, flag));
+    }
+    let panes_text = String::from_utf8_lossy(&panes.stdout);
+    for worker in &mut workers {
+        let session = format!("amux-{}", worker.worker);
+        let roots: Vec<u32> = panes_text
+            .lines()
+            .filter_map(|line| {
+                let (name, pid) = line.split_once(' ')?;
+                (name == session).then(|| pid.trim().parse().ok()).flatten()
+            })
+            .collect();
+        // Breadth first: select the interactive parent, never a nested tool's Claude.
+        let mut frontier = roots;
+        let mut seen = std::collections::HashSet::new();
+        while !frontier.is_empty() {
+            if let Some(&(pid, _, _, flag)) = processes
+                .iter()
+                .find(|(pid, _, claude, _)| *claude && frontier.contains(pid))
+            {
+                worker.pid = Some(pid);
+                worker.argv_has_flag = flag;
+                worker.bridge_entry = bridge_pids.contains(&u64::from(pid));
+                break;
+            }
+            seen.extend(frontier.iter().copied());
+            frontier = processes
+                .iter()
+                .filter(|(pid, parent, _, _)| frontier.contains(parent) && !seen.contains(pid))
+                .map(|(pid, _, _, _)| *pid)
+                .collect();
+        }
+    }
+    let results = checks::claude_remote_control_on(&workers, None);
+    for result in &results {
+        if result.status == Status::Fail {
+            tracing::warn!(
+                worker = %result.entity_key,
+                invariant = "claude.remote_control_on",
+                "running Claude worker has no Remote Control"
+            );
+        }
+    }
+    results
 }
 
 async fn argv_secret_check() -> Vec<InvariantResult> {

@@ -1363,6 +1363,14 @@ cmd_start() {
       fi
     fi
   else
+    # Quote identity as argv before serializing the nested-shell command.
+    # Add it before saving resume_fallback so a failed resume retains it.
+    local identity
+    case "$(printf '%s' "${CC_ISOLATED:-}" | tr '[:upper:]' '[:lower:]')" in
+      1|true|yes) identity=$(quote_argv --name "$name") || die "failed to quote Claude identity" ;;
+      *) identity=$(quote_argv --name "$name" --remote-control "$name") || die "failed to quote Claude identity" ;;
+    esac
+    cmd="$cmd $identity"
     [[ "$cmd" == *"--model"* ]] || cmd="$cmd --model sonnet"
     # Resume the most recent conversation in this directory by default, so a
     # restart (crash recovery, a deploy that killed the tmux server, `amux
