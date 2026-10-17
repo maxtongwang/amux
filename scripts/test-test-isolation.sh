@@ -22,10 +22,16 @@ rc=$(CC_HOME="$real/.amux" AMUX_SESSION=lane AMUX_WORKER=lane AMUX_WORKER_TOKEN=
   source scripts/lib/test-isolation.sh
   amux_test_isolate "$1" || exit 10
   [ "$HOME" = "$1" ] && [ "$CC_HOME" = "$1/.amux" ] && [ "$AMUX_HOME" = "$1/.amux" ] || exit 11
-  [ -z "${AMUX_SESSION:-}${AMUX_WORKER:-}${AMUX_WORKER_TOKEN:-}${AMUX_API:-}${AMUX_URL:-}${TMUX:-}${TMUX_PANE:-}" ] || exit 12
+  [ -z "${AMUX_SESSION:-}${AMUX_WORKER:-}${AMUX_WORKER_TOKEN:-}${TMUX:-}${TMUX_PANE:-}" ] || exit 12
+  [ "$AMUX_API" = http://127.0.0.1:9 ] && [ "$AMUX_URL" = http://127.0.0.1:9 ] || exit 14
   [ "${AMUX_BIN:-}" = ./amux ] || exit 13
 ' _ "$T/ok" >/dev/null 2>&1; echo $?)
-check "pins HOME/CC_HOME/AMUX_HOME, clears identity and API, keeps AMUX_BIN" 0 "$rc"
+check "pins HOME/CC_HOME/AMUX_HOME, clears identity, points the API at a dead port, keeps AMUX_BIN" 0 "$rc"
+
+rc=$(bash -c 'source scripts/lib/test-isolation.sh; amux_test_isolate "$1" || exit 9; export AMUX_API=https://localhost:8824; amux_test_assert_isolated' _ "$T/ok" 2>"$T/err"; echo $?)
+check "the assert refuses the live server port" 1 "$rc"
+rc=$(bash -c 'source scripts/lib/test-isolation.sh; amux_test_isolate "$1" || exit 9; unset AMUX_URL; amux_test_assert_isolated' _ "$T/ok" 2>"$T/err"; echo $?)
+check "the assert refuses an unset URL (the CLI would fall back to 8824)" 1 "$rc"
 
 rc=$(bash -c 'source scripts/lib/test-isolation.sh; amux_test_isolate "$1"' _ "$real" 2>"$T/err"; echo $?)
 check "refuses the real home as the test home" 1 "$rc"
@@ -45,6 +51,11 @@ check "the assert refuses CC_HOME pointed back at the real ~/.amux" 1 "$rc"
 
 rc=$(bash -c 'source scripts/lib/test-isolation.sh; amux_test_isolate "$1"' _ "$T/missing" 2>/dev/null; echo $?)
 check "refuses a directory that does not exist" 1 "$rc"
+
+rc=$(env -u AMUX_TEST_LIVE bash -c 'source scripts/lib/test-isolation.sh; amux_test_require_live; exit 0' 2>"$T/err"; echo $?)
+check "a live-server test skips (exit 2) without AMUX_TEST_LIVE=1" 2 "$rc"
+rc=$(AMUX_TEST_LIVE=1 bash -c 'source scripts/lib/test-isolation.sh; amux_test_require_live; exit 0' 2>/dev/null; echo $?)
+check "and runs when the caller opts in" 0 "$rc"
 
 echo "test isolation: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

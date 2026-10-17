@@ -19,6 +19,9 @@
 # nobody should believe.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source scripts/lib/test-isolation.sh; amux_test_isolate "$(mktemp -d)" || exit 1
 SRC_REPO="$(pwd)"
 PASS=0; FAIL=0
 

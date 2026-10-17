@@ -10,6 +10,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$ROOT/amux"
 TMP="$(mktemp -d)"
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$ROOT/scripts/lib/test-isolation.sh"; amux_test_isolate "$TMP" || exit 1
+# Each case below exports its own temp HOME; the state dir follows it.
+unset CC_HOME AMUX_HOME
 trap 'rm -rf "$TMP"' EXIT
 fails=0
 fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }

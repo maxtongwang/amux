@@ -3,6 +3,9 @@
 # Runs as part of the orchestration system tests
 
 set -e
+# Acts on the LIVE server by design: opt in with AMUX_TEST_LIVE=1 (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_require_live
 
 worker="${AMUX_SESSION:-unknown}"
 is_ephemeral="${CC_EPHEMERAL:-0}"

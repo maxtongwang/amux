@@ -6,6 +6,9 @@
 # render the hook refused, four times). Throwaway repos under a temp dir; the
 # control (NO_REGEN=1) must push the stale render, so the check can fail.
 set -euo pipefail
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate "$(mktemp -d)" || exit 1
 AM="${1:-$(cd "$(dirname "$0")/.." && pwd)/amux}"; AM="$(cd "$(dirname "$AM")" && pwd)/$(basename "$AM")"; HOME_LOG="$HOME/.amux/logs"; mkdir -p "$HOME_LOG/land"; T="$(mktemp -d "${TMPDIR:-/tmp}/lrg.XXXXXX")"; cd "$T"
 git init -q --bare --initial-branch=main origin.git
 git clone -q origin.git main 2>/dev/null; cd main

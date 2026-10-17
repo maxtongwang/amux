@@ -29,6 +29,9 @@ AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source scripts/lib/test-isolation.sh; amux_test_isolate "$TMP" || exit 1
 export AMUX_SESSION="addflagtest"
 # AMUX_API, *not* AMUX_URL. The board verbs read `AMUX_API` (`local
 # AMUX_API="${AMUX_API:-https://localhost:8824}"`); AMUX_URL only feeds the `url`

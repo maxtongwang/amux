@@ -21,6 +21,9 @@
 # Exit 0 = pass, 1 = failure, 2 = skipped (server unreachable — the test needs a
 # live /api/history and says so rather than passing vacuously).
 set -euo pipefail
+# Acts on the LIVE server by design: opt in with AMUX_TEST_LIVE=1 (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_require_live
 cd "$(dirname "$0")/.."
 
 PASS=0; FAIL=0

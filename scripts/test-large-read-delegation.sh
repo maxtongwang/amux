@@ -4,6 +4,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TMP="$(mktemp -d)"
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+mkdir -p "$TMP/home"
+source scripts/lib/test-isolation.sh; amux_test_isolate "$TMP/home" || exit 1
 SERVER_PID=""
 cleanup() {
   [[ -z "$SERVER_PID" ]] || kill "$SERVER_PID" 2>/dev/null || true

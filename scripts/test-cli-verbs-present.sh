@@ -9,6 +9,9 @@
 # verbs here: each needs its dispatch entry, its function, and a usage that runs.
 set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source scripts/lib/test-isolation.sh; amux_test_isolate "$(mktemp -d)" || exit 1
 FAILED=0; CELLS=0
 cell() { # <label> <command...>
   local label="$1"; shift

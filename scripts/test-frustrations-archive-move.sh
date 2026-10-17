@@ -16,6 +16,10 @@
 set -u
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 T=$(mktemp -d) || exit 2
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+mkdir -p "$T/home"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate "$T/home" || exit 1
 trap 'rm -rf "$T"' EXIT
 FAILS=0
 fail() { echo "FAIL: $1" >&2; FAILS=$((FAILS + 1)); }

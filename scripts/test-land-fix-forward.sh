@@ -7,6 +7,9 @@ set -uo pipefail
 AM="${1:-$(cd "$(dirname "$0")/.." && pwd)/amux}"
 AM="$(cd "$(dirname "$AM")" && pwd)/$(basename "$AM")"
 H="$(mktemp -d "${TMPDIR:-/tmp}/lff.XXXXXX")"; mkdir -p "$H/.amux/logs/land" "$H/srv/api/board"
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate "$H" || exit 1
 python3 - "$H/srv/api/board/GG-41" <<'PY'
 import json,sys
 json.dump({"title":"Fast Checks red on main","desc":"test_x is routed to lane-mvs\n22:15Z lane-spend owns the red test_y. Fix forward: abc\n22:17Z lane-obs: not mine, no revert from this lane"},open(sys.argv[1],"w"))

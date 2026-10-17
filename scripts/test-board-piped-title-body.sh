@@ -24,6 +24,9 @@ AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"; [ -n "${REC_PID:-}" ] && kill "$REC_PID" 2>/dev/null || true' EXIT
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source scripts/lib/test-isolation.sh; amux_test_isolate "$TMP" || exit 1
 
 cat > "$TMP/recorder.py" <<'PY'
 import json, sys
