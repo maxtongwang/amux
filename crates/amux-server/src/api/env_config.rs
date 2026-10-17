@@ -635,7 +635,7 @@ async fn apply(
     for (name, prompt) in &worker_prompts {
         let text = crate::api::session_verbs::origin_stamped(&origin, name, prompt).unwrap_or_else(|| prompt.clone());
         let _ =
-            crate::api::session_verbs::steer_enqueue(&state, name, &text, "env-apply-prompt", "")
+            crate::api::session_verbs::steer_enqueue(&state, name, &text, "env-apply-prompt", &origin)
                 .await;
     }
 
