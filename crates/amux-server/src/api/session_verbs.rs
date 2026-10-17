@@ -26599,7 +26599,7 @@ async fn post_dispatch(
         },
         "send" => send_post_detached(state, name, headers, body).await,
         "instructions" => instructions_post_verb(state, name, body).await,
-        "keys" => keys_verb(name, headers, body).await,
+        "keys" => keys_verb(name, body).await,
         "resize" => resize_verb(name, body).await,
         // "agent-nav" DELETED (ARE-7): it drove Claude Code's subagents panel
         // by pane-verified keystrokes, keyed on a "⏺ main" row the TUI no
@@ -26656,9 +26656,6 @@ async fn post_dispatch(
                 return jresp(StatusCode::CONFLICT, json!({"ok": false, "error": reason}));
             }
             let prompt = body_str(body, "prompt");
-            if !prompt.is_empty() {
-                if let Some(refusal) = worker_start_prompt_refusal(name, headers) { return refusal; }
-            }
             update_meta(name, &[("boot_start_scheduled", json!(true))]);
             if !prompt.is_empty() {
                 let queued = queue_boot_prompt(state, name, &prompt, SendOrigin::Owner).await;
@@ -26763,7 +26760,7 @@ async fn post_dispatch(
         "clear" => clear_verb(name).await,
         "duplicate" => duplicate_verb(state, name, headers, body),
         "clone" => {
-            if let Some(refusal) = membership_patch_refusal(headers, copy_carries_authority(name)) { return refusal; }
+            if let Some(refusal) = copy_refusal(name, headers) { return refusal; }
             clone_post(state, name, body).await
         }
         "archive" => {
@@ -28686,8 +28683,7 @@ pub(crate) async fn resize_verb(name: &str, body: &Value) -> Response {
 /// `keys` as a callable verb, so the promoted `/api/workers/{id}/keys`
 /// route and the legacy `/api/sessions/{name}/keys` spelling run ONE
 /// implementation instead of a route alias and a re-implementation (AF-288).
-pub(crate) async fn keys_verb(name: &str, headers: &HeaderMap, body: &Value) -> Response {
-    if let Some(refusal) = worker_peer_control_refusal(name, headers, "keys") { return refusal; }
+pub(crate) async fn keys_verb(name: &str, body: &Value) -> Response {
     let keys = body_str(body, "keys");
     if keys.is_empty() {
         return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing 'keys'"}));
@@ -30036,9 +30032,9 @@ pub(crate) async fn peek_verb(state: &AppState, name: &str, qs: &[(String, Strin
 /// implementation of that ordering is a second place for it to be wrong, on the
 /// error path, where nobody looks.
 pub(crate) fn duplicate_verb(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
-    // A copy inherits the source's groups (env file and store row), so a worker
-    // duplicating a lead would mint a worker inside the lead's groups.
-    if let Some(refusal) = membership_patch_refusal(headers, copy_carries_authority(name)) { return refusal; }
+    // A copy inherits the source's groups (env file and store row), so it is a
+    // create with those groups: only a lead, and only inside its own team.
+    if let Some(refusal) = copy_refusal(name, headers) { return refusal; }
     let new_name = body_str(body, "new_name").trim().to_string();
     if new_name.is_empty() {
         return jresp(
@@ -32843,13 +32839,9 @@ async fn apply_live_config_change(
 /// group's open-inbound switch. `membership_named` is the caller's statement
 /// that the request would set one of those.
 ///
-/// STRICT, NOT SUBSET (fix/worker-membership-create). A worker cannot place a
-/// new or existing worker even in groups it already belongs to: the PATCH rule
-/// this generalises refused any worker tag edit, and a "subset" rule would let
-/// a worker mint unbounded same-group identities, each a fresh actor inside the
-/// boundary. Owners, the dashboard and verified human members are unaffected,
-/// and server-internal spawns (project leads/executors) never reach here
-/// because their groups come from owner-configured project policy.
+/// This governs EXISTING workers: no worker may change any worker's groups,
+/// its own included. Creating a worker is [`worker_create_refusal`]'s rule.
+/// Owners, the dashboard and verified human members are unaffected.
 pub(crate) fn membership_patch_refusal(headers: &HeaderMap, membership_named: bool) -> Option<Response> {
     membership_refusal_body(headers, membership_named).map(|body| jresp(StatusCode::FORBIDDEN, body))
 }
@@ -32872,28 +32864,67 @@ fn worker_origin(headers: &HeaderMap) -> String {
     hdr_worker(headers)
 }
 
-/// A worker driving ANOTHER worker's pane (`keys`) is input across the same
-/// boundary as `send`: refused outside a shared group with the send gate's
-/// own predicate and code. Owner input and a worker's own pane are untouched.
-pub(crate) fn worker_peer_control_refusal(target: &str, headers: &HeaderMap, verb: &str) -> Option<Response> {
-    let origin = worker_origin(headers);
-    if origin.is_empty() || origin == target { return None; }
-    let reason = cross_group_send_ok(&origin, target).err()?;
-    tracing::warn!(origin = %origin, target, verb, verdict = "worker_group_boundary", measured = true,
-        n_considered = 1, "worker pane control refused outside a shared group");
-    Some(jresp(StatusCode::FORBIDDEN, json!({"ok": false, "code": "worker_group_boundary", "error": reason})))
+/// The group whose members may create workers (Max, 2026-10-16: "Only leads
+/// can create workers"). Membership of it is the owner's to grant.
+pub(crate) const LEADS_GROUP: &str = "leads";
+
+/// What a worker-originated create asks for.
+pub(crate) struct CreateRequest<'a> {
+    /// The new worker's groups (any case; compared lowercased).
+    pub tags: &'a [String],
+    /// Something only the owner may grant at create: the chat worker type
+    /// (it speaks for the owner) or a store `group` id.
+    pub owner_only: Option<&'static str>,
 }
 
-/// A `/start` prompt is queued as OWNER input with no origin stamp, so a
-/// worker may attach one only when starting itself. Peers are reached through
-/// `send`, which stamps the origin and applies the group gate.
-fn worker_start_prompt_refusal(target: &str, headers: &HeaderMap) -> Option<Response> {
+/// THE create rule, for every path that makes a worker: session create, store
+/// create, duplicate/clone and the env/config imports.
+///
+/// - The owner, the dashboard and verified human members: unchanged.
+/// - A worker not in `leads`: refused (`worker_create_requires_lead`), with or
+///   without tags.
+/// - A lead: allowed, giving the new worker only tags drawn from its own team
+///   tags, never `leads` (`worker_create_tags_outside_team`).
+///
+/// Server-internal spawns (project leads/executors) never reach here: their
+/// groups come from owner-configured project policy, not from a request.
+pub(crate) fn worker_create_refusal(headers: &HeaderMap, req: &CreateRequest) -> Option<Response> {
+    worker_create_refusal_body(headers, req).map(|body| jresp(StatusCode::FORBIDDEN, body))
+}
+
+/// [`worker_create_refusal`]'s decision and 403 body, for a handler whose
+/// return type is not a `Response`.
+pub(crate) fn worker_create_refusal_body(headers: &HeaderMap, req: &CreateRequest) -> Option<Value> {
     let origin = worker_origin(headers);
-    if origin.is_empty() || origin == target { return None; }
-    tracing::warn!(origin = %origin, target, verdict = "worker_start_prompt_refused", measured = true,
-        n_considered = 1, "a worker tried to deliver a start prompt (owner input) to another worker");
-    Some(jresp(StatusCode::FORBIDDEN, json!({"ok": false, "code": "worker_start_prompt_refused",
-        "error": format!("a start prompt is owner input; {origin} may start {target} without one and use send, which stamps the origin")})))
+    if origin.is_empty() { return None; }
+    let caller = lane_groups(&origin);
+    if !caller.contains(LEADS_GROUP) {
+        tracing::warn!(worker = %origin, verdict = "worker_create_requires_lead", measured = true, n_considered = 1,
+            "a worker outside the leads group tried to create a worker");
+        return Some(json!({"ok": false, "code": "worker_create_requires_lead",
+            "error": format!("Only leads can create workers; '{origin}' is not in the '{LEADS_GROUP}' group.")}));
+    }
+    let team: std::collections::BTreeSet<String> = caller.iter().filter(|g| *g != LEADS_GROUP).cloned().collect();
+    let outside: Vec<String> = req.tags.iter().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty() && !team.contains(t)).collect();
+    if outside.is_empty() && req.owner_only.is_none() { return None; }
+    tracing::warn!(worker = %origin, ?outside, owner_only = req.owner_only.unwrap_or(""), ?team,
+        verdict = "worker_create_tags_outside_team", measured = true, n_considered = 1,
+        "a lead tried to create a worker outside its own team");
+    let what = match req.owner_only {
+        Some(o) => format!("{o} is the owner's to grant"),
+        None => format!("tags {outside:?} are outside the lead's team {team:?} ('{LEADS_GROUP}' is the owner's to grant)"),
+    };
+    Some(json!({"ok": false, "code": "worker_create_tags_outside_team",
+        "error": format!("A lead may create workers only inside its own team: {what}."), "team": team}))
+}
+
+/// The groups a create request names, from a `tags` array or a comma string.
+pub(crate) fn tags_of(v: Option<&Value>) -> Vec<String> {
+    match v {
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+        Some(Value::String(s)) => s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect(),
+        _ => vec![],
+    }
 }
 
 /// Whether a request body asks for the chat worker type, which carries the
@@ -32908,10 +32939,12 @@ pub(crate) fn names_messaging_authority(body: &Value) -> bool {
     body.get("tags").is_some() || requests_chat_type(body)
 }
 
-/// Whether a copy of `source` (duplicate/clone) would carry messaging
-/// authority: any group membership, or the chat worker type.
-fn copy_carries_authority(source: &str) -> bool {
-    !lane_groups(source).is_empty() || crate::api::worker_exec::worker_type_of(source).as_str() == "chat"
+/// The create rule for a copy of `source` (duplicate/clone): the copy carries
+/// the source's groups and worker type, so it is a create with those.
+fn copy_refusal(source: &str, headers: &HeaderMap) -> Option<Response> {
+    let tags: Vec<String> = lane_groups(source).into_iter().collect();
+    let chat = crate::api::worker_exec::worker_type_of(source).as_str() == "chat";
+    worker_create_refusal(headers, &CreateRequest { tags: &tags, owner_only: chat.then_some("the chat worker type") })
 }
 
 /// Every config write drops the cached session list (AMUX-2926).

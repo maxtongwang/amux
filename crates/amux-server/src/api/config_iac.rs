@@ -164,16 +164,26 @@ pub async fn apply(
     //
     // Attribution is the shared rule (X-Amux-Worker canonical, X-Amux-Session
     // honoured): reading only X-Amux-Session let a worker sending just
-    // X-Amux-Worker apply as the human. Worker declarations carrying `tags`
-    // are group membership and stay the owner's even under
-    // AMUX_SCOPE_WRITE_AGENTS=1 (session_verbs::membership_patch_refusal).
+    // X-Amux-Worker apply as the human. Worker declarations hold even under
+    // AMUX_SCOPE_WRITE_AGENTS=1: a NEW worker goes through the shared create
+    // rule (only leads, only inside their team), `tags` on an EXISTING worker
+    // through the shared membership rule.
     let actor = super::groups::hdr_worker(&headers);
-    let names_membership = doc
-        .get("workers")
-        .and_then(Value::as_array)
-        .is_some_and(|ws| ws.iter().any(|w| w.get("tags").is_some()));
-    if let Some(body) = super::session_verbs::membership_refusal_body(&headers, names_membership) {
-        return (StatusCode::FORBIDDEN, Json(body));
+    let home = super::groups::amux_home();
+    for w in doc.get("workers").and_then(Value::as_array).into_iter().flatten() {
+        let Some(name) = w.get("name").and_then(Value::as_str) else { continue };
+        let refusal = if home.join("sessions").join(format!("{name}.env")).exists() {
+            super::session_verbs::membership_refusal_body(&headers, w.get("tags").is_some())
+        } else {
+            let tags = super::session_verbs::tags_of(w.get("tags"));
+            super::session_verbs::worker_create_refusal_body(
+                &headers,
+                &super::session_verbs::CreateRequest { tags: &tags, owner_only: None },
+            )
+        };
+        if let Some(body) = refusal {
+            return (StatusCode::FORBIDDEN, Json(body));
+        }
     }
     if !actor.is_empty() && std::env::var("AMUX_SCOPE_WRITE_AGENTS").ok().as_deref() != Some("1") {
         return (

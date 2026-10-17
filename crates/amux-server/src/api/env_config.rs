@@ -156,37 +156,36 @@ struct WorkerSpec {
     prompt: String,
 }
 
-/// An env apply is an OWNER bootstrap: it creates workers with groups, writes
-/// absolute files, and seeds messages with any `from`, owner included. It had
-/// no caller check, so a worker could mint group members or post as the owner
-/// (fix/worker-membership-create). A worker may still dry-run a plan.
-///
-/// Membership is refused with the shared membership rule and code; any other
-/// worker-originated apply is refused as instance configuration, the policy
-/// `/api/config/apply` already applies.
+/// An env apply creates workers with groups and had no caller check, so a
+/// worker could mint group members (fix/worker-membership-create). Each worker
+/// the spec CREATES goes through the shared create rule (only leads, only
+/// inside their team); a spec that changes an EXISTING worker's groups goes
+/// through the shared membership rule. A worker may still dry-run a plan.
 fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Option<Response> {
     if dry {
         return None;
     }
-    let membership = spec.workers.iter().any(|w| {
-        let wanted: std::collections::BTreeSet<String> =
-            w.groups.iter().map(|g| g.trim().to_lowercase()).filter(|g| !g.is_empty()).collect();
-        wanted != crate::api::session_verbs::lane_groups(&sanitize(&w.name))
-    });
-    if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(headers, membership) {
-        return Some(refusal);
+    let sessions = crate::config::amux_home().join("sessions");
+    for w in &spec.workers {
+        let name = sanitize(&w.name);
+        if name.is_empty() {
+            continue;
+        }
+        if sessions.join(format!("{name}.env")).exists() {
+            let wanted: std::collections::BTreeSet<String> =
+                w.groups.iter().map(|g| g.trim().to_lowercase()).filter(|g| !g.is_empty()).collect();
+            let changes = wanted != crate::api::session_verbs::lane_groups(&name);
+            if let Some(r) = crate::api::session_verbs::membership_patch_refusal(headers, changes) {
+                return Some(r);
+            }
+        } else if let Some(r) = crate::api::session_verbs::worker_create_refusal(
+            headers,
+            &crate::api::session_verbs::CreateRequest { tags: &w.groups, owner_only: None },
+        ) {
+            return Some(r);
+        }
     }
-    let actor = crate::api::groups::hdr_worker(headers);
-    if actor.is_empty() || crate::api::org::local_member_actor(headers).is_some() {
-        return None;
-    }
-    tracing::warn!(actor = %actor, verdict = "env_apply_worker_refused", measured = true, n_considered = 1,
-        "a worker tried to apply an environment spec");
-    Some((StatusCode::FORBIDDEN, Json(json!({
-        "ok": false,
-        "code": "instance_config_owner_only",
-        "error": format!("worker '{actor}' may not apply an environment spec (it creates workers, writes files and seeds messages as the owner); dry_run=1 still plans it"),
-    }))).into_response())
+    None
 }
 
 // ---- GET /api/env/schema ---------------------------------------------------
