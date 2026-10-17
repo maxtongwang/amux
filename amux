@@ -1080,6 +1080,51 @@ for p in providers:
         print(f"  {w.get('"'"'label'"'"') or w.get('"'"'kind'"'"')}: {used:g}% used, resets {when(w.get('"'"'resets_at'"'"'))}")
 '
 }
+# amux restore-running [--only NAME] [--dry-run] [--json]
+# Start the workers that were running before a tmux loss or reboot, from the server's
+# ~/.amux/running-set.json, in recovery order: always-alive (mrpopo) first, then leads, then the
+# rest. Idempotent: a running worker reads "already running". Owner only (POST /api/fleet/restore).
+cmd_restore_running() {
+  local only="" dry=false json=0 body out code
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --only) [[ -n "${2:-}" ]] || die "--only needs a worker name"; only="$2"; shift 2 ;;
+      --dry-run) dry=true; shift ;;
+      --json) json=1; shift ;;
+      -h|--help|help) echo "usage: amux restore-running [--only NAME] [--dry-run] [--json]   restart the recorded running set (mrpopo, leads, rest)"; exit 0 ;;
+      *) die "amux restore-running: unknown option '$1' (see: amux restore-running --help)" ;;
+    esac
+  done
+  body=$(python3 -c 'import json,sys; d={"dry_run": sys.argv[2]=="true"}
+if sys.argv[1]: d["only"]=sys.argv[1]
+print(json.dumps(d))' "$only" "$dry")
+  out=$(_curl -sk -m 600 -w '\n%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d "$body" "$AMUX_API/api/fleet/restore") || die "server unreachable"
+  code="${out##*$'\n'}"; out="${out%$'\n'*}"
+  if [[ "$json" == 1 ]]; then printf '%s\n' "$out"; fi
+  printf '%s' "$out" | python3 -c '
+import json, sys
+code, quiet = int(sys.argv[1]), sys.argv[2] == "1"
+try:
+    d = json.loads(sys.stdin.read() or "{}")
+except ValueError:
+    d = {}
+if code >= 400 or not d:
+    print(f"refused ({code}): {d.get('"'"'error'"'"') or '"'"'no response'"'"'}", file=sys.stderr); sys.exit(1)
+if quiet:
+    sys.exit(0 if d.get("ok") else 1)
+if d.get("measured") is False:
+    print(f"nothing to restore: {d.get('"'"'error'"'"') or '"'"'no running set recorded'"'"'}"); sys.exit(1)
+print(("would restore, in order: " if d.get("dry_run") else "order: ") + (", ".join(d.get("order") or []) or "(none)"))
+if not d.get("dry_run"):
+    print("restored: " + (", ".join(d.get("restored") or []) or "(none)"))
+    for f in d.get("failed") or []:
+        print(f"failed: {f.get('"'"'name'"'"')}: {f.get('"'"'error'"'"')}")
+for s in d.get("skipped") or []:
+    print(f"skipped: {s.get('"'"'name'"'"')} ({s.get('"'"'why'"'"')})")
+sys.exit(0 if d.get("ok") else 1)
+' "$code" "$json"
+}
 
 # The lane's OWN conversation id, from its meta. Empty when it has never had
 # one, which is exactly the case `--continue` gets wrong in a shared directory.
@@ -6333,6 +6378,7 @@ ${BOLD}Worker management:${RESET}
   amux worktree <name> [show|profiles|widen <p>...|profile <p>]   Sparse worktree profile, size, widen
   amux model <name> [<model>] [--effort E]   Show or switch a worker's model (see amux model --help)
   amux usage [--json]            Provider budget windows: Claude 5-hour/weekly, Codex
+  amux restore-running [--only N] [--dry-run]   Restart the recorded running set: mrpopo, leads, rest
   amux start <name> [--detach]   Start a registered worker in tmux (-d = don't attach)
                                 (--dry-run: print the command without spawning)
   amux exec <name> [flags]       Register + start in one step
@@ -9537,6 +9583,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     worktree|wt)      shift; cmd_worktree "$@" ;;
     model)            shift; cmd_model "$@" ;;
     usage)            shift; cmd_usage "$@" ;;
+    restore-running)  shift; cmd_restore_running "$@" ;;
     start)            shift; cmd_start "$@" ;;
     exec|run)         shift; cmd_exec "$@" ;;
     attach|a)         shift; cmd_attach "$@" ;;

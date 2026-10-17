@@ -129,6 +129,7 @@ pub mod ids {
     pub const ACCOUNTABILITY_NUDGE: &str = "accountability-nudge";
     pub const CONTEXT_HEALTH: &str = "context-health";
     pub const DISK_WATCH: &str = "disk-watch";
+    pub const TMUX_WATCH: &str = "tmux-watch";
     pub const STATUS_HISTORY: &str = "status-history";
     pub const BROWSER_LOGIN_SYNC: &str = "browser-login-sync";
     pub const CONNECTOR_MAINTENANCE: &str = "connector-maintenance";
@@ -185,6 +186,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::ACCOUNTABILITY_NUDGE,
     ids::CONTEXT_HEALTH,
     ids::DISK_WATCH,
+    ids::TMUX_WATCH,
     ids::HOST_METRICS,
     ids::TRACE_ARCHIVE,
     ids::HOST_GUARD,
@@ -706,6 +708,14 @@ pub const CATALOG: &[Doc] = &[
         env: NO_ENV,
         pref: None,
         detail: Some("/api/debug/context-health"),
+    },
+    Doc {
+        id: ids::TMUX_WATCH,
+        name: "Tmux watch",
+        purpose: "Notices when the live tmux server disappears, logs one tmux_server_lost event, pushes the owner, restarts the workers that were running (at most once per 10 minutes, never paused or archived ones) and tells the leads.",
+        env: NO_ENV,
+        pref: None,
+        detail: None,
     },
     Doc {
         id: ids::DISK_WATCH,
