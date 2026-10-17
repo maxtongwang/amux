@@ -1632,33 +1632,39 @@ mod tests {
     }
 
     /// The real OS scan: holders are matched on BOTH ends of the connection.
-    /// The server listens on 0.0.0.0, so this process opens two connections
-    /// that share one client end (SO_REUSEADDR) to two server addresses, as
-    /// review B2's worker did; each server end names exactly its own
+    /// Two loopback listeners on distinct ports let this process open two
+    /// connections sharing one client end (SO_REUSEADDR). Matching compares
+    /// full SocketAddrs, so differing server ports exercise the same ambiguity
+    /// as review B2's differing server IPs, without a wildcard/non-loopback bind
+    /// that raises the macOS application-firewall dialog. Each server end names its own
     /// connection, and once the first closes it is no longer held although the
     /// second still holds the same client end (dev-lead's test 4).
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn os_lookup_matches_the_exact_connection_on_both_ends() {
-        let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server_a = SocketAddr::from(([127, 0, 0, 1], port));
-        let Some(other_ip) = local_non_loopback_ip() else {
-            panic!("this test needs a non-loopback address on the host to reproduce a shared client end");
-        };
-        let server_b = SocketAddr::new(other_ip, port);
+        let listener_a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener_b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_a = listener_a.local_addr().unwrap();
+        let server_b = listener_b.local_addr().unwrap();
+        assert_ne!(server_a, server_b, "two distinct server ends");
         // Both sockets set SO_REUSEADDR/SO_REUSEPORT before binding (Linux
         // requires it of the first holder too), as review B2's worker did.
         let a = reuse_connect(std::net::Ipv4Addr::LOCALHOST, 0, server_a);
         let client_end = a.local_addr().unwrap();
-        let (a_srv, _) = listener.accept().unwrap();
+        let (a_srv, a_peer) = listener_a.accept().unwrap();
+        assert_eq!(a_peer, client_end);
         let me = std::process::id();
         let door = front_door_for(&own_addresses());
         let scan_a = os::scan(client_end, server_a, &door).expect("scan on a supported platform");
         assert_eq!(scan_a.holders, vec![me], "the exact connection, by this pid");
         assert!(os::holds(me, client_end, server_a));
+        // A server-end-only match must also fail: no established TCP client
+        // has port zero, even while this process holds a connection to A.
+        let wrong_client = SocketAddr::new(client_end.ip(), 0);
+        assert!(!os::holds(me, wrong_client, server_a));
+        assert!(os::scan(wrong_client, server_a, &door).unwrap().holders.is_empty());
         let b = reuse_connect(std::net::Ipv4Addr::LOCALHOST, client_end.port(), server_b);
-        let (b_srv, b_peer) = listener.accept().unwrap();
+        let (b_srv, b_peer) = listener_b.accept().unwrap();
         assert_eq!(b_peer, client_end, "the server sees the same client end for both connections");
         assert!(os::holds(me, client_end, server_b));
         assert_eq!(os::scan(client_end, server_b, &door).unwrap().holders, vec![me]);
@@ -1706,15 +1712,6 @@ mod tests {
             assert_eq!(libc::connect(fd, (&remote as *const libc::sockaddr_in).cast(), len), 0, "connect");
             std::net::TcpStream::from_raw_fd(fd)
         }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn local_non_loopback_ip() -> Option<std::net::IpAddr> {
-        // A UDP "connect" sends nothing; it only picks the outbound address.
-        let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-        s.connect("192.0.2.1:9").ok()?;
-        let ip = s.local_addr().ok()?.ip();
-        (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
     }
 
     /// The memo only ever confirms a worker: an Outside verdict leaves nothing
