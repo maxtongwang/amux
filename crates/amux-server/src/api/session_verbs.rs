@@ -13846,6 +13846,13 @@ async fn send_text_inner_bound(
     send_outcome(first, generating, retried)
 }
 
+/// Whether the stuck-composer sweep may start an idle-submit watcher on text it
+/// finds in a composer (AMUX-5412). Off unless `AMUX_STUCK_COMPOSER_IDLE_SUBMIT`
+/// is on: the sweep cannot tell an owner's draft from amux's own held message.
+pub(crate) fn stuck_composer_idle_submit_on(v: Option<&str>) -> bool {
+    env_flag_on(v)
+}
+
 /// Lanes with a direct message waiting in the composer for its idle Enter.
 fn direct_draft_watches() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
     static W: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
@@ -24039,8 +24046,21 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
                 // a tokio task that dies on server self-adoption (auto-builder
                 // deploy), leaving the message permanently stuck. The dedup
                 // set in spawn_direct_draft_idle_submit prevents duplicates.
+                //
+                // OFF BY DEFAULT (Max via dev-lead, 2026-10-16). The respawn
+                // watched the composer's OWN text, so the watcher's exact-match
+                // guard compared the draft with itself and pressed Enter on any
+                // owner draft left idle: three of Max's unsent drafts were
+                // submitted at 00:41-00:42Z, one of which widened Cloudflare
+                // Access. `AMUX_STUCK_COMPOSER_IDLE_SUBMIT=1` restores it.
                 if let Some(ref full_text) = typed_pending {
-                    spawn_direct_draft_idle_submit(name, full_text, now_f64(), 5.0);
+                    if stuck_composer_idle_submit_on(std::env::var("AMUX_STUCK_COMPOSER_IDLE_SUBMIT").ok().as_deref()) {
+                        spawn_direct_draft_idle_submit(name, full_text, now_f64(), 5.0);
+                    } else {
+                        tracing::info!(session = %name, measured = true, n_considered = 1,
+                            verdict = "stuck_composer_idle_submit_off",
+                            "stuck composer text left for its owner; no idle-submit watcher started (AMUX_STUCK_COMPOSER_IDLE_SUBMIT is off)");
+                    }
                 }
                 emit_event(
                     state,
@@ -48177,6 +48197,24 @@ mod composer_state_tests {
         assert_eq!(released_fate_from(text, &rows("")), ReleasedFate::Unknown);
         assert_eq!(released_fate_from("continue", &[(9, "continue".into(), "confirmed".into())]), ReleasedFate::Unknown);
         assert_eq!(released_fate_from(text, &[]), ReleasedFate::Unknown);
+    }
+
+    /// The stuck-composer sweep must never press Enter on an owner's draft by
+    /// default (2026-10-16: three of Max's unsent drafts were submitted by the
+    /// AMUX-5412 respawn). Its only watcher start is behind the switch, which is
+    /// off unless explicitly on.
+    #[test]
+    fn the_stuck_composer_sweep_starts_no_idle_submit_watcher_by_default() {
+        assert!(!stuck_composer_idle_submit_on(None), "default must be off");
+        assert!(!stuck_composer_idle_submit_on(Some("")) && !stuck_composer_idle_submit_on(Some("0")));
+        assert!(stuck_composer_idle_submit_on(Some("1")), "the owner can turn it back on");
+        let src = include_str!("session_verbs.rs");
+        let at = src.find("AMUX-5412: respawn the idle-submit watcher").expect("sweep respawn site");
+        let site = &src[at..at + 1600];
+        let gate = site.find("stuck_composer_idle_submit_on(").expect("respawn is gated");
+        let spawn = site.find("spawn_direct_draft_idle_submit(name, full_text").expect("respawn call");
+        assert!(gate < spawn, "the gate must come before the watcher start");
+        assert!(site.contains("\"stuck_composer_idle_submit_off\""), "the skipped respawn must be logged");
     }
 
     /// The idle-stuck branch of send_text must retry and then hand a still-held
