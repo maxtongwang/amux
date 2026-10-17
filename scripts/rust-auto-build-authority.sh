@@ -17,6 +17,21 @@ say() { echo "== !! ACTIVATION AUTHORITY $*" >> "$LOG"; }
 refuse() { say "REFUSED — $*"; exit 0; }
 
 [ -n "$REPO" ] || refuse "AMUX_AUTHORITY_REPO is unset; no checkout may choose the live image"
+
+# FETCH $REF's REMOTE FIRST (2026-10-16). On an install with no developer pushing from the authority
+# checkout, nothing else fetches it, so $REF never moved and green commits on the remote were never
+# seen: a merged fix sat uninstalled until someone fetched by hand. One quiet fetch per tick, bounded
+# by git's own low-speed limits (macOS has no timeout(1)) and never fatal: a failed fetch decides
+# from the last fetched $REF, as before. Opt out with AMUX_AUTHORITY_FETCH=0.
+if [ "${AMUX_AUTHORITY_FETCH:-1}" != "0" ] && [[ "$REF" == */* ]]; then
+  remote=${REF%%/*}
+  if git -C "$REPO" remote get-url "$remote" >/dev/null 2>&1; then
+    GIT_TERMINAL_PROMPT=0 GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=30 \
+      git -C "$REPO" fetch --quiet "$remote" >/dev/null 2>&1 \
+      || say "FETCH of $remote failed; deciding from the last fetched $REF verdict=fetch_failed"
+  fi
+fi
+
 tip=$(git -C "$REPO" rev-parse --verify -q "${REF}^{commit}" 2>/dev/null) \
   || refuse "cannot resolve $REF in $REPO; refusing an unmeasured activation"
 
