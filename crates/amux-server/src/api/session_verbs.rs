@@ -33075,34 +33075,7 @@ pub(crate) fn worker_origin(headers: &HeaderMap) -> String {
     }
 }
 
-/// CONFIGURING ANOTHER WORKER IS THE OWNER'S (review round 3, N2/N3). A worker
-/// may change typed settings on itself only: renaming a peer left the renamed
-/// lane with no stored token (trusted without one), and editing a peer's env,
-/// instructions or memory rewrites what that peer is. Leads have no team-config
-/// role in this codebase, so the rule is owner-only. A worker's own Chat tab
-/// (`w@chat`) counts as `w`. Owners and verified members are unaffected.
-pub(crate) fn peer_config_refusal(headers: &HeaderMap, target: &str, what: &str) -> Option<Response> {
-    peer_config_refusal_body(headers, target, what).map(|body| jresp(StatusCode::FORBIDDEN, body))
-}
 
-/// [`peer_config_refusal`]'s decision and 403 body, for a handler whose return
-/// type is not a `Response`.
-pub(crate) fn peer_config_refusal_body(headers: &HeaderMap, target: &str, what: &str) -> Option<Value> {
-    // Through the delegation table (ai-config #160). A worker acting on itself
-    // passes here; which of its own settings it may change is decided per key
-    // where the keys are known (`delegation::guarded_config_patch`, scope).
-    use super::delegation::{classify, Action, Class, Target};
-    let action = match what {
-        "rename" => Action::RenameWorker { to: String::new() },
-        "stop" => Action::StopWorker,
-        _ => Action::SetConfig { keys: vec![what.to_string()] },
-    };
-    let t = Target::Worker(target.to_string());
-    if classify(&worker_origin(headers), &t, &action) == Class::SelfWorker {
-        return None;
-    }
-    super::delegation::refusal_value(headers, &t, &action)
-}
 
 /// The group whose members may create workers (Max, 2026-10-16: "Only leads
 /// can create workers"). Membership of it is the owner's to grant.

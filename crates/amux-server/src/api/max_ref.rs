@@ -1,6 +1,7 @@
 //! STUB for piece (b) of maxtongwang/ai-config#160 (feat/delegation-max-ref).
 //! Exact interface signatures only, so piece (a) compiles before (b) lands.
 //! It refuses every reference. It is deleted when (b)'s branch is merged.
+#![allow(dead_code)] // stub: items are used once the real module is merged
 use super::AppState;
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]

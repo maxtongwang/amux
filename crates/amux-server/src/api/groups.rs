@@ -455,7 +455,7 @@ async fn group_config(state: AppState, name: String, req: Request) -> Response {
             let exists = scan_session_tags(&amux_home()).iter().any(|(_, tags)| tags.iter().any(|t| t == &name))
                 || state.store.read().ok().is_some_and(|c| c.query_row("SELECT 1 FROM group_config WHERE name=?1", [&name], |_| Ok(())).is_ok());
             let action = if exists {
-                crate::api::delegation::Action::SetGroupRules { group: crate::api::session_verbs::norm_label(&name) }
+                crate::api::delegation::Action::SetGroupConfig { group: crate::api::session_verbs::norm_label(&name) }
             } else {
                 crate::api::delegation::Action::CreateGroup { group: name.clone() }
             };

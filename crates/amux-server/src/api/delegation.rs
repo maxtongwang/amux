@@ -113,7 +113,6 @@ pub(crate) enum Action {
     /// capabilities `scope:<cap>`, row fields `row:<field>`, instance settings
     /// `settings:<name>` / `instance:apply`, group/global layers prefixed.
     SetConfig { keys: Vec<String> },
-    SetMembership { group: String },
     CreateGroup { group: String },
     SetRouting,
     SetSecret { key: String },
@@ -130,7 +129,6 @@ impl Action {
             Action::SetGroupRules { .. } => "set_group_rules".into(),
             Action::SetGroupConfig { .. } => "set_group_config".into(),
             Action::SetConfig { keys } => format!("set_config:{}", keys.join(",")),
-            Action::SetMembership { group } => format!("set_membership:{group}"),
             Action::CreateGroup { .. } => "create_group".into(),
             Action::SetRouting => "set_routing".into(),
             Action::SetSecret { .. } => "set_secret".into(),
@@ -397,7 +395,7 @@ fn decide_self(action: &Action) -> Decision {
         },
         Action::RenameWorker { to } if reserved_name(to) => reserved_denied(to),
         Action::RenameWorker { .. } | Action::StopWorker | Action::Lifecycle { .. } => Decision::Allow,
-        Action::SetTags { .. } | Action::SetMembership { .. } => membership_denied("tags"),
+        Action::SetTags { .. } => membership_denied("tags"),
         other => deny("delegation_not_allowed", format!("no delegation row lets a worker do {} on itself", other.label())),
     }
 }
@@ -481,7 +479,6 @@ fn decide_mrpopo(action: &Action, t: &TargetFacts) -> Decision {
                 deny("worker_group_membership_refused", format!("mrpopo changes only '{LEADS_GROUP}' membership; {changed:?} is another team's"))
             }
         }
-        Action::SetMembership { group } if group == LEADS_GROUP => with(vec![T_LEADS]),
         Action::SetGroupRules { group } if group == LEADS_GROUP => with(vec![T_RULES]),
         Action::SetGroupConfig { .. } => with(vec![T_GROUP_CONFIG]),
         Action::SetRouting => with(vec![T_ROUTING]),
@@ -494,7 +491,7 @@ fn decide_worker(action: &Action) -> Decision {
     match action {
         Action::CreateWorker { .. } => deny("worker_create_requires_lead", format!(
             "Only leads can create workers; the caller is not a lead (CC_ORCHESTRATOR=1 and the '{LEADS_GROUP}' group).")),
-        Action::SetTags { .. } | Action::SetMembership { .. } => membership_denied("tags"),
+        Action::SetTags { .. } => membership_denied("tags"),
         Action::RenameWorker { .. } | Action::StopWorker | Action::Lifecycle { .. } | Action::SetConfig { .. } => {
             deny("peer_config_owner_only", "configuring another worker is the owner's; no delegation row grants it to this caller".into())
         }

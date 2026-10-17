@@ -1,6 +1,7 @@
 //! STUB for piece (c) of maxtongwang/ai-config#160 (feat/delegation-log).
 //! Exact interface signatures only, so piece (a) compiles before (c) lands.
 //! It writes nothing. It is deleted when (c)'s branch is merged.
+#![allow(dead_code)] // stub: items are used once the real module is merged
 use super::AppState;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
