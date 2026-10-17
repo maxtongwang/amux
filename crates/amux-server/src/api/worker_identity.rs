@@ -298,6 +298,12 @@ pub async fn enforce(req: Request, next: Next) -> Response {
     let Some(lane) = Some(claimed).filter(|l| super::session_verbs::valid_session_name(l)) else {
         return next.run(req).await;
     };
+    // Process ancestry already proved this request comes from the lane's own
+    // pane (api/process_identity.rs). That is stronger than a token, which a
+    // sandboxed tool shell may not inherit, so it stands in for one.
+    if header(&req, super::process_identity::PROCESS_WORKER_HEADER) == Some(lane.as_str()) {
+        return next.run(req).await;
+    }
     let home = crate::config::amux_home();
     match check(&home, &lane, header(&req, TOKEN_HEADER)) {
         Check::Unenforced | Check::Valid => next.run(req).await,

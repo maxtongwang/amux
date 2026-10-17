@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Idempotently wire amux's canonical Claude lifecycle and read-routing hooks.
+"""Idempotently wire amux's canonical Claude or Codex lifecycle and read-routing hooks.
+
+--provider codex writes Codex's own events into ~/.codex/hooks.json (Codex 0.163, measured
+2026-10-16, ai-config #131): no Notification event exists there, so `blocked` comes from the
+passive observer's PermissionRequest instead; Codex has no Read tool, so the read router is wired
+for shell commands (`Bash`) only; and the ask guard is not wired, because the owner-ask goal check
+reads Claude transcripts only. Codex runs a new or changed user hook only after it is trusted in
+its `/hooks` review.
 
 Unrelated settings and hooks are preserved. Older amux report commands are
 removed before the canonical six-event set is added, and the large-read router
@@ -82,9 +89,26 @@ def canonical(hook_path: str) -> dict[str, dict[str, Any]]:
     }
 
 
-def canonical_read_guard(hook_path: str) -> list[dict[str, Any]]:
+def canonical_codex(hook_path: str) -> dict[str, dict[str, Any]]:
+    """Codex's native events for the same reports. SessionStart resets subagents for a new process
+    (hook-report skips source=compact, which Codex reports through PostCompact instead)."""
+    quoted = '"' + hook_path.replace('"', '\\"') + '"'
+    base = f"bash {quoted}"
+    return {
+        "SessionStart": group(f"{base} subagent-reset session-start-hook"),
+        "UserPromptSubmit": group(f"{base} active prompt-hook"),
+        "PostToolUse": group(f"{base} active tool-hook", ".*"),
+        "Stop": group(f"{base} idle stop-hook"),
+        "SubagentStart": group(f"{base} subagent-start subagent-start-hook"),
+        "SubagentStop": group(f"{base} subagent-stop subagent-stop-hook"),
+    }
+
+
+def canonical_read_guard(hook_path: str, provider: str = "claude") -> list[dict[str, Any]]:
     quoted = '"' + hook_path.replace('"', '\\"') + '"'
     command = f"python3 {quoted}"
+    if provider == "codex":
+        return [group(command, "Bash")]  # Codex reads files through its shell tool
     return [group(command, "Read"), group(command, "Bash")]
 
 
@@ -140,7 +164,12 @@ def merge(
     hook_path: str,
     read_guard_path: str = "$HOME/.amux/hooks/large-read-guard.py",
     ask_guard_path: str | None = None,
+    provider: str = "claude",
 ) -> dict[str, Any]:
+    if provider not in ("claude", "codex"):
+        raise ValueError(f"unknown provider {provider!r}")
+    if provider == "codex" and ask_guard_path is not None:
+        raise ValueError("the ask guard has no Codex wiring: owner-ask goal detection reads Claude transcripts only")
     raw_hooks = data.setdefault("hooks", {})
     if not isinstance(raw_hooks, dict):
         raise ValueError("settings 'hooks' must be an object")
@@ -180,9 +209,10 @@ def merge(
         else:
             raw_hooks.pop(event, None)
 
-    for event, report_group in canonical(hook_path).items():
+    events = canonical_codex(hook_path) if provider == "codex" else canonical(hook_path)
+    for event, report_group in events.items():
         raw_hooks.setdefault(event, []).append(report_group)
-    raw_hooks.setdefault("PreToolUse", []).extend(canonical_read_guard(read_guard_path))
+    raw_hooks.setdefault("PreToolUse", []).extend(canonical_read_guard(read_guard_path, provider))
     if ask_guard_path is not None:
         raw_hooks["PreToolUse"].extend(canonical_ask_guard(ask_guard_path))
     return data
@@ -213,7 +243,8 @@ def main() -> int:
     parser.add_argument(
         "--settings",
         type=Path,
-        default=Path.home() / ".claude" / "settings.json",
+        default=None,
+        help="native hook file (default: ~/.claude/settings.json, or $CODEX_HOME/hooks.json for --provider codex)",
     )
     parser.add_argument("--hook-path", default="$HOME/.amux/hook-report.sh")
     parser.add_argument(
@@ -226,18 +257,32 @@ def main() -> int:
         help="wire the AskUserQuestion goal guard (AMUX-5234); omitted = leave any existing wiring alone",
     )
     parser.add_argument(
+        "--provider",
+        choices=("claude", "codex"),
+        default="claude",
+        help="whose native events to write (codex: ~/.codex/hooks.json)",
+    )
+    parser.add_argument(
         "--allow-unsupported-events",
         action="store_true",
         help="wire canonical events even when the installed handler cannot answer them",
     )
     args = parser.parse_args()
+    if args.settings is None:
+        # Resolved after --provider: a Codex run defaulting to Claude's settings would replace Claude's
+        # managed report hooks with the Codex set and drop its Notification producer (PR #6 review).
+        if args.provider == "codex":
+            args.settings = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "hooks.json"
+        else:
+            args.settings = Path.home() / ".claude" / "settings.json"
 
     # REFUSE BEFORE WRITING. The failure this prevents is not a missing hook,
     # it is a wired hook backed by a handler that answers every notification
     # with `blocked`. Checked against the installed bytes, and the remedy names
     # the command that ships the handler, because that is the half a caller
     # running this script has not run.
-    unsupported = unsupported_events(read_hook_source(args.hook_path))
+    # Only Claude's Notification depends on a handler feature; Codex wires no such event.
+    unsupported = unsupported_events(read_hook_source(args.hook_path)) if args.provider == "claude" else []
     if unsupported and not args.allow_unsupported_events:
         raise SystemExit(
             f"refusing to wire {', '.join(unsupported)}: the installed handler at "
@@ -258,11 +303,11 @@ def main() -> int:
     else:
         data = {}
     try:
-        merged = merge(data, args.hook_path, args.read_guard_path, args.ask_guard_path)
+        merged = merge(data, args.hook_path, args.read_guard_path, args.ask_guard_path, args.provider)
     except ValueError as exc:
         raise SystemExit(f"refusing to rewrite {args.settings}: {exc}")
     write_atomic(args.settings, merged)
-    print(f"wired amux status and read-routing hooks in {args.settings}")
+    print(f"wired amux {args.provider} status and read-routing hooks in {args.settings}")
     return 0
 
 

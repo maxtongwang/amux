@@ -16,6 +16,10 @@ use tower::ServiceExt;
 fn app() -> (axum::Router, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("AMUX_HOME", dir.path());
+    // These requests carry a synthetic loopback ConnectInfo that no process
+    // holds, so process attribution (api/process_identity.rs) would rightly
+    // refuse them as unproven; this file tests the owner-bearer rules alone.
+    std::env::set_var("AMUX_PROCESS_ATTRIBUTION", "0");
     let store = std::sync::Arc::new(Store::open(&dir.path().join("amux-test.db")).unwrap());
     let state = AppState {
         store,
