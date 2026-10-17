@@ -732,6 +732,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_checkViewFreshness": {
+      "kind": "command._checkViewFreshness",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_checkWorkerStatusOrder": {
       "kind": "command._checkWorkerStatusOrder",
       "feedback_required": true,
@@ -2654,6 +2660,12 @@
     },
     "_peekFiltersReset": {
       "kind": "command._peekFiltersReset",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekFrameApplied": {
+      "kind": "command._peekFrameApplied",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"

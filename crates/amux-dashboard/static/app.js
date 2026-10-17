@@ -685,6 +685,9 @@ let archivedExpanded = false;
 let gitInfo = {};  // {sessionName: {branch, repo, _conflict}}
 let _sessionLoadError = null; // Last failed worker read; a response is not necessarily data.
 let _initialLoad = true;   // true until first data arrives from server
+let _sessionsLastAppliedAt = null; // Sessions snapshots only; transport pings are not data.
+let _sessionsStale = false;
+let _sessionsRevalidateAt = null; // A quiet-fleet revalidation is in flight since this time.
 let _lastDataTime = null;  // timestamp of last successful data
 // AC-275: when NO data has ever arrived, _lastDataTime stays null and every
 // staleness check below is falsy — so a client that never receives its first
@@ -896,6 +899,62 @@ function _modelClass(m) {
   return m.split(/[-\s]/)[0] || 'other';
 }
 let peekSession = null;
+let _peekLastAppliedAt = null;
+let _peekOpenedAt = null;
+let _peekFreshnessEpisode = '';
+let _peekMissing = false;
+function _peekFrameApplied(statusEl, label = 'Updated') {
+  const now = Date.now();
+  const wasStale = !!_peekFreshnessEpisode;
+  if (wasStale && peekSession) {
+    _peekPollBeacon('peek-recovered', peekSession, { verdict: 'peek-recovered', episode: _peekFreshnessEpisode,
+      measured: true, n_considered: 1, age_ms: _peekLastAppliedAt ? now - _peekLastAppliedAt : null });
+  }
+  _peekLastAppliedAt = now;
+  _peekFreshnessEpisode = '';
+  if (wasStale || performance.now() > _peekGeoHold) {
+    statusEl.textContent = label + ' ' + new Date(_peekLastAppliedAt).toLocaleTimeString() + ' · v' + APP_VER;
+  }
+}
+function _checkViewFreshness(now) {
+  if (peekSession && !_peekMissing && !_peekAgents.selected && !_peekChatTarget()
+      && _workerRenderer(peekSession) === 'terminal') {
+    const since = _peekLastAppliedAt || _peekOpenedAt;
+    const age = now - since;
+    if (since && age > 10000) {
+      const paused = peekSelecting || _peekHasSelection();
+      const verdict = paused ? 'selection-paused' : 'peek-stale';
+      const statusEl = document.getElementById('peek-status');
+      if (statusEl) statusEl.textContent = paused
+        ? 'Paused while text is selected · since ' + new Date(since).toLocaleTimeString()
+        : 'Stale since ' + new Date(since).toLocaleTimeString() + ' (' + Math.floor(age / 1000) + 's)';
+      if (_peekFreshnessEpisode !== verdict) {
+        _peekFreshnessEpisode = verdict;
+        _peekPollBeacon(verdict, peekSession, { verdict, measured: true, age_ms: age, n_considered: 1 });
+      }
+      // An in-flight tick owns its continuation; only replace a lost timer.
+      if (!paused && !peekTimer && !_peekPollInFlight) _schedulePeekPoll(0);
+    }
+  }
+  // Embedded terminals intentionally do not subscribe to fleet updates.
+  // The list is refetched only on an SSE invalidate, so a quiet fleet sends
+  // no data for long stretches. Quiet is not stale: after 30s, revalidate
+  // (a 304 when nothing changed); only a list that stays unconfirmed 15s
+  // past that revalidation is shown as stale.
+  if (window._peekEmbed || _sessionsStale) return;
+  const sessionsAge = now - (_sessionsLastAppliedAt || _pageLoadTime);
+  if (sessionsAge <= 30000) {
+    _sessionsRevalidateAt = null;
+  } else if (!_sessionsRevalidateAt) {
+    _sessionsRevalidateAt = now;
+    fetchSessions();
+  } else if (now - _sessionsRevalidateAt > 15000) {
+    _sessionsStale = true;
+    _interactionDiagnostic({ kind: 'view-freshness', verdict: 'sessions-stale', measured: true, n_considered: 1, age_ms: sessionsAge });
+    fetchSessions(); // Once per stale episode; success resets the latch.
+    render();
+  }
+}
 // Every open/close is a new UI life, even when it names the same worker. Async
 // peek/log/IDB responses must match BOTH coordinates before touching shared
 // view state. A name-only check let a delayed response from a prior open land
@@ -5427,7 +5486,10 @@ function _sessionReadFailed(status, reason) {
 }
 
 function _sessionReadRecovered() {
-  const changed = !!_sessionLoadError;
+  const changed = !!_sessionLoadError || _sessionsStale;
+  _sessionsLastAppliedAt = Date.now();
+  _sessionsStale = false;
+  _sessionsRevalidateAt = null;
   _sessionLoadError = null;
   _sessionRetryAttempt = 0;
   clearTimeout(_sessionRetryTimer);
@@ -7439,9 +7501,9 @@ function render() {
   // opposite: the local copy IS the UI, the network refreshes it. Staleness is
   // shown, not enforced: status badges grey out and the top-left badge says
   // which moment the list is from. Sends queue in the outbox as they already do.
-  const workersStale = !!(_sessionLoadError && sessions.length);
+  const workersStale = _sessionsStale || !!(_sessionLoadError && sessions.length);
   el.classList.toggle('workers-stale', workersStale);
-  const staleWorkerPrefix = '';
+  const staleWorkerPrefix = _sessionsStale ? '<div class="conn-sw-notice" role="status">Stale since ' + new Date(_sessionsLastAppliedAt || _pageLoadTime).toLocaleTimeString() + '</div>' : '';
   const _nonArchivedCount = sessions.filter(s => !s.project && !s.archived && !_workerLifecycleInactive(s)).length;
   if (!_nonArchivedCount && !drafts.length) {
     if (_sessionLoadError) {
@@ -7470,6 +7532,7 @@ function render() {
       el.innerHTML = '<div class="empty">' + (sessions.some(s => s.project) ? 'Project workers are grouped below.' : sessions.some(s => s.lifecycle === 'paused' || s.lifecycle === 'review') ? 'No active workers. Resume a paused worker to continue.' : 'No workers yet.<br>Tap <strong>+</strong> to create one.') +
         (!online ? '<br><span style="color:var(--yellow)">You\'re offline — workers created now will sync when connected.</span>' : '') + '</div>';
     }
+    if (staleWorkerPrefix) el.insertAdjacentHTML('afterbegin', staleWorkerPrefix);
     _renderProjectWorkersSection();
     _renderReviewSection();
     _renderPausedSection();
@@ -14648,6 +14711,9 @@ function _paintCachedPeek(cached) {
   lastPeekHTML = _peekEarlierHTML() + _peekHistoryHTML + _lastLiveHTML;
   applyPeekSearch();
   const ago = Math.floor((Date.now() - (cached.time || Date.now())) / 60000);
+  // The freshness watchdog measures from the cached frame's own time, not the
+  // open: a 5-minute-old cache is 5 minutes stale until a live frame lands.
+  if (cached.time && !_peekLastAppliedAt) _peekLastAppliedAt = cached.time;
   const st = document.getElementById('peek-status');
   if (st) st.textContent = 'Cached ' + (ago < 1 ? 'just now' : ago + 'm ago');
   return true;
@@ -15442,6 +15508,10 @@ function openPeek(name, opts) {
     _peekFilesRestore(name);
   }
   peekSession = name;
+  _peekLastAppliedAt = null;
+  _peekOpenedAt = Date.now();
+  _peekFreshnessEpisode = '';
+  _peekMissing = false;
   _applyPeekTabVisibility();
   _syncComposerPending();
   const identityOverlay = document.getElementById('peek-overlay');
@@ -18442,6 +18512,7 @@ async function _refreshPeekFrame(liveOnly, request) {
       hidePeekLoading();
       _stopPeekPoll();
       _peekPollActive = false;
+      _peekMissing = true;
       try { _peekPollBeacon('stop-404', name); } catch (e) {}
       statusEl.textContent = 'Session ' + name + ' no longer exists — stopped polling.';
       return;
@@ -18450,7 +18521,7 @@ async function _refreshPeekFrame(liveOnly, request) {
       _peekFrameSequence = Math.max(_peekFrameSequence, request.sequence);
       hidePeekLoading();
       if (!liveOnly) _peekLastFullMs = performance.now();
-      if (performance.now() > _peekGeoHold) statusEl.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
+      _peekFrameApplied(statusEl);
       return;
     }
     if (!r.ok) throw new Error('Terminal request failed (HTTP ' + r.status + ')');
@@ -18521,7 +18592,7 @@ async function _refreshPeekFrame(liveOnly, request) {
     if (!modeChanged && output === _lastPeekRaw && (histRaw === null || histRaw === _peekHistoryRaw) && lastPeekHTML) {
       acceptFrame();
       _peekTraceEnd('skip-unchanged');
-      if (performance.now() > _peekGeoHold) statusEl.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
+      _peekFrameApplied(statusEl);
       return;
     }
     // Prepare both regions before committing the raw-frame dedupe keys. A
@@ -18608,7 +18679,7 @@ async function _refreshPeekFrame(liveOnly, request) {
       _peekTraceEnd('hold-while-reading', _peekPressHold ? 'pressing in the peek' : hasSearch ? 'a search is active' : 'scrolled up');
     } else _peekTraceEnd('painted', histChanged ? 'history and live' : 'live only');
     }   // !chatOwnsBody
-    if (performance.now() > _peekGeoHold) statusEl.textContent = (data.saved ? 'Saved log' : 'Updated') + ' ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
+    _peekFrameApplied(statusEl, data.saved ? 'Saved log' : 'Updated');
     acceptFrame();
     // Cache peek output for offline browsing
     // Cache BOTH slices — since the live-split, `output` alone is just the tiny
@@ -18622,7 +18693,7 @@ async function _refreshPeekFrame(liveOnly, request) {
       reason: _peekAc.signal.aborted ? 'timeout' : 'request_or_render_error',
       verdict: 'retrying', measured: true, n_considered: 1 });
     // A failed history request is not a disconnected live terminal.
-    if ((liveOnly && request.sequence >= _peekFrameSequence) || !_peekFrameSequence) statusEl.textContent = 'Reconnecting… retrying terminal updates';
+    if (!_peekFreshnessEpisode && ((liveOnly && request.sequence >= _peekFrameSequence) || !_peekFrameSequence)) statusEl.textContent = 'Reconnecting… retrying terminal updates';
     hidePeekLoading();   // fetch failed — stop the "Loading latest…" cue (we fall back to cache / retry below)
     // Offline: load cached peek
     if (!lastPeekHTML || lastPeekHTML.includes('Loading...')) {
@@ -44884,6 +44955,8 @@ function connectSSE() {
     try {
       const msg = JSON.parse(e.data);
       if (msg.type === 'workers' || msg.type === 'sessions') {
+        if (!Array.isArray(msg.payload)) { _sessionReadFailed(200, 'invalid_payload'); return; }
+        _sessionReadRecovered();
         const j = JSON.stringify(msg.payload);
         if (j !== lastSessionsJSON) {
           const firstLoad = !lastSessionsJSON;
@@ -45164,6 +45237,7 @@ window.addEventListener('online',    () => _onClientResume('online'));
 // Periodic stale-watchdog — only fires when visible, so it's cheap on phones.
 setInterval(() => {
   if (document.hidden) return;
+  _checkViewFreshness(Date.now());
   if (_sseFallback) return;
   if (window._peekEmbed) return;
   if (_sseLooksStale()) _forceSseReconnect('watchdog stale ' + Math.round((Date.now() - _lastDataTime)/1000) + 's');
