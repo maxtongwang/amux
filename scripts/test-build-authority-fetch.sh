@@ -48,7 +48,8 @@ expect '[ "$(cat "$TMP/elected")" = "$second" ] && grep -q "verdict=fetch_failed
 # the wall-clock limit kills git and its ssh, logs why, and the last fetched origin/main is built.
 cat > "$TMP/hang-ssh" <<'SH'
 #!/usr/bin/env bash
-exec sleep 300
+# No exec: this process must keep its own command line so the leftover check below can see it.
+sleep 300; exit 0
 SH
 chmod +x "$TMP/hang-ssh"
 g -C "$TMP/authority" remote set-url origin "ssh://example.invalid/repo.git"

@@ -30,6 +30,8 @@ refuse() { say "REFUSED — $*"; exit 0; }
 if [ "${AMUX_AUTHORITY_FETCH:-1}" != "0" ] && [[ "$REF" == */* ]]; then
   remote=${REF%%/*}
   if git -C "$REPO" remote get-url "$remote" >/dev/null 2>&1; then
+    fetch_timeout="${AMUX_AUTHORITY_FETCH_TIMEOUT:-45}"
+    [[ "$fetch_timeout" =~ ^[1-9][0-9]*$ ]] || fetch_timeout=45  # 0, negative or non-numeric would lift the limit
     ssh_cmd="${GIT_SSH_COMMAND:-$(git -C "$REPO" config --get core.sshCommand 2>/dev/null || true)}"
     [ -n "$ssh_cmd" ] || ssh_cmd="ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=2"
     fetch_err=$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$ssh_cmd" \
@@ -37,9 +39,13 @@ if [ "${AMUX_AUTHORITY_FETCH:-1}" != "0" ] && [[ "$REF" == */* ]]; then
       perl -e '
         my $t = shift; my $pid = fork; defined $pid or exit 125;
         if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 }
-        $SIG{ALRM} = sub { kill "KILL", -$pid; waitpid($pid, 0); print STDERR "timed out after ${t}s\n"; exit 124 };
-        alarm $t; waitpid($pid, 0); exit($? >> 8)' \
-        "${AMUX_AUTHORITY_FETCH_TIMEOUT:-45}" git -C "$REPO" fetch --quiet "$remote" 2>&1 >/dev/null) \
+        # TERM first so git can release a ref lock in the shared checkout, then KILL the group.
+        $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; waitpid($pid, 0);
+                           print STDERR "timed out after ${t}s\n"; exit 124 };
+        alarm $t; waitpid($pid, 0);
+        if ($? & 127) { print STDERR "git killed by signal " . ($? & 127) . "\n"; exit 128 + ($? & 127) }
+        exit($? >> 8)' \
+        "$fetch_timeout" git -C "$REPO" fetch --quiet "$remote" 2>&1 >/dev/null) \
       || say "FETCH of $remote failed ($(printf '%s' "$fetch_err" | tr '\n' ' ' | cut -c1-160)); deciding from the last fetched $REF verdict=fetch_failed"
   fi
 fi
