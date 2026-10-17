@@ -225,7 +225,7 @@ fn capture_pane_bounded(pt: &str, lane: &str) -> Option<String> {
     if fleet_suppressed() {
         return None;
     }
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     // POLICY IN CONFIG, not a constant (ethos D4). A timeout hardcoded here is
     // a ceiling nobody can move when the fleet grows.
     let budget = std::time::Duration::from_secs_f64(env_secs("AMUX_PANE_CAPTURE_TIMEOUT_S", 3.0));

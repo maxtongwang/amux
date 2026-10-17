@@ -34814,7 +34814,6 @@ mod tests {
 
     #[test]
     fn tmux_shell_setup_keeps_line_and_enter_in_one_command() {
-        use std::process::Command;
         if crate::tmux_guard::std_tmux().arg("-V").output().is_err() {
             eprintln!("tmux unavailable; live shell submission test not measured");
             return;
@@ -34884,7 +34883,6 @@ mod tests {
 
     #[tokio::test]
     async fn startup_shell_receipts_preserve_long_input_and_wait_for_setup() {
-        use std::process::Command;
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let socket = dir.path().join("socket");
         struct PrivateServer(std::path::PathBuf);
