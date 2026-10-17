@@ -6004,3 +6004,101 @@ FIX: The CLI corrects AMUX_WORKER with the same narrow test as AMUX-4033 (claime
   session file, the caller's own amux- pane names one that does), and both corrections log
   `stale_env_identity_healed` once per variable and old name to cli-transport.jsonl, which ships
   to the server log. Test: scripts/test-cli-stale-worker.py (fails on the prior CLI).
+
+## A fresh Codex worker never receives its first peer message
+AREA: notices
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-10-16
+SESSION: dev-merging-installing-worker
+CARD: DMIW-1
+SYMPTOM: `amux send dev-codex-probe` answered "queued (steering) — waiting for fresh boot readiness" and was
+  never delivered: the log repeats "steering queue STALLED ... structured worker state changed or is
+  unmeasured" and then "no automated delivery: agent state is unknown (inferred evidence, unhealthy
+  telemetry)" every 30 s. Interactive Codex fires no hook until its first turn (measured: the probe recorded
+  0 status events in 12+ min; `codex exec` fires SessionStart/UserPromptSubmit/Stop at once), so the
+  structured channel stays empty. The queued message went in only after the owner typed into the pane.
+COST: Two probe relaunches and two owner keystrokes from dev-lead to finish one parity check; any Codex
+  worker started and handed work by a peer sits idle until a human types.
+FIX: For a Codex lane whose current run has no status events yet, treat an empty, visible Codex composer
+  as the boot boundary instead of refusing on unmeasured state.
+
+## Every amux CLI call from a Codex worker goes unacknowledged
+AREA: cli
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-10-16
+SESSION: dev-merging-installing-worker
+CARD: DMIW-2
+SYMPTOM: Both sends from a Codex worker ended `send_delivery_unknown ... amux did not acknowledge the request
+  after retries` (send-failures.jsonl, 3 attempts each), and neither reached _amux_messages. The launch
+  passes `--sandbox workspace-write`, which turns network off: `codex sandbox -c
+  sandbox_mode="workspace-write" -- curl https://localhost:8824/api/health` gave 000, and 200 with
+  `-c sandbox_workspace_write.network_access=true`.
+COST: A refused outside-group send looked identical to an unacknowledged one, so a group-boundary check read
+  as "unknown" instead of as a result.
+FIX: The server's codex launch arm (the only path: the CLI hands codex starts to POST /start,
+  server_owns_start) adds `-c sandbox_workspace_write.network_access=true` whenever amux itself adds
+  workspace-write, as scripts/codex-review.sh in ai-config already does.
+
+## A worker can create a worker inside any group
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-10-16
+SESSION: dev-merging-installing-worker
+CARD: DMIW-3
+SYMPTOM: PATCH /api/sessions/<w>/config {"tags":"dev"} from a worker answers "Group membership changes
+  require direct owner input", but POST /api/sessions with "tags":"dev" from the same worker created
+  dev-codex-probe2 with CC_TAGS="dev". Any worker can therefore place a new worker in any group, the leads
+  group included, and message through it.
+COST: Found by accident while replacing a probe; group isolation is only as strong as the weaker of the two
+  paths.
+FIX: Apply the PATCH path's owner-input rule to tags (and any other membership field) on create.
+
+## A Codex worker's sends arrive as the owner, unstamped, across groups
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-10-16
+SESSION: dev-merging-installing-worker
+CARD: DMIW-4
+SYMPTOM: Codex worker dev-codex-probe2 (tag dev) ran `amux send re-ops-lead`; it was delivered into
+  re-ops-lead's pane with no [amux-origin] stamp and no boundary verdict. ~/.codex/config.toml sets
+  [shell_environment_policy] inherit = "core", so Codex tool shells get no AMUX_SESSION, AMUX_WORKER,
+  AMUX_WORKER_TOKEN or TMUX_PANE (measured: `env | grep AMUX` printed NONE under core, all three under
+  -c 'shell_environment_policy.inherit="all"'), and a request with no worker identity is taken as owner input.
+COST: A worker can speak as the owner to any lane. Fix owned by amux-setup-complete's security PR (dev-lead).
+FIX: Server: a request with neither an owner bearer nor a valid worker identity is refused, never treated as
+  owner input. Launch: pass the AMUX_* identity into Codex tool shells per launch, never by editing the
+  owner's config.toml. Regression tests for Claude and Codex.
+
+## `amux register` cannot set a Codex worker's flags
+AREA: cli
+SEVERITY: slows
+STATUS: open
+DATE: 2026-10-16
+SESSION: dev-merging-installing-worker
+CARD: DMIW-5
+SYMPTOM: `amux register dev-codex-probe --model gpt-6-astra -c sandbox_workspace_write.network_access=true`
+  (and `--config ...`) stored CC_FLAGS="--model gpt-6-astra": parse_claude_flags drops every flag it does
+  not know as a Claude flag, and the config endpoint's hint lists no flags field. Only create's "flags"
+  carries Codex flags.
+COST: A probe had to be deleted and recreated to change one Codex setting.
+FIX: Pass flags through unparsed for non-Claude providers (or add a flags field to PATCH config).
+
+## amux's default Codex model fails every turn on a ChatGPT account
+AREA: cli
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-10-16
+SESSION: dev-merging-installing-worker
+CARD: DMIW-6
+SYMPTOM: A worker launched with amux's default `--model gpt-5.5` failed each turn with 400
+  invalid_request_error "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account."
+  Codex's own ~/.codex/models_cache.json lists what the account offers (gpt-6-astra, gpt-6-sol, ...), without
+  gpt-5.5.
+COST: Two dead probe turns and an owner keystroke before the cause was visible.
+FIX: The server's codex launch arm reads models_cache.json: amux's default is dropped when the account does not offer it
+  (verdict codex_default_model_unavailable) so Codex uses the account default; a configured model is kept
+  and warned about (codex_configured_model_unavailable).

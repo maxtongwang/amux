@@ -14833,6 +14833,75 @@ fn seed_codex_dir_trust(work_dir: &str) {
 /// A linked worktree's .git is a pointer file. Git writes objects in its
 /// common dir and the index/HEAD in its per-worktree git dir; neither can be
 /// inferred by appending /.git to the checkout. Resolve only this repository.
+/// The model slugs Codex last fetched for the signed-in account
+/// (`$CODEX_HOME/models_cache.json`, written by Codex itself), or None when
+/// the cache is missing, unreadable or empty — then nothing is known and no
+/// launch decision is taken from it.
+///
+/// Why it matters (DMIW-6, ai-config #131, 2026-10-16): amux's default
+/// `--model gpt-5.5` is not offered to a ChatGPT-account Codex, and every turn
+/// of a worker launched with it failed `400 invalid_request_error: The
+/// 'gpt-5.5' model is not supported when using Codex with a ChatGPT account`.
+pub(crate) fn codex_account_models(codex_home: &std::path::Path) -> Option<Vec<String>> {
+    let raw = std::fs::read_to_string(codex_home.join("models_cache.json")).ok()?;
+    let doc: Value = serde_json::from_str(&raw).ok()?;
+    let slugs: Vec<String> = doc["models"]
+        .as_array()?
+        .iter()
+        .filter_map(|m| m["slug"].as_str().or_else(|| m["id"].as_str()).map(String::from))
+        .collect();
+    (!slugs.is_empty()).then_some(slugs)
+}
+
+fn codex_home_dir() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".codex"))
+}
+
+/// The `--model` value in a flags string (`--model X`, `--model=X`, `-m X`).
+fn codex_flag_model(opts: &str) -> Option<String> {
+    let mut it = opts.split_whitespace();
+    while let Some(tok) = it.next() {
+        if let Some(v) = tok.strip_prefix("--model=") {
+            return Some(v.trim_matches(['\'', '"']).to_string());
+        }
+        if tok == "--model" || tok == "-m" {
+            return it.next().map(|v| v.trim_matches(['\'', '"']).to_string());
+        }
+    }
+    None
+}
+
+/// Decide the model part of a Codex launch against what the account offers.
+/// Returns the ` --model X` to append (empty when none should be), logging a
+/// verdict whenever the account's list disagrees with the model in play.
+/// amux's own default is dropped when unavailable, so Codex uses the
+/// account's default; a model the owner configured is kept and warned about,
+/// because replacing an explicit choice is the owner's decision.
+pub(crate) fn codex_model_opts(name: &str, opts: &str, available: Option<&[String]>) -> String {
+    if let Some(configured) = codex_flag_model(opts) {
+        if let Some(list) = available {
+            if !list.iter().any(|m| m == &configured) {
+                tracing::warn!(session = name, model = %configured, available = %list.join(","), measured = true,
+                    n_considered = list.len(), verdict = "codex_configured_model_unavailable",
+                    "this worker's configured Codex model is not offered to the signed-in account; its turns will fail until the model is changed");
+            }
+        }
+        return String::new();
+    }
+    let default = default_model_for_provider("codex");
+    match available {
+        Some(list) if !list.iter().any(|m| m == &default) => {
+            tracing::warn!(session = name, default_model = %default, available = %list.join(","), measured = true,
+                n_considered = list.len(), verdict = "codex_default_model_unavailable",
+                "amux's default Codex model is not offered to the signed-in account; launching without --model so Codex uses the account default");
+            String::new()
+        }
+        _ => format!(" --model {}", sh_quote(&default)),
+    }
+}
+
 async fn codex_repository_write_dirs(work_dir: &str) -> Vec<PathBuf> {
     let Some(out) = run_cmd(
         "git",
@@ -15540,9 +15609,8 @@ pub(crate) async fn start_session(
             if !extra_flags.is_empty() {
                 opts += &format!(" {}", shell_quote_flags(extra_flags));
             }
-            if !opts.contains("--model") && !opts.contains("-m ") {
-                opts += &format!(" --model {}", sh_quote(&default_model_for_provider("codex")));
-            }
+            let available = codex_account_models(&codex_home_dir());
+            opts += &codex_model_opts(name, &opts, available.as_deref());
             if !opts.contains("--dangerously-bypass") && !opts.contains("-a ") {
                 opts += if codex_yolo {
                     " --dangerously-bypass-approvals-and-sandbox"
@@ -15556,6 +15624,14 @@ pub(crate) async fn start_session(
                 && !opts.contains("-s ")
             {
                 opts += " --sandbox workspace-write";
+                // workspace-write turns network off, and the amux CLI reaches
+                // this server over localhost: measured 2026-10-16 (DMIW-2),
+                // curl https://localhost:8824/api/health inside that sandbox
+                // gave 000, and every `amux send` from a Codex worker ended
+                // send_delivery_unknown. With network_access it answered 200.
+                if !opts.contains("network_access") {
+                    opts += " -c sandbox_workspace_write.network_access=true";
+                }
             }
             let logs = logs_dir().to_string_lossy().into_owned();
             if !isolated && !opts.contains(&logs) {
@@ -54507,5 +54583,52 @@ mod session_limit_banner_tests {
             api_count: 0,
         };
         assert!(matches!(auto_resume_decision(&inputs), AutoResume::Send { reason: "usage_reset", .. }));
+    }
+}
+
+#[cfg(test)]
+mod codex_launch_model_tests {
+    use super::*;
+
+    fn cache(dir: &std::path::Path, body: &str) {
+        std::fs::write(dir.join("models_cache.json"), body).unwrap();
+    }
+
+    #[test]
+    fn account_models_come_from_codex_cache_and_are_none_when_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(codex_account_models(dir.path()), None, "no cache: nothing known");
+        cache(dir.path(), r#"{"models":[{"slug":"gpt-6-astra"},{"slug":"gpt-6-sol"}]}"#);
+        assert_eq!(codex_account_models(dir.path()), Some(vec!["gpt-6-astra".into(), "gpt-6-sol".into()]));
+        cache(dir.path(), r#"{"models":[]}"#);
+        assert_eq!(codex_account_models(dir.path()), None, "an empty list is not evidence");
+        cache(dir.path(), "not json");
+        assert_eq!(codex_account_models(dir.path()), None);
+    }
+
+    #[test]
+    fn flag_model_reads_every_spelling() {
+        assert_eq!(codex_flag_model(" -c x=1 --model gpt-6-astra -a never").as_deref(), Some("gpt-6-astra"));
+        assert_eq!(codex_flag_model(" --model='gpt-6-sol'").as_deref(), Some("gpt-6-sol"));
+        assert_eq!(codex_flag_model(" -m gpt-6-luna").as_deref(), Some("gpt-6-luna"));
+        assert_eq!(codex_flag_model(" -c check_for_update_on_startup=false"), None);
+    }
+
+    #[test]
+    fn unavailable_default_is_dropped_and_available_default_is_kept() {
+        let default = default_model_for_provider("codex");
+        let without: Vec<String> = vec!["gpt-6-astra".into()];
+        assert_eq!(codex_model_opts("w", " -c a=b", Some(&without)), "", "unavailable default: Codex picks the account default");
+        let with: Vec<String> = vec![default.clone(), "gpt-6-astra".into()];
+        assert_eq!(codex_model_opts("w", " -c a=b", Some(&with)), format!(" --model {}", sh_quote(&default)));
+        assert_eq!(codex_model_opts("w", " -c a=b", None), format!(" --model {}", sh_quote(&default)),
+            "no cache: today's behaviour");
+    }
+
+    #[test]
+    fn a_configured_model_is_never_replaced() {
+        let list: Vec<String> = vec!["gpt-6-astra".into()];
+        assert_eq!(codex_model_opts("w", " --model gpt-5.5", Some(&list)), "", "kept as configured, only warned about");
+        assert_eq!(codex_model_opts("w", " --model gpt-6-astra", Some(&list)), "");
     }
 }
