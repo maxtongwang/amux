@@ -421,7 +421,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <div class="settings-section" id="delegation-log-section">
           <details class="settings-fold" ontoggle="if(this.open)_delegationLogLoad()"><summary class="settings-section-label">Delegated changes</summary>
           <p class="ui-help">Configuration changes made on your behalf, newest first. Append-only; secret values are stored as &lt;redacted&gt;. Each one is also posted to the leads.</p>
-          <p class="ui-help">Pending grants: changes mrpopo asked for that wait for you. Approve here from your phone (over the tailnet), or type <code>amux grant CODE</code> in a lane other than mrpopo's.</p>
+          <p class="ui-help">Pending grants are exact changes awaiting your approval. Passkey mode requires device verification here; cite mode retains the typed and Remote-owner approval paths.</p>
+          <p id="delegation-passkey-mode" class="ui-help"></p>
+          <button class="btn" style="min-height:44px" onclick="_delegationPasskeyRegister()">Register passkey</button>
+          <p class="ui-help">Use Touch ID, Face ID, or your device PIN. First enrollment uses your owner token and is announced to the leads. Register separately at each hostname you use.</p>
+          <div id="delegation-passkeys-list"></div>
           <div id="delegation-grants-list"><p class="ui-help">Loading…</p></div>
           <div id="delegation-log-list"><p class="ui-help">Loading…</p></div>
           </details>

@@ -43,6 +43,7 @@ pub mod crm;
 pub mod deleted_substrate;
 pub(crate) mod delegation_log;
 pub(crate) mod delegation_grants;
+pub(crate) mod delegation_passkeys;
 pub mod dependency_audit;
 pub mod dictation;
 pub mod email;
@@ -374,6 +375,7 @@ pub fn router_with_connector_transport(
         .merge(delegation_log::routes())
         // ai-config#160: structured grants (pending widening changes Max approves).
         .merge(delegation_grants::routes())
+        .merge(delegation_passkeys::routes())
         .merge(chatgpt_app::routes())
         .merge(chat_delegate::routes())
         .merge(self_update::routes())

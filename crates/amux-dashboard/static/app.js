@@ -47498,8 +47498,74 @@ async function loadSpendAttribution() {
 // Settings > Workers with the vault audit list's classes. Read-only: the server
 // has no route that edits or deletes an entry.
 // ai-config#160: pending structured grants with Approve / Deny. Approve
-// applies the exact stored change once; the server accepts it only from the
-// owner over a Remote-verified connection and says so when it refuses.
+// applies the exact stored change once; passkey mode requires device UV,
+// while cite mode retains the parent Remote-owner approval path.
+// Delegation passkeys — browser ceremonies keep private keys and user verification on the owner's device (refs maxtongwang/ai-config#160).
+async function _delegationPasskeyRequest(path, body) {
+  const r = await fetch(API + path, { method: body === undefined ? 'GET' : 'POST',
+    headers: { ..._authHeaders(), 'Content-Type': 'application/json' },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  return d;
+}
+function _delegationPasskeyDecode(value) {
+  const s = value.replace(/-/g, '+').replace(/_/g, '/');
+  return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+}
+function _delegationPasskeyEncode(value) {
+  return btoa(Array.from(new Uint8Array(value), x => String.fromCharCode(x)).join('')).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+async function _delegationPasskeyCeremony(options, create) {
+  if (!window.isSecureContext || !navigator.credentials) throw new Error('Passkeys require HTTPS and a supported browser.');
+  const publicKey = options.publicKey;
+  publicKey.challenge = _delegationPasskeyDecode(publicKey.challenge);
+  if (create) publicKey.user.id = _delegationPasskeyDecode(publicKey.user.id);
+  for (const k of ['allowCredentials', 'excludeCredentials']) {
+    if (publicKey[k]) publicKey[k] = publicKey[k].map(c => ({ ...c, id: _delegationPasskeyDecode(c.id) }));
+  }
+  const cred = await navigator.credentials[create ? 'create' : 'get']({ publicKey });
+  if (!cred) throw new Error('Passkey ceremony was cancelled.');
+  const response = {};
+  for (const name of ['clientDataJSON', 'attestationObject', 'authenticatorData', 'signature', 'userHandle']) {
+    if (cred.response[name]) response[name] = _delegationPasskeyEncode(cred.response[name]);
+  }
+  if (create && cred.response.getTransports) response.transports = cred.response.getTransports();
+  return { id: cred.id, rawId: _delegationPasskeyEncode(cred.rawId), type: cred.type, response, extensions: cred.getClientExtensionResults() };
+}
+async function _delegationPasskeyProof(purpose) {
+  const d = await _delegationPasskeyRequest('/api/delegation/passkeys/authenticate/start', { purpose });
+  return { ceremony: d.ceremony, credential: await _delegationPasskeyCeremony(d.options, false) };
+}
+async function _delegationPasskeyRegister() {
+  try {
+    const d = await _delegationPasskeyRequest('/api/delegation/passkeys/register/start', {});
+    const authorization = d.authorization ? await _delegationPasskeyCeremony(d.authorization, false) : null;
+    const credential = await _delegationPasskeyCeremony(d.options, true);
+    await _delegationPasskeyRequest('/api/delegation/passkeys/register/finish', { ceremony: d.ceremony, credential, authorization });
+    showToast('Passkey registered');
+    await _delegationPasskeysLoad();
+  } catch (err) { showToast(err.message || 'Could not register passkey'); }
+}
+async function _delegationPasskeyRevoke(key) {
+  if (!await showConfirm('Revoke this passkey? You will need another registered passkey or a Remote owner connection to enroll again.')) return;
+  try {
+    const proof = await _delegationPasskeyProof('revoke:' + key);
+    await _delegationPasskeyRequest('/api/delegation/passkeys/' + encodeURIComponent(key) + '/revoke', proof);
+    showToast('Passkey revoked');
+    await _delegationPasskeysLoad();
+  } catch (err) { showToast(err.message || 'Could not revoke passkey'); }
+}
+async function _delegationPasskeysLoad() {
+  const box = document.getElementById('delegation-passkeys-list');
+  if (!box) return;
+  try {
+    const d = await _delegationPasskeyRequest('/api/delegation/passkeys');
+    document.getElementById('delegation-passkey-mode').textContent = 'Approval mode: ' + d.mode + (d.mode === 'passkey' ? '. Pending grants require device user verification.' : '. Passkeys are optional until passkey mode is selected.');
+    box.innerHTML = d.credentials.length ? '<ol class="vault-audit">' + d.credentials.map(k => '<li><span class="vault-audit-what">' + esc(k.rp_id) + ' · ' + esc(k.id.slice(0, 10)) + (k.revoked_at ? ' · Revoked' : '') + '</span>'
+      + (k.revoked_at ? '' : '<button class="btn danger" style="min-height:44px" onclick="_delegationPasskeyRevoke(\'' + esc(k.id) + '\')">Revoke</button>') + '</li>').join('') + '</ol>' : '<p class="ui-help">No passkeys registered.</p>';
+  } catch (err) { box.innerHTML = '<p class="ui-error" role="alert">' + esc(err.message) + '</p>'; }
+}
 async function _delegationGrantsLoad() {
   const box = document.getElementById('delegation-grants-list');
   if (!box) return;
@@ -47517,15 +47583,20 @@ async function _delegationGrantsLoad() {
 }
 async function _delegationGrantDecide(code, verb) {
   try {
-    const r = await fetch(API + '/api/delegation/grants/' + encodeURIComponent(code) + '/' + verb, { method: 'POST', headers: _authHeaders() });
+    const keys = verb === 'approve' ? await _delegationPasskeyRequest('/api/delegation/passkeys') : null;
+    const proof = keys?.mode === 'passkey' ? await _delegationPasskeyProof('grant:' + code) : {};
+    const r = await fetch(API + '/api/delegation/grants/' + encodeURIComponent(code) + '/' + verb, {
+      method: 'POST', headers: { ..._authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify(proof)
+    });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) showToast(d.error || ('HTTP ' + r.status));
-  } catch (err) { showToast('Could not ' + verb + ' grant ' + code); }
+  } catch (err) { showToast(err.message || ('Could not ' + verb + ' grant ' + code)); }
   _delegationGrantsLoad();
   _delegationLogLoad();
 }
 async function _delegationLogLoad() {
   _delegationGrantsLoad();
+  _delegationPasskeysLoad();
   const box = document.getElementById('delegation-log-list');
   if (!box) return;
   try {

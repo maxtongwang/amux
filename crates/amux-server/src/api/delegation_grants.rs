@@ -11,7 +11,9 @@
 //!      qualify as the owner's own words for the grant's actor
 //!      (`max_ref::row_qualifies`: human-typed, not an amux delivery, and in the
 //!      actor's own lane only a Remote owner send).
-//!    - APPROVE BUTTON: `POST /api/delegation/grants/<code>/approve` by the
+//!    In passkey mode typed approvals are disabled; the Approve button must
+//!    pass delegation_passkeys::approval_proof_ok with a grant-bound UV assertion.
+//!    - APPROVE BUTTON (cite mode): `POST /api/delegation/grants/<code>/approve` by the
 //!      owner over a Remote-verified connection (#7's process verdict; the
 //!      owner token alone is readable by every same-user worker).
 //! 3. [`apply`] flips `pending` to `applying` in one conditional UPDATE (so a
@@ -297,6 +299,7 @@ pub(crate) fn codes_in(text: &str) -> Vec<String> {
 /// Called for every Messages row as it is written: a qualifying row naming a
 /// pending grant applies it.
 pub(crate) async fn on_row(state: &AppState, row_id: i64, text: &str) {
+    if super::delegation_passkeys::passkey_mode() { return; }
     for code in codes_in(text) {
         let Some(g) = load(state, &code) else {
             tracing::info!(row_id, grant = %code, verdict = "delegation_grant_unknown_code", measured = true, n_considered = 1,
@@ -340,8 +343,18 @@ fn owner_refusal(state: &AppState, headers: &HeaderMap, uri: &Uri) -> Option<Res
     None
 }
 
-async fn approve(State(state): State<AppState>, uri: Uri, headers: HeaderMap, Path(code): Path<String>) -> Response {
-    if let Some(r) = approve_refusal(&state, &headers, &uri) {
+async fn approve(State(state): State<AppState>, uri: Uri, headers: HeaderMap, Path(code): Path<String>, body: Option<Json<Value>>) -> Response {
+    if super::delegation_passkeys::passkey_mode() {
+        if let Some(r) = owner_refusal(&state, &headers, &uri) { return r; }
+        let proof = body.and_then(|Json(v)| serde_json::from_value(v).ok());
+        let result = proof.ok_or_else(|| "a passkey assertion is required".to_string())
+            .and_then(|proof| super::delegation_passkeys::approval_proof_ok(&state, &code, &headers, proof));
+        if let Err(reason) = result {
+            tracing::warn!(grant=%code, reason=%reason, verdict="delegation_passkey_approval_refused", measured=true, n_considered=1,
+                "a passkey approval did not prove user verification");
+            return forbid("grant_passkey_required", reason);
+        }
+    } else if let Some(r) = approve_refusal(&state, &headers, &uri) {
         return r;
     }
     match apply(&state, &code, "owner:approve", None).await {
