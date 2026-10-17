@@ -44,5 +44,21 @@ rm -f "$TMP/elected"
 run wt-fail
 expect '[ "$(cat "$TMP/elected")" = "$second" ] && grep -q "verdict=fetch_failed" "$TMP/log"' "a failed fetch is logged and the last fetched origin/main is still built"
 
+# A remote that accepts and never answers (an ssh command that just sleeps) cannot hold the tick:
+# the wall-clock limit kills git and its ssh, logs why, and the last fetched origin/main is built.
+cat > "$TMP/hang-ssh" <<'SH'
+#!/usr/bin/env bash
+exec sleep 300
+SH
+chmod +x "$TMP/hang-ssh"
+g -C "$TMP/authority" remote set-url origin "ssh://example.invalid/repo.git"
+rm -f "$TMP/elected"
+t0=$(date +%s)
+run wt-hang GIT_SSH_COMMAND="$TMP/hang-ssh" AMUX_AUTHORITY_FETCH_TIMEOUT=3
+dt=$(( $(date +%s) - t0 ))
+expect '[ "$dt" -lt 20 ]' "a hanging ssh fetch is cut off by the time limit (took ${dt}s)"
+expect 'grep -q "timed out after 3s" "$TMP/log" && [ "$(cat "$TMP/elected")" = "$second" ]' "the timeout is logged with its reason and the last fetched origin/main is built"
+expect '! pgrep -f "$TMP/hang-ssh" >/dev/null' "no ssh process is left behind"
+
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -20,15 +20,27 @@ refuse() { say "REFUSED — $*"; exit 0; }
 
 # FETCH $REF's REMOTE FIRST (2026-10-16). On an install with no developer pushing from the authority
 # checkout, nothing else fetches it, so $REF never moved and green commits on the remote were never
-# seen: a merged fix sat uninstalled until someone fetched by hand. One quiet fetch per tick, bounded
-# by git's own low-speed limits (macOS has no timeout(1)) and never fatal: a failed fetch decides
-# from the last fetched $REF, as before. Opt out with AMUX_AUTHORITY_FETCH=0.
+# seen: a merged fix sat uninstalled until someone fetched by hand. One quiet fetch per tick, never
+# fatal: a failed fetch decides from the last fetched $REF, as before. Bounded for EVERY transport:
+# a hard wall-clock limit (AMUX_AUTHORITY_FETCH_TIMEOUT, default 45 s; macOS has no timeout(1), so
+# perl runs git in its own process group and kills the whole group, ssh included, on expiry), and
+# for ssh remotes a batch, keepalive-bounded ssh unless the owner configured their own ssh command.
+# launchd starts no new tick while one runs, so an unbounded fetch would stop every deploy.
+# Opt out with AMUX_AUTHORITY_FETCH=0.
 if [ "${AMUX_AUTHORITY_FETCH:-1}" != "0" ] && [[ "$REF" == */* ]]; then
   remote=${REF%%/*}
   if git -C "$REPO" remote get-url "$remote" >/dev/null 2>&1; then
-    GIT_TERMINAL_PROMPT=0 GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=30 \
-      git -C "$REPO" fetch --quiet "$remote" >/dev/null 2>&1 \
-      || say "FETCH of $remote failed; deciding from the last fetched $REF verdict=fetch_failed"
+    ssh_cmd="${GIT_SSH_COMMAND:-$(git -C "$REPO" config --get core.sshCommand 2>/dev/null || true)}"
+    [ -n "$ssh_cmd" ] || ssh_cmd="ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=2"
+    fetch_err=$(GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$ssh_cmd" \
+      GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=30 \
+      perl -e '
+        my $t = shift; my $pid = fork; defined $pid or exit 125;
+        if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 }
+        $SIG{ALRM} = sub { kill "KILL", -$pid; waitpid($pid, 0); print STDERR "timed out after ${t}s\n"; exit 124 };
+        alarm $t; waitpid($pid, 0); exit($? >> 8)' \
+        "${AMUX_AUTHORITY_FETCH_TIMEOUT:-45}" git -C "$REPO" fetch --quiet "$remote" 2>&1 >/dev/null) \
+      || say "FETCH of $remote failed ($(printf '%s' "$fetch_err" | tr '\n' ' ' | cut -c1-160)); deciding from the last fetched $REF verdict=fetch_failed"
   fi
 fi
 
