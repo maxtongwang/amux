@@ -7,6 +7,7 @@
 //! - refused with an unspecific one (names the target, not the setting):
 //!   `max_ref_does_not_name_setting`;
 //! - refused with none: `max_ref_missing`.
+//!
 //! Hands-only changes are refused even with a specific max_ref: secret
 //! values, AMUX_CONTRACT_*, AMUX_PANE_PROMPT_HISTORY, the reserved names,
 //! mrpopo's own config, and the money cap / auto-approve spending limit.
