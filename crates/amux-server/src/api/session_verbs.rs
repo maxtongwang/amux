@@ -8764,8 +8764,9 @@ fn steer_row_source(conn: &rusqlite::Connection, id: &str) -> (Option<String>, O
 ///
 /// Membership is by producer, not by heuristic, so adding a content-bearing
 /// producer is a deliberate edit here rather than something that has to be
-/// noticed later.
-const NON_COALESCING_GUARDS: &[&str] = &["board-progress"];
+/// noticed later. The delegated-change feed is one: each notice names a
+/// different change, so a second one must not overwrite the first.
+const NON_COALESCING_GUARDS: &[&str] = &["board-progress", super::delegation_log::FEED_GUARD];
 
 /// Whether `guard` names a content-bearing producer (see
 /// [`NON_COALESCING_GUARDS`]). Guards stay non-empty for these, so the isolation

@@ -41,6 +41,7 @@ pub mod connectors;
 pub mod criteria;
 pub mod crm;
 pub mod deleted_substrate;
+pub(crate) mod delegation_log;
 pub mod dependency_audit;
 pub mod dictation;
 pub mod email;
@@ -151,7 +152,6 @@ mod worker_messaging;
 mod mention_grants;
 pub mod workers_deadletters;
 pub(crate) mod delegation;
-pub(crate) mod delegation_log;
 pub(crate) mod max_ref;
 
 use crate::db::SharedStore;
@@ -369,6 +369,8 @@ pub fn router_with_connector_transport(
         .merge(land_queue::routes())
         .merge(vault::routes())
         .merge(vault_secrets::routes())
+        // ai-config#160: the delegated-change log (read-only; no edit or delete route).
+        .merge(delegation_log::routes())
         .merge(chatgpt_app::routes())
         .merge(chat_delegate::routes())
         .merge(self_update::routes())

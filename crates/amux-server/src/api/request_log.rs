@@ -1934,6 +1934,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET"],
     },
     RouteEntry {
+        path: "/api/delegation/log",
+        methods: &["GET"],
+    },
+    RouteEntry {
         path: "/api/vault/secrets/{id}",
         methods: &["PUT", "PATCH", "DELETE"],
     },
