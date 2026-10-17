@@ -172,10 +172,24 @@ pub async fn apply(
     let home = super::groups::amux_home();
     for w in doc.get("workers").and_then(Value::as_array).into_iter().flatten() {
         let Some(name) = w.get("name").and_then(Value::as_str) else { continue };
+        // The name becomes a path under sessions/, and the tags are parsed by
+        // the one parser the writer uses: a number or object is refused, not
+        // read as "no tags" and then written (review N1).
+        if !super::session_verbs::valid_session_name(name) {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("'{name}' is not a worker name")})));
+        }
+        let tags = match super::session_verbs::tags_of(w.get("tags")) {
+            Ok(t) => t,
+            Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("worker '{name}': {e}")}))),
+        };
+        for key in ["dir", "flags", "creator"] {
+            if let Some(why) = w.get(key).and_then(Value::as_str).and_then(|v| super::session_verbs::EnvFile::value_error(key, v)) {
+                return (StatusCode::BAD_REQUEST, Json(json!({"code": "env_value_invalid", "error": format!("worker '{name}': {why}")})));
+            }
+        }
         let refusal = if home.join("sessions").join(format!("{name}.env")).exists() {
             super::session_verbs::membership_refusal_body(&headers, w.get("tags").is_some())
         } else {
-            let tags = super::session_verbs::tags_of(w.get("tags"));
             super::session_verbs::worker_create_refusal_body(
                 &headers,
                 &super::session_verbs::CreateRequest { name: None, tags: &tags, owner_only: None },
@@ -332,8 +346,12 @@ pub async fn apply(
                 continue;
             };
             let f = home.join("sessions").join(format!("{name}.env"));
-            let mut env = crate::config::parse_env_file(&f);
-            let before = env.clone();
+            // The worker-file reader and writer (`EnvFile`): the one env
+            // serializer escapes quotes and refuses a newline or NUL that would
+            // write extra lines (review B2). Tags go through the same parser
+            // the authorization check above used.
+            let mut env = crate::api::session_verbs::EnvFile::load(&f);
+            let mut differs = !f.exists();
             for (yaml_key, env_key) in [
                 ("dir", "CC_DIR"),
                 ("tags", "CC_TAGS"),
@@ -341,28 +359,21 @@ pub async fn apply(
                 ("creator", "CC_CREATOR"),
             ] {
                 if let Some(v) = w.get(yaml_key) {
-                    let s = match v {
-                        Value::String(s) => s.clone(),
-                        Value::Array(a) => a
-                            .iter()
-                            .filter_map(|x| x.as_str())
-                            .collect::<Vec<_>>()
-                            .join(","),
-                        other => other.to_string(),
+                    let s = match (yaml_key, v) {
+                        ("tags", _) => super::session_verbs::tags_of(Some(v)).unwrap_or_default().join(","),
+                        (_, Value::String(s)) => s.clone(),
+                        (_, other) => other.to_string(),
                     };
-                    env.insert(env_key.to_string(), s);
+                    differs |= env.get(env_key) != Some(s.as_str());
+                    env.set(env_key, &s);
                 }
             }
             let tag = format!("worker:{name}");
-            if env == before && f.exists() {
+            if !differs {
                 unchanged.push(tag);
                 continue;
             }
-            let body: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-            if let Some(p) = f.parent() {
-                let _ = std::fs::create_dir_all(p);
-            }
-            match std::fs::write(&f, body) {
+            match env.write(&f) {
                 Ok(_) => changed.push(tag),
                 Err(e) => errors.push(json!({"item": tag, "error": e.to_string()})),
             }

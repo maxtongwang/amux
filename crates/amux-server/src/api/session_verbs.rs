@@ -669,6 +669,35 @@ impl EnvFile {
         latest.write_unlocked(path)
     }
 
+    /// Why `key=value` cannot be written to an env file, or None.
+    ///
+    /// THE ENV VALUE RULE (fix/worker-membership-create, review B2). Env files
+    /// are read line by line and the last assignment wins, so a value carrying
+    /// a newline wrote extra lines: `desc: "x\"\nCC_TAGS=\"leads,ops"` gave a
+    /// lead-created worker `leads`. A newline, carriage return or NUL in a value
+    /// is refused (it cannot round-trip through `load` either); a quote is
+    /// escaped by [`Self::env_quote`], never left unbalanced.
+    pub(crate) fn value_error(key: &str, value: &str) -> Option<String> {
+        // The same key charset `load` accepts, so any loaded file rewrites.
+        let key_ok = !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if !key_ok {
+            return Some(format!("'{key}' is not an environment variable name"));
+        }
+        value
+            .contains(['\n', '\r', '\0'])
+            .then(|| format!("{key}: an environment value may not contain a newline, carriage return or NUL"))
+    }
+
+    /// THE env serializer: one `KEY="value"` line, or an `InvalidInput` error
+    /// naming why ([`Self::value_error`]). Every env-file writer goes through
+    /// this (or [`Self::merge_plain`], which applies the same rule).
+    pub(crate) fn assignment(key: &str, value: &str) -> std::io::Result<String> {
+        match Self::value_error(key, value) {
+            Some(why) => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why)),
+            None => Ok(format!("{key}=\"{}\"\n", Self::env_quote(value))),
+        }
+    }
+
     fn write_unlocked(&self, path: &Path) -> std::io::Result<()> {
         use std::io::Write as _;
         let mut out = format!(
@@ -676,7 +705,7 @@ impl EnvFile {
             chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f")
         );
         for (k, v) in &self.pairs {
-            out.push_str(&format!("{k}=\"{}\"\n", Self::env_quote(v)));
+            out.push_str(&Self::assignment(k, v)?);
         }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -745,6 +774,11 @@ impl EnvFile {
         path: &Path,
         updates: &[(String, Option<String>)],
     ) -> std::io::Result<()> {
+        for (key, value) in updates {
+            if let Some(why) = value.as_deref().and_then(|v| Self::value_error(key, v)) {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why));
+            }
+        }
         let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
         // Read with the worker-file parser: it un-escapes the double-quoted
         // values Self::write produces, which crate::config::parse_env_file
@@ -20344,18 +20378,10 @@ fn owner_ui_proof(state: &AppState, headers: &HeaderMap) -> bool {
         .is_some_and(|v| v == ui_token(state))
 }
 
-/// Origin header, py:15208 _hdr_worker precedence (X-Amux-Worker first,
-/// legacy X-Amux-Session).
+/// The request's worker identity: the one verified claim
+/// (`worker_identity::claimed_worker`), never a second reading of the headers.
 pub(crate) fn hdr_worker(headers: &HeaderMap) -> String {
-    for k in ["x-amux-worker", "x-amux-session"] {
-        if let Some(v) = headers.get(k).and_then(|v| v.to_str().ok()) {
-            let v = v.trim();
-            if !v.is_empty() {
-                return v.to_string();
-            }
-        }
-    }
-    String::new()
+    super::worker_identity::claimed_worker(headers)
 }
 
 // ---------------------------------------------------------------------------
@@ -27166,6 +27192,11 @@ pub(crate) fn no_reply_path_stamp(origin: &str, is_isolated: bool) -> Option<Str
 
 /// A lane's groups, from `CC_TAGS` in its env file.
 pub(crate) fn lane_groups(lane: &str) -> std::collections::BTreeSet<String> {
+    // A name that is not a session name resolves to no file, never to another
+    // lane's by path (`../sessions/<lead>`, review B1).
+    if !valid_session_name(lane) || lane == "." || lane == ".." {
+        return Default::default();
+    }
     parse_env(lane)
         .get("CC_TAGS")
         .map(|v| {
@@ -32849,19 +32880,23 @@ pub(crate) fn membership_patch_refusal(headers: &HeaderMap, membership_named: bo
 /// [`membership_patch_refusal`]'s decision and 403 body, for a handler whose
 /// return type is not a `Response`.
 pub(crate) fn membership_refusal_body(headers: &HeaderMap, membership_named: bool) -> Option<Value> {
-    if !membership_named || hdr_worker(headers).is_empty() || super::org::local_member_actor(headers).is_some() { return None; }
+    let origin = worker_origin(headers);
+    if !membership_named || origin.is_empty() { return None; }
     tracing::warn!(verdict="worker_group_membership_refused", measured=true, n_considered=1,
-        worker = %hdr_worker(headers),
+        worker = %origin,
         "worker cannot widen messaging authority by editing group membership");
     Some(json!({"ok":false,"code":"worker_group_membership_refused",
         "error":"Group membership changes require direct owner input."}))
 }
 
-/// The worker this request speaks for, or empty for the owner/dashboard and
-/// verified human members (the same attribution as the membership rule).
-fn worker_origin(headers: &HeaderMap) -> String {
-    if super::org::local_member_actor(headers).is_some() { return String::new(); }
-    hdr_worker(headers)
+/// The worker this request speaks for, from the one verified identity
+/// (`worker_identity::verified_worker`): empty for the owner/dashboard and
+/// verified human members, and a name matching no worker for a refused claim.
+pub(crate) fn worker_origin(headers: &HeaderMap) -> String {
+    match super::worker_identity::verified_worker(headers) {
+        Ok(name) => name.unwrap_or_default(),
+        Err(_) => super::worker_identity::UNVERIFIED_IDENTITY.to_string(),
+    }
 }
 
 /// The group whose members may create workers (Max, 2026-10-16: "Only leads
@@ -32915,7 +32950,7 @@ pub(crate) fn worker_create_refusal_body(headers: &HeaderMap, req: &CreateReques
     if origin.is_empty() { return None; }
     let caller = lane_groups(&origin);
     let adds_no_group = req.owner_only.is_none()
-        && req.tags.iter().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).all(|t| caller.contains(&t));
+        && req.tags.iter().map(|t| norm_label(t)).filter(|t| !t.is_empty()).all(|t| caller.contains(&t));
     if req.name == Some(origin.as_str()) && adds_no_group && env_path(&origin).exists() {
         tracing::info!(worker = %origin, verdict = "worker_self_registration", measured = true, n_considered = 1,
             "a worker registered its own existing session; not a worker creation");
@@ -32928,7 +32963,7 @@ pub(crate) fn worker_create_refusal_body(headers: &HeaderMap, req: &CreateReques
             "error": format!("Only leads can create workers; '{origin}' is not in the '{LEADS_GROUP}' group.")}));
     }
     let team: std::collections::BTreeSet<String> = caller.iter().filter(|g| *g != LEADS_GROUP).cloned().collect();
-    let outside: Vec<String> = req.tags.iter().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty() && !team.contains(t)).collect();
+    let outside: Vec<String> = req.tags.iter().map(|t| norm_label(t)).filter(|t| !t.is_empty() && !team.contains(t)).collect();
     if outside.is_empty() && req.owner_only.is_none() { return None; }
     tracing::warn!(worker = %origin, ?outside, owner_only = req.owner_only.unwrap_or(""), ?team,
         verdict = "worker_create_tags_outside_team", measured = true, n_considered = 1,
@@ -32941,19 +32976,42 @@ pub(crate) fn worker_create_refusal_body(headers: &HeaderMap, req: &CreateReques
         "error": format!("A lead may create workers only inside its own team: {what}."), "team": team}))
 }
 
-/// The groups a create request names, from a `tags` array or a comma string.
-pub(crate) fn tags_of(v: Option<&Value>) -> Vec<String> {
+/// The groups a create request names, from a `tags` array or a comma string,
+/// normalized ([`norm_label`]) so the value checked is the value stored.
+/// Anything else (a number, an object, a non-string array item) is an error:
+/// a check that read it as "no tags" while a writer stored it was review N1.
+pub(crate) fn tags_of(v: Option<&Value>) -> Result<Vec<String>, String> {
+    let keep = |s: &str| Some(norm_label(s)).filter(|t| !t.is_empty());
     match v {
-        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-        Some(Value::String(s)) => s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect(),
-        _ => vec![],
+        None | Some(Value::Null) => Ok(vec![]),
+        Some(Value::String(s)) => Ok(s.split(',').filter_map(keep).collect()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|x| x.as_str().ok_or_else(|| format!("tags must be strings; got {x}")))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|v| v.into_iter().filter_map(keep).collect()),
+        Some(other) => Err(format!("tags must be an array of strings or a comma-separated string; got {other}")),
     }
+}
+
+/// THE normalizer for every tag and worker-type comparison (review B4): the
+/// parsers that store these values trim and lowercase them, so a check that
+/// compared the raw text let `"Chat"` or `" Leads "` through and then stored
+/// `chat` / `leads`.
+pub(crate) fn norm_label(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+/// Whether a worker-type value names the chat type, as
+/// `WorkerTypeId::parse` would store it.
+pub(crate) fn is_chat_type(raw: &str) -> bool {
+    norm_label(raw) == "chat"
 }
 
 /// Whether a request body asks for the chat worker type, which carries the
 /// owner's cross-group reach (see [`membership_patch_refusal`]).
 pub(crate) fn requests_chat_type(body: &Value) -> bool {
-    body.get("worker_type").and_then(Value::as_str).map(str::trim) == Some("chat")
+    body.get("worker_type").and_then(Value::as_str).is_some_and(is_chat_type)
 }
 
 /// Whether a config-style body names messaging authority: a `tags` edit of any
@@ -32970,6 +33028,23 @@ fn copy_refusal(source: &str, headers: &HeaderMap) -> Option<Response> {
     worker_create_refusal(headers, &CreateRequest { name: None, tags: &tags, owner_only: chat.then_some("the chat worker type") })
 }
 
+/// The first string in a config body (top-level values and string arrays) the
+/// env serializer would refuse, with the field it came from. `task_summary`
+/// is stored in the meta JSON, not the env file, so it may span lines.
+fn config_body_env_error(body: &Value) -> Option<String> {
+    let obj = body.as_object()?;
+    obj.iter().filter(|(k, _)| k.as_str() != "task_summary").find_map(|(k, v)| {
+        let strings: Vec<&str> = match v {
+            Value::String(s) => vec![s.as_str()],
+            Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+            _ => vec![],
+        };
+        strings.into_iter().find_map(|s| EnvFile::value_error("VALUE", s)).map(|_| {
+            format!("'{k}': an environment value may not contain a newline, carriage return or NUL")
+        })
+    })
+}
+
 /// Every config write drops the cached session list (AMUX-2926).
 ///
 /// A WRAPPER, not a call at each return: `config_patch_inner` returns from a
@@ -32983,6 +33058,12 @@ fn copy_refusal(source: &str, headers: &HeaderMap) -> Option<Response> {
 /// that did not need clearing costs one rebuild; NOT clearing one that did is
 /// the bug this fixes.
 pub(crate) async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
+    // Every config field lands in the worker's env file, so a value the env
+    // serializer would refuse is a 400 here, before any field is written
+    // (review B2), rather than a 500 from a half-applied write.
+    if let Some(why) = config_body_env_error(body) {
+        return jresp(StatusCode::BAD_REQUEST, json!({"ok": false, "code": "env_value_invalid", "error": why}));
+    }
     let out = config_patch_inner(state, name, body).await;
     crate::api::sessions_legacy::invalidate_sessions_cache();
     out

@@ -1280,8 +1280,11 @@ fn write_env(home: &Path, level: &str, name: &str, value: &Value) -> Result<(), 
                     updates.push((k.clone(), value));
                 }
             }
-            crate::api::session_verbs::EnvFile::merge_plain(&f, &updates)
-                .map_err(|e| (500, e.to_string()))?;
+            // A value the env serializer refuses (newline, NUL) is the caller's
+            // input: 400, not 500.
+            crate::api::session_verbs::EnvFile::merge_plain(&f, &updates).map_err(|e| {
+                (if e.kind() == std::io::ErrorKind::InvalidInput { 400 } else { 500 }, e.to_string())
+            })?;
         }
     }
     Ok(())

@@ -4418,8 +4418,10 @@ fn write_env_file(path: &std::path::Path, pairs: &[(&str, String)]) -> std::io::
         "# updated: {}\n",
         chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f")
     );
+    // The one env serializer (escapes quotes, refuses newlines/NUL): a raw
+    // `{k}="{v}"` let a value write extra lines (review B2).
     for (k, v) in pairs {
-        out.push_str(&format!("{k}=\"{v}\"\n"));
+        out.push_str(&crate::api::session_verbs::EnvFile::assignment(k, v)?);
     }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -4530,7 +4532,7 @@ pub(crate) const NEW_WORKER_AUTOMATION_OFF: [(&str, &str); 6] = [
 /// (AMUX-3114). Reading only a STRING made `{"tags":["gtm"]}` read "" and
 /// created the worker with NO groups, the same silent drop the PATCH handler
 /// was already fixed for.
-fn create_tags(body: &serde_json::Value) -> Vec<String> {
+fn create_tags(body: &serde_json::Value) -> Result<Vec<String>, String> {
     crate::api::session_verbs::tags_of(body.get("tags"))
 }
 
@@ -4567,7 +4569,10 @@ pub async fn create_session_legacy(
     // wrote whatever groups a worker asked for, so any worker could mint a
     // peer inside any group and message across the boundary through it. The
     // shared create rule runs before anything (work dir, env file) is written.
-    let tag_list = create_tags(&body);
+    let tag_list = match create_tags(&body) {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+    };
     let chat = crate::api::session_verbs::requests_chat_type(&body);
     if let Some(refusal) = crate::api::session_verbs::worker_create_refusal(
         &headers,
@@ -4778,9 +4783,13 @@ pub async fn create_session_legacy(
         pairs.push(("CC_DESC", desc));
     }
     if let Err(e) = write_env_file(&path, &pairs) {
+        // A value the env serializer refuses is the caller's input, not a
+        // server fault.
+        let invalid = e.kind() == std::io::ErrorKind::InvalidInput;
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("could not write session env: {e}")})),
+            if invalid { StatusCode::BAD_REQUEST } else { StatusCode::INTERNAL_SERVER_ERROR },
+            Json(json!({"error": format!("could not write session env: {e}"),
+                "code": if invalid { "env_value_invalid" } else { "env_write_failed" }})),
         )
             .into_response();
     }

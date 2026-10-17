@@ -586,15 +586,21 @@ fn parse_permissions(raw: &[String]) -> Result<Vec<String>, String> {
 pub async fn create_worker(
     state: State<AppState>,
     headers: axum::http::HeaderMap,
-    body: Json<CreateWorkerBody>,
+    Json(mut body): Json<CreateWorkerBody>,
 ) -> Response {
     // Only leads create workers (session_verbs::worker_create_refusal). A store
     // group id or the chat type is the owner's to grant at create. A worker
-    // registering its own existing session's row is self-registration.
-    let requested = body.display_name.as_deref().or(body.name.as_deref()).map(str::trim);
+    // registering its own existing session's row is self-registration. The
+    // name is trimmed once, so the name checked is the name stored.
+    for n in [&mut body.display_name, &mut body.name] {
+        if let Some(v) = n.as_mut() {
+            *v = v.trim().to_string();
+        }
+    }
+    let requested = body.display_name.as_deref().or(body.name.as_deref());
     let owner_only = if body.group.is_some() {
         Some("a store group")
-    } else if body.worker_type.as_deref().map(str::trim) == Some("chat") {
+    } else if body.worker_type.as_deref().is_some_and(crate::api::session_verbs::is_chat_type) {
         Some("the chat worker type")
     } else {
         None
@@ -605,7 +611,7 @@ pub async fn create_worker(
     ) {
         return refusal;
     }
-    let out = create_worker_inner(state, body).await;
+    let out = create_worker_inner(state, Json(body)).await;
     crate::api::sessions_legacy::invalidate_sessions_cache();
     out
 }
@@ -2791,6 +2797,193 @@ mod tests {
         assert_eq!(body["code"], "worker_identity_refused", "{body}");
         let res = over_socket(Some(&token)).await.unwrap();
         assert_eq!(res.status(), StatusCode::CREATED, "rule 10 with the lane's token");
+    }
+
+    /// One rule-10 contract lane `dev-b` (group dev) with a minted token, and a
+    /// request over a socket so rule 10 applies.
+    fn socket_request(method: &str, path: &str, body: Value, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut b = Request::builder().method(method).uri(path).header(header::CONTENT_TYPE, "application/json");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let mut req = b.body(Body::from(body.to_string())).unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 9))));
+        req
+    }
+
+    async fn status_and_body(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
+        let res = app.clone().oneshot(req).await.unwrap();
+        let st = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (st, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    /// Review B1 (probes P1, P2). The identity rule 10 verified and the one the
+    /// create rule trusted were read from the headers in opposite orders, and
+    /// an ill-formed claim skipped rule 10 while resolving a lead's env by
+    /// path. Both shapes are now refused before any handler.
+    #[tokio::test]
+    async fn review_b1_one_verified_identity_for_rule_10_and_authorization() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        membership_fleet(home.path());
+        std::fs::write(home.path().join("sessions/dev-b.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\nAMUX_CONTRACT_DONE=1\n").unwrap();
+        let token = crate::api::worker_identity::mint(home.path(), "dev-b").expect("rule 10 mints");
+        let (app, _db) = app();
+        let dir = home.path().join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        // P1: own session + own token + X-Amux-Worker naming a lead.
+        let tok = crate::api::worker_identity::TOKEN_HEADER;
+        let (st, v) = status_and_body(&app, socket_request("POST", "/api/sessions", create_body(&dir, "p1-minted", json!(["dev"])),
+            &[("X-Amux-Session", "dev-b"), (tok, &token), ("X-Amux-Worker", "dev-lead")])).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_mismatch")), "P1: {v}");
+        assert!(!home.path().join("sessions/p1-minted.env").exists());
+        // Control: the same lane alone, with its token, is a non-lead.
+        let (st, v) = status_and_body(&app, socket_request("POST", "/api/sessions", create_body(&dir, "p1-minted", json!(["dev"])),
+            &[("X-Amux-Session", "dev-b"), (tok, &token)])).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(NEEDS_LEAD)), "control: {v}");
+        // P2: an ill-formed claim that resolved the lead's env by path.
+        for bad in ["../sessions/dev-lead", "..", "dev lead"] {
+            let (st, v) = status_and_body(&app, socket_request("POST", "/api/sessions", create_body(&dir, "p2-minted", json!(["dev"])),
+                &[("X-Amux-Session", bad)])).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_invalid")), "P2 {bad:?}: {v}");
+        }
+        assert!(!home.path().join("sessions/p2-minted.env").exists());
+        // The rule holds without a socket too (in-process callers).
+        let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, "p1b", json!(["dev"]))),
+            &[("X-Amux-Session", "dev-a"), ("X-Amux-Worker", "dev-lead")]).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_mismatch")), "{v}");
+        // Same name in both headers, and a Chat-tab identity, are one valid claim.
+        let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, "p1c", json!(["dev"]))),
+            &[("X-Amux-Session", "dev-lead"), ("X-Amux-Worker", "dev-lead")]).await;
+        assert!(st.is_success(), "matching headers: {v}");
+        let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, "p1d", json!([]))),
+            &[("X-Amux-Session", "dev-lead@chat")]).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(NEEDS_LEAD)), "a Chat tab is not its lead: {v}");
+        // Unit: the shared function.
+        let h = |pairs: &[(&'static str, &'static str)]| {
+            let mut m = HeaderMap::new();
+            for (k, v) in pairs {
+                m.insert(*k, v.parse().unwrap());
+            }
+            m
+        };
+        use crate::api::worker_identity::{verified_worker, IdentityRefusal};
+        assert_eq!(verified_worker(&h(&[])), Ok(None));
+        assert_eq!(verified_worker(&h(&[("x-amux-worker", "w")])), Ok(Some("w".into())));
+        assert_eq!(verified_worker(&h(&[("x-amux-session", "w"), ("x-amux-worker", "w")])), Ok(Some("w".into())));
+        assert!(matches!(verified_worker(&h(&[("x-amux-session", "a"), ("x-amux-worker", "b")])), Err(IdentityRefusal::Mismatch { .. })));
+        assert!(matches!(verified_worker(&h(&[("x-amux-session", "../x")])), Err(IdentityRefusal::Invalid { .. })));
+    }
+
+    /// Review B2 (probe P3): a value carrying a newline wrote extra env lines,
+    /// so a lead's in-team create gained `leads` and the chat type. Every
+    /// writer now goes through one serializer that refuses it.
+    #[tokio::test]
+    async fn review_b2_env_values_cannot_inject_lines() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        membership_fleet(home.path());
+        let (app, _db) = app();
+        let dir = home.path().join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lead = [("X-Amux-Session", "dev-lead")];
+        let inj = "x\"\nCC_TAGS=\"leads,ops\"\nCC_WORKER_TYPE=\"chat";
+        let mut b = create_body(&dir, "p3-inj", json!(["dev"]));
+        b["desc"] = json!(inj);
+        let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(b), &lead).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::BAD_REQUEST, json!("env_value_invalid")), "create: {v}");
+        assert!(!home.path().join("sessions/p3-inj.env").exists());
+        let (st, _, v) = send_with(&app, "POST", "/api/env/apply",
+            Some(json!({"workers": [{"name": "p3-env", "groups": ["dev"], "desc": "x\"\nCC_TAGS=\"leads,ops"}]})), &lead).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "env/apply: {v}");
+        assert!(crate::api::session_verbs::lane_groups("p3-env").is_empty());
+        // The owner is held to the same serializer on every writer.
+        let (st, _, v) = send(&app, "PATCH", "/api/sessions/dev-a/config", Some(json!({"desc": "a\nCC_TAGS=leads"}))).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::BAD_REQUEST, json!("env_value_invalid")), "config: {v}");
+        let (st, _, v) = send(&app, "PUT", "/api/scope",
+            Some(json!({"level": "worker", "name": "dev-a", "capability": "env", "value": {"CC_DESC": "a\nCC_TAGS=leads"}}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "scope: {v}");
+        let (st, _, v) = send(&app, "PUT", "/api/config/apply",
+            Some(json!({"workers": [{"name": "dev-a", "dir": "/tmp\nCC_TAGS=leads"}]}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "config/apply: {v}");
+        assert_eq!(crate::api::session_verbs::lane_groups("dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
+        // A quote is escaped, not refused, and round-trips.
+        let (st, _, v) = send(&app, "PATCH", "/api/sessions/dev-a/config", Some(json!({"desc": "say \"hi\" $HOME"}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(crate::api::session_verbs::parse_env("dev-a").get("CC_DESC"), Some("say \"hi\" $HOME"));
+        assert_eq!(crate::api::session_verbs::lane_groups("dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
+    }
+
+    /// Review B3 (probe P4): `/api/env/apply` `files` wrote session env files
+    /// for any worker; `schedules` targeted any worker. Both are gated.
+    #[tokio::test]
+    async fn review_b3_env_apply_files_and_schedules_are_gated() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        membership_fleet(home.path());
+        let (app, _db) = app();
+        let worker = [("X-Amux-Session", "dev-a")];
+        let minted = home.path().join("sessions/p4-minted.env");
+        let files = json!({"files": [
+            {"path": minted.to_str().unwrap(), "content": "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads,ops\"\n"},
+            {"path": home.path().join("sessions/dev-a.env").to_str().unwrap(), "content": "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev,leads,ops\"\n"},
+        ]});
+        for who in [&worker[..], &[("X-Amux-Session", "dev-lead")][..]] {
+            let (st, _, v) = send_with(&app, "POST", "/api/env/apply", Some(files.clone()), who).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("env_apply_files_owner_only")), "{who:?}: {v}");
+        }
+        assert!(!minted.exists());
+        assert_eq!(crate::api::session_verbs::lane_groups("dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
+        let sched = |w: &str| json!({"schedules": [{"worker": w, "title": "t", "expr": "daily at 02:00", "enabled": false, "command": "x"}]});
+        let (st, _, v) = send_with(&app, "POST", "/api/env/apply", Some(sched("dev-lead")), &worker).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("env_apply_schedule_other_worker")), "{v}");
+        let (st, _, v) = send_with(&app, "POST", "/api/env/apply", Some(sched("dev-a")), &worker).await;
+        assert!(st.is_success(), "a worker schedules itself: {v}");
+        // Owner control: files still write.
+        let owned = home.path().join("owner-file.md");
+        let (st, _, v) = send(&app, "POST", "/api/env/apply",
+            Some(json!({"files": [{"path": owned.to_str().unwrap(), "content": "ok"}]}))).await;
+        assert!(st.is_success() && owned.exists(), "owner files: {v}");
+    }
+
+    /// Review B4 (probe P5): the chat-type and tag checks compared raw text
+    /// while the parsers stored trimmed lowercase, so `"Chat"` and `" Leads "`
+    /// passed. Every comparison now normalizes first.
+    #[tokio::test]
+    async fn review_b4_type_and_tag_checks_are_case_and_space_insensitive() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        membership_fleet(home.path());
+        let (app, _db) = app();
+        let dir = home.path().join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let worker = [("X-Amux-Session", "dev-a")];
+        let lead = [("X-Amux-Session", "dev-lead")];
+        for t in ["Chat", "CHAT", " chat "] {
+            let (st, _, v) = send_with(&app, "PATCH", "/api/sessions/dev-a/config", Some(json!({"worker_type": t})), &worker).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(MEMBERSHIP_CODE)), "config {t:?}: {v}");
+            let mut b = create_body(&dir, "p5-chat", json!(["dev"]));
+            b["worker_type"] = json!(t);
+            let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(b), &lead).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(OUTSIDE_TEAM)), "create {t:?}: {v}");
+            let (st, _, v) = send_with(&app, "POST", "/api/workers", Some(json!({"display_name": "p5-store", "cwd": "/tmp", "worker_type": t})), &lead).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(OUTSIDE_TEAM)), "store {t:?}: {v}");
+        }
+        assert_eq!(crate::api::worker_exec::worker_type_of("dev-a").as_str(), "coding");
+        for t in [" Leads ", "LEADS", "Ops"] {
+            let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, "p5-tag", json!([t]))), &lead).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(OUTSIDE_TEAM)), "lead tag {t:?}: {v}");
+        }
+        // A team tag in any case is the team tag, stored normalized.
+        let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, "p5-dev", json!([" Dev "]))), &lead).await;
+        assert!(st.is_success(), "{v}");
+        assert_eq!(crate::api::session_verbs::parse_env("p5-dev").get("CC_TAGS"), Some("dev"));
+        // N1: a non-string tag shape is refused, not read as "no tags".
+        let (st, _, v) = send(&app, "PUT", "/api/config/apply", Some(json!({"workers": [{"name": "n1", "tags": 123}]}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        let (st, _, v) = send(&app, "POST", "/api/sessions", Some(create_body(&dir, "n1b", json!(7)))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
     }
 
     /// Every other path that makes a worker applies the same create rule,

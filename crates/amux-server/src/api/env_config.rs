@@ -165,6 +165,22 @@ fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Optio
     if dry {
         return None;
     }
+    let origin = crate::api::session_verbs::worker_origin(headers);
+    let refuse = |code: &str, error: String| -> Option<Response> {
+        tracing::warn!(worker = %origin, verdict = code, measured = true, n_considered = 1, "env apply section refused for a worker");
+        Some((StatusCode::FORBIDDEN, Json(json!({"ok": false, "code": code, "error": error}))).into_response())
+    };
+    // FILES write any absolute path, session env files included, so a worker
+    // could mint a lead or join `leads` through them (review B3): owner only.
+    if !origin.is_empty() && !spec.files.is_empty() {
+        return refuse("env_apply_files_owner_only",
+            format!("worker '{origin}' may not write files through an env apply; that is the owner's"));
+    }
+    // SCHEDULES fire commands into a worker: a worker may schedule only itself.
+    if let Some(s) = spec.schedules.iter().find(|s| !origin.is_empty() && s.worker.trim() != origin) {
+        return refuse("env_apply_schedule_other_worker",
+            format!("worker '{origin}' may schedule only itself, not '{}'", s.worker.trim()));
+    }
     let sessions = crate::config::amux_home().join("sessions");
     for w in &spec.workers {
         let name = sanitize(&w.name);
@@ -173,7 +189,7 @@ fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Optio
         }
         if sessions.join(format!("{name}.env")).exists() {
             let wanted: std::collections::BTreeSet<String> =
-                w.groups.iter().map(|g| g.trim().to_lowercase()).filter(|g| !g.is_empty()).collect();
+                w.groups.iter().map(|g| crate::api::session_verbs::norm_label(g)).filter(|g| !g.is_empty()).collect();
             let changes = wanted != crate::api::session_verbs::lane_groups(&name);
             if let Some(r) = crate::api::session_verbs::membership_patch_refusal(headers, changes) {
                 return Some(r);
@@ -273,7 +289,10 @@ async fn apply(
         let path = sessions_dir.join(format!("{name}.env"));
         let existed = path.exists();
         let action = if existed { "update" } else { "create" };
-        let content = render_worker_env(w);
+        let content = match render_worker_env(w) {
+            Ok(c) => c,
+            Err(e) => return bad(e),
+        };
         // "unchanged" if the file already holds this exact config (minus the
         // volatile `# updated:` header line) — so a re-apply reports honestly.
         let action = if existed && same_env_body(&path, &content) {
@@ -893,14 +912,17 @@ fn sanitize(raw: &str) -> String {
         .collect()
 }
 
-/// The env-file body a worker spec produces (K="V" lines, no volatile header).
-fn render_worker_env(w: &WorkerSpec) -> String {
+/// The env-file body a worker spec produces (K="V" lines, no volatile header),
+/// through the one env serializer: a value it refuses (a newline or NUL that
+/// would write extra lines, review B2) is an error naming the key.
+fn render_worker_env(w: &WorkerSpec) -> Result<String, String> {
     let mut pairs: Vec<(&str, String)> = vec![];
     if !w.dir.is_empty() {
         pairs.push(("CC_DIR", w.dir.clone()));
     }
-    if !w.groups.is_empty() {
-        pairs.push(("CC_TAGS", w.groups.join(",")));
+    let groups: Vec<String> = w.groups.iter().map(|g| crate::api::session_verbs::norm_label(g)).filter(|g| !g.is_empty()).collect();
+    if !groups.is_empty() {
+        pairs.push(("CC_TAGS", groups.join(",")));
     }
     if !w.desc.is_empty() {
         pairs.push(("CC_DESC", w.desc.clone()));
@@ -925,11 +947,11 @@ fn render_worker_env(w: &WorkerSpec) -> String {
             pairs.push(("CC_FLAGS", format!("--model {}", w.model)));
         }
     }
-    pairs
-        .iter()
-        .map(|(k, v)| format!("{k}=\"{v}\""))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::new();
+    for (k, v) in &pairs {
+        out.push_str(&crate::api::session_verbs::EnvFile::assignment(k, v).map_err(|e| format!("worker '{}': {e}", w.name))?);
+    }
+    Ok(out.trim_end_matches('\n').to_string())
 }
 
 /// True if the existing env file's body (ignoring the `# updated:` header)
@@ -1021,7 +1043,7 @@ mod tests {
                 model: model.to_string(),
                 ..Default::default()
             };
-            let rendered = render_worker_env(&spec);
+            let rendered = render_worker_env(&spec).unwrap();
             let render_cc_model = env_val(&rendered, "CC_MODEL");
             let render_cc_flags = env_val(&rendered, "CC_FLAGS");
 
@@ -1048,7 +1070,7 @@ mod tests {
             provider: "ollama".into(),
             model: "qwen3.8:27b".into(),
             ..Default::default()
-        });
+        }).unwrap();
         assert_ne!(
             drift_flags,
             env_val(&ollama_render, "CC_FLAGS"),
