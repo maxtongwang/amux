@@ -1062,13 +1062,29 @@ fn scope_action(home: &Path, level: &str, name: &str, capability: &str, value: &
         "worker" => {
             let target = Target::Worker(name.to_string());
             let keys = env_keys();
+            let from: Vec<String> = crate::api::session_verbs::lane_groups(name).into_iter().collect();
+            let to = || match value.get("CC_TAGS") {
+                None | Some(Value::Null) => vec![],
+                Some(other) => crate::api::session_verbs::tags_of(Some(other)).unwrap_or_else(|_| vec!["!invalid".into()]),
+            };
             if keys.len() == 1 && keys[0] == "CC_TAGS" {
-                let from: Vec<String> = crate::api::session_verbs::lane_groups(name).into_iter().collect();
-                let to = match value.get("CC_TAGS") {
-                    None | Some(Value::Null) => vec![],
-                    Some(other) => crate::api::session_verbs::tags_of(Some(other)).unwrap_or_else(|_| vec!["!invalid".into()]),
-                };
-                return (target, Action::SetTags { from, to });
+                return (target, Action::SetTags { from, to: to() });
+            }
+            // Making a lead is ONE action: CC_ORCHESTRATOR=1 plus `leads`,
+            // nothing else (ai-config #160, review B5c).
+            if keys.len() == 2 && keys.iter().any(|k| k == "CC_TAGS") && keys.iter().any(|k| k == "CC_ORCHESTRATOR") {
+                let orch_on = value.get("CC_ORCHESTRATOR").and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_i64().map(|n| n.to_string())))
+                    .is_some_and(|v| v.trim() == "1");
+                let mut want: Vec<String> = from.clone();
+                want.push(crate::api::session_verbs::LEADS_GROUP.to_string());
+                let (mut got, mut want) = (to(), want);
+                got.sort();
+                got.dedup();
+                want.sort();
+                want.dedup();
+                if orch_on && got == want && !from.iter().any(|t| t == crate::api::session_verbs::LEADS_GROUP) {
+                    return (target, Action::MakeLead);
+                }
             }
             (target, Action::SetConfig { keys: named("", keys) })
         }

@@ -54,6 +54,8 @@ pub(crate) struct MaxRefEvidence {
     pub excerpt: String,
     /// Which human shape the row has.
     pub source: HumanSource,
+    /// An owner send forwarded from another host (process_origin = remote).
+    pub remote: bool,
 }
 
 /// Whether evidence found in `ev.session` may authorize `actor` (dev-lead's
@@ -63,9 +65,20 @@ pub(crate) struct MaxRefEvidence {
 /// therefore counts only when the cited session is NOT the actor's own lane.
 /// An own-lane citation counts only for an owner send whose process verdict
 /// was Outside/Remote, which no lane process can produce.
+///
+/// Outside is NOT owner proof here: a worker reaches it through `launchctl
+/// submit`. Until dev-lead rules, only Remote (another host's forwarder)
+/// proves the owner for an own-lane citation; Outside counts like a pane row.
 pub(crate) fn max_ref_session_allowed(actor: &str, ev: &MaxRefEvidence) -> bool {
-    let own = ev.session == actor || super::chat_worker::companion_parent(actor) == Some(ev.session.as_str());
-    !own || ev.source == HumanSource::OwnerSend
+    row_allowed_for(actor, &ev.session, ev.source, ev.remote)
+}
+
+fn row_allowed_for(actor: &str, session: &str, source: HumanSource, remote: bool) -> bool {
+    if actor.is_empty() {
+        return true;
+    }
+    let own = session == actor || super::chat_worker::companion_parent(actor) == Some(session);
+    !own || (source == HumanSource::OwnerSend && remote)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -78,6 +91,8 @@ pub(crate) enum MaxRefRefusal {
     OutsideWindow,
     DoesNotNameTarget,
     DoesNotNameSetting,
+    /// The only human rows are in the actor's own lane, which a lane can mint.
+    OwnLane,
 }
 
 impl MaxRefRefusal {
@@ -91,6 +106,7 @@ impl MaxRefRefusal {
             Self::OutsideWindow => "max_ref_outside_window",
             Self::DoesNotNameTarget => "max_ref_does_not_name_target",
             Self::DoesNotNameSetting => "max_ref_does_not_name_setting",
+            Self::OwnLane => "max_ref_own_lane",
         }
     }
 
@@ -106,6 +122,7 @@ impl MaxRefRefusal {
             Self::OutsideWindow => format!("the cited session has messages, but none within {w}s of max_ref.time"),
             Self::DoesNotNameTarget => "the owner's message does not name the worker, group or tag this change targets".into(),
             Self::DoesNotNameSetting => "the owner's message names the target but not the setting this change makes (for example the group being joined, the toggle, or routing)".into(),
+            Self::OwnLane => "the cited session is the acting worker's own lane, where a lane can mint its own pane rows; cite the message where Max typed it in another lane, or a send forwarded from another host".into(),
         }
     }
 }
@@ -131,6 +148,8 @@ struct Row {
     text: String,
     ts: f64,
     source: Option<HumanSource>,
+    /// process_origin = remote: the tailnet forwarder from another host.
+    remote: bool,
 }
 
 /// Which human shape a row has, if any (see the module comment).
@@ -162,6 +181,7 @@ fn rows(state: &AppState, sql_where: &str, params: &[&dyn rusqlite::ToSql]) -> R
                 text: r.get(2)?,
                 ts: r.get::<_, i64>(7)? as f64 / 1000.0,
                 source: human_source(&ctype, &origin, &delivery, &po),
+                remote: po == "remote",
             })
         })
         .map_err(|e| e.to_string())?;
@@ -216,6 +236,26 @@ pub(crate) fn is_amux_delivery(state: &AppState, session: &str, row_id: i64, tex
 /// `misleading`, and `dev` does not match `devops`. Used for targets and
 /// setting terms alike.
 pub(crate) fn names_phrase(text: &str, phrase: &str) -> bool {
+    // "make * a lead": each part is a word-bounded phrase, in order, with at
+    // most four words between consecutive parts.
+    if let Some((head, tail)) = phrase.split_once(" * ") {
+        let words_of = |s: &str| -> Vec<String> {
+            pane_prompts::normalize(s).to_lowercase().split(' ')
+                .map(|w| w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')).to_string())
+                .filter(|w| !w.is_empty())
+                .collect()
+        };
+        let (words, h, t) = (words_of(text), words_of(head), words_of(tail));
+        if h.is_empty() || t.is_empty() {
+            return false;
+        }
+        return (0..words.len()).any(|i| {
+            words[i..].starts_with(&h) && (1..=4).any(|gap| {
+                let s = i + h.len() + gap;
+                s + t.len() <= words.len() && words[s..s + t.len()] == t[..]
+            })
+        });
+    }
     let target = pane_prompts::normalize(phrase).to_lowercase();
     if target.is_empty() {
         return false;
@@ -238,7 +278,7 @@ pub(crate) fn verify_max_ref(state: &AppState, r: Option<&MaxRef>, targets: &[&s
     if targets.iter().all(|t| t.trim().is_empty()) {
         return logged(r, Err(MaxRefRefusal::DoesNotNameTarget));
     }
-    logged(r, verify(state, r, targets, None, now))
+    logged(r, verify(state, r, "", targets, None, now))
 }
 
 /// [`verify_max_ref`] plus the setting: ONE human-typed row must name at least
@@ -247,12 +287,20 @@ pub(crate) fn verify_max_ref(state: &AppState, r: Option<&MaxRef>, targets: &[&s
 /// `targets` is a fleet-level change with no target requirement. An empty
 /// `terms` is a caller bug and is refused as [`MaxRefRefusal::DoesNotNameSetting`].
 pub(crate) fn verify_max_ref_terms(state: &AppState, r: Option<&MaxRef>, targets: &[&str], terms: &[&str], now: f64) -> Result<MaxRefEvidence, MaxRefRefusal> {
-    if terms.iter().all(|t| t.trim().is_empty()) {
+    verify_max_ref_groups(state, r, "", targets, &[terms], now)
+}
+
+/// The delegation gate's form: ONE row must name a target and, for EVERY
+/// group in `groups`, one of its phrases; and the row must be allowed for
+/// `actor` ([`max_ref_session_allowed`]). Empty `groups`, or an empty group,
+/// is a caller bug, refused as [`MaxRefRefusal::DoesNotNameSetting`].
+pub(crate) fn verify_max_ref_groups(state: &AppState, r: Option<&MaxRef>, actor: &str, targets: &[&str], groups: &[&[&str]], now: f64) -> Result<MaxRefEvidence, MaxRefRefusal> {
+    if groups.is_empty() || groups.iter().any(|g| g.iter().all(|t| t.trim().is_empty())) {
         tracing::warn!(verdict = "max_ref_no_terms", measured = true, n_considered = 0,
-            "verify_max_ref_terms called with no setting terms; refused (caller bug)");
+            "max_ref verification called with no setting terms; refused (caller bug)");
         return logged(r, Err(MaxRefRefusal::DoesNotNameSetting));
     }
-    logged(r, verify(state, r, targets, Some(terms), now))
+    logged(r, verify(state, r, actor, targets, Some(groups), now))
 }
 
 fn logged(r: Option<&MaxRef>, out: Result<MaxRefEvidence, MaxRefRefusal>) -> Result<MaxRefEvidence, MaxRefRefusal> {
@@ -265,7 +313,7 @@ fn logged(r: Option<&MaxRef>, out: Result<MaxRefEvidence, MaxRefRefusal>) -> Res
     out
 }
 
-fn verify(state: &AppState, r: Option<&MaxRef>, targets: &[&str], terms: Option<&[&str]>, now: f64) -> Result<MaxRefEvidence, MaxRefRefusal> {
+fn verify(state: &AppState, r: Option<&MaxRef>, actor: &str, targets: &[&str], groups: Option<&[&[&str]]>, now: f64) -> Result<MaxRefEvidence, MaxRefRefusal> {
     let Some(r) = r.filter(|r| !r.session.trim().is_empty() && r.time.is_finite()) else {
         return Err(MaxRefRefusal::Missing);
     };
@@ -291,6 +339,10 @@ fn verify(state: &AppState, r: Option<&MaxRef>, targets: &[&str], terms: Option<
     if typed.is_empty() {
         return Err(MaxRefRefusal::NotHumanTyped);
     }
+    typed.retain(|row| row_allowed_for(actor, &row.session, row.source.unwrap_or(HumanSource::Pane), row.remote));
+    if typed.is_empty() {
+        return Err(MaxRefRefusal::OwnLane);
+    }
     // Each filter narrows the SAME rows, so one row satisfies both.
     if !targets.is_empty() {
         typed.retain(|row| targets.iter().any(|t| names_phrase(&row.text, t)));
@@ -298,13 +350,13 @@ fn verify(state: &AppState, r: Option<&MaxRef>, targets: &[&str], terms: Option<
             return Err(MaxRefRefusal::DoesNotNameTarget);
         }
     }
-    if let Some(terms) = terms {
-        typed.retain(|row| terms.iter().any(|t| names_phrase(&row.text, t)));
+    if let Some(groups) = groups {
+        typed.retain(|row| groups.iter().all(|g| g.iter().any(|t| names_phrase(&row.text, t))));
     }
     typed.sort_by(|a, b| (a.ts - r.time).abs().total_cmp(&(b.ts - r.time).abs()));
     let row = typed.into_iter().next().ok_or(MaxRefRefusal::DoesNotNameSetting)?;
     let source = row.source.unwrap_or(HumanSource::Pane);
-    Ok(MaxRefEvidence { row_id: row.id, session: row.session, ts: row.ts, excerpt: row.text.chars().take(EXCERPT_CHARS).collect(), source })
+    Ok(MaxRefEvidence { row_id: row.id, session: row.session, ts: row.ts, excerpt: row.text.chars().take(EXCERPT_CHARS).collect(), source, remote: row.remote })
 }
 
 #[cfg(test)]
@@ -361,7 +413,7 @@ mod tests {
         let st = state(tmp.path());
         let id = put(&st, pane("test-lead", ASK, NOW - 100.0));
         let ev = verify_max_ref(&st, Some(&mref("test-lead", NOW - 60.0)), &["test-alpha"], NOW).unwrap();
-        assert_eq!(ev, MaxRefEvidence { row_id: id, session: "test-lead".into(), ts: NOW - 100.0, excerpt: ASK.into(), source: HumanSource::Pane });
+        assert_eq!(ev, MaxRefEvidence { row_id: id, session: "test-lead".into(), ts: NOW - 100.0, excerpt: ASK.into(), source: HumanSource::Pane, remote: false });
         let long = "test-alpha ".repeat(40);
         put(&st, pane("test-long", &long, NOW));
         let ev = verify_max_ref(&st, Some(&mref("test-long", NOW)), &["test-alpha"], NOW).unwrap();
@@ -612,11 +664,23 @@ mod tests {
 
     #[test]
     fn max_ref_own_lane_pane_row_refused_owner_send_and_other_lane_accepted() {
-        let ev = |session: &str, source| MaxRefEvidence { row_id: 1, session: session.into(), ts: NOW, excerpt: String::new(), source };
-        assert!(!max_ref_session_allowed("test-actor", &ev("test-actor", HumanSource::Pane)), "own-lane pane row");
-        assert!(!max_ref_session_allowed("test-actor@chat", &ev("test-actor", HumanSource::Pane)), "own lane via its Chat tab");
-        assert!(max_ref_session_allowed("test-actor", &ev("test-actor", HumanSource::OwnerSend)), "own-lane Outside owner send");
-        assert!(max_ref_session_allowed("test-actor", &ev("test-other", HumanSource::Pane)), "other-lane pane row");
+        let ev = |session: &str, source, remote| MaxRefEvidence { row_id: 1, session: session.into(), ts: NOW, excerpt: String::new(), source, remote };
+        assert!(!max_ref_session_allowed("test-actor", &ev("test-actor", HumanSource::Pane, false)), "own-lane pane row");
+        assert!(!max_ref_session_allowed("test-actor@chat", &ev("test-actor", HumanSource::Pane, false)), "own lane via its Chat tab");
+        assert!(!max_ref_session_allowed("test-actor", &ev("test-actor", HumanSource::OwnerSend, false)), "own-lane Outside send: launchctl reaches Outside");
+        assert!(max_ref_session_allowed("test-actor", &ev("test-actor", HumanSource::OwnerSend, true)), "own-lane Remote owner send");
+        assert!(max_ref_session_allowed("test-actor", &ev("test-other", HumanSource::Pane, false)), "other-lane pane row");
+    }
+
+
+    #[test]
+    fn a_gap_phrase_needs_its_parts_in_order_with_one_to_four_words_between() {
+        assert!(names_phrase("please make review-x a lead today", "make * a lead"));
+        assert!(names_phrase("Make test-alpha, test-beta and test-gamma a lead.", "make * a lead"));
+        assert!(!names_phrase("make a lead", "make * a lead"), "no gap word");
+        assert!(!names_phrase("make one two three four five a lead", "make * a lead"), "gap over four words");
+        assert!(!names_phrase("review-x, lead the docs pass", "make * a lead"));
+        assert!(!names_phrase("a lead to make", "make * a lead"), "order matters");
     }
 
 }

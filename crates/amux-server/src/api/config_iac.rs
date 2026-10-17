@@ -170,6 +170,8 @@ pub async fn apply(
     // through the shared membership rule.
     let actor = super::groups::hdr_worker(&headers);
     let home = super::groups::amux_home();
+    // Grants decided here, logged after the apply wrote them (review H3).
+    let mut planned: Vec<(String, super::delegation::Grant)> = Vec::new();
     for w in doc.get("workers").and_then(Value::as_array).into_iter().flatten() {
         let Some(name) = w.get("name").and_then(Value::as_str) else { continue };
         // The name becomes a path under sessions/, and the tags are parsed by
@@ -196,9 +198,22 @@ pub async fn apply(
                 .iter().filter(|(k, _)| w.get(*k).is_some()).map(|(_, n)| n.to_string()).collect();
             let tags_ref = w.get("tags").and_then(|_| super::delegation::refusal_value(&headers, &target,
                 &super::delegation::Action::SetTags { from: super::session_verbs::lane_groups(name).into_iter().collect(), to: tags.clone() }));
-            tags_ref.or_else(|| (!keys.is_empty()).then(|| super::delegation::refusal_value(&headers, &target,
-                &super::delegation::Action::SetConfig { keys })).flatten())
+            let tag_action = super::delegation::Action::SetTags { from: super::session_verbs::lane_groups(name).into_iter().collect(), to: tags.clone() };
+            let cfg_action = super::delegation::Action::SetConfig { keys: keys.clone() };
+            let refused = tags_ref.or_else(|| (!keys.is_empty()).then(|| super::delegation::refusal_value(&headers, &target, &cfg_action)).flatten());
+            if refused.is_none() {
+                if w.get("tags").is_some() {
+                    planned.extend(super::delegation::grant_if_allowed(&headers, &target, &tag_action).map(|g| (name.to_string(), g)));
+                }
+                if !keys.is_empty() {
+                    planned.extend(super::delegation::grant_if_allowed(&headers, &target, &cfg_action).map(|g| (name.to_string(), g)));
+                }
+            }
+            refused
         } else {
+            let settings: Vec<String> = ["dir", "flags", "creator"].iter().filter(|k| w.get(**k).is_some()).map(|k| format!("create:{k}")).collect();
+            let action = super::delegation::Action::CreateWorker { tags: tags.clone(), settings, owner_only: None };
+            planned.extend(super::delegation::grant_if_allowed(&headers, &super::delegation::Target::NewWorker, &action).map(|g| (name.to_string(), g)));
             super::session_verbs::worker_create_refusal_body(
                 &headers,
                 &super::session_verbs::CreateRequest { name: Some(name), tags: &tags, owner_only: None,
@@ -215,7 +230,18 @@ pub async fn apply(
     let instance = doc.as_object().is_some_and(|o| o.keys().any(|k| !matches!(k.as_str(), "workers" | "max_ref" | "why" | "version")));
     let mut grant = None;
     if !actor.is_empty() && instance {
-        match super::delegation::authorize(&state, &headers, &super::delegation::Target::Fleet,
+        // The max_ref must name one of the settings applied: a column id or
+        // title, or a skin key (review H1).
+        let mut names: Vec<String> = Vec::new();
+        for c in doc.get("columns").and_then(Value::as_array).into_iter().flatten() {
+            for k in ["id", "title", "name", "gate"] {
+                if let Some(v) = c.get(k).and_then(Value::as_str) { names.push(v.to_string()); }
+            }
+        }
+        if let Some(skins) = doc.get("skins").and_then(Value::as_object) {
+            names.extend(skins.keys().cloned());
+        }
+        match super::delegation::authorize(&state, &headers, &super::delegation::Target::Settings(names),
             &super::delegation::Action::SetConfig { keys: vec!["instance:apply".into()] }, Some(&doc)) {
             Ok(g) => grant = g,
             Err(r) => {
@@ -400,15 +426,11 @@ pub async fn apply(
     if let Some(g) = grant.as_ref() {
         g.commit(&state, Value::Null, json!({"changed": changed}));
     }
-    if !actor.is_empty() {
-        for w in doc.get("workers").and_then(Value::as_array).into_iter().flatten() {
-            let Some(name) = w.get("name").and_then(Value::as_str) else { continue };
-            if !changed.iter().any(|c| c == &format!("worker:{name}")) {
-                continue;
-            }
-            let keys: Vec<String> = ["dir", "flags", "creator", "tags"].iter().filter(|k| w.get(**k).is_some()).map(|k| k.to_string()).collect();
-            super::delegation::record_allowed(&state, &headers, &super::delegation::Target::Worker(name.to_string()),
-                &super::delegation::Action::SetConfig { keys: keys.iter().filter(|k| *k == "dir").cloned().collect() }, Value::Null, w.clone());
+    for (name, g) in planned {
+        if changed.iter().any(|c| c == &format!("worker:{name}")) {
+            let decl = doc.get("workers").and_then(Value::as_array).into_iter().flatten()
+                .find(|w| w.get("name").and_then(Value::as_str) == Some(name.as_str())).cloned().unwrap_or(Value::Null);
+            g.commit(&state, Value::Null, decl);
         }
     }
     let status = if errors.is_empty() {

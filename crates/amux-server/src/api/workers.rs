@@ -856,6 +856,7 @@ pub async fn patch_worker(
     };
     let summary = json!({"display_name": body.display_name, "name": body.name, "cwd": body.cwd, "provider": body.provider,
         "model": body.model, "backend": body.backend, "worker_type": body.worker_type, "group": body.group});
+    let key = grant.as_ref().map(|(_, n)| n.clone()).unwrap_or(key);
     let resp = patch_worker_inner(State(state.clone()), Path(key), body).await;
     if let Some((g, target)) = grant.filter(|_| resp.status().is_success()) {
         g.commit(&state, json!({"name": target}), summary);
@@ -1174,7 +1175,12 @@ pub async fn start_worker(
     Path(key): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    if let Err(r) = lifecycle_gate_key(&state, &headers, &key, "start").await { return r; }
+    let (start_grant, key) = match lifecycle_gate_key(&state, &headers, &key, "start").await { Ok(g) => g, Err(r) => return r };
+    if let Some(g) = start_grant {
+        let name = key.clone();
+        let resp = Box::pin(start_worker(State(state.clone()), admission, Path(key), axum::http::HeaderMap::new())).await;
+        return lifecycle_done(&state, Some(g), &name, "start", resp);
+    }
     // Lifecycle refusal is independent of host capacity and must remain stable.
     match state
         .store
@@ -1365,6 +1371,7 @@ pub async fn stop_worker(State(state): State<AppState>, Path(key): Path<String>,
             Err(r) => return r,
         }
     };
+    let key = grant.as_ref().map(|(_, n)| n.clone()).unwrap_or(key);
     let resp = stop_worker_inner(&state, key).await;
     if let Some((g, name)) = grant.filter(|_| resp.status().is_success()) {
         g.commit(&state, json!({"name": name}), json!({"stopping": true}));
@@ -1585,8 +1592,9 @@ pub(crate) fn lifecycle_lock(name: &str) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 pub async fn pause_worker(State(state): State<AppState>, Path(key): Path<String>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = lifecycle_gate_key(&state, &headers, &key, "pause").await { return r; }
-    change_pause(state, key, true, None).await
+    let (grant, key) = match lifecycle_gate_key(&state, &headers, &key, "pause").await { Ok(g) => g, Err(r) => return r };
+    let resp = change_pause(state.clone(), key.clone(), true, None).await;
+    lifecycle_done(&state, grant, &key, "pause", resp)
 }
 
 pub async fn resume_worker(
@@ -1595,18 +1603,21 @@ pub async fn resume_worker(
     Path(key): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    if let Err(r) = lifecycle_gate_key(&state, &headers, &key, "resume").await { return r; }
-    change_pause(state, key, false, admission).await
+    let (grant, key) = match lifecycle_gate_key(&state, &headers, &key, "resume").await { Ok(g) => g, Err(r) => return r };
+    let resp = change_pause(state.clone(), key.clone(), false, admission).await;
+    lifecycle_done(&state, grant, &key, "resume", resp)
 }
 
-/// [`lifecycle_gate`] for a store key; the owner skips the lookup. The inner
-/// stop/start calls then run with no worker headers: already authorized here.
-async fn lifecycle_gate_key(state: &AppState, headers: &axum::http::HeaderMap, key: &str, verb: &str) -> Result<(), Response> {
+/// [`lifecycle_gate`] for a store key; the owner skips the lookup. Returns
+/// the grant and the RESOLVED name, which the verb then acts on (N14). The
+/// inner stop/start calls run with no worker headers: authorized here.
+async fn lifecycle_gate_key(state: &AppState, headers: &axum::http::HeaderMap, key: &str, verb: &str)
+    -> Result<(Option<crate::api::delegation::Grant>, String), Response> {
     if crate::api::session_verbs::worker_origin(headers).is_empty() {
-        return Ok(());
+        return Ok((None, key.to_string()));
     }
     let name = resolve_key(state, key.to_string()).await?;
-    lifecycle_gate(state, headers, &name, verb)
+    Ok((lifecycle_gate(state, headers, &name, verb)?, name))
 }
 
 /// `admission` only matters on Resume, which starts the worker through
@@ -2432,8 +2443,9 @@ pub async fn wake_worker(State(state): State<AppState>, Path(key): Path<String>)
 pub async fn reset_worker(State(state): State<AppState>, Path(key): Path<String>, headers: axum::http::HeaderMap) -> Response {
     match resolve_key(&state, key).await {
         Ok(name) => {
-            if let Err(r) = lifecycle_gate(&state, &headers, &name, "reset") { return r; }
-            crate::api::session_verbs::reset_verb(&state, &name).await
+            let grant = match lifecycle_gate(&state, &headers, &name, "reset") { Ok(g) => g, Err(r) => return r };
+            let resp = crate::api::session_verbs::reset_verb(&state, &name).await;
+            lifecycle_done(&state, grant, &name, "reset", resp)
         }
         Err(r) => r,
     }
@@ -2441,23 +2453,26 @@ pub async fn reset_worker(State(state): State<AppState>, Path(key): Path<String>
 
 /// Lifecycle verbs on another worker go through the delegation table
 /// (ai-config #160): self, or a lead for a non-lead worker in its team.
-fn lifecycle_gate(state: &AppState, headers: &axum::http::HeaderMap, name: &str, verb: &str) -> Result<(), Response> {
+fn lifecycle_gate(state: &AppState, headers: &axum::http::HeaderMap, name: &str, verb: &str) -> Result<Option<crate::api::delegation::Grant>, Response> {
     let action = crate::api::delegation::Action::Lifecycle { verb: verb.to_string() };
-    match crate::api::delegation::authorize(state, headers, &crate::api::delegation::Target::Worker(name.to_string()), &action, None)? {
-        Some(g) => {
-            g.commit(state, json!({"name": name}), json!({"lifecycle": verb}));
-            Ok(())
-        }
-        None => Ok(()),
+    crate::api::delegation::authorize(state, headers, &crate::api::delegation::Target::Worker(name.to_string()), &action, None)
+}
+
+/// Log a lifecycle verb's grant only once the verb succeeded (review H3).
+fn lifecycle_done(state: &AppState, grant: Option<crate::api::delegation::Grant>, name: &str, verb: &str, resp: Response) -> Response {
+    if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(state, json!({"name": name}), json!({"lifecycle": verb}));
     }
+    resp
 }
 
 /// `POST /api/workers/{id}/clear`
 pub async fn clear_worker(State(state): State<AppState>, Path(key): Path<String>, headers: axum::http::HeaderMap) -> Response {
     match resolve_key(&state, key).await {
         Ok(name) => {
-            if let Err(r) = lifecycle_gate(&state, &headers, &name, "clear") { return r; }
-            crate::api::session_verbs::clear_verb(&name).await
+            let grant = match lifecycle_gate(&state, &headers, &name, "clear") { Ok(g) => g, Err(r) => return r };
+            let resp = crate::api::session_verbs::clear_verb(&name).await;
+            lifecycle_done(&state, grant, &name, "clear", resp)
         }
         Err(r) => r,
     }

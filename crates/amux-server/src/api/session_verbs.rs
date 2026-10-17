@@ -26976,8 +26976,11 @@ async fn post_dispatch_inner(
         "clear" => clear_verb(name).await,
         "duplicate" => duplicate_verb(state, name, headers, body),
         "clone" => {
-            if let Some(refusal) = copy_refusal(name, headers) { return refusal; }
-            clone_post(state, name, body).await
+            let new_name = body_str(body, "new_name");
+            if let Some(refusal) = copy_refusal(name, headers, Some(new_name.trim())) { return refusal; }
+            let resp = clone_post(state, name, body).await;
+            if resp.status().is_success() { log_copy(state, headers, name, new_name.trim(), "clone"); }
+            resp
         }
         "archive" => {
             if !session_destructive_allowed(state, headers) {
@@ -30275,7 +30278,7 @@ pub(crate) async fn peek_verb(state: &AppState, name: &str, qs: &[(String, Strin
 pub(crate) fn duplicate_verb(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
     // A copy inherits the source's groups (env file and store row), so it is a
     // create with those groups: only a lead, and only inside its own team.
-    if let Some(refusal) = copy_refusal(name, headers) { return refusal; }
+    if let Some(refusal) = copy_refusal(name, headers, Some(body_str(body, "new_name").trim())) { return refusal; }
     let new_name = body_str(body, "new_name").trim().to_string();
     if new_name.is_empty() {
         return jresp(
@@ -30312,6 +30315,7 @@ pub(crate) fn duplicate_verb(state: &AppState, name: &str, headers: &HeaderMap, 
             );
         }
     };
+    log_copy(state, headers, name, &new_name, "duplicate");
     j200(json!({
         "ok": true,
         "message": format!("duplicated as {new_name}"),
@@ -33162,6 +33166,16 @@ pub(crate) fn worker_create_refusal_body(headers: &HeaderMap, req: &CreateReques
     let adds_no_group = req.owner_only.is_none()
         && req.tags.iter().map(|t| norm_label(t)).filter(|t| !t.is_empty()).all(|t| caller.contains(&t));
     if req.name == Some(origin.as_str()) && adds_no_group && env_path(&origin).exists() {
+        // Self-registration writes nothing new about groups, but its settings
+        // (a row's environment, permissions) still go through the table as
+        // settings on itself (review B4): no early return before them.
+        if !req.settings.is_empty() {
+            let keys: Vec<String> = req.settings.iter().map(|k| k.strip_prefix("create:").map(str::to_string).unwrap_or_else(|| k.clone())).collect();
+            if let Some(body) = super::delegation::refusal_value(headers, &super::delegation::Target::Worker(origin.clone()),
+                &super::delegation::Action::SetConfig { keys }) {
+                return Some(body);
+            }
+        }
         tracing::info!(worker = %origin, verdict = "worker_self_registration", measured = true, n_considered = 1,
             "a worker registered its own existing session; not a worker creation");
         return None;
@@ -33217,10 +33231,19 @@ pub(crate) fn requests_chat_type(body: &Value) -> bool {
 
 /// The create rule for a copy of `source` (duplicate/clone): the copy carries
 /// the source's groups and worker type, so it is a create with those.
-fn copy_refusal(source: &str, headers: &HeaderMap) -> Option<Response> {
+/// Log a delegated copy (duplicate/clone) after it succeeded.
+fn log_copy(state: &AppState, headers: &HeaderMap, source: &str, new_name: &str, verb: &str) {
+    let tags: Vec<String> = lane_groups(source).into_iter().collect();
+    let action = super::delegation::Action::CreateWorker { tags: tags.clone(), settings: super::delegation::copy_settings(source), owner_only: None };
+    if let Some(g) = super::delegation::grant_if_allowed(headers, &super::delegation::Target::NewWorker, &action) {
+        g.commit(state, json!({"source": source}), json!({"verb": verb, "name": new_name, "tags": tags}));
+    }
+}
+
+fn copy_refusal(source: &str, headers: &HeaderMap, new_name: Option<&str>) -> Option<Response> {
     let tags: Vec<String> = lane_groups(source).into_iter().collect();
     let chat = crate::api::worker_exec::worker_type_of(source).as_str() == "chat";
-    worker_create_refusal(headers, &CreateRequest { name: None, tags: &tags, owner_only: chat.then_some("the chat worker type"),
+    worker_create_refusal(headers, &CreateRequest { name: new_name.filter(|n| !n.is_empty()), tags: &tags, owner_only: chat.then_some("the chat worker type"),
         settings: super::delegation::copy_settings(source) })
 }
 

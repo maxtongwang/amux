@@ -80,11 +80,11 @@ pub(crate) fn redact(v: &Value) -> Value {
             let names_secret = map
                 .get("key")
                 .and_then(Value::as_str)
-                .is_some_and(crate::runtime_jobs::registry::is_secret_env);
+                .is_some_and(crate::api::delegation::is_secret_key);
             Value::Object(
                 map.iter()
                     .map(|(k, val)| {
-                        let secret = crate::runtime_jobs::registry::is_secret_env(k)
+                        let secret = crate::api::delegation::is_secret_key(k)
                             || (names_secret && k == "value");
                         (k.clone(), if secret { json!(REDACTED) } else { redact(val) })
                     })
@@ -180,15 +180,10 @@ fn forbidden(code: &'static str, error: String) -> Response {
 
 /// `None` when the caller may read the log: the owner, or a verified worker in
 /// the `leads` group.
-/// The claimed worker is proven: process attribution named it, or it sent
-/// its own valid rule-10 token.
+/// The claimed worker is proven (in-process, process attribution, or its
+/// valid rule-10 token), as stamped by `worker_identity::enforce`.
 fn reader_proven(headers: &HeaderMap, worker: &str) -> bool {
-    let attributed = headers.get(super::process_identity::PROCESS_WORKER_HEADER).and_then(|v| v.to_str().ok());
-    if attributed == Some(worker) {
-        return true;
-    }
-    let token = headers.get(super::worker_identity::TOKEN_HEADER).and_then(|v| v.to_str().ok());
-    super::worker_identity::check(&crate::config::amux_home(), worker, token) == super::worker_identity::Check::Valid
+    super::worker_identity::identity_proven(headers, worker)
 }
 
 fn read_refusal(state: &AppState, headers: &HeaderMap, uri: &Uri) -> Option<Response> {
@@ -202,8 +197,7 @@ fn read_refusal(state: &AppState, headers: &HeaderMap, uri: &Uri) -> Option<Resp
         // proven here: its token, or process attribution naming it.
         Ok(Some(w)) if !reader_proven(headers, &w) => refuse("delegation_log_identity_unproven", &w,
             format!("'{w}' must present its worker token or come from its own pane to read the delegated-change log")),
-        Ok(Some(w)) if w == super::delegation::MRPOPO
-            || super::session_verbs::lane_groups(&w).contains(super::session_verbs::LEADS_GROUP) => None,
+        Ok(Some(w)) if w == super::delegation::MRPOPO || super::delegation::is_lead(&w) => None,
         Ok(Some(w)) => refuse("delegation_log_leads_only", &w,
             format!("'{w}' is not in the 'leads' group; the delegated-change log is for the owner and leads")),
         Ok(None) if super::org::is_verified_local_member(headers) => refuse("delegation_log_leads_only", "member",
