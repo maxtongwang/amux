@@ -4524,6 +4524,25 @@ pub(crate) const NEW_WORKER_AUTOMATION_OFF: [(&str, &str); 6] = [
     ("AMUX_BOARD_FORCE_ADHERENCE", "0"),
 ];
 
+/// The groups a create request asks for, joined as `CC_TAGS` stores them.
+///
+/// ACCEPT tags AS AN ARRAY, which is what the dashboard and API send
+/// (AMUX-3114). Reading only a STRING made `{"tags":["gtm"]}` read "" and
+/// created the worker with NO groups, the same silent drop the PATCH handler
+/// was already fixed for.
+fn create_tags(body: &serde_json::Value) -> String {
+    match body.get("tags") {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|x| x.as_str().map(str::trim))
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(","),
+        Some(serde_json::Value::String(s)) => s.trim().to_string(),
+        _ => String::new(),
+    }
+}
+
 pub async fn create_session_legacy(
     State(_state): State<AppState>,
     headers: HeaderMap,
@@ -4552,6 +4571,18 @@ pub async fn create_session_legacy(
             Json(json!({"error": format!("'{raw_name}' is not a usable worker name")})),
         )
             .into_response();
+    }
+    // GROUP MEMBERSHIP AT CREATE (fix/worker-membership-create). PATCH config
+    // refused a worker's tag edit, while this endpoint wrote whatever groups a
+    // worker asked for, so any worker could mint a peer inside any group and
+    // message across the boundary through it. Same predicate and code as PATCH,
+    // checked before anything (work dir, env file) is written.
+    let tags = create_tags(&body);
+    if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(
+        &headers,
+        !tags.is_empty() || crate::api::session_verbs::requests_chat_type(&body),
+    ) {
+        return refusal;
     }
     // WORKTREE AT CREATE TIME (AMUX-4911). This returned 501 on the stated
     // grounds that "a worktree create needs `git worktree add` + branch
@@ -4743,19 +4774,6 @@ pub async fn create_session_legacy(
     } else if body.get("worktree").and_then(serde_json::Value::as_bool) == Some(false) {
         pairs.push(("CC_WORKTREE", "0".to_string()));
     }
-    // ACCEPT tags AS AN ARRAY, which is what the dashboard and API send
-    // (AMUX-3114). `s("tags")` only matched a STRING, so `{"tags":["gtm"]}` read
-    // "" and the worker was created with NO groups, the same silent drop the
-    // PATCH handler was already fixed for.
-    let tags = match body.get("tags") {
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .filter_map(|x| x.as_str().map(str::trim))
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(","),
-        _ => s("tags"),
-    };
     if !tags.is_empty() {
         pairs.push(("CC_TAGS", tags.clone()));
     }

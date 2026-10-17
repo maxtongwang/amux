@@ -936,6 +936,7 @@ async fn put_scope(state: AppState, req: Request) -> Response {
     // 2026-10-07). Their grant decides, not the session rule.
     let member = super::org::local_member_scope(req.headers())
         .filter(|_| super::org::local_member_actor(req.headers()).is_some());
+    let headers = req.headers().clone();
     let bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
         Ok(b) => b,
         Err(e) => return j(400, json!({"error": e.to_string()})),
@@ -984,6 +985,21 @@ async fn put_scope(state: AppState, req: Request) -> Response {
                 "capabilities": SCOPE_CAPS.iter().map(|c| c.key).collect::<Vec<_>>(),
             }),
         );
+    }
+    // Messaging-authority keys stay the owner's even under
+    // AMUX_SCOPE_WRITE_AGENTS=1, with the same predicate and code as every
+    // other membership path (session_verbs::membership_patch_refusal).
+    if capability == "env" {
+        let home = super::groups::amux_home();
+        let value = body.get("value").cloned().unwrap_or(Value::Null);
+        if let Some(k) = membership_key_changed(&home, &level, &name, &value) {
+            if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(&headers, true) {
+                tracing::warn!(actor = %actor, level = %level, name = %name, key = %k,
+                    verdict = "scope_membership_key_refused", measured = true, n_considered = 1,
+                    "a session tried to change a messaging-authority scope key");
+                return refusal;
+            }
+        }
     }
     scope_write(
         &state,
@@ -1178,9 +1194,31 @@ fn is_owner_only_env_key(k: &str) -> bool {
     OWNER_ONLY_ENV_PREFIXES.iter().any(|p| k.starts_with(p))
 }
 
+/// Env keys that ARE messaging authority (session_verbs::membership_patch_refusal):
+/// a worker's groups, its worker type (chat speaks for the owner) and a
+/// group's open-inbound switch. A worker's own worker layer is writable by
+/// that worker, so without this `PUT /api/scope {CC_TAGS: "leads"}` was a
+/// self-join of any group.
+const MEMBERSHIP_ENV_KEYS: &[&str] = &[
+    "CC_TAGS",
+    "CC_WORKER_TYPE",
+    crate::api::worker_messaging::OPEN_INBOUND_KEY,
+];
+
 /// The first owner-only key whose value this write would change, if any.
-/// Handles both write shapes: a full-text replace and a key/value merge.
 pub(crate) fn owner_only_key_changed(home: &Path, level: &str, name: &str, value: &Value) -> Option<String> {
+    env_key_changed(home, level, name, value, is_owner_only_env_key)
+}
+
+/// The first messaging-authority key whose value this write would change.
+pub(crate) fn membership_key_changed(home: &Path, level: &str, name: &str, value: &Value) -> Option<String> {
+    env_key_changed(home, level, name, value, |k| MEMBERSHIP_ENV_KEYS.contains(&k))
+}
+
+/// The first key matching `guarded` whose value this write would change.
+/// Handles both write shapes: a full-text replace and a key/value merge.
+fn env_key_changed(home: &Path, level: &str, name: &str, value: &Value, guarded: impl Fn(&str) -> bool) -> Option<String> {
+    let is_owner_only_env_key = |k: &str| guarded(k);
     let parse = |text: &str| -> std::collections::BTreeMap<String, String> {
         text.lines()
             .filter_map(|l| {

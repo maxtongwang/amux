@@ -156,6 +156,39 @@ struct WorkerSpec {
     prompt: String,
 }
 
+/// An env apply is an OWNER bootstrap: it creates workers with groups, writes
+/// absolute files, and seeds messages with any `from`, owner included. It had
+/// no caller check, so a worker could mint group members or post as the owner
+/// (fix/worker-membership-create). A worker may still dry-run a plan.
+///
+/// Membership is refused with the shared membership rule and code; any other
+/// worker-originated apply is refused as instance configuration, the policy
+/// `/api/config/apply` already applies.
+fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Option<Response> {
+    if dry {
+        return None;
+    }
+    let membership = spec.workers.iter().any(|w| {
+        let wanted: std::collections::BTreeSet<String> =
+            w.groups.iter().map(|g| g.trim().to_lowercase()).filter(|g| !g.is_empty()).collect();
+        wanted != crate::api::session_verbs::lane_groups(&sanitize(&w.name))
+    });
+    if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(headers, membership) {
+        return Some(refusal);
+    }
+    let actor = crate::api::groups::hdr_worker(headers);
+    if actor.is_empty() || crate::api::org::local_member_actor(headers).is_some() {
+        return None;
+    }
+    tracing::warn!(actor = %actor, verdict = "env_apply_worker_refused", measured = true, n_considered = 1,
+        "a worker tried to apply an environment spec");
+    Some((StatusCode::FORBIDDEN, Json(json!({
+        "ok": false,
+        "code": "instance_config_owner_only",
+        "error": format!("worker '{actor}' may not apply an environment spec (it creates workers, writes files and seeds messages as the owner); dry_run=1 still plans it"),
+    }))).into_response())
+}
+
 // ---- GET /api/env/schema ---------------------------------------------------
 
 async fn schema() -> Response {
@@ -213,6 +246,9 @@ async fn apply(
         }
     };
 
+    if let Some(refusal) = worker_apply_refusal(&headers, &spec, dry) {
+        return refusal;
+    }
     let home = crate::config::amux_home();
     let sessions_dir = home.join("sessions");
 

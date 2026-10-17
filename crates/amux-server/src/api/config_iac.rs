@@ -161,11 +161,20 @@ pub async fn apply(
 ) -> (StatusCode, Json<Value>) {
     // Writing global/group configuration is the human's, matching
     // /api/scope's own policy: a session may not reshape the whole instance.
-    let actor = headers
-        .get("x-amux-session")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    //
+    // Attribution is the shared rule (X-Amux-Worker canonical, X-Amux-Session
+    // honoured): reading only X-Amux-Session let a worker sending just
+    // X-Amux-Worker apply as the human. Worker declarations carrying `tags`
+    // are group membership and stay the owner's even under
+    // AMUX_SCOPE_WRITE_AGENTS=1 (session_verbs::membership_patch_refusal).
+    let actor = super::groups::hdr_worker(&headers);
+    let names_membership = doc
+        .get("workers")
+        .and_then(Value::as_array)
+        .is_some_and(|ws| ws.iter().any(|w| w.get("tags").is_some()));
+    if let Some(body) = super::session_verbs::membership_refusal_body(&headers, names_membership) {
+        return (StatusCode::FORBIDDEN, Json(body));
+    }
     if !actor.is_empty() && std::env::var("AMUX_SCOPE_WRITE_AGENTS").ok().as_deref() != Some("1") {
         return (
             StatusCode::FORBIDDEN,
