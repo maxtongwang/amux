@@ -96,9 +96,7 @@ case "$_throttle_max" in
   ''|*[!0-9]*|0) echo 'cargo_budget_refused: AMUX_CARGO_MAX_CONCURRENT must be positive' >&2; exit 75 ;;
 esac
 [ "$_throttle_max" -gt 0 ] || { echo 'cargo_budget_refused: concurrency must be positive' >&2; exit 75; }
-# Under AMUX_HOME, like every other amux state dir: a test that sets AMUX_HOME to
-# a fixture must not queue behind the host's real builds for a slot (DMIW-7).
-_throttle_dir="${AMUX_HOME:-$HOME/.amux}/cargo-throttle"
+_throttle_dir="$HOME/.amux/cargo-throttle"
 mkdir -p "$_throttle_dir" 2>/dev/null || true
 _throttle_slot=""
 _throttle_announced=0

@@ -59,7 +59,9 @@ def leads():
 
 
 def notify(level, free, recipients):
-    amux = os.environ.get('AMUX_BIN', 'amux')
+    # The builder runs under launchd with the default PATH, which lacks ~/.local/bin.
+    amux = (os.environ.get('AMUX_BIN') or shutil.which('amux')
+            or str(Path.home() / '.local' / 'bin' / 'amux'))
     text = ('Disk alarm: {:.0f} GB free on this machine (alarm below {} GB). Rust build caches '
             'reclaim automatically; anything else large needs an owner.').format(
                 free / GB, os.environ.get('AMUX_DISK_ALARM_LEADS_GB', '50'))

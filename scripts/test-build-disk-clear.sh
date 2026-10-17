@@ -30,6 +30,9 @@ trap 'echo "test-build-disk-clear: ABORTED at line $LINENO (\`$BASH_COMMAND\`) -
 # Cleanup diagnostics cannot depend on a running server or an inherited fleet
 # endpoint. This also reproduces CI, where no deployment-permit server exists.
 export AMUX_URL=http://127.0.0.1:1
+# The builder tick now runs disk-alarm.py (DMIW-7). On a nearly full machine it would
+# message the leads and page the owner for real; a test must never do that.
+export AMUX_BIN=true AMUX_DISK_ALARM_TO=test-no-recipient
 
 # The script redirects its whole build block to $LOG, so stdout is empty by
 # design — read the log it actually writes. AMUX_RS_BUILD_LOG is the existing
@@ -218,13 +221,15 @@ else ok; fi
 # ---------------------------------------------------------------------------
 dbg_run() { # $1 = fake HOME leaf, $2 = MIN_FREE_GB, $3 = peer-pid override
   local h="$TMP/$1"; local lg="$h/build.log"
-  mkdir -p "$h/.amux/rust-build-target/debug"
-  : > "$h/.amux/rust-build-target/debug/marker"
+  # A dependency unit, since the reclaim removes compiled units, not stray files.
+  mkdir -p "$h/.amux/rust-build-target/debug/deps"
+  head -c 65536 /dev/zero > "$h/.amux/rust-build-target/debug/deps/libmarker-0123456789abcdef.rlib"  # real bytes: an empty file frees nothing
   HOME="$h" \
   AMUX_RS_BUILD_LOG="$lg" \
   AMUX_BUILD_MIN_FREE_GB="$2" \
   AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB=0 \
   AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB=-1 \
+  AMUX_CARGO_RECLAIM_TO_GB=0 \
   AMUX_BUILD_PEER_PIDS_OVERRIDE="$3" \
   AMUX_RS_DISK_CLEAR_ONLY=1 \
     bash "$SCRIPT" >/dev/null 2>&1
@@ -235,7 +240,7 @@ dbg_run() { # $1 = fake HOME leaf, $2 = MIN_FREE_GB, $3 = peer-pid override
 out6=$(dbg_run peerbuild 0 "4242")
 if printf '%s\n' "$out6" | grep -q "DEFERRED"; then ok
 else bad "(j) with a peer build in flight and healthy disk the clear must DEFER" "$out6"; fi
-if [ -f "$TMP/peerbuild/.amux/rust-build-target/debug/marker" ]; then ok
+if [ -f "$TMP/peerbuild/.amux/rust-build-target/debug/deps/libmarker-0123456789abcdef.rlib" ]; then ok
 else bad "(j) a peer's debug artifacts must SURVIVE the deferral" "$out6"; fi
 
 # (k) NO peer building: clear as before. Without this, a fix that simply never
@@ -243,15 +248,15 @@ else bad "(j) a peer's debug artifacts must SURVIVE the deferral" "$out6"; fi
 out7=$(dbg_run nopeer 0 "")
 if printf '%s\n' "$out7" | grep -q "Clearing"; then ok
 else bad "(k) with no peer build in flight the clear must still happen" "$out7"; fi
-if [ -f "$TMP/nopeer/.amux/rust-build-target/debug/marker" ]; then
-  bad "(k) debug/ should have been removed when no peer is building" "$out7"
+if [ -f "$TMP/nopeer/.amux/rust-build-target/debug/deps/libmarker-0123456789abcdef.rlib" ]; then
+  bad "(k) the debug unit should have been reclaimed when no peer is building" "$out7"
 else ok; fi
 
 # (l) Disk pressure never overrides active debug builds (ATE-92).
 out8=$(dbg_run peerbutfull 999999 "4242")
 if printf '%s\n' "$out8" | grep -q "cargo_reclaim_deferred"; then ok
 else bad "(l) below the fleet floor the clear must still defer" "$out8"; fi
-if [ -f "$TMP/peerbutfull/.amux/rust-build-target/debug/marker" ]; then ok
+if [ -f "$TMP/peerbutfull/.amux/rust-build-target/debug/deps/libmarker-0123456789abcdef.rlib" ]; then ok
 else bad "(l) active debug artifacts must survive severe disk pressure" "$out8"; fi
 
 # (m) THE DETECTOR'S PRECISION, exercised for real with NO override. A process
