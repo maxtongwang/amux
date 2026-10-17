@@ -646,7 +646,22 @@ mod tests {
             r#"{"generation":1,"input_hash":"test","report":{"head":"ignored"}}"#,
         )
         .unwrap();
+        // This worker was renamed here from test-ret-src (review of 3f5ab3df, B1).
+        crate::api::rename_identity::record(&f.home, "test-ret-src", &f.name).unwrap();
+        assert_eq!(
+            crate::api::board::callback_target(&f.home, "test-ret-src".into()),
+            f.name,
+            "control: the alias resolves while the worker holds the name"
+        );
         assert_eq!(f.retire(&fleet).await.unwrap(), Outcome::Expired);
+        // An unrelated worker takes the expired name: the alias must not follow.
+        std::fs::write(f.env(), "CC_TAGS=other\n").unwrap();
+        assert_eq!(
+            crate::api::board::callback_target(&f.home, "test-ret-src".into()),
+            "test-ret-src",
+            "an expired worker's aliases must not attach to the next holder of its name"
+        );
+        std::fs::remove_file(f.env()).unwrap();
         assert_eq!(fleet.stops.load(Ordering::SeqCst), 1);
         assert!(!Path::new(&f.w.path).exists());
         assert!(!crate::api::session_verbs::worktree_is_registered(&f.w.repo, &f.w.path).await);
