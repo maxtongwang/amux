@@ -226,11 +226,11 @@ pub async fn apply(
     }
     // Instance-level sections (skins, columns, anything but worker
     // declarations) are an instance apply: owner, or mrpopo with a specific
-    // max_ref (ai-config #160). AMUX_SCOPE_WRITE_AGENTS no longer opens it.
-    let instance = doc.as_object().is_some_and(|o| o.keys().any(|k| !matches!(k.as_str(), "workers" | "max_ref" | "why" | "version")));
+    // grant Max approves (ai-config #160). AMUX_SCOPE_WRITE_AGENTS no longer opens it.
+    let instance = doc.as_object().is_some_and(|o| o.keys().any(|k| !matches!(k.as_str(), "workers" | "why" | "version")));
     let mut grant = None;
     if !actor.is_empty() && instance {
-        // The max_ref must name one of the settings applied: a column id or
+        // The grant names the settings applied (the target): a column id or
         // title, or a skin key (review H1).
         let mut names: Vec<String> = Vec::new();
         for c in doc.get("columns").and_then(Value::as_array).into_iter().flatten() {

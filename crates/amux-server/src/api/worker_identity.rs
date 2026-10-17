@@ -292,8 +292,13 @@ fn identity_refusal(req: &Request, refusal: IdentityRefusal) -> Response {
 /// server's own in-process calls (no ConnectInfo) act for lanes by design and
 /// are not a lane asserting itself.
 pub async fn enforce(mut req: Request, next: Next) -> Response {
-    // Server-only: a client copy of the proof stamp is dropped.
+    // Server-only: a client copy of the proof stamp is dropped, and so is a
+    // grant-replay marker arriving over a socket (only the server's own
+    // in-process replay of an approved grant carries one).
     req.headers_mut().remove(PROOF_HEADER);
+    if req.extensions().get::<ConnectInfo<SocketAddr>>().is_some() {
+        req.headers_mut().remove(super::delegation_grants::GRANT_HEADER);
+    }
     let claimed = match verified_worker(req.headers()) {
         Ok(name) => name.unwrap_or_default(),
         Err(refusal) => return identity_refusal(&req, refusal),

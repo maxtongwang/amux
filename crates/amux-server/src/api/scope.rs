@@ -996,7 +996,7 @@ async fn put_scope(state: AppState, req: Request) -> Response {
     let is_worker = member.is_none() && !actor.is_empty();
     let raw_env = capability == "env" && body.get("value").is_some_and(Value::is_string);
     // Group rules are a delegation row (ai-config #160: a lead's own team,
-    // mrpopo's `leads` with max_ref); every other rules layer stays the owner's.
+    // any group's rules through a grant Max approves); every other rules layer stays the owner's.
     if is_worker && (raw_env || (capability == "rules" && level != "group")) {
         tracing::warn!(actor = %actor, level = %level, name = %name, capability = %capability,
             verdict = "scope_raw_text_refused", measured = true, n_considered = 1,
@@ -1038,7 +1038,7 @@ async fn put_scope(state: AppState, req: Request) -> Response {
         member.as_ref(),
         match grant.as_ref() {
             None => Delegated::No,
-            Some(g) if g.class == crate::api::delegation::Class::Mrpopo && g.evidence_row.is_some() => Delegated::WithMaxRef,
+            Some(g) if g.class == crate::api::delegation::Class::Mrpopo && g.grant.is_some() => Delegated::WithGrant,
             Some(_) => Delegated::Table,
         },
     )
@@ -1113,8 +1113,8 @@ enum Delegated {
     No,
     /// Allowed by the delegation table.
     Table,
-    /// mrpopo's grant backed by a verified max_ref (its rows ARE owner-only keys).
-    WithMaxRef,
+    /// The replay of a grant Max approved for mrpopo (its rows ARE owner-only keys).
+    WithGrant,
 }
 
 /// Python `_scope_write`: validate → authorize → before-read → storage write
@@ -1177,9 +1177,9 @@ async fn scope_write(
 
     let value = value.cloned().unwrap_or(Value::Null);
     // Defense in depth (design review N16): kept after the table allowed,
-    // except for mrpopo's grant backed by a verified max_ref, whose rows ARE
+    // except for the replay of a grant Max approved for mrpopo, whose rows ARE
     // these keys.
-    if key == "env" && !actor.is_empty() && delegated != Delegated::WithMaxRef {
+    if key == "env" && !actor.is_empty() && delegated != Delegated::WithGrant {
         if let Some(k) = owner_only_key_changed(&home, level, name, &value) {
             tracing::warn!(actor = %actor, level, name, key = %k, verdict = "scope_owner_only_key_refused",
                 "a session tried to change an owner-only scope key");

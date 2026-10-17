@@ -6977,7 +6977,7 @@ pub(crate) struct DeliveryMeta<'a> {
     pub repeat_of: Option<i64>,
     /// The process-attribution verdict of the request that sent an OWNER
     /// message (`outside` or `remote`, from `process_identity`), migration
-    /// 0124. `max_ref` accepts an owner send as the owner's own words only on
+    /// 0124. `max_ref::row_qualifies` accepts an owner send as the owner's own words only on
     /// one of those two. None on every other row: peer, member, schedule,
     /// pane, and every row written before 0124.
     pub process_origin: Option<&'a str>,
@@ -7739,6 +7739,9 @@ pub(crate) async fn cmd_hist_record_with_id(
     if session.is_empty() || text.is_empty() {
         return 0;
     }
+    // A typed `amux grant <code>` approves a pending grant (ai-config #160);
+    // the grant module decides whether this row qualifies.
+    let grant_text = (!super::delegation_grants::codes_in(text).is_empty()).then(|| text.to_string());
     if ctype == "user" {
         spawn_task_title(session, text);
     }
@@ -8047,7 +8050,11 @@ pub(crate) async fn cmd_hist_record_with_id(
             .await;
         }
     }
-    msg_row_id.load(std::sync::atomic::Ordering::SeqCst)
+    let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
+    if let Some(t) = grant_text.filter(|_| row_id > 0) {
+        Box::pin(super::delegation_grants::on_row(state, row_id, &t)).await;
+    }
+    row_id
 }
 
 async fn link_queued_message(state: &AppState, session: &str, row_id: i64, queue_id: &str) {
@@ -27516,9 +27523,9 @@ async fn get_cross_group_config() -> Response {
 /// cross-group channel, which is the escalation the scope policy exists to stop.
 /// A request carrying no worker origin is the dashboard.
 async fn put_cross_group_config(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
-    // Routing is a delegation row (ai-config #160): mrpopo with max_ref only.
+    // Routing is a delegation row (ai-config #160): mrpopo through a grant only.
     // This legacy endpoint can only CLEAR the override and has no AppState to
-    // verify a max_ref, so every worker gets the table's refusal here; the
+    // store a grant, so every worker gets the table's refusal here; the
     // header check below stays for verified members.
     if let Some(refusal) = super::delegation::refusal_value(&headers, &super::delegation::Target::Fleet, &super::delegation::Action::SetRouting) {
         return jresp(StatusCode::FORBIDDEN, refusal);

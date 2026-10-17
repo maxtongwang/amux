@@ -190,7 +190,7 @@ fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Optio
     }
     // Group config and the instance sections go through the delegation table
     // like their own endpoints (ai-config #160, review B3): group config is a
-    // lead's own team or mrpopo with max_ref (PATCH /api/groups/<g>/config);
+    // lead's own team or mrpopo through a grant (PATCH /api/groups/<g>/config);
     // cards, messages, columns and global are owner-only here.
     if !origin.is_empty() {
         use crate::api::delegation::{refusal_value, Action, Target};

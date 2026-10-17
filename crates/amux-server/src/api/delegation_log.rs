@@ -37,7 +37,6 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub(crate) use super::max_ref::MaxRef;
 
 /// One change made on the owner's behalf.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -50,7 +49,8 @@ pub(crate) struct DelegatedChange {
     pub target: String,
     pub before: Value,
     pub after: Value,
-    pub max_ref: Option<MaxRef>,
+    /// The structured grant this change applied or this entry is about.
+    pub grant: Option<String>,
     pub evidence_row: Option<i64>,
     pub why: Option<String>,
 }
@@ -134,6 +134,10 @@ fn flat(s: &str, max: usize) -> String {
 
 /// The leads feed line: `delegated: <actor> <action> <target> (why)`.
 pub(crate) fn feed_text(c: &DelegatedChange) -> String {
+    // A grant request carries its exact sentence, so Max sees what he approves.
+    if let Some(sentence) = c.after.get("sentence").and_then(Value::as_str).filter(|_| c.action == "grant:requested") {
+        return format!("delegated, pending Max: {}", flat(sentence, 600));
+    }
     let why = c.why.as_deref().map(|w| format!(" ({})", flat(w, 200))).unwrap_or_default();
     format!("delegated: {} {} {}{why}", flat(&c.actor, 64), flat(&c.action, 64), flat(&c.target, 120))
 }
@@ -183,7 +187,7 @@ fn reader_proven(headers: &HeaderMap, worker: &str) -> bool {
     super::worker_identity::identity_proven(headers, worker)
 }
 
-fn read_refusal(state: &AppState, headers: &HeaderMap, uri: &Uri) -> Option<Response> {
+pub(crate) fn read_refusal(state: &AppState, headers: &HeaderMap, uri: &Uri) -> Option<Response> {
     let refuse = |code: &'static str, who: &str, error: String| {
         tracing::warn!(who, verdict = code, measured = true, n_considered = 1, "refused a delegation log read");
         Some(forbidden(code, error))
@@ -349,7 +353,7 @@ mod tests {
             target: target.into(),
             before: json!({"tags": ["dev"]}),
             after: json!({"tags": ["dev", "ops"]}),
-            max_ref: None,
+            grant: None,
             evidence_row: None,
             why: Some("Max asked".into()),
         }

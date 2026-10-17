@@ -450,7 +450,7 @@ async fn group_config(state: AppState, name: String, req: Request) -> Response {
                 }
             };
             // Group configuration goes through the delegation table (ai-config
-            // #160): a lead's own team, mrpopo's `leads` with max_ref. A group
+            // #160): a lead's own team, mrpopo through a grant Max approves. A group
             // nobody wears and nobody configured yet is a group CREATE.
             let exists = scan_session_tags(&amux_home()).iter().any(|(_, tags)| tags.iter().any(|t| t == &name))
                 || state.store.read().ok().is_some_and(|c| c.query_row("SELECT 1 FROM group_config WHERE name=?1", [&name], |_| Ok(())).is_ok());

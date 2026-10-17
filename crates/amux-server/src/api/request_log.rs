@@ -1938,6 +1938,18 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET"],
     },
     RouteEntry {
+        path: "/api/delegation/grants",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/delegation/grants/{code}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/delegation/grants/{code}/deny",
+        methods: &["POST"],
+    },
+    RouteEntry {
         path: "/api/vault/secrets/{id}",
         methods: &["PUT", "PATCH", "DELETE"],
     },

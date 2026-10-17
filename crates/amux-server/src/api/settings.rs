@@ -53,7 +53,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// Instance settings go through the delegation table (ai-config #160): a
-/// worker needs mrpopo plus a specific max_ref; `env` writes provider API key
+/// worker needs mrpopo and a grant Max approves; `env` writes provider API key
 /// VALUES, which are never delegated. The owner is unaffected.
 async fn gated<F: std::future::Future<Output = Response>>(state: &AppState, headers: &axum::http::HeaderMap, key: &str, body: &Value, run: F) -> Response {
     use crate::api::delegation::{authorize, Action, Target};
