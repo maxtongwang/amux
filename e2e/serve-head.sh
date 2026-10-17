@@ -116,8 +116,14 @@ export AMUX_ISOLATED=1
 # one build path in the repo that skipped the wrapper: no budget, no reclaim on an
 # over-cap target, no concurrency slot. The target dir is unchanged (AMUX-2961
 # below); only the build goes through the sanctioned path.
+# CI runners are throwaway, so the shared-target cap means nothing there, and
+# safe-cargo's `systemd-run --user` scope is not something a hosted runner offers.
 serve_built() {
-  "$REPO/scripts/safe-cargo.sh" build -p amux-server || exit $?
+  if [ -n "${CI:-}" ]; then
+    cargo build -p amux-server || exit $?
+  else
+    "$REPO/scripts/safe-cargo.sh" build -p amux-server || exit $?
+  fi
   exec "$CARGO_TARGET_DIR/debug/amux-server"
 }
 

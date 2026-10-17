@@ -338,9 +338,9 @@ def entry_bytes(path):
 
 
 def last_used(path):
-    """Newest access or modification under path. Reading an artifact updates its
-    atime on APFS and relatime Linux, so a dependency read by every build but not
-    rebuilt for days still counts as used."""
+    """Newest access or modification under path. rustc memory-maps the libraries it
+    links, which updates their atime, so a dependency used by every build but not
+    rebuilt for days still counts as used (sweep relies on this only for deps/)."""
     newest = 0.0
     paths = [path]
     if path.is_dir() and not path.is_symlink():
@@ -431,8 +431,13 @@ def sweep(targets, idle_s=SWEEP_IDLE_S, *, now=None, process_probe=active_proces
             incremental = profile / 'incremental'
             if incremental.is_dir():
                 swept += [[s] for s in incremental.iterdir() if last_used(s) < cutoff]
+        # Only units with compiled outputs in deps/: rustc memory-maps those, which
+        # keeps their atime current. A build script's out/ dir is read by include!
+        # and plain reads do not move atime on this Mac (measured in review), so it
+        # would look idle while in use; size-driven reclaim may still take it.
         swept += [paths for paths in dep_units(profiles).values()
-                  if max(last_used(p) for p in paths) < cutoff]
+                  if any(p.parent.name == 'deps' for p in paths)
+                  and max(last_used(p) for p in paths) < cutoff]
         for paths in swept:
             for path in paths:
                 remove(path, locks)

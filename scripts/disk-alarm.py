@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """DMIW-7: say so before the disk fills, instead of after every build fails.
 
-Run by rust-auto-build.sh on each tick. Below AMUX_DISK_ALARM_LEADS_GB (50) free,
+Run by rust-auto-build.sh on each build run. Below AMUX_DISK_ALARM_LEADS_GB (50) free,
 every lead (workers tagged `leads`, or AMUX_DISK_ALARM_TO) gets one message; below
 AMUX_DISK_ALARM_OWNER_GB (20) the owner also gets `amux alert` (push + text).
 A level is announced when it is first reached or gets worse, and repeated every
-AMUX_DISK_ALARM_REPEAT_S (6 h) while it lasts; recovery clears it. State lives
+AMUX_DISK_ALARM_REPEAT_S (6 h) while it lasts; recovery clears it. Each recipient
+is tracked on its own, so a failed send is retried on the next run without
+repeating it to those who already got it. State lives
 in <home>/.amux/disk-alarm.json.
 
 Usage: disk-alarm.py <home>   (prints one JSON verdict line, exits 0)
@@ -34,15 +36,15 @@ def level_for(free, leads_gb, owner_gb):
 
 
 def decide(level, state, now, repeat_s):
-    """(fire, new_state). Fire on a new or worse level, or when the last
-    announcement of this level is older than repeat_s."""
+    """(announce, new_state). A new or worse level, or one last announced repeat_s
+    ago, starts a fresh announcement round: nobody has been told yet."""
     if level == 'ok':
         return False, {}
     worse = RANK[level] > RANK.get(state.get('level', 'ok'), 0)
     stale = now - float(state.get('at', 0)) >= repeat_s
     if worse or stale:
-        return True, {'level': level, 'at': now}
-    return False, state
+        return True, {'level': level, 'at': now, 'told': []}
+    return bool(set(state.get('pending', []))), state
 
 
 def leads():
@@ -58,24 +60,33 @@ def leads():
                   if not s.get('archived') and 'leads' in (s.get('tags') or []))
 
 
+def tool_env():
+    """launchd's builder PATH lacks Homebrew and ~/.local/bin, and `amux send`
+    needs tmux before anything else (measured in review: "tmux is required")."""
+    extra = ['/opt/homebrew/bin', '/usr/local/bin', str(Path.home() / '.local' / 'bin')]
+    path = os.environ.get('PATH', '/usr/bin:/bin').split(':')
+    return {**os.environ, 'PATH': ':'.join(path + [p for p in extra if p not in path])}
+
+
 def notify(level, free, recipients):
-    # The builder runs under launchd with the default PATH, which lacks ~/.local/bin.
-    amux = (os.environ.get('AMUX_BIN') or shutil.which('amux')
+    """Send to each recipient ('owner' means `amux alert`); (sent, failed)."""
+    env = tool_env()
+    amux = (os.environ.get('AMUX_BIN') or shutil.which('amux', path=env['PATH'])
             or str(Path.home() / '.local' / 'bin' / 'amux'))
     text = ('Disk alarm: {:.0f} GB free on this machine (alarm below {} GB). Rust build caches '
             'reclaim automatically; anything else large needs an owner.').format(
                 free / GB, os.environ.get('AMUX_DISK_ALARM_LEADS_GB', '50'))
     sent, failed = [], []
     for name in recipients:
-        ok = subprocess.run([amux, 'send', name, '--stdin'], input=text, text=True,
-                            capture_output=True, timeout=20).returncode == 0
-        (sent if ok else failed).append(name)
-    if level == 'owner':
-        ok = subprocess.run([amux, 'alert', 'Disk nearly full: {:.0f} GB free. Builds and workers will '
-                             'start failing; clear space or tell a lead.'.format(free / GB),
-                             'disk below {} GB'.format(os.environ.get('AMUX_DISK_ALARM_OWNER_GB', '20'))],
-                            capture_output=True, text=True, timeout=30).returncode == 0
-        (sent if ok else failed).append('owner')
+        if name == 'owner':
+            argv = [amux, 'alert', 'Disk nearly full: {:.0f} GB free. Builds and workers will '
+                    'start failing; clear space or tell a lead.'.format(free / GB),
+                    'disk below {} GB'.format(os.environ.get('AMUX_DISK_ALARM_OWNER_GB', '20'))]
+            done = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=30)
+        else:
+            done = subprocess.run([amux, 'send', name, '--stdin'], input=text, env=env,
+                                  text=True, capture_output=True, timeout=20)
+        (sent if done.returncode == 0 else failed).append(name)
     return sent, failed
 
 
@@ -100,12 +111,18 @@ def main():
         verdict.update(measured=True, level=level, free_gb=round(free / GB, 1), fired=fire)
         if fire:
             try:
-                recipients = leads()
+                everyone = leads()
             except Exception as error:  # noqa: BLE001 - the owner alert must not depend on it
-                recipients, verdict['leads_error'] = [], '{}: {}'.format(type(error).__name__, error)
-            verdict['sent'], verdict['failed'] = notify(level, free, recipients)
-            if verdict['failed'] or not verdict['sent']:
-                new_state = state  # retry on the next tick rather than mark it announced
+                everyone, verdict['leads_error'] = [], '{}: {}'.format(type(error).__name__, error)
+            if level == 'owner':
+                everyone = everyone + ['owner']
+            told = set(new_state.get('told', []))
+            todo = [n for n in everyone if n not in told]
+            verdict['sent'], verdict['failed'] = notify(level, free, todo)
+            # An unreadable lead list is a failure too: keep the round open so the
+            # next run retries rather than waiting out the 6-hour repeat.
+            pending = verdict['failed'] + (['leads-unlisted'] if 'leads_error' in verdict else [])
+            new_state = {**new_state, 'told': sorted(told | set(verdict['sent'])), 'pending': pending}
         if new_state != state:
             state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_text(json.dumps(new_state))

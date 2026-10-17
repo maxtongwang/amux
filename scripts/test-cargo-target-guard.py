@@ -377,6 +377,8 @@ class ReclaimAndSweepTests(unittest.TestCase):
         self.mid = [put(debug / 'deps' / 'libmid-1111111111111111.rlib', MB, NOW - 3 * DAY),
                     put(debug / 'deps' / 'mid-1111111111111111.d', 10, NOW - 3 * DAY)]
         self.new = [put(debug / 'deps' / 'new-2222222222222222', MB, NOW - 1 * DAY)]
+        # a build script's output: no deps/ files, looks idle (plain reads keep no atime)
+        self.script_out = put(debug / 'build' / 'gen-3333333333333333' / 'out' / 'bindings.rs', 10, NOW - 9 * DAY)
         # protected profiles, older than everything and larger than everything
         self.protected = [put(self.root / 'deploy' / 'amux-server', 3 * MB, NOW - 30 * DAY),
                           put(self.root / 'release' / 'deps' / 'libold-0123456789abcdef.rlib', 3 * MB, NOW - 30 * DAY)]
@@ -409,10 +411,12 @@ class ReclaimAndSweepTests(unittest.TestCase):
         self.assert_protected()
 
     def test_then_least_recently_used_units_whole_until_the_goal(self):
-        # goal 1.5 MB: incremental, then old (5 days), then mid (3 days); new (1 day) stays.
+        # goal 1.5 MB: incremental, then the build-script output (9 days), old (5 days),
+        # mid (3 days); new (1 day) stays. Reclaim, unlike sweep, may take script output.
         result = guard.reclaim([self.root], 4 * MB, int(1.5 * MB), process_probe=quiet)
         self.assertEqual(result['verdict'], 'cargo_reclaimed')
-        self.assertEqual(result['units_removed'], 2)
+        self.assertEqual(result['units_removed'], 3)
+        self.assertFalse(self.script_out.exists())
         self.assertTrue(all(not p.exists() for p in self.old + self.mid), 'every output of a unit goes together')
         self.assertTrue(all(p.exists() for p in self.new))
         self.assertTrue(result['reached_goal'])
@@ -441,11 +445,13 @@ class ReclaimAndSweepTests(unittest.TestCase):
         self.assertTrue(all(not p.exists() for p in self.old + self.mid))
         self.assertTrue(all(p.exists() for p in self.new))
         self.assertTrue(self.incremental.exists(), 'a session used yesterday stays')
+        self.assertTrue(self.script_out.exists(), 'build-script output is left to the size-driven reclaim')
         self.assertEqual(result['units_removed'], 2)
         self.assert_protected()
         # a day later the rest is idle too
         guard.sweep([self.root], 2 * DAY, now=NOW + 1.5 * DAY, process_probe=quiet)
         self.assertFalse(self.incremental.exists() or any(p.exists() for p in self.new))
+        self.assertTrue(self.script_out.exists())
         self.assert_protected()
 
     def test_a_read_counts_as_use(self):

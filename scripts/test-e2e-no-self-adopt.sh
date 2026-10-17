@@ -9,8 +9,10 @@
 #
 # Two properties, and the second is the one a careless edit breaks:
 #   1. serve-head.sh exports AMUX_NO_SELF_ADOPT=1
-#   2. it does so BEFORE it exec's cargo — an export after the exec line is
-#      unreachable, and would look completely correct in a diff.
+#   2. it does so BEFORE the server starts — an export after that line is
+#      unreachable, and would look completely correct in a diff. The server
+#      starts at the last top-level `serve_built` (build through safe-cargo, then
+#      exec the binary; DMIW-7), formerly `exec cargo run`.
 #
 # Exit 0 = all pass, 1 = a failure. Wired into .github/workflows/checks.yml.
 set -euo pipefail
@@ -34,8 +36,8 @@ fi
 # 2. it is reachable. `exec` replaces the process, so anything after the FIRST
 #    unconditional exec never runs. Compare line numbers rather than trusting
 #    that the file reads top-to-bottom the way it looks.
-exp_line=$(grep -nE '^[[:space:]]*export[[:space:]]+AMUX_NO_SELF_ADOPT=1' "$SERVE" | head -1 | cut -d: -f1)
-exec_line=$(grep -nE '^[[:space:]]*exec[[:space:]]+cargo' "$SERVE" | tail -1 | cut -d: -f1)
+exp_line=$(grep -nE '^[[:space:]]*export[[:space:]]+AMUX_NO_SELF_ADOPT=1' "$SERVE" | head -1 | cut -d: -f1 || true)
+exec_line=$(grep -nE '^[[:space:]]*(exec[[:space:]]+cargo|serve_built[[:space:]]*$)' "$SERVE" | tail -1 | cut -d: -f1 || true)
 if [ -n "$exp_line" ] && [ -n "$exec_line" ]; then
   if [ "$exp_line" -lt "$exec_line" ]; then
     ok "the export (line $exp_line) precedes the exec (line $exec_line), so it reaches the server"

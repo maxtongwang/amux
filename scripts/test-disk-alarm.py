@@ -24,7 +24,8 @@ class DiskAlarmTests(unittest.TestCase):
         self.home = Path(self.temp.name)
         self.calls = self.home / 'amux-calls'
         self.amux = self.home / 'amux'
-        self.amux.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "{}"\nexit ${{FAKE_AMUX_EXIT:-0}}\n'.format(self.calls))
+        self.amux.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "{}"\n'
+                             '[ "$2" = "${{FAKE_AMUX_FAIL:-}}" ] && exit 1\nexit ${{FAKE_AMUX_EXIT:-0}}\n'.format(self.calls))
         self.amux.chmod(0o755)
 
     def run_alarm(self, free_gb, now=NOW, **extra):
@@ -77,6 +78,43 @@ class DiskAlarmTests(unittest.TestCase):
         verdict = self.run_alarm(90, AMUX_DISK_ALARM_LEADS_GB='100', AMUX_DISK_ALARM_OWNER_GB='95')
         self.assertEqual(verdict['level'], 'owner')
 
+
+    def test_a_partial_failure_retries_only_the_failed_recipient(self):
+        self.run_alarm(45, FAKE_AMUX_FAIL='dev-lead')
+        self.run_alarm(45, now=NOW + 60)
+        sends = [c for c in self.calls_made() if c.startswith('send ')]
+        self.assertEqual(sends.count('send business-lead --stdin'), 1, 'told once, not again')
+        self.assertEqual(sends.count('send dev-lead --stdin'), 2, 'failed once, retried once')
+        self.run_alarm(45, now=NOW + 120)
+        self.assertEqual(len(self.calls_made()), 3, 'nothing pending: quiet until the repeat')
+
+    def test_the_owner_is_not_paged_again_when_a_lead_send_fails(self):
+        for minute in range(3):  # three builder runs, a lead failing each time
+            self.run_alarm(15, now=NOW + 600 * minute, FAKE_AMUX_FAIL='dev-lead')
+        alerts = [c for c in self.calls_made() if c.startswith('alert ')]
+        self.assertEqual(len(alerts), 1)
+
+    def test_an_unlisted_lead_set_is_retried(self):
+        env = {'AMUX_DISK_ALARM_TO': '', 'AMUX_URL': 'https://127.0.0.1:1'}
+        verdict = self.run_alarm(45, **env)
+        self.assertIn('leads_error', verdict)
+        state = json.loads((self.home / '.amux' / 'disk-alarm.json').read_text())
+        self.assertEqual(state['pending'], ['leads-unlisted'])
+
+    def test_the_builder_path_reaches_homebrew_tools(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('disk_alarm', SCRIPT)
+        alarm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(alarm)
+        old = os.environ.get('PATH')
+        os.environ['PATH'] = '/usr/bin:/bin'  # launchd's builder PATH, roughly
+        try:
+            path = alarm.tool_env()['PATH'].split(':')
+        finally:
+            os.environ['PATH'] = old
+        self.assertIn('/opt/homebrew/bin', path)
+        self.assertEqual(path[:2], ['/usr/bin', '/bin'], 'existing order kept')
 
 if __name__ == '__main__':
     unittest.main()
