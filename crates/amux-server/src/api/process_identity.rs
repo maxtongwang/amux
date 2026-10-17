@@ -49,7 +49,11 @@
 //! tmux server) reads as outside. A hostile same-uid process can also remove
 //! tmux's socket (tmux then reports no server), rename a session out of the
 //! `amux-` prefix, drive the owner's browser, edit `~/.amux` directly, or reach
-//! the front door from another tailnet host. This closes the accidental and
+//! the front door from another tailnet host, or keep its connected socket in
+//! flight (SCM_RIGHTS) so no process holds it during the scan and the forward
+//! test cannot see it (tailscaled's own sockets are unlistable, so its holding
+//! the matching connection cannot be confirmed; same-user, issue #136). This
+//! closes the accidental and
 //! naive paths (stripped env, `env -i`, a backgrounded send), which are the
 //! measured ones; a hostile same-uid process needs an OS sandbox, not an HTTP
 //! check.
@@ -376,35 +380,45 @@ fn pane_map(fresh: bool) -> Result<Panes, String> {
 const TMUX_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Run a command with a deadline: (exit ok, stdout, stderr), or an error when
-/// it cannot start or outlives `limit` (it is then killed).
+/// it cannot start or outlives `limit` (it is then killed). Both pipes are
+/// drained while it runs (review round 7: a full pipe blocked the child, which
+/// then could not exit and was killed as hung).
 fn run_bounded(cmd: &mut std::process::Command, limit: Duration) -> Result<(bool, String, String), String> {
     use std::io::Read;
+    use wait_timeout::ChildExt;
+    let program = format!("{:?}", cmd.get_program());
     let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not run {:?}: {e}", cmd.get_program()))?;
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(5)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{:?} did not answer within {}ms", cmd.get_program(), limit.as_millis()));
+        .map_err(|e| format!("could not run {program}: {e}"))?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
             }
-            Err(e) => return Err(format!("could not wait for {:?}: {e}", cmd.get_program())),
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    };
+    let out = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let status = match child.wait_timeout(limit) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{program} did not answer within {}ms", limit.as_millis()));
+        }
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("could not wait for {program}: {e}"));
         }
     };
-    let (mut out, mut err) = (String::new(), String::new());
-    if let Some(mut o) = child.stdout.take() {
-        let _ = o.read_to_string(&mut out);
-    }
-    if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_string(&mut err);
-    }
+    let out = out.join().map_err(|_| format!("{program}: stdout reader failed"))?;
+    let err = err.join().map_err(|_| format!("{program}: stderr reader failed"))?;
     Ok((status.success(), out, err))
 }
 
@@ -470,7 +484,9 @@ fn root_tailscaled_cached() -> Result<Vec<u32>, String> {
     Ok(pids)
 }
 
-/// `ps -A -o pid=,uid=,ucomm=` rows naming root `tailscaled`.
+/// `ps -A -o pid=,uid=,ucomm=` rows naming root `tailscaled` (macOS reads
+/// the table with ps; Linux reads /proc directly).
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn parse_root_tailscaled(text: &str) -> Vec<u32> {
     text.lines()
         .filter_map(|l| {
@@ -494,10 +510,84 @@ pub(crate) fn is_tailnet(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// A socket connected to this host's own tailscale serve front door: the
-/// remote end is this host's tailnet address (the same as the local end) on 443.
-pub(crate) fn is_front_door(local: SocketAddr, remote: SocketAddr) -> bool {
-    remote.port() == 443 && remote.ip().to_canonical() == local.ip().to_canonical() && is_tailnet(remote.ip())
+/// The ports `tailscale serve` exposes on this host's tailnet addresses, or
+/// None when they cannot be read (then every tailnet port counts: fail closed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ServedPorts {
+    Known(std::collections::BTreeSet<u16>),
+    Unknown,
+}
+
+/// The port set from `tailscale serve status --json`: the `TCP` map's keys and
+/// the port of each `Web` host ("name:port"). Unparseable JSON is Unknown.
+pub(crate) fn parse_served_ports(json: &str) -> ServedPorts {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return ServedPorts::Unknown };
+    let mut ports = std::collections::BTreeSet::new();
+    if let Some(tcp) = v.get("TCP").and_then(|t| t.as_object()) {
+        for k in tcp.keys() {
+            match k.parse::<u16>() {
+                Ok(p) => {
+                    ports.insert(p);
+                }
+                Err(_) => return ServedPorts::Unknown,
+            }
+        }
+    }
+    if let Some(web) = v.get("Web").and_then(|w| w.as_object()) {
+        for k in web.keys() {
+            match k.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()) {
+                Some(p) => {
+                    ports.insert(p);
+                }
+                None => return ServedPorts::Unknown,
+            }
+        }
+    }
+    ServedPorts::Known(ports)
+}
+
+type ServedCache = Mutex<Option<(Instant, ServedPorts)>>;
+
+/// Served ports, read at most every 10s. A failed read is Unknown and not
+/// cached, so the next connection tries again.
+pub(crate) fn served_ports_cached() -> ServedPorts {
+    static CACHE: OnceLock<ServedCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(g) = cache.lock() {
+        if let Some((at, ports)) = g.as_ref() {
+            if at.elapsed() < Duration::from_secs(10) {
+                return ports.clone();
+            }
+        }
+    }
+    let read = ["tailscale", "/usr/local/bin/tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"]
+        .iter()
+        .find_map(|bin| {
+            let (ok, out, _) = run_bounded(std::process::Command::new(bin).args(["serve", "status", "--json"]), Duration::from_secs(2)).ok()?;
+            ok.then(|| parse_served_ports(&out))
+        });
+    match read {
+        Some(ports @ ServedPorts::Known(_)) => {
+            if let Ok(mut g) = cache.lock() {
+                *g = Some((Instant::now(), ports.clone()));
+            }
+            ports
+        }
+        _ => ServedPorts::Unknown,
+    }
+}
+
+/// A socket that may be connected to this host's tailscale serve front door:
+/// a tailnet address on a served port, whatever the local end (review round 7:
+/// a worker can bind loopback or a LAN address and still reach this host's
+/// tailnet IP). Other tailnet hosts on those ports match too; that only makes a
+/// forward ambiguous, which fails closed. Served ports unknown: any tailnet port.
+pub(crate) fn is_front_door(_local: SocketAddr, remote: SocketAddr, served: &ServedPorts) -> bool {
+    is_tailnet(remote.ip())
+        && match served {
+            ServedPorts::Known(ports) => ports.contains(&remote.port()),
+            ServedPorts::Unknown => true,
+        }
 }
 
 type Shared = Arc<dyn PeerResolver>;
@@ -888,6 +978,7 @@ mod macos {
         if pids.is_empty() {
             return Err(LookupError::Failed("proc_listallpids returned nothing".into()));
         }
+        let served = super::served_ports_cached();
         let mut out = super::Scan::default();
         for pid in pids.into_iter().filter(|&p| p > 0) {
             let fds = match socket_fds(pid) {
@@ -902,7 +993,7 @@ mod macos {
             for fd in fds {
                 if let Some((local, remote)) = endpoints(pid, fd) {
                     holds |= local == client && remote == server;
-                    door |= super::is_front_door(local, remote);
+                    door |= super::is_front_door(local, remote, &served);
                 }
             }
             if holds {
@@ -1016,7 +1107,8 @@ mod linux {
     pub(crate) fn scan(client: SocketAddr, server: SocketAddr) -> Result<super::Scan, LookupError> {
         let rows = sockets()?;
         let target: HashSet<u64> = rows.iter().filter(|(l, r, _)| *l == client && *r == server).map(|(_, _, i)| *i).collect();
-        let doors: HashSet<u64> = rows.iter().filter(|(l, r, _)| super::is_front_door(*l, *r)).map(|(_, _, i)| *i).collect();
+        let served = super::served_ports_cached();
+        let doors: HashSet<u64> = rows.iter().filter(|(l, r, _)| super::is_front_door(*l, *r, &served)).map(|(_, _, i)| *i).collect();
         let mut out = super::Scan::default();
         let procs = std::fs::read_dir("/proc").map_err(|e| LookupError::Failed(e.to_string()))?;
         for entry in procs.flatten() {
@@ -1173,17 +1265,36 @@ mod tests {
         assert!(r.is_err(), "{r:?}");
         assert!(start.elapsed() < Duration::from_secs(2), "the deadline held");
         assert_eq!(run_bounded(std::process::Command::new("/bin/echo").arg("hi"), Duration::from_secs(2)).unwrap().1.trim(), "hi");
+        // Output far larger than a pipe buffer, on both streams, still completes.
+        let big = run_bounded(std::process::Command::new("/bin/sh").args(["-c",
+            "i=0; while [ $i -lt 20000 ]; do echo 12345 501 process-name; echo err-line >&2; i=$((i+1)); done"]), Duration::from_secs(10)).unwrap();
+        assert!(big.0, "exited cleanly");
+        assert_eq!(big.1.lines().count(), 20000);
+        assert_eq!(big.2.lines().count(), 20000);
     }
 
     #[test]
     fn root_tailscaled_is_read_from_the_process_table_and_the_front_door_is_this_hosts_tailnet_443() {
         assert_eq!(parse_root_tailscaled("  416     0 tailscaled\n  417   501 tailscaled\n  418     0 tailscale\n"), vec![416]);
         let a = |s: &str| s.parse::<SocketAddr>().unwrap();
-        assert!(is_front_door(a("100.85.233.44:50000"), a("100.85.233.44:443")));
-        assert!(is_front_door(a("[fd7a:115c:a1e0::b132:e92c]:50000"), a("[fd7a:115c:a1e0::b132:e92c]:443")));
-        assert!(!is_front_door(a("100.85.233.44:50000"), a("100.85.233.45:443")), "another tailnet host");
-        assert!(!is_front_door(a("100.85.233.44:50000"), a("100.85.233.44:8824")), "the server port itself");
-        assert!(!is_front_door(a("192.168.1.207:50000"), a("192.168.1.207:443")), "not tailnet");
+        let served = parse_served_ports(r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:8824"}}}"#);
+        assert_eq!(served, ServedPorts::Known([443].into()));
+        assert!(is_front_door(a("100.85.233.44:50000"), a("100.85.233.44:443"), &served));
+        assert!(is_front_door(a("[fd7a:115c:a1e0::b132:e92c]:50000"), a("[fd7a:115c:a1e0::b132:e92c]:443"), &served));
+        assert!(is_front_door(a("192.168.1.207:50000"), a("100.85.233.44:443"), &served), "a LAN-bound worker reaching the tailnet IP");
+        assert!(is_front_door(a("127.0.0.1:50000"), a("100.85.233.44:443"), &served), "a loopback-bound worker reaching the tailnet IP");
+        assert!(is_front_door(a("100.85.233.44:50000"), a("100.85.233.45:443"), &served), "another tailnet host: ambiguous, fails closed");
+        assert!(!is_front_door(a("100.85.233.44:50000"), a("100.85.233.44:8824"), &served), "not a served port");
+        assert!(!is_front_door(a("192.168.1.207:50000"), a("192.168.1.207:443"), &served), "not tailnet");
+        // Every served port counts, including web handlers.
+        let more = parse_served_ports(r#"{"TCP":{"443":{},"8443":{}},"Web":{"macbook.tail213292.ts.net:10000":{}}}"#);
+        assert_eq!(more, ServedPorts::Known([443, 8443, 10000].into()));
+        assert!(is_front_door(a("127.0.0.1:1"), a("100.85.233.44:10000"), &more));
+        // Unreadable serve status: every tailnet port counts.
+        assert_eq!(parse_served_ports("not json"), ServedPorts::Unknown);
+        assert_eq!(parse_served_ports(r#"{"TCP":{"x":{}}}"#), ServedPorts::Unknown);
+        assert!(is_front_door(a("127.0.0.1:1"), a("100.85.233.44:8824"), &ServedPorts::Unknown));
+        assert!(!is_front_door(a("127.0.0.1:1"), a("192.168.1.207:443"), &ServedPorts::Unknown));
     }
 
     /// Fake lookups for the shipped decision.
