@@ -916,6 +916,142 @@ else:
 '
 }
 
+# amux model <worker> [<model>] [--effort <level>]  (ai-config #149)
+# Shows or changes a worker's model over PATCH /api/sessions/<w>/config: a hot
+# /model for Claude (conversation kept, acknowledgement checked), restart with
+# resume for other providers, an env-only change when the worker is stopped.
+# Who may switch is the server's rule, reported as-is when it refuses: the
+# owner any worker, a worker only itself. The owner's routes are an amux hub
+# pane, the dashboard, or typing /model in the session; a shell inside a worker
+# pane is that worker (amux #7), and there is no owner-token path from one.
+cmd_model() {
+  local name="${1:-}" model="" effort="" body out code
+  case "$name" in
+    ""|-h|--help|help)
+      cat <<'EOF'
+usage: amux model <worker>                     show configured and live model
+       amux model <worker> <model> [--effort E] switch the model (and effort)
+       amux model <worker> --effort E           change effort only
+Claude switches in place with /model and keeps the conversation; other providers
+restart with resume; a stopped worker only has its config changed.
+Who may switch: the owner any worker, a worker only itself (the server decides
+and its refusal is printed). The owner's routes are an amux hub pane, the
+dashboard, or typing /model in the session: a shell inside a worker pane acts as
+that worker, never as the owner.
+A model another engine runs is a new conversation there, not a model change:
+see `amux-route <role> --worker <w>` (action handoff).
+EOF
+      [[ -n "$name" ]] && exit 0 || exit 2 ;;
+  esac
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --effort) [[ -n "${2:-}" ]] || die "--effort needs a level (low|medium|high|xhigh|max)"; effort="$2"; shift 2 ;;
+      --effort=*) effort="${1#--effort=}"; [[ -n "$effort" ]] || die "--effort needs a level"; shift ;;
+      -*) die "amux model: unknown option '$1' (see: amux model --help)" ;;
+      *) [[ -z "$model" ]] || die "amux model: one model only (got '$model' and '$1')"; model="$1"; shift ;;
+    esac
+  done
+  local hdr=(-H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}")
+  if [[ -z "$model" && -z "$effort" ]]; then
+    out=$(_curl -sk -m 20 ${hdr[@]+"${hdr[@]}"} "$AMUX_API/api/sessions") || die "server unreachable"
+    printf '%s' "$out" | python3 -c '
+import json, sys
+name = sys.argv[1]
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    print("error: the server returned no session list", file=sys.stderr); sys.exit(1)
+if isinstance(rows, dict):
+    print("error:", rows.get("error") or "unexpected response", file=sys.stderr); sys.exit(1)
+w = next((r for r in rows if r.get("name") == name), None)
+if w is None:
+    print(f"error: no worker named {name!r}", file=sys.stderr); sys.exit(1)
+print(f"{name}: provider {w.get('"'"'provider'"'"') or '"'"'?'"'"'}")
+print(f"  configured: {w.get('"'"'model'"'"') or '"'"'(unpinned: provider default)'"'"'}")
+print(f"  live:       {w.get('"'"'active_model'"'"') or '"'"'(not reported)'"'"'}" + (f"  [{w['"'"'model_source'"'"']}]" if w.get("model_source") else ""))
+' "$name"
+    return
+  fi
+  body=$(python3 -c 'import json,sys
+d = {}
+if sys.argv[1]: d["model"] = sys.argv[1]
+if sys.argv[2]: d["effort"] = sys.argv[2]
+print(json.dumps(d))' "$model" "$effort")
+  out=$(_curl -sk -m 150 -w '\n%{http_code}' -X PATCH -H 'Content-Type: application/json' ${hdr[@]+"${hdr[@]}"} \
+    -d "$body" "$AMUX_API/api/sessions/$name/config") || die "server unreachable"
+  code="${out##*$'\n'}"; out="${out%$'\n'*}"
+  printf '%s' "$out" | python3 -c '
+import json, sys
+code, name = int(sys.argv[1]), sys.argv[2]
+try:
+    d = json.loads(sys.stdin.read() or "{}")
+except ValueError:
+    d = {}
+if code >= 400 or d.get("ok") is False:
+    why = d.get("error") or d.get("message") or f"HTTP {code}"
+    print(f"refused ({code}): {why}", file=sys.stderr)
+    if code in (401, 403):
+        print("  only the owner may switch another worker; a worker may switch itself", file=sys.stderr)
+    sys.exit(1)
+mode = d.get("mode") or "?"
+print(f"{name}: {d.get('"'"'message'"'"') or '"'"'changed'"'"'}  [mode {mode}, applied {str(d.get('"'"'applied'"'"')).lower()}]")
+if d.get("hot_error"):
+    print(f"  note: {d['"'"'hot_error'"'"']}")
+if d.get("effort_governed_by"):
+    print(f"  note: effort is set by the model on this provider ({d['"'"'effort_governed_by'"'"']})")
+' "$code" "$name"
+}
+
+# amux usage [--json]  (ai-config #149): each provider's measured windows from
+# /api/usage, so leads read the Claude 5-hour and weekly windows and Codex usage
+# without the dashboard. Every line says whether it was measured.
+cmd_usage() {
+  local json=0 out
+  case "${1:-}" in
+    -h|--help|help) echo "usage: amux usage [--json]   provider budget windows (used %, reset), from /api/usage"; exit 0 ;;
+    --json) json=1 ;;
+    "") ;;
+    *) die "amux usage: unknown option '$1' (see: amux usage --help)" ;;
+  esac
+  out=$(_curl -sk -m 30 -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" "$AMUX_API/api/usage") || die "server unreachable"
+  if [[ "$json" == 1 ]]; then printf '%s\n' "$out"; return; fi
+  printf '%s' "$out" | python3 -c '
+import datetime as dt, json, sys
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    print("error: the server returned no usage data", file=sys.stderr); sys.exit(1)
+if d.get("error"):
+    print("error:", d["error"], file=sys.stderr); sys.exit(1)
+def when(v):
+    if v in (None, ""): return "?"
+    try:
+        t = dt.datetime.fromtimestamp(v, dt.timezone.utc) if isinstance(v, (int, float)) else dt.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (ValueError, OSError):
+        return str(v)
+    return t.astimezone().strftime("%a %H:%M")
+providers = d.get("providers") or []
+if not providers:
+    print(f"no providers reported (measured {str(d.get('"'"'measured'"'"')).lower()})"); sys.exit(1)
+for p in providers:
+    label = p.get("label") or p.get("id")
+    if p.get("available") is False:
+        print(f"{label}: unavailable ({p.get('"'"'reason'"'"') or p.get('"'"'cause'"'"') or '"'"'reported unavailable'"'"'})"); continue
+    if p.get("local"):
+        print(f"{label}: local, unmetered"); continue
+    wins = p.get("windows") or []
+    if not p.get("measured") or not wins:
+        print(f"{label}: unmeasured ({p.get('"'"'summary'"'"') or p.get('"'"'reason'"'"') or '"'"'no usage data'"'"'})"); continue
+    print(f"{label}:" + (f"  (as of {p['"'"'cache_age_s'"'"']}s ago)" if p.get("cache_age_s") is not None else ""))
+    for w in wins:
+        used = w.get("used_percent")
+        if used is None:
+            continue
+        print(f"  {w.get('"'"'label'"'"') or w.get('"'"'kind'"'"')}: {used:g}% used, resets {when(w.get('"'"'resets_at'"'"'))}")
+'
+}
+
 # The lane's OWN conversation id, from its meta. Empty when it has never had
 # one, which is exactly the case `--continue` gets wrong in a shared directory.
 _lane_conversation_id() {
@@ -6097,6 +6233,8 @@ verb parity. New verbs land in amux-rs (crates/amux-cli).${RESET}
 ${BOLD}Worker management:${RESET}
   amux register <name> [flags]   Register a worker with Claude Code flags
   amux worktree <name> [show|profiles|widen <p>...|profile <p>]   Sparse worktree profile, size, widen
+  amux model <name> [<model>] [--effort E]   Show or switch a worker's model (see amux model --help)
+  amux usage [--json]            Provider budget windows: Claude 5-hour/weekly, Codex
   amux start <name> [--detach]   Start a registered worker in tmux (-d = don't attach)
                                 (--dry-run: print the command without spawning)
   amux exec <name> [flags]       Register + start in one step
@@ -9299,6 +9437,8 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
   case "${1:-}" in
     register|reg)     shift; cmd_register "$@" ;;
     worktree|wt)      shift; cmd_worktree "$@" ;;
+    model)            shift; cmd_model "$@" ;;
+    usage)            shift; cmd_usage "$@" ;;
     start)            shift; cmd_start "$@" ;;
     exec|run)         shift; cmd_exec "$@" ;;
     attach|a)         shift; cmd_attach "$@" ;;
