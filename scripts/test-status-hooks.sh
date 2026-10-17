@@ -562,4 +562,39 @@ else
   echo "skip hook native re-exec: this run is not a translated shell on arm64 hardware, so there is no Rosetta tax to remove"
 fi
 
+# Codex: its own events in ~/.codex/hooks.json (ai-config #131). No Notification (Codex has none;
+# `blocked` comes from the passive observer's PermissionRequest), the read router on Bash only (no
+# Read tool), no ask guard (owner-ask goal detection reads Claude transcripts), unrelated hooks kept.
+CODEX_HOOKS="$TMP/codex-hooks.json"
+printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Edit|Write","hooks":[{"type":"command","command":"~/.codex/scripts/worktree-guard.sh"}]}],
+  "Stop":[{"hooks":[{"type":"command","command":"python3 /x/.amux/native-status.py codex"}]}]}}' > "$CODEX_HOOKS"
+for _ in 1 2; do
+  /usr/bin/python3 scripts/hooks/install-claude-status-hooks.py --provider codex \
+    --settings "$CODEX_HOOKS" --hook-path '$HOME/.amux/hook-report.sh' >/dev/null
+done
+/usr/bin/python3 - "$CODEX_HOOKS" <<'PY'
+import json, sys
+hooks=json.load(open(sys.argv[1]))["hooks"]
+rows=[(e, g.get("matcher"), h.get("command","")) for e, gs in hooks.items() for g in gs for h in g.get("hooks",[])]
+reports={(e, c.split()[-2]) for e, _, c in rows if "hook-report.sh" in c}
+want={("SessionStart","subagent-reset"),("UserPromptSubmit","active"),("PostToolUse","active"),("Stop","idle"),
+      ("SubagentStart","subagent-start"),("SubagentStop","subagent-stop")}
+assert reports == want, reports
+assert sum("hook-report.sh" in c for _, _, c in rows) == 6, "a second install must not duplicate reports"
+assert "Notification" not in hooks
+guards=[(e, m) for e, m, c in rows if "large-read-guard.py" in c]
+assert guards == [("PreToolUse", "Bash")], guards
+assert not any("ask-guard.py" in c for _, _, c in rows)
+assert ("PreToolUse", "Edit|Write", "~/.codex/scripts/worktree-guard.sh") in rows
+assert ("Stop", None, "python3 /x/.amux/native-status.py codex") in rows
+print("ok   codex: six native report events, Bash read router, no Notification or ask guard, unrelated hooks kept, idempotent")
+PY
+if /usr/bin/python3 scripts/hooks/install-claude-status-hooks.py --provider codex --settings "$TMP/codex-ask.json" \
+  --hook-path '$HOME/.amux/hook-report.sh' --ask-guard-path '$HOME/.amux/hooks/ask-guard.py' 2>"$TMP/codex-ask.err"; then
+  echo "FAIL codex accepted an ask guard it cannot honour" >&2; exit 1
+fi
+grep -q "Claude transcripts only" "$TMP/codex-ask.err"
+[ ! -e "$TMP/codex-ask.json" ] || { echo "FAIL a refused codex install still wrote hooks.json" >&2; exit 1; }
+echo "ok   codex: the ask guard is refused with its reason and nothing is written"
+
 echo "ok   all shipped status-hook durability regressions passed"
