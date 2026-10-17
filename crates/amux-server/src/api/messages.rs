@@ -1365,6 +1365,71 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "the owner configures groups: {v}");
     }
 
+    #[tokio::test]
+    async fn env_apply_new_worker_prompt_respects_groups_before_writing() {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("review-lead.env"), "CC_TAGS=leads,alpha\n").unwrap();
+        for (name, groups, expected) in [
+            ("review-new", json!([]), StatusCode::FORBIDDEN),
+            ("review-team", json!(["alpha"]), StatusCode::OK),
+        ] {
+            let response = app.clone().oneshot(Request::builder().method("POST")
+                .uri("/api/env/apply")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Amux-Session", "review-lead")
+                .body(Body::from(json!({"workers": [{"name": name, "groups": groups,
+                    "prompt": "kickoff task"}]}).to_string())).unwrap()).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status, expected, "{body}");
+            if expected == StatusCode::FORBIDDEN {
+                assert_eq!(body["code"], "env_apply_prompt_outside_group");
+                assert!(!sessions.join(format!("{name}.env")).exists());
+            } else {
+                assert!(body["errors"].as_array().unwrap().is_empty(), "{body}");
+                let conn = store.read().unwrap();
+                let (sender, text): (String, String) = conn.query_row(
+                    "SELECT sender, text FROM steering_queue WHERE session=?1",
+                    [name], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+                assert_eq!(sender, "review-lead");
+                assert!(text.contains("kickoff task"), "{text}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn env_apply_reports_enqueue_time_prompt_refusal() {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(dir.path().join("env")).unwrap();
+        std::fs::write(sessions.join("review-lead.env"), "CC_TAGS=leads,alpha\n").unwrap();
+        std::fs::write(dir.path().join("env/alpha.env"), "CC_RECEIVE_DENY=leads\n").unwrap();
+        let response = app.oneshot(Request::builder().method("POST").uri("/api/env/apply")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("X-Amux-Session", "review-lead")
+            .body(Body::from(json!({"workers": [{"name": "review-denied",
+                "groups": ["alpha"], "prompt": "kickoff task"}]}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let errors = body["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{body}");
+        assert_eq!(errors[0]["kind"], "prompt");
+        assert_eq!(errors[0]["name"], "review-denied");
+        assert_eq!(errors[0]["code"], "peer_receive_denied");
+        assert!(errors[0]["error"].as_str().unwrap().contains("worker exists without it"));
+        assert!(sessions.join("review-denied.env").exists());
+        let queued: i64 = store.read().unwrap().query_row(
+            "SELECT count(*) FROM steering_queue WHERE session='review-denied'", [], |r| r.get(0)).unwrap();
+        assert_eq!(queued, 0);
+    }
+
     fn queries_name(store: &crate::db::SharedStore, id: &str) -> String {
         queries::get_worker(&store.read().unwrap(), id).unwrap().unwrap().display_name
     }

@@ -213,6 +213,23 @@ fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Optio
             &crate::api::session_verbs::CreateRequest { name: None, tags: &w.groups, owner_only: None },
         ) {
             return Some(r);
+        } else if !origin.is_empty() && !w.prompt.trim().is_empty()
+            && !crate::api::session_verbs::chat_speaks_for_owner(&origin)
+            && !crate::api::session_verbs::owner_mention_grant_allows(&origin, &name)
+        {
+            // Check the groups the env serializer will store before creating
+            // anything. Receive-policy changes are still checked at enqueue.
+            let groups = w.groups.iter()
+                .map(|g| crate::api::session_verbs::norm_label(g))
+                .flat_map(|g| g.split(',').map(|t| t.trim().trim_matches('"').to_string()).collect::<Vec<_>>())
+                .filter(|g| !g.is_empty()).collect();
+            let open = super::worker_messaging::open_inbound_groups(&crate::config::amux_home(), &groups);
+            if let Some(r) = super::worker_messaging::worker_group_refusal(
+                &origin, &name, &crate::api::session_verbs::lane_groups(&origin), &groups, &open,
+            ) {
+                return refuse("env_apply_prompt_outside_group", format!(
+                    "kickoff for '{name}' refused at the group boundary; nothing was applied: {}", r.reason));
+            }
         }
     }
     None
@@ -634,9 +651,16 @@ async fn apply(
     // when the worker starts. Only newly-created workers are here (see the loop).
     for (name, prompt) in &worker_prompts {
         let text = crate::api::session_verbs::origin_stamped(&origin, name, prompt).unwrap_or_else(|| prompt.clone());
-        let _ =
+        if let Err(code) =
             crate::api::session_verbs::steer_enqueue(&state, name, &text, "env-apply-prompt", &origin)
-                .await;
+                .await
+        {
+            tracing::warn!(worker = %name, sender = %origin, %code,
+                verdict = "env_apply_prompt_refused", measured = true, n_considered = 1,
+                "env apply kickoff refused; worker exists without its kickoff");
+            errors.push(json!({"kind": "prompt", "name": name, "code": code,
+                "error": "kickoff refused at the group boundary or enqueue gate; the worker exists without it"}));
+        }
     }
 
     // ---- files: write each seed doc to its absolute path -------------------
