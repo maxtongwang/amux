@@ -24059,6 +24059,13 @@ pub fn reconcile_orphaned_steering_claims(conn: &rusqlite::Connection) -> rusqli
 /// "not delivered". They are NOT re-sent: a message days old arriving unasked
 /// would surprise the worker more than the owner re-sending it would.
 fn settle_interrupted_receipts(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
+    settle_interrupted_receipts_with(conn, orphan_landing)
+}
+
+fn settle_interrupted_receipts_with(
+    conn: &rusqlite::Connection,
+    landing: impl Fn(&str, &str, f64) -> OrphanLanding,
+) -> rusqlite::Result<usize> {
     let since = now_f64() - 7.0 * 86400.0;
     let rows: Vec<(String, String, String, f64)> = conn
         .prepare(
@@ -24071,7 +24078,7 @@ fn settle_interrupted_receipts(conn: &rusqlite::Connection) -> rusqlite::Result<
         .collect();
     let mut settled = 0;
     for (id, session, text, queued_at) in rows {
-        match orphan_landing(&session, &text, queued_at) {
+        match landing(&session, &text, queued_at) {
             OrphanLanding::Landed => {
                 conn.execute(
                     "UPDATE steering_history SET outcome=?2 WHERE id=?1",
@@ -24079,9 +24086,9 @@ fn settle_interrupted_receipts(conn: &rusqlite::Connection) -> rusqlite::Result<
                 )?;
                 conn.execute(
                     "UPDATE cmd_history SET delivery='queued', submit_verdict='confirmed', \
-                     delivered_at=CAST((SELECT delivered_at FROM steering_history WHERE id=?1) * 1000 AS INTEGER) \
-                     WHERE queue_id=?1",
-                    [&id],
+                     delivered_at=CAST((SELECT delivered_at FROM steering_history WHERE id=?1) * 1000 AS INTEGER), \
+                     reconciled_at=?2 WHERE queue_id=?1",
+                    rusqlite::params![id, now_i64() * 1000],
                 )?;
                 tracing::info!(steer_id = %id, session = %session, verdict = "interrupted_receipt_confirmed",
                     measured = true, n_considered = 1, "an interrupted delivery was found in the transcript; receipt settled as delivered");
@@ -43841,6 +43848,53 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         row("queued-e", "an unlinked queued message", "queued", None, None).await;
         assert_eq!(drain("Q-MISSING", "an unlinked queued message").await, 1);
         assert_eq!(receipt("queued-e").await["queued"], true, "a text-fallback stamp is not a receipt");
+    }
+
+    /// PR #9 N17: transcript text/time evidence may confirm the Messages
+    /// view, but cannot confirm the receipt for this message ID.
+    #[tokio::test]
+    async fn interrupted_text_reconciliation_never_settles_a_receipt() {
+        let (state, _dir) = state();
+        let name = "receipt-interrupted-fixture";
+        let msg_id = "interrupted-message-id";
+        let before_ms = now_i64() * 1000;
+        state.store.write_async(move |conn| {
+            ensure_fleet_tables(conn)?;
+            conn.execute(
+                "INSERT INTO steering_history(id, session, text, queued_at, delivered_at, outcome) \
+                 VALUES ('Q-INTERRUPTED', ?1, 'same text is not identity', ?2, ?2, 'interrupted: restart')",
+                rusqlite::params![name, now_f64()],
+            )?;
+            conn.execute(
+                "INSERT INTO cmd_history(text, type, session, ts, delivery, queue_id, msg_id) \
+                 VALUES ('same text is not identity', 'user', ?1, ?2, 'uncertain', 'Q-INTERRUPTED', ?3)",
+                rusqlite::params![name, before_ms, msg_id],
+            )?;
+            assert_eq!(settle_interrupted_receipts_with(conn, |session, text, queued_at| {
+                assert_eq!(session, name);
+                assert_eq!(text, "same text is not identity");
+                assert!(queued_at >= before_ms as f64 / 1000.0);
+                OrphanLanding::Landed
+            })?, 1);
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        let shown: (String, String, Option<i64>) = state.store.read().unwrap().query_row(
+            "SELECT delivery, submit_verdict, delivered_at FROM cmd_history WHERE msg_id=?1",
+            [msg_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!((shown.0.as_str(), shown.1.as_str()), ("queued", "confirmed"));
+        assert!(shown.2.is_some_and(|at| at >= before_ms), "Messages still shows delivered: {shown:?}");
+        let response = send_receipt_resolving(&state, name, msg_id, "same text is not identity").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap(),
+        ).unwrap();
+        assert_eq!(value["accepted"], false, "text/time evidence never accepts this message ID: {value}");
+        assert_eq!(value["queued"], true, "the inferred delivery still waits for an ID-based receipt: {value}");
+        let reconciled_at: i64 = state.store.read().unwrap().query_row(
+            "SELECT reconciled_at FROM cmd_history WHERE msg_id=?1", [msg_id], |r| r.get(0),
+        ).unwrap();
+        assert!((before_ms..=now_i64() * 1000).contains(&reconciled_at), "reconciled_at is current milliseconds");
     }
 
     /// AMUX-4589. The client leaves while the send is parked on the lane lock,
