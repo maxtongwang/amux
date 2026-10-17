@@ -1,7 +1,10 @@
 //! Structured grants (maxtongwang/ai-config#160): mrpopo's widening change is
 //! stored as a pending grant and applied exactly once, only on Max's approval.
-//! Approval is a typed `amux grant <code>` in a qualifying row, or the owner's
-//! Approve over a Remote-verified connection.
+//! Approval is ONLY an owner send attributed Remote containing
+//! `amux grant <code>`, or the owner's Approve over a Remote-verified
+//! connection. In-process requests carry no Remote verdict, so the approving
+//! paths are proven in the lib tests (api/delegation_grants.rs, with #7's
+//! resolver); this suite proves every non-Remote path does NOT approve.
 //!
 //! Run under `amux-isolated`; the harness (delegation_support) isolates HOME,
 //! AMUX_HOME, CC_HOME and tmux.
@@ -49,45 +52,29 @@ async fn a_grant_is_created_logged_and_posted_but_not_applied() {
     assert!(seen, "the leads feed names the grant: {:?}", e.queued_for(DEV_LEAD));
 }
 
+/// Pane rows never approve, in another lane or the actor's own: any lane's
+/// process can mint one through its own /report.
 #[tokio::test]
-async fn a_typed_code_in_another_lane_applies_exactly_once() {
+async fn a_typed_pane_row_never_approves() {
     let e = setup().await;
     let code = ask_yolo(&e).await;
-    let (st, v) = e.type_in_pane(MAX_PANE, &format!("go ahead: amux grant {code}")).await;
-    assert_allowed(st, &v, "Max types the code in his own pane");
-    assert_eq!(e.grant_status(&code), "applied");
-    assert!(yolo_on(&e), "the stored change applied: {}", e.env_text(DEV_A));
-    let after_first = e.snapshot();
-    // Replay: typing it again (or approving it) does nothing more.
-    let (st, v) = e.type_in_pane(MAX_PANE, &format!("again amux grant {code}")).await;
-    assert_allowed(st, &v, "typing again is just a message");
-    assert_eq!(after_first, e.snapshot(), "a replay does not apply twice");
-    let applied = e.log_entries().iter().filter(|m| m["action"] == json!("grant:applied")).count();
-    assert_eq!(applied, 1, "{:?}", e.log_entries());
-}
-
-#[tokio::test]
-async fn an_own_lane_pane_row_does_not_approve() {
-    let e = setup().await;
-    let code = ask_yolo(&e).await;
-    let (st, v) = e.type_in_pane(MRPOPO, &format!("amux grant {code}")).await;
-    assert_allowed(st, &v, "the report itself is accepted");
-    assert_eq!(e.grant_status(&code), "pending", "mrpopo's own lane cannot approve its grant");
+    for lane in [MAX_PANE, DEV_LEAD, MRPOPO] {
+        let (st, v) = e.type_in_pane(lane, &format!("go ahead: amux grant {code}")).await;
+        assert_allowed(st, &v, "the report itself is accepted");
+        assert_eq!(e.grant_status(&code), "pending", "a pane row in {lane} must not approve");
+    }
     assert!(!yolo_on(&e));
+    assert!(!e.log_entries().iter().any(|m| m["action"] == json!("grant:approved")), "{:?}", e.log_entries());
 }
 
 #[tokio::test]
-async fn a_wrong_or_expired_code_does_not_apply() {
+async fn a_wrong_code_does_nothing() {
     let e = setup().await;
     let code = ask_yolo(&e).await;
     let wrong = if code == "ZZZZ" { "YYYY" } else { "ZZZZ" };
-    e.type_in_pane(MAX_PANE, &format!("amux grant {wrong}")).await;
+    let (st, v) = e.call(Who::Owner, "POST", &format!("/api/delegation/grants/{wrong}/deny"), None).await;
+    assert_eq!(st.as_u16(), 404, "{v}");
     assert_eq!(e.grant_status(&code), "pending");
-    e.expire_grant(&code);
-    e.type_in_pane(MAX_PANE, &format!("amux grant {code}")).await;
-    assert_eq!(e.grant_status(&code), "expired");
-    assert!(!yolo_on(&e), "an expired grant never applies");
-    assert!(e.log_entries().iter().any(|m| m["action"] == json!("grant:expired")), "{:?}", e.log_entries());
 }
 
 #[tokio::test]
@@ -108,7 +95,8 @@ async fn the_owner_approve_route_requires_remote_and_deny_works() {
     let (st, v) = e.call(Who::Owner, "POST", &format!("/api/delegation/grants/{code}/deny"), None).await;
     assert_allowed(st, &v, "owner denies");
     assert_eq!(e.grant_status(&code), "denied");
-    e.type_in_pane(MAX_PANE, &format!("amux grant {code}")).await;
+    let (st, _) = e.call(Who::Owner, "POST", &format!("/api/delegation/grants/{code}/approve"), None).await;
+    assert_eq!(st.as_u16(), 403, "still refused locally");
     assert_eq!(e.grant_status(&code), "denied", "a denied grant never applies");
     assert!(!yolo_on(&e));
     assert!(e.log_entries().iter().any(|m| m["action"] == json!("grant:denied")), "{:?}", e.log_entries());

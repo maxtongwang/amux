@@ -6,11 +6,13 @@
 //!    request (method, path, body) as a PENDING grant and answers 202 with
 //!    `{grant_code, sentence}`: `amux grant 7K3Q: <the exact change>`.
 //! 2. Approval applies EXACTLY the stored request, once:
-//!    - TYPED: Max types or pastes a line containing `amux grant <code>`. Every
-//!      Messages row passes through [`on_row`] when it is written; the row must
-//!      qualify as the owner's own words for the grant's actor
-//!      (`max_ref::row_qualifies`: human-typed, not an amux delivery, and in the
-//!      actor's own lane only a Remote owner send).
+//!    - SENT: Max sends a line containing `amux grant <code>` from his phone or
+//!      another host (an owner send #7 attributes Remote). Every Messages row
+//!      passes through [`on_row`] when it is written; only such a row approves
+//!      (`max_ref::row_qualifies` / `approval_source_allowed`). Pane rows (any
+//!      lane, Remote Control included) and Outside sends never approve. Max
+//!      types the code himself: pasting a leads-feed notice back into a lane
+//!      that received it is that delivery, and is refused.
 //!    - APPROVE BUTTON: `POST /api/delegation/grants/<code>/approve` by the
 //!      owner over a Remote-verified connection (#7's process verdict; the
 //!      owner token alone is readable by every same-user worker).
@@ -142,7 +144,7 @@ pub(crate) fn request(state: &AppState, actor: &str, class: &str, action: &str, 
                     "a widening change was stored as a pending grant for Max's approval");
                 return (StatusCode::ACCEPTED, Json(json!({"ok": true, "pending": true, "grant_code": code, "sentence": text,
                     "expires_at": created + GRANT_TTL_S,
-                    "how": format!("Max approves by typing `amux grant {code}` (in a lane other than {actor}'s), or with Approve in Settings > Delegated changes")}))).into_response();
+                    "how": format!("Max approves by sending `amux grant {code}` from his phone (a Remote owner send), or with Approve in Settings > Delegated changes over the tailnet")}))).into_response();
             }
             Ok(_) => continue,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": e.to_string()}))).into_response(),
@@ -303,9 +305,9 @@ pub(crate) async fn on_row(state: &AppState, row_id: i64, text: &str) {
                 "a typed line named a grant code that does not exist");
             continue;
         };
-        if let Err(r) = super::max_ref::row_qualifies(state, row_id, &g.actor) {
+        if let Err(r) = super::max_ref::row_qualifies(state, row_id) {
             tracing::warn!(row_id, grant = %code, actor = %g.actor, code = r.code(), verdict = "delegation_grant_row_not_qualifying",
-                measured = true, n_considered = 1, "a line naming a grant did not qualify as Max's own words for this actor");
+                measured = true, n_considered = 1, "a line naming a grant is not a Remote owner send; it does not approve");
             continue;
         }
         if let Err((c, why)) = apply(state, &code, &format!("owner:typed:{row_id}"), Some(row_id)).await {
@@ -324,7 +326,7 @@ fn approve_refusal(state: &AppState, headers: &HeaderMap, uri: &Uri) -> Option<R
     }
     let origin = headers.get(super::process_identity::PROCESS_ORIGIN_HEADER).and_then(|v| v.to_str().ok());
     (origin != Some("remote")).then(|| forbid("grant_approve_requires_remote",
-        "Approve applies only from the owner over a Remote-verified connection (the phone over the tailnet); the owner token alone is readable by workers. Or type `amux grant <code>` in a lane".into()))
+        "Approve applies only from the owner over a Remote-verified connection (the phone over the tailnet); the owner token alone is readable by workers".into()))
 }
 
 fn owner_refusal(state: &AppState, headers: &HeaderMap, uri: &Uri) -> Option<Response> {
@@ -443,35 +445,116 @@ mod tests {
         }).unwrap();
     }
 
-    /// The session rule on typed approvals, with the verdicts only a real
-    /// socket produces: in mrpopo's OWN lane an Outside owner send does not
-    /// approve (a worker reaches Outside with `launchctl submit`); a Remote one
-    /// does, and applies the stored change.
-    #[tokio::test]
-    async fn in_the_actors_own_lane_only_a_remote_owner_send_approves() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
-        std::fs::write(tmp.path().join("sessions/test-dev-a.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\n").unwrap();
-        std::fs::write(tmp.path().join("sessions/mrpopo.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads\"\n").unwrap();
-        let state = AppState {
-            store: std::sync::Arc::new(crate::db::Store::open(&tmp.path().join("t.db")).unwrap()),
+    fn test_state(dir: &std::path::Path) -> AppState {
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        std::fs::write(dir.join("sessions/test-dev-a.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\n").unwrap();
+        std::fs::write(dir.join("sessions/mrpopo.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads\"\n").unwrap();
+        AppState {
+            store: std::sync::Arc::new(crate::db::Store::open(&dir.join("t.db")).unwrap()),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
             reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        };
+        }
+    }
+
+    fn yolo_on(dir: &std::path::Path) -> bool {
+        let env = std::fs::read_to_string(dir.join("sessions/test-dev-a.env")).unwrap();
+        env.contains("dangerously") || env.contains("CC_AUTO_CONTINUE=\"1\"")
+    }
+
+    fn logged(dir: &std::path::Path, action: &str) -> usize {
+        std::fs::read_to_string(super::super::delegation_log::log_path(dir)).unwrap_or_default()
+            .lines().filter(|l| l.contains(&format!("\"action\":\"{action}\""))).count()
+    }
+
+    fn put_pane(state: &AppState, session: &str, text: &str) -> i64 {
+        let (session, text) = (session.to_string(), text.to_string());
+        let id = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let idw = id.clone();
+        state.store.write(move |c| {
+            crate::api::session_verbs::ensure_fleet_tables(c)?;
+            c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts) VALUES(?1,?2,'user','pane','pane',?3)",
+                rusqlite::params![session, text, (now() * 1000.0) as i64])?;
+            idw.store(c.last_insert_rowid(), std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        id.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The approval rule end to end: a pane row (another lane or mrpopo's own)
+    /// and an Outside send do not approve; a Remote owner send does, applies
+    /// the stored change once, and a replay applies nothing more.
+    #[tokio::test]
+    async fn only_a_remote_owner_send_approves_and_it_applies_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
         put_grant(&state, "7K3Q");
-        let outside = put_row(&state, "mrpopo", "amux grant 7K3Q", "outside");
-        on_row(&state, outside, "amux grant 7K3Q").await;
-        assert_eq!(load(&state, "7K3Q").unwrap().status, "pending", "own-lane Outside does not approve");
-        let remote = put_row(&state, "mrpopo", "ok, amux grant 7K3Q", "remote");
-        on_row(&state, remote, "ok, amux grant 7K3Q").await;
+        for row in [put_pane(&state, "test-desk", "amux grant 7K3Q"), put_pane(&state, "mrpopo", "amux grant 7K3Q"),
+            put_row(&state, "test-desk", "amux grant 7K3Q now", "outside"), put_row(&state, "mrpopo", "ok amux grant 7K3Q", "outside")] {
+            on_row(&state, row, "amux grant 7K3Q").await;
+            assert_eq!(load(&state, "7K3Q").unwrap().status, "pending", "row {row} must not approve");
+        }
+        assert!(!yolo_on(tmp.path()));
+        let remote = put_row(&state, "test-desk", "go ahead, amux grant 7K3Q", "remote");
+        on_row(&state, remote, "go ahead, amux grant 7K3Q").await;
         let g = load(&state, "7K3Q").unwrap();
-        assert_eq!(g.status, "applied", "own-lane Remote approves");
+        assert_eq!(g.status, "applied", "a Remote owner send approves");
         assert_eq!(g.evidence_row, Some(remote));
-        let env = std::fs::read_to_string(tmp.path().join("sessions/test-dev-a.env")).unwrap();
-        assert!(env.contains("dangerously") || env.contains("CC_AUTO_CONTINUE=\"1\""), "the stored change applied: {env}");
+        assert!(yolo_on(tmp.path()), "the stored change applied");
+        let again = put_row(&state, "mrpopo", "amux grant 7K3Q again", "remote");
+        on_row(&state, again, "amux grant 7K3Q again").await;
+        assert_eq!(load(&state, "7K3Q").unwrap().evidence_row, Some(remote), "a replay changes nothing");
+        assert!(yolo_on(tmp.path()), "still applied once, not toggled back");
+        assert_eq!(logged(tmp.path(), "grant:applied"), 1);
+        assert_eq!(logged(tmp.path(), "grant:approved"), 1);
+    }
+
+    #[tokio::test]
+    async fn an_expired_grant_never_applies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        put_grant(&state, "ABCD");
+        state.store.write(|c| {
+            c.execute("UPDATE _amux_delegation_grants SET expires_at=1 WHERE code='ABCD'", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let row = put_row(&state, "test-desk", "amux grant ABCD", "remote");
+        on_row(&state, row, "amux grant ABCD").await;
+        assert_eq!(load(&state, "ABCD").unwrap().status, "expired");
+        assert!(!yolo_on(tmp.path()));
+        assert_eq!(logged(tmp.path(), "grant:expired"), 1);
+    }
+
+    /// The Approve button through the real router: refused from a local
+    /// (Outside) owner, applied from a Remote one (#7's verdict, by resolver).
+    #[tokio::test]
+    async fn the_approve_button_applies_only_over_remote() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        put_grant(&state, "WXYZ");
+        let _r = super::super::process_identity::test_support::set_resolver(std::sync::Arc::new(
+            super::super::process_identity::test_support::ByPort(std::collections::HashMap::from([
+                (41001u16, super::super::process_identity::Origin::Outside),
+                (41002u16, super::super::process_identity::Origin::Remote),
+            ]))));
+        let app = super::super::router(state.clone());
+        let post = |port: u16| {
+            let mut req = Request::builder().method("POST").uri("/api/delegation/grants/WXYZ/approve").body(Body::empty()).unwrap();
+            req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], port))));
+            req
+        };
+        let res = app.clone().oneshot(post(41001)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "an Outside owner cannot approve");
+        assert_eq!(load(&state, "WXYZ").unwrap().status, "pending");
+        let res = app.clone().oneshot(post(41002)).await.unwrap();
+        assert!(res.status().is_success(), "a Remote owner approves: {}", res.status());
+        assert_eq!(load(&state, "WXYZ").unwrap().status, "applied");
+        assert!(yolo_on(tmp.path()));
     }
 
     #[test]

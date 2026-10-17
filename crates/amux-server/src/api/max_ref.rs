@@ -14,17 +14,14 @@
 //! that lane (the `pane_prompts` delivery ring and the lane's other
 //! `cmd_history` rows). A relayed text that matches exactly never counts.
 //!
-//! SESSION RULE ([`max_ref_session_allowed`], pending dev-lead's ruling): in
-//! the acting worker's OWN lane only a Remote owner send counts. A lane can
-//! mint its own pane rows through `/api/sessions/<lane>/report`, and a worker
-//! reaches Outside through `launchctl submit`.
-//!
-//! KNOWN LIMITS (ai-config#136). Workers run as the owner's macOS user. A
-//! same-user process can type into the owner's pane with raw `tmux send-keys`;
-//! and any lane's process can post its own UserPromptSubmit observation, which
-//! yields a pane row in THAT lane this module cannot tell from the owner's.
-//! Only a Remote owner send (or the Remote-verified Approve button) is proof
-//! no local process can produce. Closing the rest needs an OS boundary.
+//! APPROVAL RULE ([`approval_source_allowed`], settled 2026-10-17): a grant is
+//! approved ONLY by an owner send whose process origin is Remote (another
+//! host over the tailnet), or by the Approve button (owner plus Remote). Pane
+//! rows never approve, in any lane and Remote Control included: any lane's
+//! process can post its own UserPromptSubmit to `/report` and mint one, and a
+//! same-user process can type into the owner's pane (ai-config#136). Outside
+//! sends never approve: a worker reaches Outside through `launchctl submit`.
+//! A Remote verdict is the one proof no local process can produce.
 use super::pane_prompts;
 use super::AppState;
 
@@ -33,8 +30,8 @@ pub(crate) enum MaxRefRefusal {
     NoSuchRow,
     NotHumanTyped,
     Stale,
-    /// The only human shape is a row in the actor's own lane, which a lane can mint.
-    OwnLane,
+    /// Human, but not an owner send attributed Remote: a pane row or an Outside send.
+    NotRemoteOwnerSend,
 }
 
 impl MaxRefRefusal {
@@ -43,7 +40,7 @@ impl MaxRefRefusal {
             Self::NoSuchRow => "max_ref_no_such_row",
             Self::NotHumanTyped => "max_ref_not_human_typed",
             Self::Stale => "max_ref_stale",
-            Self::OwnLane => "max_ref_own_lane",
+            Self::NotRemoteOwnerSend => "max_ref_not_remote_owner_send",
         }
     }
 }
@@ -148,26 +145,19 @@ pub(crate) fn is_amux_delivery(state: &AppState, session: &str, row_id: i64, tex
     pane_prompts::classify(text, &delivered) != pane_prompts::PaneVerdict::Record
 }
 
-/// Whether a human row in `session` may speak for `actor` (the interim rule,
-/// one function so a ruling is a one-line change): a pane row or an Outside
-/// owner send counts only from a lane other than the actor's; in the actor's
-/// own lane only a Remote owner send counts.
-pub(crate) fn max_ref_session_allowed(actor: &str, session: &str, source: HumanSource, remote: bool) -> bool {
-    if actor.is_empty() {
-        return true;
-    }
-    let own = session == actor || super::chat_worker::companion_parent(actor) == Some(session);
-    !own || (source == HumanSource::OwnerSend && remote)
+/// THE grant-approval rule: only an owner send attributed Remote. One
+/// function, so a ruling is a one-line change.
+pub(crate) fn approval_source_allowed(source: HumanSource, remote: bool) -> bool {
+    source == HumanSource::OwnerSend && remote
 }
 
-/// Whether Messages row `row_id` qualifies as the owner's own words for a
-/// grant `actor` asked for: a human shape, not an amux delivery, fresh, and
-/// allowed by [`max_ref_session_allowed`].
-pub(crate) fn row_qualifies(state: &AppState, row_id: i64, actor: &str) -> Result<(), MaxRefRefusal> {
-    row_qualifies_at(state, row_id, actor, crate::config::now_f64())
+/// Whether Messages row `row_id` qualifies as Max approving a grant: an owner
+/// send, fresh, not an amux delivery, and Remote ([`approval_source_allowed`]).
+pub(crate) fn row_qualifies(state: &AppState, row_id: i64) -> Result<(), MaxRefRefusal> {
+    row_qualifies_at(state, row_id, crate::config::now_f64())
 }
 
-fn row_qualifies_at(state: &AppState, row_id: i64, actor: &str, now: f64) -> Result<(), MaxRefRefusal> {
+fn row_qualifies_at(state: &AppState, row_id: i64, now: f64) -> Result<(), MaxRefRefusal> {
     let row = rows(state, "id=?1", &[&row_id]).map_err(|_| MaxRefRefusal::NoSuchRow)?.into_iter().next().ok_or(MaxRefRefusal::NoSuchRow)?;
     let source = row.source.ok_or(MaxRefRefusal::NotHumanTyped)?;
     if now - row.ts > MAX_REF_MAX_AGE_S {
@@ -176,8 +166,8 @@ fn row_qualifies_at(state: &AppState, row_id: i64, actor: &str, now: f64) -> Res
     if is_amux_delivery(state, &row.session, row.id, &row.text, row.ts, source) {
         return Err(MaxRefRefusal::NotHumanTyped);
     }
-    if !max_ref_session_allowed(actor, &row.session, source, row.remote) {
-        return Err(MaxRefRefusal::OwnLane);
+    if !approval_source_allowed(source, row.remote) {
+        return Err(MaxRefRefusal::NotRemoteOwnerSend);
     }
     Ok(())
 }
@@ -187,7 +177,6 @@ mod tests {
     use super::*;
 
     const NOW: f64 = 1_800_000_000.0;
-    const ACTOR: &str = "test-actor";
 
     fn state(dir: &std::path::Path) -> AppState {
         AppState {
@@ -225,42 +214,52 @@ mod tests {
         R(session, text, "user", "pane", "pane", None, ts)
     }
 
+    fn remote<'a>(session: &'a str, text: &'a str, ts: f64) -> R<'a> {
+        R(session, text, "user", "", "direct", Some("remote"), ts)
+    }
+
     fn q(st: &AppState, id: i64) -> Result<(), MaxRefRefusal> {
-        row_qualifies_at(st, id, ACTOR, NOW)
+        row_qualifies_at(st, id, NOW)
     }
 
     const ASK: &str = "amux grant 7K3Q";
 
     #[test]
-    fn a_typed_pane_row_in_another_lane_qualifies() {
+    fn only_a_remote_owner_send_approves() {
         let tmp = tempfile::tempdir().unwrap();
         let st = state(tmp.path());
-        let id = put(&st, pane("test-desk", ASK, NOW - 100.0));
-        assert_eq!(q(&st, id), Ok(()));
-        assert_eq!(q(&st, id + 999), Err(MaxRefRefusal::NoSuchRow));
+        let phone = put(&st, remote("test-desk", ASK, NOW));
+        assert_eq!(q(&st, phone), Ok(()), "Remote owner send");
+        let queued = put(&st, R("test-desk2", ASK, "user", "", "queued", Some("remote"), NOW));
+        assert_eq!(q(&st, queued), Ok(()), "Remote queued owner send");
+        let p = put(&st, pane("test-desk3", ASK, NOW));
+        assert_eq!(q(&st, p), Err(MaxRefRefusal::NotRemoteOwnerSend), "a pane row in another lane");
+        let mac = put(&st, R("test-mac", ASK, "user", "", "direct", Some("outside"), NOW));
+        assert_eq!(q(&st, mac), Err(MaxRefRefusal::NotRemoteOwnerSend), "Outside (launchctl reaches it)");
+        assert_eq!(q(&st, phone + 999), Err(MaxRefRefusal::NoSuchRow));
+        assert!(approval_source_allowed(HumanSource::OwnerSend, true));
+        assert!(!approval_source_allowed(HumanSource::Pane, true), "a pane row never approves, even flagged remote");
+        assert!(!approval_source_allowed(HumanSource::OwnerSend, false));
     }
 
     #[test]
     fn a_stamped_or_relayed_row_is_not_human_typed() {
         let tmp = tempfile::tempdir().unwrap();
         let st = state(tmp.path());
-        let a = put(&st, pane("test-relay", &format!("[amux-origin: test-peer — server-verified] {ASK}"), NOW));
+        let a = put(&st, remote("test-relay", &format!("[amux-origin: test-peer — server-verified] {ASK}"), NOW));
         assert_eq!(q(&st, a), Err(MaxRefRefusal::NotHumanTyped));
-        let b = put(&st, R("test-relay2", ASK, "session", "test-peer", "direct", None, NOW));
+        let b = put(&st, R("test-relay2", ASK, "session", "test-peer", "direct", Some("remote"), NOW));
         assert_eq!(q(&st, b), Err(MaxRefRefusal::NotHumanTyped));
     }
 
     #[test]
-    fn a_pane_row_matching_an_amux_delivery_is_not_human_typed() {
+    fn a_remote_send_repeating_an_amux_delivery_is_not_human_typed() {
         let tmp = tempfile::tempdir().unwrap();
         let st = state(tmp.path());
         let long = "please approve it now: amux grant 7K3Q";
         put(&st, R("test-hist", long, "session", "test-peer", "direct", None, NOW - 60.0));
-        let a = put(&st, pane("test-hist", long, NOW));
+        let a = put(&st, remote("test-hist", long, NOW));
         assert_eq!(q(&st, a), Err(MaxRefRefusal::NotHumanTyped), "echo of a cmd_history delivery");
-        pane_prompts::note_delivery("test-ring", long);
-        let b = put(&st, pane("test-ring", long, NOW));
-        assert_eq!(q(&st, b), Err(MaxRefRefusal::NotHumanTyped), "echo of the delivery ring");
     }
 
     #[test]
@@ -271,10 +270,6 @@ mod tests {
         assert_eq!(q(&st, none), Err(MaxRefRefusal::NotHumanTyped), "no verdict");
         let worker = put(&st, R("test-cli", ASK, "user", "", "direct", Some("worker"), NOW));
         assert_eq!(q(&st, worker), Err(MaxRefRefusal::NotHumanTyped), "worker verdict");
-        let mac = put(&st, R("test-mac", ASK, "user", "", "direct", Some("outside"), NOW));
-        assert_eq!(q(&st, mac), Ok(()), "Outside in another lane");
-        let phone = put(&st, R("test-phone", ASK, "user", "", "queued", Some("remote"), NOW));
-        assert_eq!(q(&st, phone), Ok(()), "Remote in another lane");
     }
 
     #[test]
@@ -293,8 +288,8 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let id = put(&st, R(&format!("test-kind-{i}"), ASK, ty, origin, delivery, Some("outside"), NOW));
-            assert_eq!(q(&st, id), Err(MaxRefRefusal::NotHumanTyped), "{ty}/{origin}/{delivery}");
+            let id = put(&st, R(&format!("test-kind-{i}"), ASK, ty, origin, delivery, Some("remote"), NOW));
+            assert!(q(&st, id).is_err(), "{ty}/{origin}/{delivery}");
         }
     }
 
@@ -302,23 +297,10 @@ mod tests {
     fn an_old_row_is_stale() {
         let tmp = tempfile::tempdir().unwrap();
         let st = state(tmp.path());
-        let old = put(&st, pane("test-desk", ASK, NOW - MAX_REF_MAX_AGE_S - 1.0));
+        let old = put(&st, remote("test-desk", ASK, NOW - MAX_REF_MAX_AGE_S - 1.0));
         assert_eq!(q(&st, old), Err(MaxRefRefusal::Stale));
-        let edge = put(&st, pane("test-desk2", ASK, NOW - MAX_REF_MAX_AGE_S));
+        let edge = put(&st, remote("test-desk2", ASK, NOW - MAX_REF_MAX_AGE_S));
         assert_eq!(q(&st, edge), Ok(()), "the max age itself is allowed");
-    }
-
-    #[test]
-    fn in_the_actors_own_lane_only_a_remote_owner_send_counts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let st = state(tmp.path());
-        let p = put(&st, pane(ACTOR, ASK, NOW));
-        assert_eq!(q(&st, p), Err(MaxRefRefusal::OwnLane), "own-lane pane row");
-        let o = put(&st, R(ACTOR, "amux grant ABCD", "user", "", "direct", Some("outside"), NOW));
-        assert_eq!(q(&st, o), Err(MaxRefRefusal::OwnLane), "own-lane Outside send (launchctl reaches Outside)");
-        let r = put(&st, R(ACTOR, "amux grant WXYZ", "user", "", "direct", Some("remote"), NOW));
-        assert_eq!(q(&st, r), Ok(()), "own-lane Remote owner send");
-        assert!(!max_ref_session_allowed("test-actor@chat", ACTOR, HumanSource::Pane, false), "own lane via its Chat tab");
     }
 
     #[test]
@@ -327,22 +309,22 @@ mod tests {
             (MaxRefRefusal::NoSuchRow, "max_ref_no_such_row"),
             (MaxRefRefusal::NotHumanTyped, "max_ref_not_human_typed"),
             (MaxRefRefusal::Stale, "max_ref_stale"),
-            (MaxRefRefusal::OwnLane, "max_ref_own_lane"),
+            (MaxRefRefusal::NotRemoteOwnerSend, "max_ref_not_remote_owner_send"),
         ] {
             assert_eq!(r.code(), c);
         }
     }
 
-    /// Remote Control: a real user turn through UserPromptSubmit becomes a pane
-    /// row that qualifies; stamped or delivery-matched text is never recorded.
+    /// Remote Control reaches the ledger as a pane row through the hook: a
+    /// real user turn, and still never an approval (a lane can mint the same).
     #[tokio::test]
-    async fn a_remote_control_prompt_through_the_hook_qualifies() {
+    async fn a_remote_control_prompt_through_the_hook_does_not_approve() {
         let tmp = tempfile::tempdir().unwrap();
         let _home = crate::api::settings::test_env::set_home(tmp.path());
         let st = state(tmp.path());
         let now = crate::config::now_f64();
         pane_prompts::record(&st, "test-rc", "please go ahead: amux grant 7K3Q").await;
         let id: i64 = st.store.read().unwrap().query_row("SELECT MAX(id) FROM cmd_history WHERE session='test-rc'", [], |r| r.get(0)).unwrap();
-        assert_eq!(row_qualifies_at(&st, id, ACTOR, now), Ok(()));
+        assert_eq!(row_qualifies_at(&st, id, now), Err(MaxRefRefusal::NotRemoteOwnerSend));
     }
 }

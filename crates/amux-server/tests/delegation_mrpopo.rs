@@ -2,9 +2,11 @@
 //!
 //! Every non-secret change that was owner-only is mrpopo's to ASK for: the
 //! server stores it as a pending grant (202 with a code and the exact
-//! sentence) and applies it only when Max approves, exactly once. Each
-//! delegable class is driven: request -> pending and unapplied -> Max types
-//! `amux grant <code>` in another lane -> applied.
+//! sentence) and applies it only when Max approves, exactly once, from a
+//! Remote owner send or the Remote Approve button (proven in the lib tests:
+//! in-process requests carry no Remote verdict). Each delegable class is
+//! driven here: request -> pending and unapplied -> a typed pane row does not
+//! approve it.
 //!
 //! Hands-only changes never even become a grant: secret values,
 //! AMUX_CONTRACT_*, AMUX_PANE_PROMPT_HISTORY, the reserved names, mrpopo's own
@@ -131,7 +133,7 @@ fn classes() -> Vec<Class> {
 
 /// Each class in its own fresh home.
 #[tokio::test]
-async fn each_delegable_class_is_a_pending_grant_until_max_approves() {
+async fn each_delegable_class_is_a_pending_grant_that_a_pane_row_cannot_approve() {
     let mut failures = Vec::new();
     for i in 0..classes().len() {
         let c = classes().remove(i);
@@ -149,12 +151,9 @@ async fn each_delegable_class_is_a_pending_grant_until_max_approves() {
         if e.grant_status(&code) != "pending" {
             failures.push(format!("{}: grant {code} is {}, not pending", c.name, e.grant_status(&code)));
         }
-        let (st, v) = e.type_in_pane(MAX_PANE, &format!("ok amux grant {code}")).await;
-        if !st.is_success() {
-            failures.push(format!("{}: typing the code failed: {st} {v}", c.name));
-        }
-        if e.grant_status(&code) != "applied" {
-            failures.push(format!("{}: after Max typed the code the grant is {}", c.name, e.grant_status(&code)));
+        e.type_in_pane(MAX_PANE, &format!("ok amux grant {code}")).await;
+        if e.grant_status(&code) != "pending" || e.snapshot() != before {
+            failures.push(format!("{}: a pane row approved or applied grant {code} ({})", c.name, e.grant_status(&code)));
         }
     }
     assert!(failures.is_empty(), "{} failing classes:\n{}", failures.len(), failures.join("\n"));
@@ -221,9 +220,7 @@ async fn mrpopo_at_the_group_and_global_layers() {
         let e = setup().await;
         let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(scope_body(level, name, "env", json!({"AMUX_EMAIL_EXTERNAL_ALLOW": "1"})))).await;
         let code = assert_grant_pending(st, &v, &format!("{level}-layer external email"));
-        let (st, v) = e.type_in_pane(MAX_PANE, &format!("amux grant {code}")).await;
-        assert_allowed(st, &v, "Max types the code");
-        assert_eq!(e.grant_status(&code), "applied", "{level}");
+        assert_eq!(e.grant_status(&code), "pending", "{level}");
 
         let before = e.snapshot();
         let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(scope_body(level, name, "env", json!({"CC_SOMETHING_OWNER_ONLY": "1"})))).await;

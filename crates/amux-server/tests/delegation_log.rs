@@ -45,16 +45,8 @@ async fn each_allowed_delegated_change_appends_exactly_one_entry() {
     assert_eq!(entries[2]["action"], json!("grant:requested"), "{}", entries[2]);
     assert_eq!(entries[2]["grant"], json!(code), "{}", entries[2]);
     assert_eq!(entries[2]["why"], json!("Max asked for a second lead"), "{}", entries[2]);
-    let (st, v) = e.type_in_pane(MAX_PANE, &format!("amux grant {code}")).await;
-    assert_allowed(st, &v, "Max types the code");
-    assert_eq!(e.grant_status(&code), "applied");
-    let entries = e.log_entries();
-    let actions: Vec<&str> = entries.iter().filter_map(|m| m["action"].as_str()).collect();
-    assert_eq!(&actions[3..], ["grant:approved", "set_tags", "grant:applied"], "{entries:?}");
-    let m = &entries[4];
-    assert_entry_shape(m, MRPOPO, "mrpopo", DEV_B);
-    assert_eq!(m["grant"], json!(code), "{m}");
-    assert!(m["evidence_row"].as_i64().is_some(), "the typed row is the evidence: {m}");
+    assert_entry_shape(&entries[2], MRPOPO, "mrpopo", DEV_B);
+    // The approved/applied entries are proven in the lib tests (Remote only).
 }
 
 #[tokio::test]
