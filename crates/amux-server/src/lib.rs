@@ -660,6 +660,7 @@ async fn async_main() {
     drop(runtime_jobs::heartbeat::spawn(store.clone()));
     drop(runtime_jobs::storage::spawn(state.clone()));
     drop(runtime_jobs::disk_watch::spawn(state.clone()));
+    drop(runtime_jobs::tmux_watch::spawn(state.clone()));
     drop(runtime_jobs::host_metrics::spawn(state.clone()));
     drop(runtime_jobs::trace_archive::spawn(state.clone()));
     drop(runtime_jobs::host_guard::spawn());
