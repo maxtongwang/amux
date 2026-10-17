@@ -324,6 +324,17 @@ install_hook_from_head() {
 
 # Installing these tracked bytes must not alter owner/provider hook settings.
 mkdir -p "$AMUX_HOME/hooks"
+
+# Worker-pane tmux guard. The server prepends $AMUX_HOME/worker-bin to WORKER
+# PANE PATHs only (session_verbs.rs worker_tmux_guard_rc), so a lane's bare
+# `tmux kill-server` is refused instead of ending the whole fleet. The server's
+# own PATH (LAUNCHD_PATH below) must never contain this dir.
+mkdir -p "$AMUX_HOME/worker-bin"
+if install_hook_from_head "scripts/worker-bin/tmux" "$AMUX_HOME/worker-bin/tmux"; then
+  chmod 0755 "$AMUX_HOME/worker-bin/tmux"
+else
+  warn "scripts/worker-bin/tmux not found; worker panes run tmux unguarded"
+fi
 for observed_half in pre post; do
   install_hook_from_head "scripts/claude-hooks/observed-edits-${observed_half}.py" \
     "$AMUX_HOME/hooks/observed-edits-${observed_half}.py"
@@ -641,6 +652,9 @@ launchctl_reload_agent() {
 # written HERE, or it fails only when launchd starts it and works in every
 # terminal you debug from.
 LAUNCHD_PATH="$HOME/.cargo/bin:$BIN_DIR:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+case ":$LAUNCHD_PATH:" in
+  *"/worker-bin:"*) echo "install.sh: LAUNCHD_PATH contains a worker-bin dir; the server's tmux calls would hit the worker guard" >&2; exit 1 ;;
+esac
 
 # NO LimitLoadToSessionType KEY BELOW — worth saying explicitly, because its
 # absence is itself a property, not a gap. It defaults the server agent (and
