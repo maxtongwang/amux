@@ -1142,6 +1142,7 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("location_motion", "received", false),
     ("location_place_names", "fetched_at", false), // location.rs area names, epoch seconds
     ("cmd_history", "delivered_at", true),
+    ("cmd_history", "reconciled_at", true),
     ("cmd_history", "intake_called_at", false),
     ("cmd_history", "intake_retry_at", false),
     ("cmd_history", "queued_at", true),

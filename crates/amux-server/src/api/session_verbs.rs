@@ -55411,7 +55411,8 @@ mod composer_guard_tests {
         struct Pane(String);
         impl Drop for Pane {
             fn drop(&mut self) {
-                let _ = std::process::Command::new("tmux").args(["kill-session", "-t", &session_target(&self.0)]).output();
+                let st = session_target(&self.0);
+                let _ = std::process::Command::new("tmux").args(["kill-session", "-t", &st]).output();
             }
         }
         for (label, frame) in [("claude", claude("yes add both")), ("codex", codex("yes add both"))] {
