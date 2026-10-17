@@ -8174,6 +8174,9 @@ async fn link_queued_message(state: &AppState, session: &str, row_id: i64, queue
                 "UPDATE cmd_history SET queue_id=?1 WHERE id=?2 AND delivery='queued'",
                 rusqlite::params![id, row_id],
             )?;
+            if linked > 0 {
+                mark_transcript_inferred_delivery(conn, &id)?;
+            }
             Ok(crate::db::WriteOutcome {
                 applied: linked > 0,
                 events: if linked > 0 {
@@ -9614,24 +9617,10 @@ fn stranded_answer(body: Value) -> Response {
     response
 }
 
-/// The receipt read, plus a verdict for a reservation no live send owns
-/// (AMUX-4594). Before this a reservation left by a dropped request answered
-/// `accepted:false` forever, and the dashboard showed "checking automatically"
-/// for as long as the tab stayed open: 64 such rows across 26 lanes on
-/// 2026-09-14, the oldest from 09-10, one of them Ethan's 3:17 PM "continue"
-/// to mixpeek-homepage-claude, which never reached the worker.
-///
-/// No live send may own the reservation. Positive, hash-bound transcript proof
-/// can confirm immediately after restart; releasing a missing prompt still
-/// requires the gate's 120 s pending window. Delivery uses the one
-/// piece of evidence amux has, the lane's transcript:
-/// - the text is there after the reservation: record a receipt, so the sender
-///   stops waiting and nothing is resent;
-/// - the transcript covers the reservation and the text is not there: release
-///   it, so the sender can send once with the same ID;
-/// - anything else (no transcript, no text, a text too long to judge, a text
-///   that does not match what was reserved): say `delivered: "unknown"` and
-///   keep the reservation, because releasing on a guess could deliver twice.
+/// Resolve a send receipt only from its reservation or history carrying this
+/// message ID. Transcript/text/time inference may update Messages but never
+/// accepts a receipt. An unowned reservation with no ID-bound history expires
+/// after the pending window; delivery stays unknown and is never retried here.
 async fn send_receipt_resolving(
     state: &AppState,
     name: &str,
@@ -23969,7 +23958,32 @@ fn transcript_has_user_text(records: &[Value], needle: &str, since: f64) -> bool
     })
 }
 
+const TRANSCRIPT_INFERRED_OUTCOME: &str =
+    "sent: confirmed in the worker's transcript after a restart interrupted the delivery record";
+
+/// Run after history insertion/update or late linking, inside the caller's
+/// store write transaction. The 0086 triggers confirm Messages, not receipts.
+fn mark_transcript_inferred_delivery(conn: &rusqlite::Connection, queue_id: &str) -> rusqlite::Result<()> {
+    let marked = conn.execute(
+        "UPDATE cmd_history SET reconciled_at=?2 WHERE queue_id=?1 \
+         AND EXISTS(SELECT 1 FROM steering_history WHERE id=?1 AND outcome=?3)",
+        rusqlite::params![queue_id, now_i64() * 1000, TRANSCRIPT_INFERRED_OUTCOME],
+    )?;
+    if marked > 0 {
+        tracing::info!(queue_id, verdict = "transcript_delivery_inferred", measured = true,
+            n_considered = marked, "delivery shown in Messages is transcript-inferred, not a send receipt");
+    }
+    Ok(())
+}
+
 pub fn reconcile_orphaned_steering_claims(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
+    reconcile_orphaned_steering_claims_with(conn, orphan_landing)
+}
+
+fn reconcile_orphaned_steering_claims_with(
+    conn: &rusqlite::Connection,
+    landing: impl Fn(&str, &str, f64) -> OrphanLanding,
+) -> rusqlite::Result<usize> {
     let orphans: Vec<OrphanedSteeringClaim> = conn
         .prepare(
             "SELECT id, session, text, queued_at, guard, sender FROM steering_queue \
@@ -24005,7 +24019,7 @@ pub fn reconcile_orphaned_steering_claims(conn: &rusqlite::Connection) -> rusqli
         // landed; absent (and not sitting in the composer) means it never did,
         // so it goes back in the queue. Only when neither can be read does the
         // old interrupted outcome stand.
-        match orphan_landing(session, text, *queued_at) {
+        match landing(session, text, *queued_at) {
             OrphanLanding::Landed => {
                 conn.execute(
                     "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
@@ -24015,9 +24029,10 @@ pub fn reconcile_orphaned_steering_claims(conn: &rusqlite::Connection) -> rusqli
                         // Messages row as confirmed only for outcomes starting
                         // with it, so any other wording would leave the chip
                         // at "delivery unknown" for a message that landed.
-                        "sent: confirmed in the worker's transcript after a restart interrupted the delivery record",
+                        TRANSCRIPT_INFERRED_OUTCOME,
                         guard, sender],
                 )?;
+                mark_transcript_inferred_delivery(conn, id)?;
                 conn.execute("DELETE FROM steering_queue WHERE id=?1", [id])?;
                 tracing::info!(steer_id = %id, session = %session, verdict = "steering_orphan_confirmed_delivered",
                     measured = true, n_considered = 1, "restart-orphaned steering message was found in the transcript");
@@ -24048,7 +24063,7 @@ pub fn reconcile_orphaned_steering_claims(conn: &rusqlite::Connection) -> rusqli
         )?;
         conn.execute("DELETE FROM steering_queue WHERE id=?1", [id])?;
     }
-    let settled = settle_interrupted_receipts(conn)?;
+    let settled = settle_interrupted_receipts_with(conn, landing)?;
     Ok(orphans.len() + settled)
 }
 
@@ -24058,10 +24073,6 @@ pub fn reconcile_orphaned_steering_claims(conn: &rusqlite::Connection) -> rusqli
 /// transcript settles it as confirmed; missing settles it as `lost`, shown as
 /// "not delivered". They are NOT re-sent: a message days old arriving unasked
 /// would surprise the worker more than the owner re-sending it would.
-fn settle_interrupted_receipts(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
-    settle_interrupted_receipts_with(conn, orphan_landing)
-}
-
 fn settle_interrupted_receipts_with(
     conn: &rusqlite::Connection,
     landing: impl Fn(&str, &str, f64) -> OrphanLanding,
@@ -24082,16 +24093,17 @@ fn settle_interrupted_receipts_with(
             OrphanLanding::Landed => {
                 conn.execute(
                     "UPDATE steering_history SET outcome=?2 WHERE id=?1",
-                    rusqlite::params![id, "sent: confirmed in the worker's transcript after a restart interrupted the delivery record"],
+                    rusqlite::params![id, TRANSCRIPT_INFERRED_OUTCOME],
                 )?;
                 conn.execute(
                     "UPDATE cmd_history SET delivery='queued', submit_verdict='confirmed', \
-                     delivered_at=CAST((SELECT delivered_at FROM steering_history WHERE id=?1) * 1000 AS INTEGER), \
-                     reconciled_at=?2 WHERE queue_id=?1",
-                    rusqlite::params![id, now_i64() * 1000],
+                     delivered_at=CAST((SELECT delivered_at FROM steering_history WHERE id=?1) * 1000 AS INTEGER) \
+                     WHERE queue_id=?1",
+                    [&id],
                 )?;
+                mark_transcript_inferred_delivery(conn, &id)?;
                 tracing::info!(steer_id = %id, session = %session, verdict = "interrupted_receipt_confirmed",
-                    measured = true, n_considered = 1, "an interrupted delivery was found in the transcript; receipt settled as delivered");
+                    measured = true, n_considered = 1, "an interrupted delivery was found in the transcript; delivery shown in Messages is not a receipt");
             }
             OrphanLanding::Absent => {
                 conn.execute(
@@ -43895,6 +43907,131 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             "SELECT reconciled_at FROM cmd_history WHERE msg_id=?1", [msg_id], |r| r.get(0),
         ).unwrap();
         assert!((before_ms..=now_i64() * 1000).contains(&reconciled_at), "reconciled_at is current milliseconds");
+    }
+
+    // Store::open in state() applies the real migrations, including BOTH 0086
+    // triggers. These fixtures never install a replacement receipt schema.
+    async fn inferred_receipt_fixture(state: &AppState, linked: bool, reserved: bool) -> i64 {
+        let row_id = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let row_out = row_id.clone();
+        state.store.write_async(move |conn| {
+            let triggers: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' \
+                 AND name IN ('steering_receipt_after_history','steering_receipt_after_link')",
+                [], |r| r.get(0),
+            )?;
+            assert_eq!(triggers, 2, "the real receipt triggers must be installed");
+            conn.execute(
+                "INSERT INTO cmd_history(text,type,session,ts,delivery,queue_id,msg_id) \
+                 VALUES('same words are not identity','user','inferred-receipt',?1,'queued',?2,'inferred-id')",
+                rusqlite::params![now_i64() * 1000, linked.then_some("Q-INFERRED")],
+            )?;
+            row_out.store(conn.last_insert_rowid(), std::sync::atomic::Ordering::SeqCst);
+            if reserved {
+                conn.execute(
+                    "INSERT INTO send_dedup(session,msg_id,ts,receipt_id) \
+                     VALUES('inferred-receipt','inferred-id',?1,NULL)", [now_i64()],
+                )?;
+            }
+            let reservations: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM send_dedup WHERE session='inferred-receipt' \
+                 AND msg_id='inferred-id' AND receipt_id IS NULL", [], |r| r.get(0),
+            )?;
+            assert_eq!(reservations, i64::from(reserved), "exercise both missing and unreceipted reservations");
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        row_id.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn assert_inferred_messages_not_receipt(state: &AppState) {
+        let shown: (String, String, Option<i64>, Option<i64>) = state.store.read().unwrap().query_row(
+            "SELECT delivery,submit_verdict,delivered_at,reconciled_at FROM cmd_history WHERE msg_id='inferred-id'",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).unwrap();
+        assert_eq!((shown.0.as_str(), shown.1.as_str()), ("queued", "confirmed"), "Messages: {shown:?}");
+        assert!(shown.2.is_some(), "the trigger must show delivery in Messages");
+        let response = send_receipt_resolving(state, "inferred-receipt", "inferred-id", "").await;
+        let value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap(),
+        ).unwrap();
+        assert_eq!(value["accepted"], false, "a trigger's inferred confirmation is not a receipt: {value}");
+        assert_eq!(value["queued"], true, "{value}");
+        assert!(shown.3.is_some_and(|at| at > 1_000_000_000_000 && at <= now_i64() * 1000),
+            "inference timestamp is milliseconds: {shown:?}");
+        let accepted: i64 = state.store.read().unwrap().query_row(
+            "SELECT COUNT(*) FROM send_dedup WHERE session='inferred-receipt' \
+             AND msg_id='inferred-id' AND receipt_id IS NOT NULL", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(accepted, 0, "receipt resolution must not persist acceptance");
+    }
+
+    #[tokio::test]
+    async fn orphan_transcript_landing_confirms_messages_but_never_a_receipt() {
+        for reserved in [false, true] {
+            let (state, _dir) = state();
+            inferred_receipt_fixture(&state, true, reserved).await;
+            state.store.write_async(|conn| {
+                conn.execute(
+                    "INSERT INTO steering_queue(id,session,text,queued_at,delivering_since) \
+                     VALUES('Q-INFERRED','inferred-receipt','same words are not identity',?1,?1)", [now_f64()],
+                )?;
+                assert_eq!(reconcile_orphaned_steering_claims_with(conn, |session, text, _| {
+                    assert_eq!(session, "inferred-receipt");
+                    assert_eq!(text, "same words are not identity");
+                    OrphanLanding::Landed
+                })?, 1);
+                let remaining: i64 = conn.query_row("SELECT COUNT(*) FROM steering_queue WHERE id='Q-INFERRED'", [], |r| r.get(0))?;
+                assert_eq!(remaining, 0);
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            }).await.unwrap();
+            // Removing mark_transcript_inferred_delivery(conn, id)? from the
+            // orphan Landed arm makes the accepted=false assertion fail.
+            assert_inferred_messages_not_receipt(&state).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn late_link_of_transcript_history_never_accepts_a_receipt() {
+        let (state, _dir) = state();
+        let row_id = inferred_receipt_fixture(&state, false, true).await;
+        state.store.write_async(|conn| {
+            conn.execute(
+                "INSERT INTO steering_history(id,session,text,queued_at,delivered_at,outcome) \
+                 VALUES('Q-INFERRED','inferred-receipt','same words are not identity',?1,?1,?2)",
+                rusqlite::params![now_f64(), TRANSCRIPT_INFERRED_OUTCOME],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        link_queued_message(&state, "inferred-receipt", row_id, "Q-INFERRED").await;
+        // Removing mark_transcript_inferred_delivery(conn, &id)? from
+        // link_queued_message makes the accepted=false assertion fail.
+        assert_inferred_messages_not_receipt(&state).await;
+    }
+
+    #[tokio::test]
+    async fn queue_id_drain_accepts_a_receipt_after_transcript_inference() {
+        let (state, _dir) = state();
+        inferred_receipt_fixture(&state, true, true).await;
+        state.store.write_async(|conn| {
+            conn.execute(
+                "INSERT INTO steering_queue(id,session,text,queued_at,delivering_since) \
+                 VALUES('Q-INFERRED','inferred-receipt','same words are not identity',?1,?1)", [now_f64()],
+            )?;
+            assert_eq!(reconcile_orphaned_steering_claims_with(conn, |_, _, _| OrphanLanding::Landed)?, 1);
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        assert_inferred_messages_not_receipt(&state).await;
+        state.store.write_async(|conn| {
+            assert_eq!(stamp_queued_delivery(conn, "inferred-receipt", "Q-INFERRED", "different words", now_i64() * 1000)?, 1);
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        let response = send_receipt_resolving(&state, "inferred-receipt", "inferred-id", "").await;
+        let value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap(),
+        ).unwrap();
+        // Removing reconciled_at=NULL from stamp_queued_delivery's ID UPDATE
+        // makes this assertion fail, even with Messages still confirmed.
+        assert_eq!(value["accepted"], true, "the exact queue ID accepts the send: {value}");
     }
 
     /// AMUX-4589. The client leaves while the send is parked on the lane lock,
