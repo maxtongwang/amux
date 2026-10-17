@@ -156,6 +156,56 @@ struct WorkerSpec {
     prompt: String,
 }
 
+/// An env apply creates workers with groups and had no caller check, so a
+/// worker could mint group members (fix/worker-membership-create). Each worker
+/// the spec CREATES goes through the shared create rule (only leads, only
+/// inside their team); a spec naming an EXISTING worker rewrites its whole env
+/// file and is the owner's. A worker may still dry-run a plan.
+fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Option<Response> {
+    if dry {
+        return None;
+    }
+    let origin = crate::api::session_verbs::worker_origin(headers);
+    let refuse = |code: &str, error: String| -> Option<Response> {
+        tracing::warn!(worker = %origin, verdict = code, measured = true, n_considered = 1, "env apply section refused for a worker");
+        Some((StatusCode::FORBIDDEN, Json(json!({"ok": false, "code": code, "error": error}))).into_response())
+    };
+    // FILES write any absolute path, session env files included, so a worker
+    // could mint a lead or join `leads` through them (review B3): owner only.
+    if !origin.is_empty() && !spec.files.is_empty() {
+        return refuse("env_apply_files_owner_only",
+            format!("worker '{origin}' may not write files through an env apply; that is the owner's"));
+    }
+    // SCHEDULES fire commands into a worker: a worker may schedule only itself.
+    if let Some(s) = spec.schedules.iter().find(|s| !origin.is_empty() && s.worker.trim() != origin) {
+        return refuse("env_apply_schedule_other_worker",
+            format!("worker '{origin}' may schedule only itself, not '{}'", s.worker.trim()));
+    }
+    let sessions = crate::config::amux_home().join("sessions");
+    for w in &spec.workers {
+        let name = sanitize(&w.name);
+        if name.is_empty() {
+            continue;
+        }
+        if sessions.join(format!("{name}.env")).exists() {
+            // An apply REWRITES the whole env file, dropping every key the spec
+            // does not name (AMUX_CONTRACT_DONE among them, which switched off
+            // a peer's rule-10 token check: review round 3, N1). That is raw
+            // env, and the owner's, for a worker's own file as much as a peer's.
+            if !origin.is_empty() {
+                return refuse("env_apply_existing_owner_only", format!(
+                    "worker '{origin}' may not rewrite the existing worker '{name}' through an env apply; change typed settings with PATCH /api/sessions/<self>/config"));
+            }
+        } else if let Some(r) = crate::api::session_verbs::worker_create_refusal(
+            headers,
+            &crate::api::session_verbs::CreateRequest { name: None, tags: &w.groups, owner_only: None },
+        ) {
+            return Some(r);
+        }
+    }
+    None
+}
+
 // ---- GET /api/env/schema ---------------------------------------------------
 
 async fn schema() -> Response {
@@ -213,6 +263,9 @@ async fn apply(
         }
     };
 
+    if let Some(refusal) = worker_apply_refusal(&headers, &spec, dry) {
+        return refusal;
+    }
     let home = crate::config::amux_home();
     let sessions_dir = home.join("sessions");
 
@@ -238,7 +291,10 @@ async fn apply(
         let path = sessions_dir.join(format!("{name}.env"));
         let existed = path.exists();
         let action = if existed { "update" } else { "create" };
-        let content = render_worker_env(w);
+        let content = match render_worker_env(w) {
+            Ok(c) => c,
+            Err(e) => return bad(e),
+        };
         // "unchanged" if the file already holds this exact config (minus the
         // volatile `# updated:` header line) — so a re-apply reports honestly.
         let action = if existed && same_env_body(&path, &content) {
@@ -858,14 +914,17 @@ fn sanitize(raw: &str) -> String {
         .collect()
 }
 
-/// The env-file body a worker spec produces (K="V" lines, no volatile header).
-fn render_worker_env(w: &WorkerSpec) -> String {
+/// The env-file body a worker spec produces (K="V" lines, no volatile header),
+/// through the one env serializer: a value it refuses (a newline or NUL that
+/// would write extra lines, review B2) is an error naming the key.
+fn render_worker_env(w: &WorkerSpec) -> Result<String, String> {
     let mut pairs: Vec<(&str, String)> = vec![];
     if !w.dir.is_empty() {
         pairs.push(("CC_DIR", w.dir.clone()));
     }
-    if !w.groups.is_empty() {
-        pairs.push(("CC_TAGS", w.groups.join(",")));
+    let groups: Vec<String> = w.groups.iter().map(|g| crate::api::session_verbs::norm_label(g)).filter(|g| !g.is_empty()).collect();
+    if !groups.is_empty() {
+        pairs.push(("CC_TAGS", groups.join(",")));
     }
     if !w.desc.is_empty() {
         pairs.push(("CC_DESC", w.desc.clone()));
@@ -890,11 +949,11 @@ fn render_worker_env(w: &WorkerSpec) -> String {
             pairs.push(("CC_FLAGS", format!("--model {}", w.model)));
         }
     }
-    pairs
-        .iter()
-        .map(|(k, v)| format!("{k}=\"{v}\""))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::new();
+    for (k, v) in &pairs {
+        out.push_str(&crate::api::session_verbs::EnvFile::assignment(k, v).map_err(|e| format!("worker '{}': {e}", w.name))?);
+    }
+    Ok(out.trim_end_matches('\n').to_string())
 }
 
 /// True if the existing env file's body (ignoring the `# updated:` header)
@@ -986,7 +1045,7 @@ mod tests {
                 model: model.to_string(),
                 ..Default::default()
             };
-            let rendered = render_worker_env(&spec);
+            let rendered = render_worker_env(&spec).unwrap();
             let render_cc_model = env_val(&rendered, "CC_MODEL");
             let render_cc_flags = env_val(&rendered, "CC_FLAGS");
 
@@ -1013,7 +1072,7 @@ mod tests {
             provider: "ollama".into(),
             model: "qwen3.8:27b".into(),
             ..Default::default()
-        });
+        }).unwrap();
         assert_ne!(
             drift_flags,
             env_val(&ollama_render, "CC_FLAGS"),

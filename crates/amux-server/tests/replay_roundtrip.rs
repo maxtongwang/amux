@@ -59,10 +59,33 @@ async fn send(
     path: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
-    let b = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("x-amux-session", "replay-test");
+    send_as(app, Some("replay-test"), method, path, body).await
+}
+
+/// The owner's request (no worker header). Creating or configuring ANOTHER
+/// worker is the owner's act, and this suite tests journal replay, not
+/// authorization, so its worker create, patch and start are made as the
+/// owner rather than as `replay-test`.
+async fn send_owner(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    send_as(app, None, method, path, body).await
+}
+
+async fn send_as(
+    app: &axum::Router,
+    worker: Option<&str>,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut b = Request::builder().method(method).uri(path);
+    if let Some(w) = worker {
+        b = b.header("x-amux-session", w);
+    }
     let req = match body {
         Some(v) => b
             .header(header::CONTENT_TYPE, "application/json")
@@ -92,7 +115,7 @@ async fn write_then_replay_round_trip() {
 
     // Worker: create -> config patch -> start (Created, Updated,
     // StatusChanged events, each with a snapshot).
-    let (st, w) = send(
+    let (st, w) = send_owner(
         &r.app,
         "POST",
         "/api/workers",
@@ -101,7 +124,7 @@ async fn write_then_replay_round_trip() {
     .await;
     assert_eq!(st, StatusCode::CREATED, "{w}");
     let wid = w["id"].as_str().unwrap().to_string();
-    let (st, body) = send(
+    let (st, body) = send_owner(
         &r.app,
         "PATCH",
         &format!("/api/workers/{wid}"),
@@ -109,7 +132,7 @@ async fn write_then_replay_round_trip() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    let (st, body) = send(&r.app, "POST", &format!("/api/workers/{wid}/start"), None).await;
+    let (st, body) = send_owner(&r.app, "POST", &format!("/api/workers/{wid}/start"), None).await;
     assert_eq!(st, StatusCode::ACCEPTED, "{body}");
 
     // Board card: create -> desc edit -> status changes (gate acked).
@@ -208,7 +231,7 @@ async fn write_then_replay_round_trip() {
 #[tokio::test]
 async fn divergence_detection_names_the_corrupted_rows() {
     let r = rig();
-    let (st, w) = send(
+    let (st, w) = send_owner(
         &r.app,
         "POST",
         "/api/workers",

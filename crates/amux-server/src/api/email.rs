@@ -189,18 +189,7 @@ fn email_err_with(e: &str, extra: Value) -> Response {
 /// works. `None` (not "") when unattributed so the ledger's `session` field
 /// round-trips as Python's `null`.
 pub(crate) fn hdr_worker(headers: &HeaderMap) -> Option<String> {
-    for name in ["x-amux-worker", "x-amux-session"] {
-        if let Some(v) = headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-        {
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
+    Some(super::worker_identity::claimed_worker(headers)).filter(|w| !w.is_empty())
 }
 
 /// Which Gmail accounts this lane is scoped to, or `None` for "unrestricted"

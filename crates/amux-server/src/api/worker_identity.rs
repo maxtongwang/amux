@@ -185,17 +185,117 @@ fn header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
     req.headers().get(name).and_then(|v| v.to_str().ok()).map(str::trim).filter(|s| !s.is_empty())
 }
 
-/// The one place a claimed worker identity is checked. Mutating requests over
-/// a real socket only: the server's own in-process calls (no ConnectInfo) act
-/// for lanes by design and are not a lane asserting itself.
+/// Why a request's claimed worker identity cannot be used.
+#[derive(Debug, PartialEq)]
+pub(crate) enum IdentityRefusal {
+    /// `X-Amux-Session` and `X-Amux-Worker` name different workers.
+    Mismatch { session: String, worker: String },
+    /// A claimed name that is not a worker name (`../sessions/x`, `a b`).
+    Invalid { value: String },
+}
+
+/// Returned by [`claimed_worker`] for a claim that failed [`claimed_identity`]:
+/// non-empty (so it is never the owner) and no worker's name (so it resolves
+/// to no env file and no groups).
+pub(crate) const UNVERIFIED_IDENTITY: &str = "!unverified-identity";
+
+/// Whether `name` can be a worker identity: a session name, or a session
+/// name's Chat tab (`w@chat`) or delegate (`w@delegate`). `.` and `..` are
+/// not, though the session-name charset admits them.
+pub(crate) fn valid_identity(name: &str) -> bool {
+    let base = name
+        .strip_suffix(super::chat_delegate::DELEGATE_SUFFIX)
+        .or_else(|| name.strip_suffix(super::chat_worker::COMPANION_SUFFIX))
+        .unwrap_or(name);
+    base != "." && base != ".." && super::session_verbs::valid_session_name(base)
+}
+
+/// THE worker identity of a request (fix/worker-membership-create, review B1).
+/// Every authorization reader goes through this; keep the signature stable
+/// (delivery stamping and process attribution build on it).
+///
+/// - `Ok(Some(name))`: the worker this request speaks for. On a protected
+///   route `enforce` has refused the request unless this name carried its
+///   rule-10 token (mutating requests over a socket on a rule-10 lane).
+/// - `Ok(None)`: no worker identity: the owner, a verified human member, or
+///   a request with neither header.
+/// - `Err`: `X-Amux-Session` and `X-Amux-Worker` name different workers, or
+///   the claim is not a worker identity ([`valid_identity`]). `enforce`
+///   answers 403 `worker_identity_mismatch` / `worker_identity_invalid`.
+///
+/// Why one function: rule 10 verified `X-Amux-Session` first while every
+/// authorization check read `X-Amux-Worker` first, so a lane could present
+/// its own session and token plus `X-Amux-Worker: <a lead>` and be authorized
+/// as the lead; and a claim failing the name check skipped rule 10 while
+/// still resolving another lane's env by path (`../sessions/<lead>`).
+pub(crate) fn verified_worker(headers: &axum::http::HeaderMap) -> Result<Option<String>, IdentityRefusal> {
+    if super::org::local_member_actor(headers).is_some() {
+        return Ok(None);
+    }
+    let read = |h: &str| {
+        headers.get(h).and_then(|v| v.to_str().ok()).map(str::trim).filter(|s| !s.is_empty()).map(String::from)
+    };
+    let (session, worker) = (read("x-amux-session"), read("x-amux-worker"));
+    if let (Some(s), Some(w)) = (&session, &worker) {
+        if s != w {
+            return Err(IdentityRefusal::Mismatch { session: s.clone(), worker: w.clone() });
+        }
+    }
+    match session.or(worker) {
+        None => Ok(None),
+        Some(name) if valid_identity(&name) => Ok(Some(name)),
+        Some(value) => Err(IdentityRefusal::Invalid { value }),
+    }
+}
+
+/// [`verified_worker`] as the attribution string the existing readers expect:
+/// the worker's name, "" for none, [`UNVERIFIED_IDENTITY`] for an `Err`
+/// (never the owner, never another lane). A verified member keeps its stamped
+/// `member:<email>` attribution; callers tell a member apart with
+/// `org::local_member_actor`, as before.
+pub(crate) fn claimed_worker(headers: &axum::http::HeaderMap) -> String {
+    if super::org::local_member_actor(headers).is_some() {
+        return ["x-amux-worker", "x-amux-session"]
+            .iter()
+            .find_map(|h| headers.get(*h).and_then(|v| v.to_str().ok()).map(str::trim).filter(|s| !s.is_empty()))
+            .unwrap_or("")
+            .to_string();
+    }
+    match verified_worker(headers) {
+        Ok(name) => name.unwrap_or_default(),
+        Err(_) => UNVERIFIED_IDENTITY.to_string(),
+    }
+}
+
+fn identity_refusal(req: &Request, refusal: IdentityRefusal) -> Response {
+    let (code, error) = match &refusal {
+        IdentityRefusal::Mismatch { session, worker } => ("worker_identity_mismatch", format!(
+            "X-Amux-Session names '{session}' but X-Amux-Worker names '{worker}'; a request speaks for one worker")),
+        IdentityRefusal::Invalid { value } => ("worker_identity_invalid", format!(
+            "'{value}' is not a worker name")),
+    };
+    tracing::warn!(method = %req.method(), path = %req.uri().path(), ?refusal, verdict = code,
+        measured = true, n_considered = 1, "refused a request whose claimed worker identity cannot be used");
+    (StatusCode::FORBIDDEN, Json(json!({"ok": false, "code": code, "error": error}))).into_response()
+}
+
+/// The one place a claimed worker identity is checked. Every protected request
+/// carries at most one valid claim ([`verified_worker`]); rule 10's token
+/// check then applies to mutating requests over a real socket only: the
+/// server's own in-process calls (no ConnectInfo) act for lanes by design and
+/// are not a lane asserting itself.
 pub async fn enforce(req: Request, next: Next) -> Response {
+    let claimed = match verified_worker(req.headers()) {
+        Ok(name) => name.unwrap_or_default(),
+        Err(refusal) => return identity_refusal(&req, refusal),
+    };
     let mutating = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
     let socket = req.extensions().get::<ConnectInfo<SocketAddr>>().is_some();
-    let claimed = header(&req, "x-amux-session").or_else(|| header(&req, "x-amux-worker")).map(String::from);
     if !mutating || !socket {
         return next.run(req).await;
     }
-    let Some(lane) = claimed.filter(|l| super::session_verbs::valid_session_name(l)) else {
+    // A Chat tab or delegate identity has no lane token of its own.
+    let Some(lane) = Some(claimed).filter(|l| super::session_verbs::valid_session_name(l)) else {
         return next.run(req).await;
     };
     // Process ancestry already proved this request comes from the lane's own

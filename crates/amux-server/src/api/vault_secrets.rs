@@ -731,14 +731,7 @@ fn holders(ledger: &serde_json::Map<String, Value>, running: &std::collections::
 // ---------------------------------------------------------------------------
 
 fn worker_origin(headers: &HeaderMap) -> Option<String> {
-    ["x-amux-session", "x-amux-worker"].iter().find_map(|h| {
-        headers
-            .get(*h)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    })
+    Some(super::worker_identity::claimed_worker(headers)).filter(|w| !w.is_empty())
 }
 
 fn err(code: StatusCode, v: Value) -> Response {

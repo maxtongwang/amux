@@ -4418,8 +4418,10 @@ fn write_env_file(path: &std::path::Path, pairs: &[(&str, String)]) -> std::io::
         "# updated: {}\n",
         chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f")
     );
+    // The one env serializer (escapes quotes, refuses newlines/NUL): a raw
+    // `{k}="{v}"` let a value write extra lines (review B2).
     for (k, v) in pairs {
-        out.push_str(&format!("{k}=\"{v}\"\n"));
+        out.push_str(&crate::api::session_verbs::EnvFile::assignment(k, v)?);
     }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -4524,6 +4526,16 @@ pub(crate) const NEW_WORKER_AUTOMATION_OFF: [(&str, &str); 6] = [
     ("AMUX_BOARD_FORCE_ADHERENCE", "0"),
 ];
 
+/// The groups a create request asks for, joined as `CC_TAGS` stores them.
+///
+/// ACCEPT tags AS AN ARRAY, which is what the dashboard and API send
+/// (AMUX-3114). Reading only a STRING made `{"tags":["gtm"]}` read "" and
+/// created the worker with NO groups, the same silent drop the PATCH handler
+/// was already fixed for.
+fn create_tags(body: &serde_json::Value) -> Result<Vec<String>, String> {
+    crate::api::session_verbs::tags_of(body.get("tags"))
+}
+
 pub async fn create_session_legacy(
     State(_state): State<AppState>,
     headers: HeaderMap,
@@ -4553,6 +4565,26 @@ pub async fn create_session_legacy(
         )
             .into_response();
     }
+    // ONLY LEADS CREATE WORKERS (fix/worker-membership-create). This endpoint
+    // wrote whatever groups a worker asked for, so any worker could mint a
+    // peer inside any group and message across the boundary through it. The
+    // shared create rule runs before anything (work dir, env file) is written.
+    let tag_list = match create_tags(&body) {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+    };
+    let chat = crate::api::session_verbs::requests_chat_type(&body);
+    if let Some(refusal) = crate::api::session_verbs::worker_create_refusal(
+        &headers,
+        &crate::api::session_verbs::CreateRequest {
+            name: Some(&name),
+            tags: &tag_list,
+            owner_only: chat.then_some("the chat worker type"),
+        },
+    ) {
+        return refusal;
+    }
+    let tags = tag_list.join(",");
     // WORKTREE AT CREATE TIME (AMUX-4911). This returned 501 on the stated
     // grounds that "a worktree create needs `git worktree add` + branch
     // bookkeeping that does not exist here yet". That premise was wrong:
@@ -4743,19 +4775,6 @@ pub async fn create_session_legacy(
     } else if body.get("worktree").and_then(serde_json::Value::as_bool) == Some(false) {
         pairs.push(("CC_WORKTREE", "0".to_string()));
     }
-    // ACCEPT tags AS AN ARRAY, which is what the dashboard and API send
-    // (AMUX-3114). `s("tags")` only matched a STRING, so `{"tags":["gtm"]}` read
-    // "" and the worker was created with NO groups, the same silent drop the
-    // PATCH handler was already fixed for.
-    let tags = match body.get("tags") {
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .filter_map(|x| x.as_str().map(str::trim))
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(","),
-        _ => s("tags"),
-    };
     if !tags.is_empty() {
         pairs.push(("CC_TAGS", tags.clone()));
     }
@@ -4764,9 +4783,13 @@ pub async fn create_session_legacy(
         pairs.push(("CC_DESC", desc));
     }
     if let Err(e) = write_env_file(&path, &pairs) {
+        // A value the env serializer refuses is the caller's input, not a
+        // server fault.
+        let invalid = e.kind() == std::io::ErrorKind::InvalidInput;
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("could not write session env: {e}")})),
+            if invalid { StatusCode::BAD_REQUEST } else { StatusCode::INTERNAL_SERVER_ERROR },
+            Json(json!({"error": format!("could not write session env: {e}"),
+                "code": if invalid { "env_value_invalid" } else { "env_write_failed" }})),
         )
             .into_response();
     }

@@ -576,18 +576,7 @@ fn err(status: StatusCode, body: Value) -> Response {
 /// Python `_hdr_worker`: X-Amux-Worker canonical, X-Amux-Session accepted.
 /// The urgent-alert handler truncates it to 64 chars.
 pub(crate) fn hdr_worker(headers: &HeaderMap) -> String {
-    for name in ["x-amux-worker", "x-amux-session"] {
-        if let Some(v) = headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-        {
-            if !v.is_empty() {
-                return v.to_string();
-            }
-        }
-    }
-    String::new()
+    super::worker_identity::claimed_worker(headers)
 }
 
 // ---- /api/alert/config -----------------------------------------------------

@@ -582,45 +582,83 @@ impl EnvFile {
         out
     }
 
+    /// One line as `load` reads it: `Some((key, value))` for an assignment it
+    /// keeps, `None` for a line it skips. THE env line grammar: `load`,
+    /// [`Self::parse_canonical`] and every guard that judges env text use this,
+    /// so a guard can never see a different file than the reader
+    /// (fix/worker-membership-create, review round 3: a scope guard that
+    /// stripped `export ` and trimmed keys passed `CC_TAGS=leads\nexport
+    /// CC_TAGS=dev` while the reader kept `leads`).
+    fn parse_line(raw: &str) -> Option<(String, String)> {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let (k, v) = line.split_once('=')?;
+        if k.is_empty() || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return None;
+        }
+        let v = v.trim();
+        let (v, was_double_quoted) = if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
+            (&v[1..v.len() - 1], true)
+        } else if v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2 {
+            (&v[1..v.len() - 1], false)
+        } else {
+            (v, false)
+        };
+        // Only a DOUBLE-quoted value was escaped on the way out, and single quotes
+        // in shell do not take escapes at all, so unescaping one would corrupt it.
+        let v = if was_double_quoted { Self::env_unquote(v) } else { v.to_string() };
+        Some((k.to_string(), v))
+    }
+
+    /// Env TEXT as the reader will see it, or why it is not canonical. Canonical
+    /// text is exactly what `load` reads with nothing skipped or shadowed:
+    /// every non-blank, non-comment line is `KEY=value` with a bare key (no
+    /// `export `, no whitespace around it), and no key appears twice. Anything
+    /// else is refused, from the owner too, because a line the reader skips or
+    /// a later duplicate is where a guard and the reader can disagree.
+    pub(crate) fn parse_canonical(text: &str) -> Result<Vec<(String, String)>, String> {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for (n, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = Self::parse_line(raw) else {
+                return Err(format!("line {}: not a KEY=value assignment the env reader keeps (no `export`, no spaces in the key)", n + 1));
+            };
+            if !line.starts_with(&format!("{k}=")) {
+                return Err(format!("line {}: '{k}' has whitespace around its key", n + 1));
+            }
+            if pairs.iter().any(|(pk, _)| *pk == k) {
+                return Err(format!("line {}: '{k}' is assigned twice", n + 1));
+            }
+            if let Some(why) = Self::value_error(&k, &v) {
+                return Err(format!("line {}: {why}", n + 1));
+            }
+            pairs.push((k, v));
+        }
+        Ok(pairs)
+    }
+
+    /// The key/value pairs as read, in file order.
+    pub(crate) fn pairs(&self) -> &[(String, String)] {
+        &self.pairs
+    }
+
     pub(crate) fn load(path: &Path) -> Self {
-        let mut pairs = Vec::new();
+        let mut pairs: Vec<(String, String)> = Vec::new();
         let Ok(text) = std::fs::read_to_string(path) else {
             return Self {
                 pairs,
                 dirty: Vec::new(),
             };
         };
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((k, v)) = line.split_once('=') else {
-                continue;
-            };
-            if k.is_empty() || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-                continue;
-            }
-            let v = v.trim();
-            let (v, was_double_quoted) = if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
-                (&v[1..v.len() - 1], true)
-            } else if v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2 {
-                (&v[1..v.len() - 1], false)
-            } else {
-                (v, false)
-            };
-            // Only a DOUBLE-quoted value was escaped on the way out, and single quotes
-            // in shell do not take escapes at all, so unescaping one would corrupt it.
-            let owned;
-            let v = if was_double_quoted {
-                owned = Self::env_unquote(v);
-                owned.as_str()
-            } else {
-                v
-            };
-            match pairs.iter_mut().find(|(pk, _)| pk == k) {
-                Some((_, pv)) => *pv = v.to_string(),
-                None => pairs.push((k.to_string(), v.to_string())),
+        for (k, v) in text.lines().filter_map(Self::parse_line) {
+            match pairs.iter_mut().find(|(pk, _)| *pk == k) {
+                Some((_, pv)) => *pv = v,
+                None => pairs.push((k, v)),
             }
         }
         Self {
@@ -669,6 +707,35 @@ impl EnvFile {
         latest.write_unlocked(path)
     }
 
+    /// Why `key=value` cannot be written to an env file, or None.
+    ///
+    /// THE ENV VALUE RULE (fix/worker-membership-create, review B2). Env files
+    /// are read line by line and the last assignment wins, so a value carrying
+    /// a newline wrote extra lines: `desc: "x\"\nCC_TAGS=\"leads,ops"` gave a
+    /// lead-created worker `leads`. A newline, carriage return or NUL in a value
+    /// is refused (it cannot round-trip through `load` either); a quote is
+    /// escaped by [`Self::env_quote`], never left unbalanced.
+    pub(crate) fn value_error(key: &str, value: &str) -> Option<String> {
+        // The same key charset `load` accepts, so any loaded file rewrites.
+        let key_ok = !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if !key_ok {
+            return Some(format!("'{key}' is not an environment variable name"));
+        }
+        value
+            .contains(['\n', '\r', '\0'])
+            .then(|| format!("{key}: an environment value may not contain a newline, carriage return or NUL"))
+    }
+
+    /// THE env serializer: one `KEY="value"` line, or an `InvalidInput` error
+    /// naming why ([`Self::value_error`]). Every env-file writer goes through
+    /// this (or [`Self::merge_plain`], which applies the same rule).
+    pub(crate) fn assignment(key: &str, value: &str) -> std::io::Result<String> {
+        match Self::value_error(key, value) {
+            Some(why) => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why)),
+            None => Ok(format!("{key}=\"{}\"\n", Self::env_quote(value))),
+        }
+    }
+
     fn write_unlocked(&self, path: &Path) -> std::io::Result<()> {
         use std::io::Write as _;
         let mut out = format!(
@@ -676,7 +743,7 @@ impl EnvFile {
             chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f")
         );
         for (k, v) in &self.pairs {
-            out.push_str(&format!("{k}=\"{}\"\n", Self::env_quote(v)));
+            out.push_str(&Self::assignment(k, v)?);
         }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -745,6 +812,11 @@ impl EnvFile {
         path: &Path,
         updates: &[(String, Option<String>)],
     ) -> std::io::Result<()> {
+        for (key, value) in updates {
+            if let Some(why) = value.as_deref().and_then(|v| Self::value_error(key, v)) {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why));
+            }
+        }
         let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
         // Read with the worker-file parser: it un-escapes the double-quoted
         // values Self::write produces, which crate::config::parse_env_file
@@ -20420,18 +20492,10 @@ fn owner_ui_proof(state: &AppState, headers: &HeaderMap) -> bool {
         .is_some_and(|v| v == ui_token(state))
 }
 
-/// Origin header, py:15208 _hdr_worker precedence (X-Amux-Worker first,
-/// legacy X-Amux-Session).
+/// The request's worker identity: the one verified claim
+/// (`worker_identity::claimed_worker`), never a second reading of the headers.
 pub(crate) fn hdr_worker(headers: &HeaderMap) -> String {
-    for k in ["x-amux-worker", "x-amux-session"] {
-        if let Some(v) = headers.get(k).and_then(|v| v.to_str().ok()) {
-            let v = v.trim();
-            if !v.is_empty() {
-                return v.to_string();
-            }
-        }
-    }
-    String::new()
+    super::worker_identity::claimed_worker(headers)
 }
 
 // ---------------------------------------------------------------------------
@@ -26681,6 +26745,12 @@ async fn post_dispatch(
     headers: &HeaderMap,
     body: &Value,
 ) -> Response {
+    // The verbs that rewrite who a worker is (its name, its instructions, its
+    // memory) follow the peer-config rule; the rename alias and PATCH config
+    // must not differ.
+    if matches!(action, "rename" | "instructions" | "memory") {
+        if let Some(refusal) = peer_config_refusal(headers, name, action) { return refusal; }
+    }
     match action {
         "transcripts" => match backup_session_jsonl(name, "manual") {
             Some(path) => j200(json!({"ok": true, "path": path})),
@@ -26847,8 +26917,11 @@ async fn post_dispatch(
             )
         }
         "clear" => clear_verb(name).await,
-        "duplicate" => duplicate_verb(state, name, body),
-        "clone" => clone_post(state, name, body).await,
+        "duplicate" => duplicate_verb(state, name, headers, body),
+        "clone" => {
+            if let Some(refusal) = copy_refusal(name, headers) { return refusal; }
+            clone_post(state, name, body).await
+        }
         "archive" => {
             if !session_destructive_allowed(state, headers) {
                 return jresp(
@@ -27252,6 +27325,11 @@ pub(crate) fn no_reply_path_stamp(origin: &str, is_isolated: bool) -> Option<Str
 
 /// A lane's groups, from `CC_TAGS` in its env file.
 pub(crate) fn lane_groups(lane: &str) -> std::collections::BTreeSet<String> {
+    // A name that is not a session name resolves to no file, never to another
+    // lane's by path (`../sessions/<lead>`, review B1).
+    if !valid_session_name(lane) || lane == "." || lane == ".." {
+        return Default::default();
+    }
     parse_env(lane)
         .get("CC_TAGS")
         .map(|v| {
@@ -30117,7 +30195,10 @@ pub(crate) async fn peek_verb(state: &AppState, name: &str, qs: &[(String, Strin
 /// duplicate existing as an env file the worker store cannot see. A second
 /// implementation of that ordering is a second place for it to be wrong, on the
 /// error path, where nobody looks.
-pub(crate) fn duplicate_verb(state: &AppState, name: &str, body: &Value) -> Response {
+pub(crate) fn duplicate_verb(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
+    // A copy inherits the source's groups (env file and store row), so it is a
+    // create with those groups: only a lead, and only inside its own team.
+    if let Some(refusal) = copy_refusal(name, headers) { return refusal; }
     let new_name = body_str(body, "new_name").trim().to_string();
     if new_name.is_empty() {
         return jresp(
@@ -31859,7 +31940,8 @@ pub(crate) async fn report_post(
 // ---------------------------------------------------------------------------
 
 async fn patch_dispatch(state: &AppState, name: &str, action: &str, body: &Value, headers: &HeaderMap) -> Response {
-    if let Some(refusal) = membership_patch_refusal(headers, body.get("tags").is_some()) { return refusal; }
+    if let Some(refusal) = peer_config_refusal(headers, name, action) { return refusal; }
+    if let Some(refusal) = membership_patch_refusal(headers, names_messaging_authority(body)) { return refusal; }
     match action {
         "commit-guard" => commit_guard_patch_verb(name, body),
         "config" => config_patch(state, name, body).await,
@@ -32912,6 +32994,214 @@ async fn apply_live_config_change(
     }
 }
 
+/// THE membership rule: a worker-originated request may not set or change a
+/// worker's messaging authority. Every path that writes group membership calls
+/// this one predicate, so the rule and its error code have one definition.
+///
+/// Messaging authority is group membership (`CC_TAGS`, `_amux_workers.group`)
+/// plus the two settings that act as membership of every group: the chat
+/// worker type, which speaks for the owner (`chat_speaks_for_owner`), and a
+/// group's open-inbound switch. `membership_named` is the caller's statement
+/// that the request would set one of those.
+///
+/// This governs EXISTING workers: no worker may change any worker's groups,
+/// its own included. Creating a worker is [`worker_create_refusal`]'s rule.
+/// Owners, the dashboard and verified human members are unaffected.
+pub(crate) fn membership_patch_refusal(headers: &HeaderMap, membership_named: bool) -> Option<Response> {
+    membership_refusal_body(headers, membership_named).map(|body| jresp(StatusCode::FORBIDDEN, body))
+}
+
+/// [`membership_patch_refusal`]'s decision and 403 body, for a handler whose
+/// return type is not a `Response`.
+pub(crate) fn membership_refusal_body(headers: &HeaderMap, membership_named: bool) -> Option<Value> {
+    let origin = worker_origin(headers);
+    if !membership_named || origin.is_empty() { return None; }
+    tracing::warn!(verdict="worker_group_membership_refused", measured=true, n_considered=1,
+        worker = %origin,
+        "worker cannot widen messaging authority by editing group membership");
+    Some(json!({"ok":false,"code":"worker_group_membership_refused",
+        "error":"Group membership changes require direct owner input."}))
+}
+
+/// The worker this request speaks for, from the one verified identity
+/// (`worker_identity::verified_worker`): empty for the owner/dashboard and
+/// verified human members, and a name matching no worker for a refused claim.
+pub(crate) fn worker_origin(headers: &HeaderMap) -> String {
+    match super::worker_identity::verified_worker(headers) {
+        Ok(name) => name.unwrap_or_default(),
+        Err(_) => super::worker_identity::UNVERIFIED_IDENTITY.to_string(),
+    }
+}
+
+/// CONFIGURING ANOTHER WORKER IS THE OWNER'S (review round 3, N2/N3). A worker
+/// may change typed settings on itself only: renaming a peer left the renamed
+/// lane with no stored token (trusted without one), and editing a peer's env,
+/// instructions or memory rewrites what that peer is. Leads have no team-config
+/// role in this codebase, so the rule is owner-only. A worker's own Chat tab
+/// (`w@chat`) counts as `w`. Owners and verified members are unaffected.
+pub(crate) fn peer_config_refusal(headers: &HeaderMap, target: &str, what: &str) -> Option<Response> {
+    peer_config_refusal_body(headers, target, what).map(|body| jresp(StatusCode::FORBIDDEN, body))
+}
+
+/// [`peer_config_refusal`]'s decision and 403 body, for a handler whose return
+/// type is not a `Response`.
+pub(crate) fn peer_config_refusal_body(headers: &HeaderMap, target: &str, what: &str) -> Option<Value> {
+    let origin = worker_origin(headers);
+    if origin.is_empty() || origin == target || super::chat_worker::companion_parent(&origin) == Some(target) {
+        return None;
+    }
+    tracing::warn!(origin = %origin, target, what, verdict = "peer_config_owner_only", measured = true,
+        n_considered = 1, "a worker tried to configure another worker");
+    Some(json!({"ok": false, "code": "peer_config_owner_only",
+        "error": format!("'{origin}' may not change {what} of '{target}'; configuring another worker is the owner's")}))
+}
+
+/// The group whose members may create workers (Max, 2026-10-16: "Only leads
+/// can create workers"). Membership of it is the owner's to grant.
+pub(crate) const LEADS_GROUP: &str = "leads";
+
+/// What a worker-originated create asks for.
+pub(crate) struct CreateRequest<'a> {
+    /// The name the request would register, when it names one. Equal to the
+    /// caller's own verified identity it may be SELF-REGISTRATION (below).
+    pub name: Option<&'a str>,
+    /// The new worker's groups (any case; compared lowercased).
+    pub tags: &'a [String],
+    /// Something only the owner may grant at create: the chat worker type
+    /// (it speaks for the owner) or a store `group` id.
+    pub owner_only: Option<&'static str>,
+}
+
+/// THE create rule, for every path that makes a worker: session create, store
+/// create, duplicate/clone and the env/config imports.
+///
+/// - The owner, the dashboard and verified human members: unchanged.
+/// - A worker not in `leads`: refused (`worker_create_requires_lead`), with or
+///   without tags.
+/// - A lead: allowed, giving the new worker only tags drawn from its own team
+///   tags, never `leads` (`worker_create_tags_outside_team`).
+///
+/// SELF-REGISTRATION is not creation: a worker registering a row for its OWN
+/// existing session (`POST /api/workers {"name": <itself>}`) makes no new
+/// worker. It is allowed only when the requested name equals the caller's
+/// verified identity, that session's env file exists, and the request adds no
+/// group: its tags are a subset of the session's existing groups and it sets
+/// nothing owner-only. Anything else is a create and takes the rule above.
+///
+/// "Verified identity" is [`worker_origin`]: the header identity that
+/// `worker_identity::enforce` (rule 10) has already checked against the
+/// lane's token before any handler runs. Process attribution (the separate
+/// `fix/worker-attribution` work) slots in by rewriting that identity before
+/// this point, so this predicate needs no change for it.
+///
+/// Server-internal spawns (project leads/executors) never reach here: their
+/// groups come from owner-configured project policy, not from a request.
+pub(crate) fn worker_create_refusal(headers: &HeaderMap, req: &CreateRequest) -> Option<Response> {
+    worker_create_refusal_body(headers, req).map(|body| jresp(StatusCode::FORBIDDEN, body))
+}
+
+/// [`worker_create_refusal`]'s decision and 403 body, for a handler whose
+/// return type is not a `Response`.
+pub(crate) fn worker_create_refusal_body(headers: &HeaderMap, req: &CreateRequest) -> Option<Value> {
+    let origin = worker_origin(headers);
+    if origin.is_empty() { return None; }
+    let caller = lane_groups(&origin);
+    let adds_no_group = req.owner_only.is_none()
+        && req.tags.iter().map(|t| norm_label(t)).filter(|t| !t.is_empty()).all(|t| caller.contains(&t));
+    if req.name == Some(origin.as_str()) && adds_no_group && env_path(&origin).exists() {
+        tracing::info!(worker = %origin, verdict = "worker_self_registration", measured = true, n_considered = 1,
+            "a worker registered its own existing session; not a worker creation");
+        return None;
+    }
+    if !caller.contains(LEADS_GROUP) {
+        tracing::warn!(worker = %origin, verdict = "worker_create_requires_lead", measured = true, n_considered = 1,
+            "a worker outside the leads group tried to create a worker");
+        return Some(json!({"ok": false, "code": "worker_create_requires_lead",
+            "error": format!("Only leads can create workers; '{origin}' is not in the '{LEADS_GROUP}' group.")}));
+    }
+    let team: std::collections::BTreeSet<String> = caller.iter().filter(|g| *g != LEADS_GROUP).cloned().collect();
+    let outside: Vec<String> = req.tags.iter().map(|t| norm_label(t)).filter(|t| !t.is_empty() && !team.contains(t)).collect();
+    if outside.is_empty() && req.owner_only.is_none() { return None; }
+    tracing::warn!(worker = %origin, ?outside, owner_only = req.owner_only.unwrap_or(""), ?team,
+        verdict = "worker_create_tags_outside_team", measured = true, n_considered = 1,
+        "a lead tried to create a worker outside its own team");
+    let what = match req.owner_only {
+        Some(o) => format!("{o} is the owner's to grant"),
+        None => format!("tags {outside:?} are outside the lead's team {team:?} ('{LEADS_GROUP}' is the owner's to grant)"),
+    };
+    Some(json!({"ok": false, "code": "worker_create_tags_outside_team",
+        "error": format!("A lead may create workers only inside its own team: {what}."), "team": team}))
+}
+
+/// The groups a create request names, from a `tags` array or a comma string,
+/// normalized ([`norm_label`]) so the value checked is the value stored.
+/// Anything else (a number, an object, a non-string array item) is an error:
+/// a check that read it as "no tags" while a writer stored it was review N1.
+pub(crate) fn tags_of(v: Option<&Value>) -> Result<Vec<String>, String> {
+    let keep = |s: &str| Some(norm_label(s)).filter(|t| !t.is_empty());
+    match v {
+        None | Some(Value::Null) => Ok(vec![]),
+        Some(Value::String(s)) => Ok(s.split(',').filter_map(keep).collect()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|x| x.as_str().ok_or_else(|| format!("tags must be strings; got {x}")))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|v| v.into_iter().filter_map(keep).collect()),
+        Some(other) => Err(format!("tags must be an array of strings or a comma-separated string; got {other}")),
+    }
+}
+
+/// THE normalizer for every tag and worker-type comparison (review B4): the
+/// parsers that store these values trim and lowercase them, so a check that
+/// compared the raw text let `"Chat"` or `" Leads "` through and then stored
+/// `chat` / `leads`.
+pub(crate) fn norm_label(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+/// Whether a worker-type value names the chat type, as
+/// `WorkerTypeId::parse` would store it.
+pub(crate) fn is_chat_type(raw: &str) -> bool {
+    norm_label(raw) == "chat"
+}
+
+/// Whether a request body asks for the chat worker type, which carries the
+/// owner's cross-group reach (see [`membership_patch_refusal`]).
+pub(crate) fn requests_chat_type(body: &Value) -> bool {
+    body.get("worker_type").and_then(Value::as_str).is_some_and(is_chat_type)
+}
+
+/// Whether a config-style body names messaging authority: a `tags` edit of any
+/// shape (clearing counts, as before) or a switch to the chat worker type.
+pub(crate) fn names_messaging_authority(body: &Value) -> bool {
+    body.get("tags").is_some() || requests_chat_type(body)
+}
+
+/// The create rule for a copy of `source` (duplicate/clone): the copy carries
+/// the source's groups and worker type, so it is a create with those.
+fn copy_refusal(source: &str, headers: &HeaderMap) -> Option<Response> {
+    let tags: Vec<String> = lane_groups(source).into_iter().collect();
+    let chat = crate::api::worker_exec::worker_type_of(source).as_str() == "chat";
+    worker_create_refusal(headers, &CreateRequest { name: None, tags: &tags, owner_only: chat.then_some("the chat worker type") })
+}
+
+/// The first string in a config body (top-level values and string arrays) the
+/// env serializer would refuse, with the field it came from. `task_summary`
+/// is stored in the meta JSON, not the env file, so it may span lines.
+fn config_body_env_error(body: &Value) -> Option<String> {
+    let obj = body.as_object()?;
+    obj.iter().filter(|(k, _)| k.as_str() != "task_summary").find_map(|(k, v)| {
+        let strings: Vec<&str> = match v {
+            Value::String(s) => vec![s.as_str()],
+            Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+            _ => vec![],
+        };
+        strings.into_iter().find_map(|s| EnvFile::value_error("VALUE", s)).map(|_| {
+            format!("'{k}': an environment value may not contain a newline, carriage return or NUL")
+        })
+    })
+}
+
 /// Every config write drops the cached session list (AMUX-2926).
 ///
 /// A WRAPPER, not a call at each return: `config_patch_inner` returns from a
@@ -32924,15 +33214,13 @@ async fn apply_live_config_change(
 /// several branches write one field and then reject a second. Clearing a cache
 /// that did not need clearing costs one rebuild; NOT clearing one that did is
 /// the bug this fixes.
-pub(crate) fn membership_patch_refusal(headers: &HeaderMap, membership_named: bool) -> Option<Response> {
-    if !membership_named || hdr_worker(headers).is_empty() || super::org::local_member_actor(headers).is_some() { return None; }
-    tracing::warn!(verdict="worker_group_membership_refused", measured=true, n_considered=1,
-        "worker cannot widen messaging authority by editing group membership");
-    Some(jresp(StatusCode::FORBIDDEN,json!({"ok":false,"code":"worker_group_membership_refused",
-        "error":"Group membership changes require direct owner input."})))
-}
-
 pub(crate) async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
+    // Every config field lands in the worker's env file, so a value the env
+    // serializer would refuse is a 400 here, before any field is written
+    // (review B2), rather than a 500 from a half-applied write.
+    if let Some(why) = config_body_env_error(body) {
+        return jresp(StatusCode::BAD_REQUEST, json!({"ok": false, "code": "env_value_invalid", "error": why}));
+    }
     let out = config_patch_inner(state, name, body).await;
     crate::api::sessions_legacy::invalidate_sessions_cache();
     out

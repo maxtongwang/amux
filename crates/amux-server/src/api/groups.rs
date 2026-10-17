@@ -98,15 +98,7 @@ pub(crate) use crate::config::amux_home;
 /// X-Amux-Session still honored. Shared with api/scope.rs (same attribution
 /// rule for scope writes).
 pub(crate) fn hdr_worker(headers: &HeaderMap) -> String {
-    for h in ["x-amux-worker", "x-amux-session"] {
-        if let Some(v) = headers.get(h).and_then(|v| v.to_str().ok()) {
-            let v = v.trim();
-            if !v.is_empty() {
-                return v.to_string();
-            }
-        }
-    }
-    String::new()
+    super::worker_identity::claimed_worker(headers)
 }
 
 /// Quarantined session names (`~/.amux/blocked-sessions.txt`,
