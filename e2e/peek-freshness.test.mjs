@@ -198,3 +198,20 @@ test('idle attach input has a half-second polling budget without speeding offlin
  now+=2000;ctx.online=true;assert.equal(ctx._peekPollInterval(),250);
  now+=1000;assert.equal(ctx._peekPollInterval(),500);
 });
+
+test('a cached open is measured from the cache, and recovery from a stale episode is reported', async()=>{
+  const f=fixture();
+  const cachedAt=Date.now()-300000;
+  f.ctx._peekLastAppliedAt=null;
+  assert.equal(f.ctx._paintCachedPeek({output:'cached frame',time:cachedAt}),true);
+  assert.equal(f.ctx._peekLastAppliedAt,cachedAt,'freshness must start from the cached frame, not the open');
+  f.ctx._peekFreshnessEpisode='peek-stale';
+  f.ctx._peekFrameApplied(f.status);
+  const recovered=f.beacons.find(b=>b.action==='peek-recovered');
+  assert.ok(recovered,'a recovered stale episode sends one beacon');
+  assert.equal(recovered.episode,'peek-stale');
+  assert.ok(recovered.age_ms>=300000,'recovery reports the real staleness');
+  assert.equal(f.ctx._peekFreshnessEpisode,'');
+  f.ctx._peekFrameApplied(f.status);
+  assert.equal(f.beacons.filter(b=>b.action==='peek-recovered').length,1,'no beacon without an episode');
+});

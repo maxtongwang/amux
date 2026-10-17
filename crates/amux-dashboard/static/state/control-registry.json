@@ -2664,6 +2664,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_peekFrameApplied": {
+      "kind": "command._peekFrameApplied",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_peekGeoBeacon": {
       "kind": "command._peekGeoBeacon",
       "feedback_required": true,

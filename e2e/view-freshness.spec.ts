@@ -21,7 +21,9 @@ async function setup(page: Page) {
   allowUnusedRoute(page, `**/api/sessions/${NAME}/**`); // Optional companion/plan reads.
   await page.route(`**/api/sessions/${NAME}/peek**`, async r => {
     if (state.hangPeek) return;
-    if (state.peek304) { await r.fulfill({ status: 304 }); return; }
+    // WebKit refuses to fulfill a route with 304 ("redirect status"), so the
+    // page turns a marked 200 into a 304, as terminal-update-recovery.spec.ts does.
+    if (state.peek304) { await r.fulfill({ headers: { 'X-Test-Not-Modified': '1' }, json: {} }); return; }
     await r.fulfill({ headers: { ETag: '"freshness-frame"' }, json: { name: NAME, output: 'Terminal freshness specimen',
       live: 'Terminal freshness specimen', history: '' } });
   });
@@ -30,6 +32,13 @@ async function setup(page: Page) {
     await r.fulfill({ json: { ok: true } });
   });
   await page.addInitScript(() => localStorage.setItem('amux_walkthrough_done', '1'));
+  await page.addInitScript(() => {
+    const original = window.fetch.bind(window);
+    window.fetch = async (input, init) => {
+      const response = await original(input, init);
+      return response.headers.has('X-Test-Not-Modified') ? new Response(null, { status: 304 }) : response;
+    };
+  });
   await page.goto('/');
   await page.waitForFunction(name => typeof (window as any).openPeek === 'function'
     && (globalThis as any).eval('sessions').some((s: any) => s.name === name), NAME);

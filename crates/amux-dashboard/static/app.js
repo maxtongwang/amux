@@ -904,8 +904,13 @@ let _peekOpenedAt = null;
 let _peekFreshnessEpisode = '';
 let _peekMissing = false;
 function _peekFrameApplied(statusEl, label = 'Updated') {
-  _peekLastAppliedAt = Date.now();
+  const now = Date.now();
   const wasStale = !!_peekFreshnessEpisode;
+  if (wasStale && peekSession) {
+    _peekPollBeacon('peek-recovered', peekSession, { verdict: 'peek-recovered', episode: _peekFreshnessEpisode,
+      measured: true, n_considered: 1, age_ms: _peekLastAppliedAt ? now - _peekLastAppliedAt : null });
+  }
+  _peekLastAppliedAt = now;
   _peekFreshnessEpisode = '';
   if (wasStale || performance.now() > _peekGeoHold) {
     statusEl.textContent = label + ' ' + new Date(_peekLastAppliedAt).toLocaleTimeString() + ' · v' + APP_VER;
@@ -945,7 +950,7 @@ function _checkViewFreshness(now) {
     fetchSessions();
   } else if (now - _sessionsRevalidateAt > 15000) {
     _sessionsStale = true;
-    _interactionDiagnostic({ verdict: 'sessions-stale', measured: true, n_considered: 1, age_ms: sessionsAge });
+    _interactionDiagnostic({ kind: 'view-freshness', verdict: 'sessions-stale', measured: true, n_considered: 1, age_ms: sessionsAge });
     fetchSessions(); // Once per stale episode; success resets the latch.
     render();
   }
@@ -14706,6 +14711,9 @@ function _paintCachedPeek(cached) {
   lastPeekHTML = _peekEarlierHTML() + _peekHistoryHTML + _lastLiveHTML;
   applyPeekSearch();
   const ago = Math.floor((Date.now() - (cached.time || Date.now())) / 60000);
+  // The freshness watchdog measures from the cached frame's own time, not the
+  // open: a 5-minute-old cache is 5 minutes stale until a live frame lands.
+  if (cached.time && !_peekLastAppliedAt) _peekLastAppliedAt = cached.time;
   const st = document.getElementById('peek-status');
   if (st) st.textContent = 'Cached ' + (ago < 1 ? 'just now' : ago + 'm ago');
   return true;
