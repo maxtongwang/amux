@@ -444,6 +444,11 @@ async fn tick(state: AppState) {
     if let Census::Up(workers) = &census {
         write_running_set(&home, workers, now);
     }
+    // Persist the loss (its pending set) BEFORE any start can change what tmux shows, so an
+    // interruption after the keeper's start can never consume it.
+    if st != before {
+        save_state(&home, &st);
+    }
     // Mr Popo first, before anything else, whatever stopped him.
     let kept = keep_alive(&state, &home, &mut st, &census, now).await;
     if st != before {
@@ -534,6 +539,19 @@ async fn drive_pending(state: &AppState, home: &Path, st: &mut WatchState, kept:
             tracing::warn!(target: "tmux_watch", session = %lead, %why, verdict = "fleet_restored_lead_unnotified", "a lead was not told about the restore");
         }
     }
+}
+
+/// A lead may restore one named worker of its own team: the caller carries `leads`, and the two
+/// share at least one other tag (the team).
+pub(crate) fn lead_may_restore(home: &Path, lead: &str, target: &str) -> bool {
+    let tags = |n: &str| -> std::collections::BTreeSet<String> {
+        crate::config::parse_env_file(&home.join("sessions").join(format!("{n}.env")))
+            .get("CC_TAGS")
+            .map(|t| t.split(',').map(|x| x.trim().trim_matches('"').to_lowercase()).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default()
+    };
+    let (mine, theirs) = (tags(lead), tags(target));
+    mine.contains("leads") && mine.iter().any(|t| t != "leads" && theirs.contains(t))
 }
 
 /// `POST /api/fleet/restore {"only": NAME?, "dry_run": bool}`: start the recorded running set in
@@ -651,7 +669,10 @@ mod tests {
         assert!(matches!(observe(&mut st, &Census::NoServer, 300.0, None), Decision::Lost { restore: false, .. }),
             "a second loss inside the gap is reported but not restored");
         observe(&mut st, &up(&["a"]), 320.0, None);
-        assert!(matches!(observe(&mut st, &Census::NoServer, 10.0 + RESTORE_GAP_SECS, None), Decision::Lost { restore: true, .. }));
+        // The gap runs from the most recent loss (storm safety), so 300 + 600.
+        assert!(matches!(observe(&mut st, &Census::NoServer, 300.0 + RESTORE_GAP_SECS - 1.0, None), Decision::Lost { restore: false, .. }));
+        observe(&mut st, &up(&["a"]), 950.0, None);
+        assert!(matches!(observe(&mut st, &Census::NoServer, 899.0 + RESTORE_GAP_SECS, None), Decision::Lost { restore: true, .. }));
     }
 
     #[test]
