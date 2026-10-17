@@ -47,7 +47,7 @@ class CargoReclaimTests(unittest.TestCase):
         cargo.write_text('#!/bin/sh\nprintf "ready\\n"\nread -r release\n')
         cargo.chmod(0o755)
         env = {**os.environ, 'PATH': str(bin_dir) + ':' + os.environ['PATH'],
-               'CARGO_TARGET_DIR': str(self.root)}
+               'CARGO_TARGET_DIR': str(self.root), 'HOME': str(self.base / 'fixture-home')}
         proc = subprocess.Popen(['bash', str(SCRIPT.with_name('safe-cargo.sh')), 'check'],
                                 env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True)
@@ -72,7 +72,7 @@ class CargoReclaimTests(unittest.TestCase):
         scope.write_text('#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n'); scope.chmod(0o755)
         cargo = bin_dir / 'cargo'
         cargo.write_text('#!/bin/sh\nif [ "$1" = clean ]; then rm "$CLEAN_MARKER"; exit 0; fi\nprintf "ready\\n"\nread -r release\n'); cargo.chmod(0o755)
-        env = {**os.environ, 'PATH':str(bin_dir)+':'+os.environ['PATH'], 'CARGO_TARGET_DIR':str(self.root), 'CLEAN_MARKER':str(self.marker), 'AMUX_HOME':str(self.base/'fixture-home'), 'AMUX_SESSION':'target-guard-fixture'}
+        env = {**os.environ, 'PATH':str(bin_dir)+':'+os.environ['PATH'], 'CARGO_TARGET_DIR':str(self.root), 'CLEAN_MARKER':str(self.marker), 'AMUX_HOME':str(self.base/'fixture-home'), 'HOME':str(self.base/'fixture-home'), 'AMUX_SESSION':'target-guard-fixture'}
         wrapper = str(SCRIPT.with_name('safe-cargo.sh'))
         holder = subprocess.Popen(['bash',wrapper,'test'], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         try:
@@ -343,6 +343,173 @@ class CargoReclaimTests(unittest.TestCase):
         # A reclaim that got through ends it.
         guard.clear_streak([self.root])
         self.assertEqual(guard.bump_streak([self.root], 'anything')['deferral_streak'], 1)
+
+
+MB = 1024 * 1024
+DAY = 86400.0
+NOW = 1_800_000_000.0  # the fake clock
+
+
+def put(path, size, used_at):
+    """A file of `size` real bytes whose access and modification time is used_at."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'wb') as handle:
+        handle.write(os.urandom(size))
+    os.utime(path, (used_at, used_at))
+    return path
+
+
+class ReclaimAndSweepTests(unittest.TestCase):
+    """DMIW-7: the budget refused an over-cap target and nothing ever shrank it.
+    Fake target, fake clock; the live target is never touched."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve() / 'rust-build-target'
+        debug = self.root / 'debug'
+        # incremental: 2 MB; three dependency units of 1 MB each, used 5, 3 and 1 days ago,
+        # each with a .fingerprint entry and (the oldest) a build/ dir.
+        self.incremental = put(debug / 'incremental' / 'amux_server-abc' / 's-1' / 'dep-graph.bin', 2 * MB, NOW - 1 * DAY)
+        self.old = [put(debug / 'deps' / 'libold-0123456789abcdef.rlib', MB, NOW - 5 * DAY),
+                    put(debug / '.fingerprint' / 'old-0123456789abcdef' / 'lib-old', 10, NOW - 5 * DAY),
+                    put(debug / 'build' / 'old-0123456789abcdef' / 'out' / 'gen.rs', 10, NOW - 5 * DAY)]
+        self.mid = [put(debug / 'deps' / 'libmid-1111111111111111.rlib', MB, NOW - 3 * DAY),
+                    put(debug / 'deps' / 'mid-1111111111111111.d', 10, NOW - 3 * DAY)]
+        self.new = [put(debug / 'deps' / 'new-2222222222222222', MB, NOW - 1 * DAY)]
+        # a build script's output: no deps/ files, looks idle (plain reads keep no atime)
+        self.script_out = put(debug / 'build' / 'gen-3333333333333333' / 'out' / 'bindings.rs', 10, NOW - 9 * DAY)
+        # protected profiles, older than everything and larger than everything
+        self.protected = [put(self.root / 'deploy' / 'amux-server', 3 * MB, NOW - 30 * DAY),
+                          put(self.root / 'release' / 'deps' / 'libold-0123456789abcdef.rlib', 3 * MB, NOW - 30 * DAY)]
+
+    def assert_protected(self):
+        for path in self.protected:
+            self.assertTrue(path.exists(), path)
+
+    def test_unit_key_pairs_a_units_outputs(self):
+        self.assertEqual(guard.unit_key('libold-0123456789abcdef.rlib'), 'old-0123456789abcdef')
+        self.assertEqual(guard.unit_key('old-0123456789abcdef.d'), 'old-0123456789abcdef')
+        self.assertEqual(guard.unit_key('liblibc-0123456789abcdef.rmeta'), 'libc-0123456789abcdef')
+        self.assertEqual(guard.unit_key('libc-0123456789abcdef.d'), 'libc-0123456789abcdef')
+        self.assertEqual(guard.unit_key('adler2-0123456789abcdef.adler2.5f4ad9222612777e-cgu.0.rcgu.o'),
+                         'adler2-0123456789abcdef')
+
+    def test_under_the_cap_nothing_is_touched(self):
+        result = guard.reclaim([self.root], 100 * MB, 1 * MB, process_probe=quiet)
+        self.assertEqual(result['verdict'], 'cargo_reclaim_not_needed')
+        self.assertTrue(self.incremental.exists() and all(p.exists() for p in self.old))
+
+    def test_incremental_goes_first_and_may_be_enough(self):
+        # ~5 MB reclaimable; cap 4 MB, goal 3.5 MB: clearing incremental (2 MB) suffices.
+        result = guard.reclaim([self.root], 4 * MB, int(3.5 * MB), process_probe=quiet)
+        self.assertEqual(result['verdict'], 'cargo_reclaimed')
+        self.assertFalse(self.incremental.exists())
+        self.assertEqual(result['units_removed'], 0)
+        self.assertTrue(all(p.exists() for p in self.old + self.mid + self.new))
+        self.assertTrue(result['reached_goal'])
+        self.assert_protected()
+
+    def test_then_least_recently_used_units_whole_until_the_goal(self):
+        # goal 1.5 MB: incremental, then the build-script output (9 days), old (5 days),
+        # mid (3 days); new (1 day) stays. Reclaim, unlike sweep, may take script output.
+        result = guard.reclaim([self.root], 4 * MB, int(1.5 * MB), process_probe=quiet)
+        self.assertEqual(result['verdict'], 'cargo_reclaimed')
+        self.assertEqual(result['units_removed'], 3)
+        self.assertFalse(self.script_out.exists())
+        self.assertTrue(all(not p.exists() for p in self.old + self.mid), 'every output of a unit goes together')
+        self.assertTrue(all(p.exists() for p in self.new))
+        self.assertTrue(result['reached_goal'])
+        self.assertLess(result['after_bytes'], result['before_bytes'])
+        self.assert_protected()
+
+    def test_an_active_build_defers_and_removes_nothing(self):
+        with self.assertRaisesRegex(guard.Deferred, 'active cargo'):
+            guard.reclaim([self.root], 0, 0, process_probe=lambda _: (['4242'], 9))
+        with self.assertRaisesRegex(guard.Deferred, 'active cargo'):
+            guard.sweep([self.root], now=NOW, process_probe=lambda _: (['4242'], 9))
+        self.assertTrue(self.incremental.exists() and all(p.exists() for p in self.old))
+
+    def test_a_held_lease_defers(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        try:
+            with self.assertRaisesRegex(guard.Deferred, 'lock busy'):
+                guard.reclaim([self.root], 0, 0, process_probe=quiet)
+        finally:
+            os.close(fd)
+        self.assertTrue(all(p.exists() for p in self.old))
+
+    def test_sweep_removes_only_what_is_unused_for_two_days(self):
+        result = guard.sweep([self.root], 2 * DAY, now=NOW, process_probe=quiet)
+        self.assertEqual(result['verdict'], 'cargo_swept')
+        self.assertTrue(all(not p.exists() for p in self.old + self.mid))
+        self.assertTrue(all(p.exists() for p in self.new))
+        self.assertTrue(self.incremental.exists(), 'a session used yesterday stays')
+        self.assertTrue(self.script_out.exists(), 'build-script output is left to the size-driven reclaim')
+        self.assertEqual(result['units_removed'], 2)
+        self.assert_protected()
+        # a day later the rest is idle too
+        guard.sweep([self.root], 2 * DAY, now=NOW + 1.5 * DAY, process_probe=quiet)
+        self.assertFalse(self.incremental.exists() or any(p.exists() for p in self.new))
+        self.assertTrue(self.script_out.exists())
+        self.assert_protected()
+
+    def test_a_read_counts_as_use(self):
+        # rebuilt 5 days ago, read yesterday: atime keeps it
+        os.utime(self.old[0], (NOW - 1 * DAY, NOW - 5 * DAY))
+        guard.sweep([self.root], 2 * DAY, now=NOW, process_probe=quiet)
+        self.assertTrue(self.old[0].exists())
+
+
+class SafeCargoReclaimTests(unittest.TestCase):
+    """The shipped wrapper: a budget refusal on size reclaims and retries once."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp(prefix='amux-cargo-guard-test.')).resolve()
+        self.addCleanup(lambda: subprocess.run(['rm', '-rf', str(self.base)]))
+        self.root = self.base / 'rust-build-target'
+        for i in range(3):  # 3 MB of old dependency units over a 2 MB cap
+            put(self.root / 'debug' / 'deps' / ('libdep%d-%016x.rlib' % (i, i)), MB, NOW - (5 - i) * DAY)
+        self.keep = put(self.root / 'release' / 'amux-server', MB, NOW - 30 * DAY)
+        bin_dir = self.base / 'bin'
+        bin_dir.mkdir()
+        (bin_dir / 'systemd-run').write_text('#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n')
+        self.runs = self.base / 'cargo-runs'
+        (bin_dir / 'cargo').write_text('#!/bin/sh\necho run >> "%s"\n' % self.runs)
+        for name in ('systemd-run', 'cargo'):
+            (bin_dir / name).chmod(0o755)
+        self.env = {**os.environ, 'PATH': str(bin_dir) + ':' + os.environ['PATH'],
+                    'CARGO_TARGET_DIR': str(self.root), 'HOME': str(self.base / 'home'),
+                    'AMUX_CARGO_MAX_TARGET_MB': '2', 'AMUX_CARGO_RECLAIM_TO_GB': str(1.5 / 1024),
+                    'AMUX_CARGO_MIN_FREE_GB': '1',
+                    # the guard's temporary-fixture probe seam: host builds cannot defer this
+                    'AMUX_CARGO_GUARD_TEST_FIXTURE': str(self.base), 'AMUX_RS_DISK_CLEAR_ONLY': '1'}
+
+    def run_wrapper(self):
+        return subprocess.run(['bash', str(SCRIPT.with_name('safe-cargo.sh')), 'check'], env=self.env,
+                              capture_output=True, text=True, timeout=120)
+
+    def test_refusal_on_size_reclaims_then_the_build_runs(self):
+        done = self.run_wrapper()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn('cargo_budget_refused', done.stderr)
+        self.assertIn('cargo_reclaimed', done.stderr)
+        self.assertEqual(self.runs.read_text().count('run'), 1, 'refused once, then ran once')
+        self.assertTrue(self.keep.exists(), 'release/ is protected')
+        self.assertEqual(len(list((self.root / 'debug' / 'deps').iterdir())), 1, 'the newest unit stays')
+
+    def test_a_held_lease_defers_the_reclaim_and_the_refusal_stands(self):
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        try:
+            # the wrapper's own run takes a shared lease too, so it is not blocked; the
+            # exclusive reclaim is, and the build must not run on an over-cap target
+            done = self.run_wrapper()
+        finally:
+            os.close(fd)
+        self.assertEqual(done.returncode, 75, done.stderr)
+        self.assertIn('refusal stands', done.stderr)
+        self.assertFalse(self.runs.exists())
+        self.assertEqual(len(list((self.root / 'debug' / 'deps').iterdir())), 3)
 
 
 if __name__ == '__main__':
