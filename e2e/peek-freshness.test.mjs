@@ -24,6 +24,7 @@ function fixture() {
     _peekHistoryRaw:'', _peekHistoryHTML:'', _lastPeekRaw:'', _lastLiveHTML:'', lastPeekHTML:'',
     _peekEarlier:{}, _peekEarlierHTML:()=>'', _trimPeekLiveOverlap:(_history,live)=>live,
     _peekLiveHtml:value=>value, _peekHtml:value=>value, hidePeekLoading(){}, _stopPeekPoll(){},
+    _peekLastAppliedAt:null, _peekFreshnessEpisode:'',   // freshness state the real _peekFrameApplied writes
     _peekPollActive:true, _peekPollInFlight:false, _peekPollAgain:false, _peekFullPending:false,
     _peekScrollLocked:false, _peekPressHold:false, _peekTraceBegin(){}, _peekTraceFrame(){}, _peekTraceEnd(){}, _peekTraceCur:null, _peekTraceRegion:'history', _peekFollowBottom:true, _peekBufferedOutput:false, _peekPendingFindScroll:false,
     _isScrolledToBottom:()=>true, _sendingSnapshot:null, _hideScrollLockBadge(){}, _showScrollLockBadge(){},
@@ -42,6 +43,7 @@ function fixture() {
   });
   // Exercise the real cache painter newly called by refreshPeek, too.
   vm.runInContext(source.slice(source.indexOf('function _paintCachedPeek('), source.indexOf('// ── Worker types')),ctx);
+  vm.runInContext(source.slice(source.indexOf('function _peekFrameApplied('), source.indexOf('function _checkViewFreshness(')),ctx);
   vm.runInContext(code,ctx);
   ctx._resetPeekRequests();
   return {ctx,calls,beacons,body,status,timers,advance(ms){clock+=ms;},switchWorker(name){generation++;ctx.peekSession=name;ctx._resetPeekRequests();}};
