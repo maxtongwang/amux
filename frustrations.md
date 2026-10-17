@@ -6102,3 +6102,20 @@ COST: Two dead probe turns and an owner keystroke before the cause was visible.
 FIX: The server's codex launch arm reads models_cache.json: amux's default is dropped when the account does not offer it
   (verdict codex_default_model_unavailable) so Codex uses the account default; a configured model is kept
   and warned about (codex_configured_model_unavailable).
+
+## Owner-only e2e steps cannot run from inside a worker pane
+AREA: attribution
+SEVERITY: degrades
+STATUS: open
+DATE: 2026-10-16
+SESSION: dev-merging-installing-worker
+CARD: DMIW-8
+SYMPTOM: After #7 attributes local requests to the process that opened the socket, Playwright run from an
+  amux worker pane is that worker, even against the e2e harness's own throwaway server. LC-ISOLATED-OWNER's
+  owner-only steer (`e2e/isolated-worker.spec.ts:110`) returned 403 `isolated_target` in 6 of 6 local runs,
+  before the step under test, so the spec can be measured only on hosted CI.
+COST: The isolated-worker flake on #6 could not be reproduced or bisected locally; two extra hosted reruns
+  and a separate test-hardening PR (#13) instead of a local loop.
+FIX: The e2e harness mints a test-only owner identity for the server it starts (its own AMUX_HOME and port)
+  and sends it on owner-only steps. The identity is accepted only by that isolated test server, never by
+  the live one on 8824.
