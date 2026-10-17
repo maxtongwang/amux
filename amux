@@ -1014,7 +1014,17 @@ cmd_usage() {
     "") ;;
     *) die "amux usage: unknown option '$1' (see: amux usage --help)" ;;
   esac
-  out=$(_curl -sk -m 30 -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" "$AMUX_API/api/usage") || die "server unreachable"
+  local code
+  out=$(_curl -sk -m 30 -w '\n%{http_code}' -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" "$AMUX_API/api/usage") || die "server unreachable"
+  code="${out##*$'\n'}"; out="${out%$'\n'*}"
+  # A refusal is a failure in both modes: --json keeps the body for the caller but never exits 0 on it.
+  if [[ ! "$code" =~ ^2[0-9][0-9]$ ]]; then
+    [[ "$json" == 1 ]] && printf '%s\n' "$out"
+    die "amux usage: the server answered HTTP $code: $(printf '%s' "$out" | python3 -c 'import json,sys
+try: d = json.load(sys.stdin)
+except ValueError: d = {}
+print(d.get("error") or d.get("reason") or "no usage data")' 2>/dev/null)"
+  fi
   if [[ "$json" == 1 ]]; then printf '%s\n' "$out"; return; fi
   printf '%s' "$out" | python3 -c '
 import datetime as dt, json, sys

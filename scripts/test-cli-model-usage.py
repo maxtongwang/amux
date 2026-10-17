@@ -31,7 +31,7 @@ USAGE = {'measured': True, 'providers': [
 
 
 class CliModelUsageTests(unittest.TestCase):
-    def run_cli(self, *args, patch_status=200, patch_reply=None):
+    def run_cli(self, *args, patch_status=200, patch_reply=None, usage_status=200, usage_reply=None):
         seen = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -45,7 +45,7 @@ class CliModelUsageTests(unittest.TestCase):
                 if self.path.startswith('/api/sessions'):
                     self.reply(200, SESSIONS)
                 elif self.path.startswith('/api/usage'):
-                    self.reply(200, USAGE)
+                    self.reply(usage_status, usage_reply if usage_reply is not None else USAGE)
                 else:
                     self.reply(200, {'ok': True})
 
@@ -140,6 +140,14 @@ class CliModelUsageTests(unittest.TestCase):
         self.assertIn('Gemini: unavailable', r.stdout)
         self.assertIn('Ollama: local, unmetered', r.stdout)
         self.assertIn('Grok: unmeasured', r.stdout)
+
+    def test_a_usage_refusal_fails_in_both_modes(self):
+        refusal = {'error': 'unauthorized', 'reason': 'missing_credential'}
+        for args in (('usage',), ('usage', '--json')):
+            r, _ = self.run_cli(*args, usage_status=401, usage_reply=refusal)
+            self.assertNotEqual(r.returncode, 0, args)
+            self.assertIn('HTTP 401', r.stderr, args)
+            self.assertIn('unauthorized', r.stderr, args)
 
     def test_usage_json_is_the_server_document(self):
         r, _ = self.run_cli('usage', '--json')
