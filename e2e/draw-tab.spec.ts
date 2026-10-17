@@ -346,6 +346,16 @@ const addEl = (page: Page, id: string, type = 'rectangle') => page.evaluate(([ni
   d.api.updateScene({ elements: d.api.getSceneElementsIncludingDeleted().concat(els) });
 }, [id, type]);
 
+// The recents file is server-wide (<data dir>/draw/recents.json), capped at
+// 12, and every draw spec in a parallel worker writes it, so a test that reads
+// its own entries back points the page at a file in its temp folder. app.js is
+// a classic script: its callers resolve the global at call time. Call after
+// every reload, before Draw opens.
+async function ownRecents(page: Page, dir: string) {
+  await page.waitForFunction(() => typeof (window as any)._drawRecentsPath === 'function');
+  await page.evaluate(p => { (window as any)._drawRecentsPath = () => p; }, join(dir, 'recents.json'));
+}
+
 async function withDrawPrefs(page: Page, request: APIRequestContext, info: TestInfo, prefix: string, body: (dir: string) => Promise<void>) {
   const dir = await mkdtemp(join(tmpdir(), prefix));
   await page.addInitScript(() => localStorage.setItem('amux_walkthrough_done', '1'));
@@ -372,6 +382,7 @@ test('Draw: clicking a drawing in Recent or In this folder opens it, and no file
     await writeFile(a, sceneOf([{ id: 'alpha-rect', type: 'rectangle', x: 0 }, { id: 'alpha-ell', type: 'ellipse', x: 150 }]));
     await writeFile(b, sceneOf([{ id: 'beta-diamond', type: 'diamond', x: 0 }]));
     await page.reload();
+    await ownRecents(page, dir);
     await openDraw(page);
     const saved = () => expect(page.locator('#draw-save-state')).toHaveAttribute('data-state', 'saved', { timeout: 15_000 });
     // Edit each through the app so both files were last written by it.
@@ -409,6 +420,7 @@ test('Draw: clicking a drawing in Recent or In this folder opens it, and no file
     await page.waitForFunction(() => !(window as unknown as Win)._draw.recentsTimer, null, { timeout: 10_000 });
     await page.waitForTimeout(500);
     await page.reload();
+    await ownRecents(page, dir);
     await openDraw(page);
     await expect.poll(() => sceneIds(page)).toEqual(['beta-diamond', 'beta-new']);
     await showDrawings(page);
@@ -771,9 +783,7 @@ test('Draw: saving recents keeps entries another tab wrote', async ({ page, requ
     const mine = join(dir, 'Mine.excalidraw');
     await writeFile(mine, sceneOf([{ id: 'mine-rect', type: 'rectangle', x: 0 }]));
     await page.reload();
-    await page.waitForFunction(() => typeof (window as any)._drawRecentsPath === 'function');
-    // app.js is a classic script: its callers resolve the global at call time.
-    await page.evaluate(p => { (window as any)._drawRecentsPath = () => p; }, join(dir, 'recents.json'));
+    await ownRecents(page, dir);
     await openDraw(page);
     await page.evaluate(p => (window as any)._drawOpen(p), mine);
     await expect.poll(() => sceneIds(page)).toEqual(['mine-rect']);

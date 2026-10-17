@@ -27812,25 +27812,12 @@ pub(crate) fn peer_input_refusal(origin: &str, target: &str) -> Option<PeerInput
     worker_group_refusal(origin, target, &lane_groups(origin), &target_groups, &open)
 }
 
-/// Queue producers use an empty sender for system input and "owner" for saved
-/// owner rules. Internal producer names are explicit; a retired worker without
-/// an env file cannot turn its pending message into owner input.
-/// The worker a request speaks for, or empty for the owner and verified human
-/// members. Headers are process-attributed by api/process_identity.rs, so a
-/// worker cannot drop or swap them to read as the owner.
-pub(crate) fn request_worker_origin(headers: &HeaderMap) -> String {
-    if super::org::local_member_actor(headers).is_some() {
-        return String::new();
-    }
-    hdr_worker(headers)
-}
-
 /// Input that reaches another worker outside `send` (a `/start` prompt, raw
 /// `keys`) answers to the same peer gate as `send`: refused across a group
 /// boundary or a receive policy, with send's own codes. The owner and a
 /// worker acting on itself are untouched.
 pub(crate) fn peer_input_gate(headers: &HeaderMap, target: &str, verb: &str) -> Option<Response> {
-    let origin = request_worker_origin(headers);
+    let origin = worker_origin(headers);
     if origin.is_empty() || origin == target {
         return None;
     }
@@ -27850,7 +27837,7 @@ pub(crate) fn start_prompt_for(headers: &HeaderMap, target: &str, prompt: String
     if let Some(refusal) = peer_input_gate(headers, target, "start") {
         return Err(refusal);
     }
-    Ok(origin_stamped(&request_worker_origin(headers), target, &prompt).unwrap_or(prompt))
+    Ok(origin_stamped(&worker_origin(headers), target, &prompt).unwrap_or(prompt))
 }
 
 /// Writes that become a worker's own context or standing owner input (its
@@ -27859,7 +27846,7 @@ pub(crate) fn start_prompt_for(headers: &HeaderMap, target: &str, prompt: String
 /// itself, may make them; a peer reaches a worker through `send`, which stamps
 /// and gates. Mirrors scope.rs, where a worker may write only its own layer.
 pub(crate) fn owner_or_self_refusal(headers: &HeaderMap, target: &str, what: &str, code: &'static str) -> Option<Response> {
-    let origin = request_worker_origin(headers);
+    let origin = worker_origin(headers);
     if origin.is_empty() || origin == target {
         return None;
     }
@@ -27873,6 +27860,9 @@ pub(crate) fn instructions_write_refusal(headers: &HeaderMap, target: &str) -> O
     owner_or_self_refusal(headers, target, "standing instructions (owner input re-sent on every start)", "worker_instructions_refused")
 }
 
+/// Queue producers use an empty sender for system input and "owner" for saved
+/// owner rules. Internal producer names are explicit; a retired worker without
+/// an env file cannot turn its pending message into owner input.
 fn queued_peer_input_refusal(sender: &str, target: &str) -> Option<PeerInputRefusal> {
     if sender.is_empty() || sender == "owner" || sender.starts_with("harness:") || sender == "browser-reaper" { return None; }
     if chat_speaks_for_owner(sender) { return None; }

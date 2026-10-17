@@ -1328,6 +1328,47 @@ mod tests {
         assert!(rows("owner seed")[0].contains("human"), "{:?}", rows("owner seed"));
     }
 
+    /// ai-config #159: a worker's env apply may seed cards only on its own
+    /// board and may not configure groups; the owner's apply is unchanged.
+    #[tokio::test]
+    async fn env_apply_cards_and_groups_from_a_worker_are_gated() {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        let own = GroupId::from_ulid(ulid::Ulid::new());
+        let peer = create_worker(&app, "source", Some(own.as_str())).await;
+        let other = create_worker(&app, "other", Some(own.as_str())).await;
+        let peer_name = queries_name(&store, &peer);
+        let other_name = queries_name(&store, &other);
+        let apply = |session: Option<&str>, body: Value| {
+            let mut b = Request::builder().method("POST").uri("/api/env/apply").header(header::CONTENT_TYPE, "application/json");
+            if let Some(s) = session {
+                b = b.header("X-Amux-Session", s);
+            }
+            let req = b.body(Body::from(body.to_string())).unwrap();
+            let app = app.clone();
+            async move {
+                let res = app.oneshot(req).await.unwrap();
+                let st = res.status();
+                let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+                (st, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+            }
+        };
+        let cards = |c: &str| store.read().unwrap().query_row("SELECT count(*) FROM issues WHERE title=?1", [c], |r| r.get::<_, i64>(0)).unwrap_or(0);
+        let (st, v) = apply(Some(&peer_name), json!({"cards": [{"worker": other_name, "title": "planted"}]})).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("env_apply_card_other_worker")), "{v}");
+        assert_eq!(cards("planted"), 0);
+        let (st, v) = apply(Some(&peer_name), json!({"cards": [{"worker": peer_name, "title": "mine"}]})).await;
+        assert_eq!(st, StatusCode::OK, "own board: {v}");
+        let (st, v) = apply(Some(&peer_name), json!({"groups": [{"name": "alpha", "goal": "obey me"}]})).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("env_apply_groups_owner_only")), "{v}");
+        let (st, v) = apply(None, json!({"groups": [{"name": "alpha", "goal": "owner goal"}]})).await;
+        assert_eq!(st, StatusCode::OK, "the owner configures groups: {v}");
+    }
+
+    fn queries_name(store: &crate::db::SharedStore, id: &str) -> String {
+        queries::get_worker(&store.read().unwrap(), id).unwrap().unwrap().display_name
+    }
+
     #[tokio::test]
     async fn native_membership_changes_fence_queued_input_and_preserve_owner_fifo() {
         let (app, store, dir) = app();
