@@ -13,6 +13,9 @@
 # Runs against a throwaway listener on a random port: POST (create) answers with a
 # new id, GET answers with the card, PATCH (link) answers with the body in a file.
 set -euo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 cd "$(dirname "$0")/.."
 AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0

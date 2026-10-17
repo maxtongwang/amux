@@ -19,6 +19,9 @@
 # fleet on every run is its own incident, and the CLI refuses an unknown worker
 # before it ever POSTs.
 set -euo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 cd "$(dirname "$0")/.."
 AMUX_BIN="${AMUX_BIN:-./amux}"   # override to run against a broken fixture
 PASS=0; FAIL=0

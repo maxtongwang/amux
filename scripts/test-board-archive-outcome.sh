@@ -9,6 +9,9 @@
 # CLI-side write (the PATCH body is built in the shell), so runs the REAL
 # shipped verb against a MOCK curl, same pattern as test-board-shepherd.sh.
 set -euo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 cd "$(dirname "$0")/.."
 AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0

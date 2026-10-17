@@ -1076,7 +1076,7 @@ pub(crate) fn pick_tree(configured: Option<PathBuf>, live: Option<PathBuf>, head
 /// The git toplevel of the lane's live tmux pane, if it is in one.
 fn live_checkout(lane: &str) -> Option<PathBuf> {
     let pt = crate::backend::tmux::pane_target(&format!("amux-{lane}"));
-    let out = std::process::Command::new("tmux").args(["display-message", "-p", "-t", &pt, "#{pane_current_path}"]).output().ok()?;
+    let out = crate::tmux_guard::std_tmux().args(["display-message", "-p", "-t", &pt, "#{pane_current_path}"]).output().ok()?;
     let cwd = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if !out.status.success() || cwd.is_empty() {
         return None;

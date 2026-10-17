@@ -6,6 +6,9 @@
 # shipped file rather than paraphrased, because a check pinning a copy of the
 # logic is exactly as green as one pinning the wrong layer (ethos rule 7).
 set -u
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 ROOT_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOOK="$ROOT_REPO/scripts/git-hooks/pre-commit"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT

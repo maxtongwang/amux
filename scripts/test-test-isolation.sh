@@ -57,5 +57,40 @@ check "a live-server test skips (exit 2) without AMUX_TEST_LIVE=1" 2 "$rc"
 rc=$(AMUX_TEST_LIVE=1 bash -c 'source scripts/lib/test-isolation.sh; amux_test_require_live; exit 0' 2>/dev/null; echo $?)
 check "and runs when the caller opts in" 0 "$rc"
 
+# ── tmux: never the real user's default socket ──────────────────────────────
+rc=$(bash -c 'source scripts/lib/test-isolation.sh; amux_test_isolate "$1" || exit 9
+  [ -z "${TMUX:-}${TMUX_PANE:-}" ] || exit 10
+  [ "$TMUX_TMPDIR" = "$1/tmux" ] && [ -d "$TMUX_TMPDIR" ] || exit 11' _ "$T/ok" 2>/dev/null; echo $?)
+check "TMUX/TMUX_PANE unset and TMUX_TMPDIR private to the test" 0 "$rc"
+rc=$(bash -c 'source scripts/lib/test-isolation.sh; amux_test_isolate "$1" || exit 9; export TMUX_TMPDIR=/tmp; amux_test_assert_isolated' _ "$T/ok" 2>"$T/err"; echo $?)
+check "refuses TMUX_TMPDIR pointed at the system tmp" 1 "$rc"
+grep -q "default tmux socket" "$T/err"; check "names the default-socket cause" 0 $?
+rc=$(bash -c 'source scripts/lib/test-isolation.sh; amux_test_isolate "$1" || exit 9; unset TMUX_TMPDIR; amux_test_assert_isolated' _ "$T/ok" 2>"$T/err"; echo $?)
+check "refuses an unset TMUX_TMPDIR (tmux would use the real default socket)" 1 "$rc"
+rc=$(bash -c 'source scripts/lib/test-isolation.sh; amux_test_isolate "$1" || exit 9; export TMUX=/tmp/tmux-0/default,1,0; amux_test_assert_isolated' _ "$T/ok" 2>/dev/null; echo $?)
+check "refuses an inherited TMUX set after isolating" 1 "$rc"
+
+# A rename and a new-session inside a guarded test land on the PRIVATE server,
+# and its server is gone once the test shell exits. Only the private socket
+# is ever named (-S <private path>); the default socket is never called.
+if command -v tmux >/dev/null 2>&1; then
+  mkdir -p "$T/tm"
+  sock="$T/tm/tmux/tmux-$(id -u)/default"
+  rc=$(bash -c 'source scripts/lib/test-isolation.sh; amux_test_isolate "$1" || exit 9
+    tmux -f /dev/null new-session -d -s amux-guard-probe "sleep 60" || exit 10
+    tmux rename-session -t =amux-guard-probe amux-guard-renamed || exit 11
+    priv="$TMUX_TMPDIR/tmux-$(id -u)/default"
+    [ -S "$priv" ] || exit 12
+    [ "$(tmux -S "$priv" ls -F "#{session_name}")" = amux-guard-renamed ] || exit 13' _ "$T/tm" 2>"$T/err"; echo $?)
+  check "new-session and rename land on the private socket, which holds only the probe (12: no private socket, 13: other sessions) $(head -1 "$T/err")" 0 "$rc"
+  gone=1
+  for _ in 1 2 3 4 5 6; do
+    if env -u TMUX tmux -S "$sock" has-session 2>/dev/null; then sleep 1; else gone=0; break; fi
+  done
+  check "the private tmux server is killed after the test shell exits" 0 "$gone"
+else
+  echo "  note  tmux not installed: the private-server cells were NOT run"
+fi
+
 echo "test isolation: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

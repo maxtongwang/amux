@@ -270,7 +270,7 @@ fn seed_context(worker: &str) -> String {
         s.push_str("\n\n");
     }
     let pt = pane_target_of(worker);
-    if let Ok(o) = std::process::Command::new("tmux")
+    if let Ok(o) = crate::tmux_guard::std_tmux()
         .args(["capture-pane", "-p", "-J", "-S", "-300", "-t", &pt])
         .output()
     {

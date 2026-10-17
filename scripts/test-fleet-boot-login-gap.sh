@@ -11,6 +11,9 @@
 # injectable, which is what AMUX_FLEET_BOOT_EPOCH is for. This drives all three
 # arms and asserts exactly one fires.
 set -uo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 BOOT="${FLEET_BOOT_SH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/fleet-boot.sh}"
 [[ -x "$BOOT" ]] || { echo "FAIL: $BOOT not executable"; exit 1; }
 

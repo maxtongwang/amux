@@ -1247,7 +1247,8 @@ pub(crate) async fn run_cmd(
     args: &[&str],
     timeout: Duration,
 ) -> Option<std::process::Output> {
-    let mut cmd = tokio::process::Command::new(bin);
+    // tmux goes through the test guard (tmux_guard): never the host server in a test.
+    let mut cmd = if bin == "tmux" { crate::tmux_guard::tokio_tmux() } else { tokio::process::Command::new(bin) };
     cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -23364,7 +23365,7 @@ fn orphan_landing(session: &str, text: &str, queued_at: f64) -> OrphanLanding {
     // Pasted but not submitted: re-queueing would type it twice.
     // Exact-match target, so a sibling `amux-<session>-2` is never read instead.
     let pt = crate::backend::tmux::pane_target(&format!("amux-{session}"));
-    let pane = std::process::Command::new("tmux")
+    let pane = crate::tmux_guard::std_tmux()
         .args(["capture-pane", "-p", "-t", &pt, "-S", "-80"])
         .output()
         .ok()
@@ -29883,7 +29884,7 @@ pub(crate) async fn refresh_scoped_context(
             continue;
         }
         let st = crate::backend::tmux::session_target(&format!("amux-{w}"));
-        let running = tokio::process::Command::new("tmux")
+        let running = crate::tmux_guard::tokio_tmux()
             .args(["has-session", "-t", &st])
             .status()
             .await
@@ -34814,7 +34815,7 @@ mod tests {
     #[test]
     fn tmux_shell_setup_keeps_line_and_enter_in_one_command() {
         use std::process::Command;
-        if Command::new("tmux").arg("-V").output().is_err() {
+        if crate::tmux_guard::std_tmux().arg("-V").output().is_err() {
             eprintln!("tmux unavailable; live shell submission test not measured");
             return;
         }
@@ -34823,7 +34824,7 @@ mod tests {
         struct PrivateServer(std::path::PathBuf);
         impl Drop for PrivateServer {
             fn drop(&mut self) {
-                let _ = Command::new("tmux")
+                let _ = crate::tmux_guard::std_tmux()
                     .arg("-S")
                     .arg(&self.0)
                     .arg("kill-server")
@@ -34831,7 +34832,7 @@ mod tests {
             }
         }
         let _server = PrivateServer(socket.clone());
-        let created = Command::new("tmux")
+        let created = crate::tmux_guard::std_tmux()
             .arg("-S")
             .arg(&socket)
             .args([
@@ -34855,7 +34856,7 @@ mod tests {
                 "printf '%s\\n' {value} >> {}",
                 super::sh_quote(&receipt.to_string_lossy())
             );
-            let out = Command::new("tmux")
+            let out = crate::tmux_guard::std_tmux()
                 .arg("-S")
                 .arg(&socket)
                 .args(super::shell_line_args(&pt, &line))
@@ -34889,7 +34890,7 @@ mod tests {
         struct PrivateServer(std::path::PathBuf);
         impl Drop for PrivateServer {
             fn drop(&mut self) {
-                let _ = Command::new("tmux")
+                let _ = crate::tmux_guard::std_tmux()
                     .arg("-S")
                     .arg(&self.0)
                     .arg("kill-server")
@@ -34897,7 +34898,7 @@ mod tests {
             }
         }
         let _server = PrivateServer(socket.clone());
-        let created = Command::new("tmux")
+        let created = crate::tmux_guard::std_tmux()
             .arg("-S")
             .arg(&socket)
             .args([
@@ -34920,7 +34921,7 @@ mod tests {
             let socket = socket.clone();
             async move {
                 let target = super::pt("startup-proof");
-                tokio::process::Command::new("tmux")
+                crate::tmux_guard::tokio_tmux()
                     .arg("-S")
                     .arg(socket)
                     .args(super::shell_line_args(&target, &line))
@@ -35103,7 +35104,7 @@ mod tests {
             .await
             .unwrap();
         let pt = super::pt("startup-proof");
-        let pane = Command::new("tmux")
+        let pane = crate::tmux_guard::std_tmux()
             .arg("-S")
             .arg(&socket)
             .args(["capture-pane", "-p", "-t", pt.as_str(), "-S", "-"])
@@ -44117,7 +44118,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         impl Drop for Pane {
             fn drop(&mut self) {
                 let st = session_target(&self.0);
-                let _ = std::process::Command::new("tmux")
+                let _ = crate::tmux_guard::std_tmux()
                     .args(["kill-session", "-t", &st])
                     .output();
             }
@@ -44623,7 +44624,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         // And nothing was created. This is the assertion the incident needed:
         // the test could not tell it had spawned, because from inside every
         // call returned as though it worked.
-        let live = tokio::process::Command::new("tmux")
+        let live = crate::tmux_guard::tokio_tmux()
             .args(["list-sessions", "-F", "#{session_name}"])
             .output()
             .await
@@ -47632,7 +47633,7 @@ mod submission_gate_tests {
         impl Drop for Pane {
             fn drop(&mut self) {
                 let st = session_target(&self.0);
-                let _ = std::process::Command::new("tmux")
+                let _ = crate::tmux_guard::std_tmux()
                     .args(["kill-session", "-t", &st])
                     .output();
             }
@@ -47668,7 +47669,7 @@ with open(sys.argv[3],'ab',buffering=0) as log:
         if key in (b'\r',b'\n'): paint(sys.argv[2])
 "#
         );
-        let output = std::process::Command::new("tmux")
+        let output = crate::tmux_guard::std_tmux()
             .args([
                 "new-session",
                 "-d",
@@ -47726,7 +47727,7 @@ with open(sys.argv[3],'ab',buffering=0) as log:
         impl Drop for Pane {
             fn drop(&mut self) {
                 let stq = session_target(&self.0);
-                let _ = std::process::Command::new("tmux")
+                let _ = crate::tmux_guard::std_tmux()
                     .args(["kill-session", "-t", &stq])
                     .output();
             }
@@ -47744,7 +47745,7 @@ with open(sys.argv[3],'ab',buffering=0) as log:
                 (now_f64() * 1_000_000.0) as u64
             );
             let pane = Pane(tmux_name(&lane));
-            let output = std::process::Command::new("tmux").args([
+            let output = crate::tmux_guard::std_tmux().args([
                 "new-session", "-d", "-s", &pane.0, "-x", "200", "-y", "24",
                 "python3", "-c", "import pathlib,sys,time;print(pathlib.Path(sys.argv[1]).read_text(),flush=True);time.sleep(20)",
                 path.to_str().unwrap(),

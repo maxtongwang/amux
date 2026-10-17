@@ -234,7 +234,7 @@ fn capture_pane_bounded(pt: &str, lane: &str) -> Option<String> {
     // that by NAME. It caught this refactor — the caller does pass a real
     // pane_target(), and renaming the parameter is what keeps the audit able to
     // see that at the call site it inspects.
-    let mut cmd = Command::new("tmux");
+    let mut cmd = crate::tmux_guard::std_tmux();
     cmd.args(["capture-pane", "-t", pt, "-p", "-e", "-S", "-30"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -1241,7 +1241,7 @@ impl FleetSignals {
         // child exits with no timeout; a wedged tmux held this request open for
         // 697s on 2026-08-28. `run_bounded_output` rather than `run_bounded`
         // because the WARN below needs `status` and `stderr`.
-        let mut lsc = std::process::Command::new("tmux");
+        let mut lsc = crate::tmux_guard::std_tmux();
         let format = "#{session_name}:#{session_activity}:#{session_created}:#{window_activity}";
         if let Some(name) = lane {
             let pt = Self::lane_probe_target(name);
@@ -1290,7 +1290,7 @@ impl FleetSignals {
         // worse than the bug it fixes.
         // BOUNDED (AF-301) — was a bare `.output()`.
         let all_panes_dead = {
-            let mut c = std::process::Command::new("tmux");
+            let mut c = crate::tmux_guard::std_tmux();
             if let Some(name) = lane {
                 let pt = Self::lane_probe_target(name);
                 c.args([
@@ -1348,7 +1348,7 @@ impl FleetSignals {
         let mut provider_children_measured = false;
         // BOUNDED (AF-301) — was a bare `.output()`.
         let panes_probe = {
-            let mut c = std::process::Command::new("tmux");
+            let mut c = crate::tmux_guard::std_tmux();
             if let Some(name) = lane {
                 let pt = Self::lane_probe_target(name);
                 c.args([

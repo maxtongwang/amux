@@ -19,9 +19,17 @@
 #     AMUX_TEST_*, which are the test's own inputs,
 #   - points AMUX_API and AMUX_URL at a dead loopback port (unset, the CLI
 #     falls back to the live https://localhost:8824),
+#   - puts tmux on a PRIVATE server: TMUX and TMUX_PANE unset, TMUX_TMPDIR set
+#     to <tmpdir>/tmux, and that server killed when the test shell exits
+#     (2026-10-16: a test's rename probe renamed the live amux-dev-lead session
+#     through the default socket),
 #   - REFUSES (returns 1 with a reason on stderr) when <tmpdir> is the user's
-#     real home or lies inside the real ~/.amux, or when an endpoint.json is
-#     reachable from the resolved home, i.e. the CLI could still find a server.
+#     real home or lies inside the real ~/.amux, when an endpoint.json is
+#     reachable from the resolved home (the CLI could still find a server), or
+#     when tmux would resolve the real user's default socket (TMUX_TMPDIR unset
+#     or the system tmp).
+#
+# Never call tmux on the default socket from a test, not even read-only.
 #
 # Set the test's own AMUX_API/AMUX_URL (a loopback recorder) AFTER calling it.
 # `amux_test_assert_isolated` re-checks the invariants, for a test that builds
@@ -34,6 +42,28 @@ _amux_real_home() {
 }
 
 _amux_resolve() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"; }
+
+# Is $1 a tmux socket directory other than the real user's default? The
+# default is TMUX_TMPDIR unset (tmux uses /tmp) or the system tmp itself.
+_amux_private_tmux_dir() {
+  local d="${1:-}" r s
+  [ -n "$d" ] && [ -d "$d" ] || return 1
+  r=$(_amux_resolve "$d")
+  for s in / /tmp /private/tmp /var/tmp "${TMPDIR:-/tmp}"; do
+    [ "$r" = "$(_amux_resolve "$s")" ] && return 1
+  done
+  return 0
+}
+
+# Kill the private tmux server whose sockets live in $1 (never the default).
+_amux_kill_private_tmux() {
+  _amux_private_tmux_dir "${1:-}" || return 0
+  local bin; bin=$(command -v tmux 2>/dev/null) || return 0
+  env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$1" "$bin" kill-server >/dev/null 2>&1 || true
+}
+
+# Explicit teardown, for a test that wants the server gone before it exits.
+amux_test_teardown() { _amux_kill_private_tmux "${TMUX_TMPDIR:-}"; }
 
 amux_test_assert_isolated() {
   local real home cc
@@ -62,6 +92,9 @@ amux_test_assert_isolated() {
       *localhost:8824*|*127.0.0.1:8824*) echo "amux_test_isolate: REFUSING: $v points at the live server port (${!v})" >&2; return 1 ;;
     esac
   done
+  if ! _amux_private_tmux_dir "${TMUX_TMPDIR:-}"; then
+    echo "amux_test_isolate: REFUSING: TMUX_TMPDIR='${TMUX_TMPDIR:-}' resolves to the real user's default tmux socket" >&2; return 1
+  fi
   for v in AMUX_SESSION AMUX_WORKER AMUX_WORKER_TOKEN TMUX TMUX_PANE; do
     if [ -n "${!v:-}" ]; then
       echo "amux_test_isolate: REFUSING: $v is still set; a lane identity would ride the test's requests" >&2; return 1
@@ -91,7 +124,31 @@ amux_test_isolate() {
   # The session hooks probe health at their own default (the live port).
   export AMUX_HEALTH_URL="$AMUX_TEST_DEAD_URL/health"
   mkdir -p "$CC_HOME"
+  amux_test_isolate_tmux "$tmp" || return 1
   amux_test_assert_isolated
+}
+
+# The tmux half alone, for a test that already pins its own homes: TMUX and
+# TMUX_PANE unset, TMUX_TMPDIR=<tmpdir>/tmux, refuse the default socket, and
+# kill the private server when the test shell exits.
+amux_test_isolate_tmux() {
+  local tmp="${1:-}"
+  if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then
+    echo "amux_test_isolate_tmux: needs an existing temp directory (got '${tmp}')" >&2; return 1
+  fi
+  unset TMUX TMUX_PANE
+  mkdir -p "$tmp/tmux"
+  export TMUX_TMPDIR="$tmp/tmux"
+  if ! _amux_private_tmux_dir "$TMUX_TMPDIR"; then
+    echo "amux_test_isolate: REFUSING: TMUX_TMPDIR='$TMUX_TMPDIR' resolves to the real user's default tmux socket" >&2; return 1
+  fi
+  # Teardown that survives the test's own EXIT trap (which may replace any
+  # trap set here): a detached watcher kills the private server once this
+  # shell is gone.
+  local dir="$TMUX_TMPDIR" parent=$$
+  ( while kill -0 "$parent" 2>/dev/null; do sleep 1; done; _amux_kill_private_tmux "$dir" ) </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  return 0
 }
 
 # For the few tests that exist to exercise a RUNNING server (they create and
