@@ -4537,11 +4537,24 @@ fn create_tags(body: &serde_json::Value) -> Result<Vec<String>, String> {
 }
 
 pub async fn create_session_legacy(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let body = body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null);
+    let resp = create_session_legacy_inner(headers.clone(), body.clone()).await;
+    // A worker's create passed the delegation table: log it (ai-config #160).
+    if resp.status().is_success() {
+        let tags = create_tags(&body).unwrap_or_default();
+        let action = crate::api::delegation::Action::CreateWorker {
+            tags: tags.clone(), settings: crate::api::delegation::create_body_settings(&body), owner_only: None };
+        crate::api::delegation::record_allowed(&state, &headers, &crate::api::delegation::Target::NewWorker, &action,
+            serde_json::Value::Null, json!({"name": body.get("name"), "tags": tags}));
+    }
+    resp
+}
+
+async fn create_session_legacy_inner(headers: HeaderMap, body: serde_json::Value) -> Response {
     let s = |k: &str| {
         body.get(k)
             .and_then(serde_json::Value::as_str)
@@ -4580,6 +4593,7 @@ pub async fn create_session_legacy(
             name: Some(&name),
             tags: &tag_list,
             owner_only: chat.then_some("the chat worker type"),
+            settings: crate::api::delegation::create_body_settings(&body),
         },
     ) {
         return refusal;

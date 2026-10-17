@@ -26750,17 +26750,19 @@ async fn post_dispatch(
     // must not differ.
     // Through the delegation table (ai-config #160); `stop` joined these: a
     // worker stops itself, a lead its team, anyone else is refused.
-    if matches!(action, "rename" | "instructions" | "memory" | "stop") {
-        use super::delegation::{authorize, rename_refusal, Action, Target};
+    if matches!(action, "rename" | "instructions" | "memory" | "stop" | "start" | "reset" | "clear" | "git" | "git-push" | "worktree" | "archive" | "keys") {
+        use super::delegation::{authorize, reserved_name_refusal, Action, Target};
         let act = match action {
             "rename" => {
                 let to = body_str(body, "name");
                 let to = if to.is_empty() { body_str(body, "rename") } else { to };
-                if let Some(r) = rename_refusal(headers, &to) { return r; }
+                if let Some(r) = reserved_name_refusal(headers, &to) { return r; }
                 Action::RenameWorker { to }
             }
             "stop" => Action::StopWorker,
-            other => Action::SetConfig { keys: vec![other.to_string()] },
+            // keys: self only (a pane writer); never a lead power.
+            "instructions" | "memory" | "keys" => Action::SetConfig { keys: vec![action.to_string()] },
+            other => Action::Lifecycle { verb: other.to_string() },
         };
         let grant = match authorize(state, headers, &Target::Worker(name.to_string()), &act, Some(body)) {
             Ok(g) => g,
@@ -27494,6 +27496,13 @@ async fn get_cross_group_config() -> Response {
 /// cross-group channel, which is the escalation the scope policy exists to stop.
 /// A request carrying no worker origin is the dashboard.
 async fn put_cross_group_config(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    // Routing is a delegation row (ai-config #160): mrpopo with max_ref only.
+    // This legacy endpoint can only CLEAR the override and has no AppState to
+    // verify a max_ref, so every worker gets the table's refusal here; the
+    // header check below stays for verified members.
+    if let Some(refusal) = super::delegation::refusal_value(&headers, &super::delegation::Target::Fleet, &super::delegation::Action::SetRouting) {
+        return jresp(StatusCode::FORBIDDEN, refusal);
+    }
     if ["x-amux-session", "x-amux-worker"].iter().any(|h| {
         headers
             .get(*h)
@@ -33077,26 +33086,10 @@ pub(crate) fn membership_refusal_body(headers: &HeaderMap, membership_named: boo
     // change has no group to scope a grant to, so no non-owner row allows it;
     // the paths that DO delegate membership (config/scope tags) call
     // `delegation::authorize` with the real before/after tags.
-    delegation_refusal(headers, &super::delegation::Target::Fleet,
+    super::delegation::refusal_value(headers, &super::delegation::Target::Fleet,
         &super::delegation::Action::SetMembership { group: String::new() })
 }
 
-/// A delegation decision as an optional #8-shaped 403 body, for the #8
-/// wrappers whose callers have no `AppState` (so no max_ref can be checked:
-/// `AllowWithMaxRef` is refused here, naming the path that can verify it).
-fn delegation_refusal(headers: &HeaderMap, target: &super::delegation::Target, action: &super::delegation::Action) -> Option<Value> {
-    use super::delegation::Decision;
-    let (origin, class, decision) = super::delegation::decide_for(headers, target, action);
-    let (code, error) = match decision {
-        Decision::Allow => return None,
-        Decision::AllowWithMaxRef => ("max_ref_missing",
-            format!("{} needs proof of Max's instruction; send it through PATCH /api/sessions/<worker>/config or PUT /api/scope with max_ref", action.label())),
-        Decision::Deny { code, reason } => (code, reason),
-    };
-    tracing::warn!(actor = %origin, class = %class.label(), ?target, action = %action.label(), code,
-        verdict = "delegation_refused", measured = true, n_considered = 1, "a delegated change was refused");
-    Some(super::delegation::refusal_body(code, &error))
-}
 
 /// The worker this request speaks for, from the one verified identity
 /// (`worker_identity::verified_worker`): empty for the owner/dashboard and
@@ -33134,7 +33127,7 @@ pub(crate) fn peer_config_refusal_body(headers: &HeaderMap, target: &str, what: 
     if classify(&worker_origin(headers), &t, &action) == Class::SelfWorker {
         return None;
     }
-    delegation_refusal(headers, &t, &action)
+    super::delegation::refusal_value(headers, &t, &action)
 }
 
 /// The group whose members may create workers (Max, 2026-10-16: "Only leads
@@ -33151,6 +33144,9 @@ pub(crate) struct CreateRequest<'a> {
     /// Something only the owner may grant at create: the chat worker type
     /// (it speaks for the owner) or a store `group` id.
     pub owner_only: Option<&'static str>,
+    /// Every other setting the create writes, classified by the delegation
+    /// table (`create:<field>`, `row:<field>`, `env:<KEY>`; design review B3).
+    pub settings: Vec<String>,
 }
 
 /// THE create rule, for every path that makes a worker: session create, store
@@ -33196,8 +33192,12 @@ pub(crate) fn worker_create_refusal_body(headers: &HeaderMap, req: &CreateReques
     }
     // The create rule is a delegation-table row (ai-config #160): only a lead
     // (CC_ORCHESTRATOR=1 and `leads`), only with its own team tag.
-    delegation_refusal(headers, &super::delegation::Target::NewWorker,
-        &super::delegation::Action::CreateWorker { tags: req.tags.to_vec(), owner_only: req.owner_only })
+    if let Some(name) = req.name.filter(|n| super::delegation::reserved_name(n)) {
+        return Some(super::delegation::refusal_body("reserved_name",
+            &format!("'{name}' is a reserved identity; only the owner may give a worker that name")));
+    }
+    super::delegation::refusal_value(headers, &super::delegation::Target::NewWorker,
+        &super::delegation::Action::CreateWorker { tags: req.tags.to_vec(), settings: req.settings.clone(), owner_only: req.owner_only })
 }
 
 /// The groups a create request names, from a `tags` array or a comma string,
@@ -33249,7 +33249,8 @@ pub(crate) fn names_messaging_authority(body: &Value) -> bool {
 fn copy_refusal(source: &str, headers: &HeaderMap) -> Option<Response> {
     let tags: Vec<String> = lane_groups(source).into_iter().collect();
     let chat = crate::api::worker_exec::worker_type_of(source).as_str() == "chat";
-    worker_create_refusal(headers, &CreateRequest { name: None, tags: &tags, owner_only: chat.then_some("the chat worker type") })
+    worker_create_refusal(headers, &CreateRequest { name: None, tags: &tags, owner_only: chat.then_some("the chat worker type"),
+        settings: super::delegation::copy_settings(source) })
 }
 
 /// The first string in a config body (top-level values and string arrays) the

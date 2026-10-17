@@ -1,5 +1,5 @@
 // Owner-delegated configuration changes: the ONE allowlist that answers "may X do Y to Z" — refs maxtongwang/ai-config#160.
-// Every config-mutating endpoint asks `authorize` (or the #8 wrappers built on `decide`); anything not on the table is refused.
+// Every config-mutating endpoint asks `authorize` (or `refusal_value` where no AppState exists); anything not in the table is refused.
 //! Max, 2026-10-17: "Why? Automation is key and losing it is not the way even
 //! for security reasons". amux PR #8 made worker creation, membership and peer
 //! config owner-only. That is safe, but it stalled automation. This module
@@ -10,27 +10,26 @@
 //! | Class | Who |
 //! |---|---|
 //! | Owner | no worker identity: the owner bearer, the dashboard, a verified human member |
-//! | SelfWorker | a worker acting on itself (its Chat tab counts as itself) |
+//! | SelfWorker | a worker acting on itself (its Chat tab counts only when process attribution agrees) |
 //! | Mrpopo | the verified worker named `mrpopo`, Max's owner agent |
-//! | Lead { team } | a verified worker with `CC_ORCHESTRATOR=1` and group `leads`; `team` is its team tag that the target shares |
+//! | Lead | a verified worker with `CC_ORCHESTRATOR=1` and group `leads`; its teams are its other groups |
 //! | Worker | every other worker, and any claim that failed verification |
 //!
-//! WHAT (`decide`, the table; default deny):
+//! WHAT (`decide`; default deny):
 //!
-//! | Class | Allowed | Needs max_ref |
+//! | Class | Allowed | With a specific max_ref |
 //! |---|---|---|
-//! | Owner | everything | never |
-//! | Lead T | create workers tagged only T; rename/stop workers in T; remove T from a worker in T; rules of group T; model/effort on workers in T | any other tag change it makes |
-//! | Mrpopo | nothing without proof | rules and membership of `leads`; routing; permission toggles on any worker |
-//! | SelfWorker | non-privileged settings ([`key_class`] SelfOk/LeadOk), rename, stop | never; privileged keys stay refused |
-//! | Worker | nothing | never |
+//! | Owner | everything | - |
+//! | Lead | create workers tagged with a non-empty subset of its teams, writing only SelfOk/LeadOk settings; stop and lifecycle verbs on non-lead workers in its team; remove its team tag from such a worker; rules and group config of its teams; model and effort on such workers | nothing |
+//! | Mrpopo | nothing | one row of [`MAXREF_ROWS`] per setting: the instruction must name the target and that row's setting |
+//! | SelfWorker | settings in [`SELF_ENV_KEYS`] / SelfOk config fields, rename (not to a reserved name), stop and lifecycle verbs | nothing |
+//! | Worker | nothing | nothing |
 //!
-//! Secrets ([`is_secret_key`]) are Max-only: no row grants them, with or
-//! without max_ref. A request carries an optional `max_ref: {session, time}`
-//! (verified by `max_ref::verify_max_ref`) and an optional `why`; every change a
-//! non-owner makes through the table is appended to the delegated-change log
-//! (`delegation_log::record`) by [`Grant::commit`]. Refusals are not logged as
-//! changes: each is a WARN line with `verdict = "delegation_refused"`.
+//! Never delegated: secret values ([`is_secret_key`]) and everything in
+//! [`HELD_FOR_MAX`] (one line each, so delegating one later is a one-line
+//! change). Lead rename is refused until amux #3 (token moves with a rename).
+//! Every non-owner change is logged by [`Grant::commit`]; refusals are WARN
+//! lines with `verdict = "delegation_refused"`, never log entries.
 use super::AppState;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -42,22 +41,52 @@ use std::collections::BTreeSet;
 pub(crate) const MRPOPO: &str = "mrpopo";
 use super::session_verbs::LEADS_GROUP;
 
+/// HANDS-ONLY: owner only, never delegable even with max_ref (dev-lead,
+/// 2026-10-17). Secret VALUES are the first class ([`is_secret_key`]); the
+/// rest are one line each, with the reason, so changing one is a one-line
+/// edit. `env:` entries are key prefixes, `name:` entries reserved worker
+/// names, `mrpopo:own-config` mrpopo changing its own settings.
+pub(crate) const HELD_FOR_MAX: &[(&str, &str)] = &[
+    ("env:AMUX_CONTRACT_", "the rule-10 token-check switch: turning it off un-verifies a worker's identity"),
+    ("env:AMUX_PANE_PROMPT_HISTORY", "the recorder max_ref's evidence comes from: turning it off blinds the proof"),
+    ("env:AMUX_NEEDS_INPUT_AUTO_MONEY", "the auto-approve spending switch and money cap: paying is Max's move"),
+    ("env:AMUX_CARD_MAX_USD", "a card's spending limit: paying is Max's move"),
+    ("name:mrpopo", "the owner agent's identity: a worker given this name would act as mrpopo"),
+    ("name:owner", "reads as the owner in every log and message"),
+    ("mrpopo:own-config", "mrpopo widening itself would need no one else's act"),
+];
+
+fn held_items(prefix: &str) -> impl Iterator<Item = &'static str> + '_ {
+    HELD_FOR_MAX.iter().filter_map(move |(h, _)| h.strip_prefix(prefix))
+}
+
+fn held_env(key: &str) -> bool {
+    held_items("env:").any(|p| key.starts_with(p))
+}
+
+/// A worker name only the owner may give (create, rename, row rename).
+pub(crate) fn reserved_name(name: &str) -> bool {
+    let n = super::session_verbs::norm_label(name);
+    held_items("name:").any(|r| r == n)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Class {
     Owner,
-    Lead { team: String },
+    /// `team` is the lead's team the target shares (else its first team);
+    /// `teams` is every team tag it holds.
+    Lead { team: String, teams: Vec<String> },
     Mrpopo,
     SelfWorker,
     Worker,
 }
 
 impl Class {
-    /// The log's `class` field: "lead:<team>" | "mrpopo" | "self" (owner and
-    /// worker never reach the log).
+    /// The log's `class` field: "lead:<team>" | "mrpopo" | "self".
     pub(crate) fn label(&self) -> String {
         match self {
             Class::Owner => "owner".into(),
-            Class::Lead { team } => format!("lead:{team}"),
+            Class::Lead { team, .. } => format!("lead:{team}"),
             Class::Mrpopo => "mrpopo".into(),
             Class::SelfWorker => "self".into(),
             Class::Worker => "worker".into(),
@@ -67,18 +96,23 @@ impl Class {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Action {
-    /// `owner_only` names something only the owner grants at create (the chat
-    /// worker type, a store group id).
-    CreateWorker { tags: Vec<String>, owner_only: Option<&'static str> },
+    /// `settings`: every setting the create writes besides name and tags
+    /// (`create:<field>`, `row:<field>` or `env:<KEY>`). `owner_only` names
+    /// what only the owner grants at create (chat type, store group id).
+    CreateWorker { tags: Vec<String>, settings: Vec<String>, owner_only: Option<&'static str> },
     RenameWorker { to: String },
     StopWorker,
-    /// A worker's whole tag set, before and after (normalized).
+    /// start, reset, clear, git, worktree, archive, keys.
+    Lifecycle { verb: String },
+    /// A worker's whole tag set, before and after.
     SetTags { from: Vec<String>, to: Vec<String> },
     SetGroupRules { group: String },
-    /// Setting names: config-body fields as sent, env keys as `env:KEY`, scope
-    /// capabilities as `scope:<cap>`, worker-row fields as `row:<field>`.
+    /// department/goal/kpis (`PATCH /api/groups/<g>/config`).
+    SetGroupConfig { group: String },
+    /// Setting names: config-body fields as sent, env keys `env:KEY`, scope
+    /// capabilities `scope:<cap>`, row fields `row:<field>`, instance settings
+    /// `settings:<name>` / `instance:apply`, group/global layers prefixed.
     SetConfig { keys: Vec<String> },
-    /// A store group id or the chat worker type on an existing worker.
     SetMembership { group: String },
     CreateGroup { group: String },
     SetRouting,
@@ -91,8 +125,10 @@ impl Action {
             Action::CreateWorker { .. } => "create_worker".into(),
             Action::RenameWorker { .. } => "rename_worker".into(),
             Action::StopWorker => "stop_worker".into(),
+            Action::Lifecycle { verb } => format!("lifecycle:{verb}"),
             Action::SetTags { .. } => "set_tags".into(),
             Action::SetGroupRules { .. } => "set_group_rules".into(),
+            Action::SetGroupConfig { .. } => "set_group_config".into(),
             Action::SetConfig { keys } => format!("set_config:{}", keys.join(",")),
             Action::SetMembership { group } => format!("set_membership:{group}"),
             Action::CreateGroup { .. } => "create_group".into(),
@@ -102,41 +138,99 @@ impl Action {
     }
 }
 
+/// Phrases a max_ref text must contain (case-insensitive, word boundary).
+pub(crate) type Terms = &'static [&'static str];
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Decision {
     Allow,
-    AllowWithMaxRef,
+    /// Allowed with one verified max_ref that names the target AND, for every
+    /// entry, one of its phrases.
+    AllowWithMaxRef { terms: Vec<Terms> },
     Deny { code: &'static str, reason: String },
 }
 
-/// What one setting is, for [`decide`]. Exhaustive over the config PATCH body
-/// (`session_verbs::CONFIG_PATCH_OPS` plus its modifiers): an unknown name is
-/// `OwnerOnly`, so a new field is refused until someone classifies it here.
+/// What one setting is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyClass {
-    /// A worker may set it on itself.
+    /// A worker may set it on itself (and a lead may write it at create).
     SelfOk,
-    /// SelfOk, and a lead may set it on a worker in its team.
+    /// SelfOk, and a lead may set it on a non-lead worker in its team.
     LeadOk,
-    /// Widens what the worker may do without the owner: mrpopo with max_ref.
-    Permission,
-    /// Cross-group message routing: mrpopo with max_ref.
-    Routing,
-    /// Messaging authority (groups, worker type): handled as membership.
+    /// Messaging authority: groups, worker type.
     Membership,
+    /// Mrpopo with a max_ref naming the target and one of these phrases.
+    MaxRef(Terms),
     Secret,
-    /// The owner's, never delegated.
+    /// In [`HELD_FOR_MAX`].
+    Held,
+    /// No row grants it.
     OwnerOnly,
 }
+
+pub(crate) const T_YOLO: Terms = &["yolo", "permission bypass", "bypass permissions", "skip permissions", "dangerously-skip-permissions"];
+pub(crate) const T_EMAIL: Terms = &["external email", "outside email"];
+pub(crate) const T_ISOLATED: Terms = &["isolated", "isolation", "isolate"];
+pub(crate) const T_AUTO_CONTINUE: Terms = &["auto-continue", "auto continue", "autocontinue"];
+pub(crate) const T_NEEDS_INPUT: Terms = &["auto-approve", "auto approve", "auto-approval", "auto approval", "outbound approval"];
+pub(crate) const T_BROWSER: Terms = &["browser profile", "browser profiles"];
+pub(crate) const T_APPROVAL: Terms = &["approval type", "approval types"];
+pub(crate) const T_GATES: Terms = &["gate", "gates"];
+pub(crate) const T_CONNECTORS: Terms = &["connector", "connectors"];
+pub(crate) const T_PERMISSIONS: Terms = &["permission", "permissions"];
+pub(crate) const T_MAKE_LEAD: Terms = &["make lead", "make a lead", "a lead", "lead"];
+pub(crate) const T_LEADS: Terms = &["leads", "lead"];
+pub(crate) const T_RULES: Terms = &["rule", "rules"];
+pub(crate) const T_ROUTING: Terms = &["routing", "route", "open inbound", "inbound", "cross-group", "send allow"];
+pub(crate) const T_GROUP_CONFIG: Terms = &["goal", "department", "kpi", "kpis", "group config"];
+pub(crate) const T_COMMIT_GUARD: Terms = &["commit guard", "commit-guard"];
+pub(crate) const T_TASK_GUARD: Terms = &["task guard", "task-guard"];
+pub(crate) const T_DEFAULT_MODEL: Terms = &["default model", "default-model"];
+pub(crate) const T_APPLY: Terms = &["config apply", "apply"];
+
+/// Mrpopo's rows: each previously owner-only setting with the phrases Max's
+/// instruction must contain. Explicit; there is no "mrpopo may do anything".
+pub(crate) const MAXREF_ROWS: &[(&str, Terms)] = &[
+    ("toggle_yolo", T_YOLO),
+    ("env:CC_FLAGS", T_YOLO),
+    ("create:yolo", T_YOLO),
+    ("create:flags", T_YOLO),
+    ("external_email_allowed", T_EMAIL),
+    ("env:AMUX_EMAIL_EXTERNAL_ALLOW", T_EMAIL),
+    ("isolated", T_ISOLATED),
+    ("env:CC_ISOLATED", T_ISOLATED),
+    ("create:isolated", T_ISOLATED),
+    ("toggle_auto_continue", T_AUTO_CONTINUE),
+    ("env:CC_AUTO_CONTINUE", T_AUTO_CONTINUE),
+    ("env:AMUX_NEEDS_INPUT_AUTO*", T_NEEDS_INPUT),
+    ("env:AMUX_BROWSER_PROFILES_*", T_BROWSER),
+    ("env:AMUX_APPROVAL_TYPES", T_APPROVAL),
+    ("scope:gates", T_GATES),
+    ("scope:connectors", T_CONNECTORS),
+    ("row:permissions", T_PERMISSIONS),
+    ("env:CC_ORCHESTRATOR", T_MAKE_LEAD),
+    ("send_allow", T_ROUTING),
+    ("spans_groups", T_ROUTING),
+    ("env:CC_SEND_ALLOW", T_ROUTING),
+    ("settings:commit-guard", T_COMMIT_GUARD),
+    ("settings:task-guard", T_TASK_GUARD),
+    ("settings:default-model", T_DEFAULT_MODEL),
+    ("instance:apply", T_APPLY),
+];
+
+/// Env keys a worker may set on itself (H4: an explicit list, not "anything
+/// not privileged"). Display and runtime-choice keys only.
+pub(crate) const SELF_ENV_KEYS: &[&str] = &[
+    "CC_MODEL", "CC_EFFORT", "CC_DESC", "CC_DIR", "CC_PINNED", "CC_BRANCH", "CC_PROVIDER", "CC_WORKTREE_PROFILE", "CC_MCP",
+];
 
 /// Request fields that carry delegation metadata, never a setting.
 pub(crate) const META_FIELDS: [&str; 2] = ["max_ref", "why"];
 
-/// Config-body fields, one row per field (`config_patch_with_liveness`).
-const CONFIG_FIELDS: &[(&str, KeyClass)] = &[
+/// Config-body, scope, row and create fields that are not MaxRef rows.
+const FIELDS: &[(&str, KeyClass)] = &[
     ("model", KeyClass::LeadOk),
     ("effort", KeyClass::LeadOk),
-    // Rides with `model` (overrides the unknown-model check).
     ("force", KeyClass::LeadOk),
     ("provider", KeyClass::SelfOk),
     ("dir", KeyClass::SelfOk),
@@ -151,75 +245,89 @@ const CONFIG_FIELDS: &[(&str, KeyClass)] = &[
     ("new_conversation", KeyClass::SelfOk),
     ("restart", KeyClass::SelfOk),
     ("rename", KeyClass::SelfOk),
-    // The commit guard PATCH verb, and the instructions/memory verbs.
     ("commit-guard", KeyClass::SelfOk),
     ("instructions", KeyClass::SelfOk),
     ("memory", KeyClass::SelfOk),
-    // The verification command the harness runs as this worker's gate.
+    ("keys", KeyClass::SelfOk),
     ("worktree_verify", KeyClass::OwnerOnly),
     ("worker_type", KeyClass::Membership),
     ("tags", KeyClass::Membership),
-    ("toggle_yolo", KeyClass::Permission),
-    ("toggle_auto_continue", KeyClass::Permission),
-    ("external_email_allowed", KeyClass::Permission),
-    ("isolated", KeyClass::Permission),
-    ("send_allow", KeyClass::Routing),
-    ("spans_groups", KeyClass::Routing),
-    // Scope capabilities on a worker layer (`/api/scope`).
     ("scope:memory", KeyClass::SelfOk),
     ("scope:skin", KeyClass::SelfOk),
     ("scope:status_mode", KeyClass::SelfOk),
-    ("scope:gates", KeyClass::Permission),
-    ("scope:connectors", KeyClass::Permission),
     ("scope:rules", KeyClass::OwnerOnly),
-    // Worker-row fields (`PATCH /api/workers/{id}`).
     ("row:display_name", KeyClass::SelfOk),
     ("row:name", KeyClass::SelfOk),
     ("row:cwd", KeyClass::SelfOk),
     ("row:provider", KeyClass::SelfOk),
     ("row:model", KeyClass::LeadOk),
     ("row:backend", KeyClass::SelfOk),
-    ("row:expect_version", KeyClass::SelfOk),
     ("row:environment", KeyClass::OwnerOnly),
-    ("row:permissions", KeyClass::Permission),
     ("row:group", KeyClass::Membership),
     ("row:worker_type", KeyClass::Membership),
+    ("create:dir", KeyClass::SelfOk),
+    ("create:desc", KeyClass::SelfOk),
+    ("create:model", KeyClass::LeadOk),
+    ("create:provider", KeyClass::SelfOk),
+    ("create:prompt", KeyClass::SelfOk),
+    ("create:worktree", KeyClass::SelfOk),
+    ("create:worktree_profile", KeyClass::SelfOk),
+    ("create:creator", KeyClass::OwnerOnly),
 ];
 
-/// Env keys that widen what a worker may do without the owner (beyond
-/// `scope::is_owner_only_env_key`): the permission-bypass flags live in
-/// CC_FLAGS, and CC_ORCHESTRATOR is half of being a lead.
-const PERMISSION_ENV_KEYS: [&str; 4] = ["CC_FLAGS", "CC_AUTO_CONTINUE", "CC_ISOLATED", "CC_ORCHESTRATOR"];
-
-/// A key name that holds a secret: never delegable, with or without max_ref.
+/// A key name that holds a secret value: never delegable, with or without max_ref.
 pub(crate) fn is_secret_key(key: &str) -> bool {
     let k = key.trim().to_ascii_uppercase();
-    k == super::worker_identity::TOKEN_ENV
-        || k.starts_with("AMUX_CONTRACT_")
-        || super::worker_identity::credential_like(&k)
+    k == super::worker_identity::TOKEN_ENV || super::worker_identity::credential_like(&k)
+}
+
+fn maxref_row(name: &str) -> Option<Terms> {
+    MAXREF_ROWS.iter().find_map(|(row, t)| {
+        let hit = match row.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => *row == name,
+        };
+        hit.then_some(*t)
+    })
 }
 
 pub(crate) fn key_class(key: &str) -> KeyClass {
+    // Group and global layers: secrets and held keys keep their class; no
+    // other row exists for them.
+    for layer in ["group:", "global:"] {
+        if let Some(inner) = key.strip_prefix(layer) {
+            return match key_class(inner) {
+                c @ (KeyClass::Secret | KeyClass::Held) => c,
+                _ => KeyClass::OwnerOnly,
+            };
+        }
+    }
     if let Some(env) = key.strip_prefix("env:") {
         let k = env.trim().to_ascii_uppercase();
         if is_secret_key(&k) {
             return KeyClass::Secret;
         }
+        if held_env(&k) {
+            return KeyClass::Held;
+        }
         if k == "CC_TAGS" || k == "CC_WORKER_TYPE" {
             return KeyClass::Membership;
         }
-        if k == "CC_SEND_ALLOW" || k == super::worker_messaging::OPEN_INBOUND_KEY {
-            return KeyClass::Routing;
+        if let Some(t) = maxref_row(&format!("env:{k}")) {
+            return KeyClass::MaxRef(t);
         }
-        if k == "CC_WORKTREE_VERIFY" {
-            return KeyClass::OwnerOnly;
+        if k == "CC_MODEL" || k == "CC_EFFORT" {
+            return KeyClass::LeadOk;
         }
-        if PERMISSION_ENV_KEYS.contains(&k.as_str()) || super::scope::is_owner_only_env_key(&k) {
-            return KeyClass::Permission;
+        if SELF_ENV_KEYS.contains(&k.as_str()) {
+            return KeyClass::SelfOk;
         }
-        return KeyClass::SelfOk;
+        return KeyClass::OwnerOnly;
     }
-    CONFIG_FIELDS.iter().find(|(k, _)| *k == key).map(|(_, c)| *c).unwrap_or(KeyClass::OwnerOnly)
+    if let Some(t) = maxref_row(key) {
+        return KeyClass::MaxRef(t);
+    }
+    FIELDS.iter().find(|(k, _)| *k == key).map(|(_, c)| *c).unwrap_or(KeyClass::OwnerOnly)
 }
 
 fn deny(code: &'static str, reason: String) -> Decision {
@@ -230,83 +338,168 @@ fn set(v: &[String]) -> BTreeSet<String> {
     v.iter().map(|t| super::session_verbs::norm_label(t)).filter(|t| !t.is_empty()).collect()
 }
 
-/// THE table. Pure: identity is resolved by [`classify`], the target's team by
-/// [`target_team`]. `target_team` is `Some(team)` only when the target belongs
-/// to the lead's `team`.
-pub(crate) fn decide(class: &Class, action: &Action, target_team: Option<&str>) -> Decision {
-    use Decision::{Allow, AllowWithMaxRef};
-    if *class == Class::Owner {
-        return Allow;
-    }
-    let secret = match action {
-        Action::SetSecret { key } => Some(key.clone()),
-        Action::SetConfig { keys } => keys.iter().find(|k| key_class(k) == KeyClass::Secret).cloned(),
-        _ => None,
-    };
-    if let Some(k) = secret {
-        return deny("secret_owner_only", format!("'{k}' holds a secret; setting it is Max's alone and is never delegated"));
-    }
-    match (class, action) {
-        (Class::SelfWorker, Action::SetConfig { keys }) => match keys.iter().find(|k| !matches!(key_class(k), KeyClass::SelfOk | KeyClass::LeadOk)) {
-            None => Allow,
-            Some(k) if key_class(k) == KeyClass::Membership => membership_denied(k),
-            Some(k) => deny("owner_only_key", format!(
-                "'{k}' is owner-only: it widens what this worker may do without the owner. A worker changes only non-privileged settings on itself")),
-        },
-        (Class::SelfWorker, Action::RenameWorker { .. } | Action::StopWorker) => Allow,
-        (Class::SelfWorker, Action::SetTags { .. } | Action::SetMembership { .. }) => membership_denied("tags"),
-        (Class::Lead { team }, Action::CreateWorker { tags, owner_only }) => {
-            let outside: Vec<String> = set(tags).into_iter().filter(|t| t != team).collect();
-            match owner_only {
-                Some(o) => deny("worker_create_tags_outside_team", format!("A lead may create workers only inside its own team: {o} is the owner's to grant.")),
-                None if outside.is_empty() => Allow,
-                None => deny("worker_create_tags_outside_team", format!(
-                    "A lead may create workers only inside its own team: tags {outside:?} are outside the lead's team '{team}' ('{LEADS_GROUP}' is the owner's to grant).")),
-            }
-        }
-        (Class::Lead { team }, Action::RenameWorker { .. } | Action::StopWorker | Action::SetConfig { .. }) if target_team != Some(team.as_str()) => {
-            deny("peer_config_owner_only", format!("a lead acts only on workers in its own team '{team}'; this worker is not in it"))
-        }
-        (Class::Lead { .. }, Action::RenameWorker { .. } | Action::StopWorker) => Allow,
-        (Class::Lead { team }, Action::SetConfig { keys }) => match keys.iter().find(|k| key_class(k) != KeyClass::LeadOk) {
-            None => Allow,
-            Some(k) => deny("peer_config_owner_only", format!(
-                "a lead may set only model and effort on workers in its team '{team}', not '{k}'")),
-        },
-        (Class::Lead { team }, Action::SetTags { from, to }) => {
-            let (from, to) = (set(from), set(to));
-            let changed: BTreeSet<String> = from.symmetric_difference(&to).cloned().collect();
-            if from.contains(team) && changed.iter().all(|t| t == team) {
-                Allow
-            } else {
-                AllowWithMaxRef
-            }
-        }
-        (Class::Lead { team }, Action::SetGroupRules { group }) if group == team => Allow,
-        (Class::Mrpopo, Action::SetGroupRules { group } | Action::SetMembership { group }) if group == LEADS_GROUP => AllowWithMaxRef,
-        (Class::Mrpopo, Action::SetTags { from, to }) => {
-            let changed: BTreeSet<String> = set(from).symmetric_difference(&set(to)).cloned().collect();
-            if changed.iter().all(|t| t == LEADS_GROUP) {
-                AllowWithMaxRef
-            } else {
-                deny("delegation_not_allowed", format!("mrpopo changes only '{LEADS_GROUP}' membership; {changed:?} is another team's"))
-            }
-        }
-        (Class::Mrpopo, Action::SetRouting) => AllowWithMaxRef,
-        (Class::Mrpopo, Action::SetConfig { keys }) if keys.iter().all(|k| matches!(key_class(k), KeyClass::Permission | KeyClass::Routing)) => AllowWithMaxRef,
-        (Class::Worker | Class::Mrpopo, Action::CreateWorker { .. }) => {
-            deny("worker_create_requires_lead", format!("Only leads can create workers; the caller is not a lead (CC_ORCHESTRATOR=1 and the '{LEADS_GROUP}' group)."))
-        }
-        (_, Action::SetTags { .. } | Action::SetMembership { .. }) => membership_denied("tags"),
-        (_, Action::RenameWorker { .. } | Action::StopWorker | Action::SetConfig { .. }) => {
-            deny("peer_config_owner_only", "configuring another worker is the owner's; no delegation row grants it to this caller".into())
-        }
-        (_, other) => deny("delegation_not_allowed", format!("no delegation row lets a {} do {}", class.label(), other.label())),
-    }
+/// Facts about the target that the table needs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct TargetFacts {
+    /// The target belongs to the lead's `team`.
+    pub in_team: bool,
+    /// The target is mrpopo or a member of `leads` (a lead never acts on one).
+    pub privileged: bool,
+    /// The target is the actor itself.
+    pub is_actor: bool,
 }
 
 fn membership_denied(what: &str) -> Decision {
     deny("worker_group_membership_refused", format!("Group membership changes require direct owner input ('{what}')."))
+}
+
+/// THE table. Pure: identity from [`classify`], target facts from [`facts`].
+pub(crate) fn decide(class: &Class, action: &Action, t: &TargetFacts) -> Decision {
+    use Decision::Allow;
+    if *class == Class::Owner {
+        return Allow;
+    }
+    let keys: Vec<String> = match action {
+        Action::SetConfig { keys } => keys.clone(),
+        Action::CreateWorker { settings, .. } => settings.clone(),
+        Action::SetSecret { key } => vec![format!("env:{key}")],
+        _ => vec![],
+    };
+    if matches!(action, Action::SetSecret { .. }) || keys.iter().any(|k| key_class(k) == KeyClass::Secret) {
+        return deny("secret_owner_only", "setting a secret value is Max's alone and is never delegated".into());
+    }
+    if let Some(k) = keys.iter().find(|k| key_class(k) == KeyClass::Held) {
+        let key = k.rsplit("env:").next().unwrap_or(k).to_ascii_uppercase();
+        let why = HELD_FOR_MAX.iter().find(|(h, _)| h.strip_prefix("env:").is_some_and(|p| key.starts_with(p))).map(|(_, r)| *r).unwrap_or("");
+        return deny("held_for_max", format!("'{k}' is hands-only (HELD_FOR_MAX: {why}); only the owner may change it"));
+    }
+    if let Action::SetConfig { keys } = action {
+        if keys.is_empty() {
+            return deny("delegation_not_allowed", "a change that names no setting is not delegable".into());
+        }
+    }
+    match class {
+        Class::Owner => Allow,
+        Class::SelfWorker => decide_self(action),
+        Class::Lead { team, teams } => decide_lead(team, teams, action, t),
+        Class::Mrpopo => decide_mrpopo(action, t),
+        Class::Worker => decide_worker(action),
+    }
+}
+
+fn decide_self(action: &Action) -> Decision {
+    match action {
+        Action::SetConfig { keys } => match keys.iter().find(|k| !matches!(key_class(k), KeyClass::SelfOk | KeyClass::LeadOk)) {
+            None => Decision::Allow,
+            Some(k) if key_class(k) == KeyClass::Membership => membership_denied(k),
+            Some(k) => deny("owner_only_key", format!(
+                "'{k}' is owner-only: it widens what this worker may do without the owner. A worker changes only non-privileged settings on itself")),
+        },
+        Action::RenameWorker { to } if reserved_name(to) => reserved_denied(to),
+        Action::RenameWorker { .. } | Action::StopWorker | Action::Lifecycle { .. } => Decision::Allow,
+        Action::SetTags { .. } | Action::SetMembership { .. } => membership_denied("tags"),
+        other => deny("delegation_not_allowed", format!("no delegation row lets a worker do {} on itself", other.label())),
+    }
+}
+
+fn reserved_denied(name: &str) -> Decision {
+    deny("reserved_name", format!("'{name}' is a reserved identity; only the owner may give a worker that name"))
+}
+
+fn decide_lead(team: &str, teams: &[String], action: &Action, t: &TargetFacts) -> Decision {
+    let on_team_worker = t.in_team && !t.privileged;
+    let not_team = || deny("peer_config_owner_only", format!(
+        "a lead acts only on non-lead workers in its own team '{team}'; this worker is not one"));
+    match action {
+        Action::CreateWorker { tags, settings, owner_only } => {
+            let teams: BTreeSet<String> = teams.iter().cloned().collect();
+            let tags = set(tags);
+            if let Some(o) = owner_only {
+                return deny("worker_create_tags_outside_team", format!("A lead may create workers only inside its own team: {o} is the owner's to grant."));
+            }
+            if tags.is_empty() {
+                return deny("worker_create_tags_outside_team", format!("A lead's new worker must carry its team tag (one of {teams:?}); untagged creates are the owner's."));
+            }
+            let outside: Vec<&String> = tags.iter().filter(|g| !teams.contains(*g)).collect();
+            if !outside.is_empty() {
+                return deny("worker_create_tags_outside_team", format!(
+                    "A lead may create workers only inside its own team: tags {outside:?} are outside the lead's teams {teams:?} ('{LEADS_GROUP}' is the owner's to grant)."));
+            }
+            match settings.iter().find(|k| !matches!(key_class(k), KeyClass::SelfOk | KeyClass::LeadOk)) {
+                None => Decision::Allow,
+                Some(k) => deny("worker_create_setting_refused", format!(
+                    "a lead may not create a worker with '{k}'; that setting follows the same rule as on an existing worker")),
+            }
+        }
+        Action::RenameWorker { .. } => deny("lead_rename_pending", "a lead may not rename workers until amux #3 moves the worker token with a rename".into()),
+        Action::StopWorker | Action::Lifecycle { .. } if on_team_worker => Decision::Allow,
+        Action::SetConfig { keys } if on_team_worker => match keys.iter().find(|k| key_class(k) != KeyClass::LeadOk) {
+            None => Decision::Allow,
+            Some(k) => deny("peer_config_owner_only", format!("a lead may set only model and effort on workers in its team '{team}', not '{k}'")),
+        },
+        Action::StopWorker | Action::Lifecycle { .. } | Action::SetConfig { .. } => not_team(),
+        Action::SetTags { from, to } => {
+            let (from, to) = (set(from), set(to));
+            let changed: BTreeSet<String> = from.symmetric_difference(&to).cloned().collect();
+            if on_team_worker && from.contains(team) && changed.iter().all(|g| g == team) {
+                Decision::Allow
+            } else {
+                deny("worker_group_membership_refused", format!(
+                    "a lead may only remove its team tag '{team}' from a non-lead worker in its team; {changed:?} is a membership change for mrpopo with max_ref or the owner"))
+            }
+        }
+        Action::SetGroupRules { group } | Action::SetGroupConfig { group } if teams.iter().any(|g| g == group) => Decision::Allow,
+        other => deny("delegation_not_allowed", format!("no delegation row lets a lead do {}", other.label())),
+    }
+}
+
+fn decide_mrpopo(action: &Action, t: &TargetFacts) -> Decision {
+    let with = |terms: Vec<Terms>| Decision::AllowWithMaxRef { terms };
+    if t.is_actor && held_items("mrpopo:").any(|h| h == "own-config") {
+        return deny("held_for_max", "mrpopo changing its own configuration is held for Max's decision (HELD_FOR_MAX)".into());
+    }
+    match action {
+        Action::SetConfig { keys } => {
+            let mut terms: Vec<Terms> = Vec::new();
+            for k in keys {
+                match key_class(k) {
+                    KeyClass::MaxRef(tm) => {
+                        if !terms.contains(&tm) {
+                            terms.push(tm);
+                        }
+                    }
+                    _ => return deny("delegation_not_allowed", format!("no delegation row lets mrpopo set '{k}'")),
+                }
+            }
+            with(terms)
+        }
+        Action::SetTags { from, to } => {
+            let changed: BTreeSet<String> = set(from).symmetric_difference(&set(to)).cloned().collect();
+            if !changed.is_empty() && changed.iter().all(|g| g == LEADS_GROUP) {
+                with(vec![T_LEADS])
+            } else {
+                deny("worker_group_membership_refused", format!("mrpopo changes only '{LEADS_GROUP}' membership; {changed:?} is another team's"))
+            }
+        }
+        Action::SetMembership { group } if group == LEADS_GROUP => with(vec![T_LEADS]),
+        Action::SetGroupRules { group } if group == LEADS_GROUP => with(vec![T_RULES]),
+        Action::SetGroupConfig { .. } => with(vec![T_GROUP_CONFIG]),
+        Action::SetRouting => with(vec![T_ROUTING]),
+        Action::CreateWorker { .. } => deny("worker_create_requires_lead", "Only leads can create workers.".into()),
+        other => deny("delegation_not_allowed", format!("no delegation row lets mrpopo do {}", other.label())),
+    }
+}
+
+fn decide_worker(action: &Action) -> Decision {
+    match action {
+        Action::CreateWorker { .. } => deny("worker_create_requires_lead", format!(
+            "Only leads can create workers; the caller is not a lead (CC_ORCHESTRATOR=1 and the '{LEADS_GROUP}' group).")),
+        Action::SetTags { .. } | Action::SetMembership { .. } => membership_denied("tags"),
+        Action::RenameWorker { .. } | Action::StopWorker | Action::Lifecycle { .. } | Action::SetConfig { .. } => {
+            deny("peer_config_owner_only", "configuring another worker is the owner's; no delegation row grants it to this caller".into())
+        }
+        other => deny("delegation_not_allowed", format!("no delegation row lets this worker do {}", other.label())),
+    }
 }
 
 /// What the request acts on.
@@ -329,9 +522,8 @@ impl Target {
     }
 }
 
-/// Whether `origin` is a lead: CC_ORCHESTRATOR=1 and in `leads`. Returns its
-/// team tags (groups other than `leads`), or None for a non-lead.
-fn lead_teams(origin: &str) -> Option<BTreeSet<String>> {
+/// A lead's team tags (groups other than `leads`), or None for a non-lead.
+fn lead_teams(origin: &str) -> Option<Vec<String>> {
     let groups = super::session_verbs::lane_groups(origin);
     let orchestrator = super::session_verbs::parse_env(origin).get("CC_ORCHESTRATOR").is_some_and(|v| v.trim() == "1");
     (orchestrator && groups.contains(LEADS_GROUP)).then(|| groups.into_iter().filter(|g| g != LEADS_GROUP).collect())
@@ -340,16 +532,14 @@ fn lead_teams(origin: &str) -> Option<BTreeSet<String>> {
 fn target_groups(target: &Target, action: &Action) -> BTreeSet<String> {
     match (target, action) {
         (_, Action::CreateWorker { tags, .. }) => set(tags),
-        (Target::Worker(w), Action::SetTags { from, .. }) if !from.is_empty() || super::session_verbs::lane_groups(w).is_empty() => set(from),
         (Target::Worker(w), _) => super::session_verbs::lane_groups(w),
         (Target::Group(g), _) => [super::session_verbs::norm_label(g)].into_iter().collect(),
         _ => BTreeSet::new(),
     }
 }
 
-/// The class of `origin` (the verified worker identity, empty for the owner)
-/// acting on `target`. A lead's `team` is its team tag the target shares, else
-/// its first team tag (empty when it has none).
+/// The class of `origin` (verified worker identity, empty for the owner)
+/// acting on `target`.
 pub(crate) fn classify(origin: &str, target: &Target, action: &Action) -> Class {
     if origin.is_empty() {
         return Class::Owner;
@@ -357,38 +547,57 @@ pub(crate) fn classify(origin: &str, target: &Target, action: &Action) -> Class 
     if origin == super::worker_identity::UNVERIFIED_IDENTITY {
         return Class::Worker;
     }
+    if origin == MRPOPO {
+        return Class::Mrpopo;
+    }
     if let Target::Worker(w) = target {
         if origin == w || super::chat_worker::companion_parent(origin) == Some(w.as_str()) {
             return Class::SelfWorker;
         }
     }
-    if origin == MRPOPO {
-        return Class::Mrpopo;
-    }
     match lead_teams(origin) {
         Some(teams) => {
             let tg = target_groups(target, action);
-            let team = teams.iter().find(|t| tg.contains(*t)).or_else(|| teams.iter().next()).cloned().unwrap_or_default();
-            Class::Lead { team }
+            let team = teams.iter().find(|t| tg.contains(*t)).or_else(|| teams.first()).cloned().unwrap_or_default();
+            Class::Lead { team, teams }
         }
         None => Class::Worker,
     }
 }
 
-/// `Some(team)` when the target belongs to the lead's team.
-pub(crate) fn target_team(class: &Class, target: &Target, action: &Action) -> Option<String> {
-    let Class::Lead { team } = class else { return None };
-    (!team.is_empty() && target_groups(target, action).contains(team)).then(|| team.clone())
+/// The facts [`decide`] needs about `target` for `class`.
+pub(crate) fn facts(origin: &str, class: &Class, target: &Target, action: &Action) -> TargetFacts {
+    let groups = target_groups(target, action);
+    let (in_team, privileged) = match target {
+        Target::Worker(w) => (
+            matches!(class, Class::Lead { team, .. } if !team.is_empty() && groups.contains(team)),
+            w == MRPOPO || super::session_verbs::lane_groups(w).contains(LEADS_GROUP),
+        ),
+        _ => (false, false),
+    };
+    let is_actor = matches!(target, Target::Worker(w) if w == origin);
+    TargetFacts { in_team, privileged, is_actor }
 }
 
-/// Classify and decide for a request's headers, with no max_ref handling:
-/// for the #8 wrappers in `session_verbs`, whose callers have no `AppState`.
-/// `AllowWithMaxRef` is returned as is; such callers treat it as a refusal.
-pub(crate) fn decide_for(headers: &HeaderMap, target: &Target, action: &Action) -> (String, Class, Decision) {
+/// The request's verified worker identity, with M12 applied: a Chat-tab
+/// identity (`X@chat`) counts only when process attribution says the request
+/// came from that tab or from X; otherwise it is an unverified claim.
+fn verified_origin(headers: &HeaderMap) -> String {
     let origin = super::session_verbs::worker_origin(headers);
+    if let Some(parent) = super::chat_worker::companion_parent(&origin) {
+        let attributed = headers.get(super::process_identity::PROCESS_WORKER_HEADER).and_then(|v| v.to_str().ok()).unwrap_or("");
+        if attributed != origin && attributed != parent {
+            return super::worker_identity::UNVERIFIED_IDENTITY.to_string();
+        }
+    }
+    origin
+}
+
+/// Classify and decide for a request's headers, with no max_ref handling.
+pub(crate) fn decide_for(headers: &HeaderMap, target: &Target, action: &Action) -> (String, Class, Decision) {
+    let origin = verified_origin(headers);
     let class = classify(&origin, target, action);
-    let tt = target_team(&class, target, action);
-    let decision = decide(&class, action, tt.as_deref());
+    let decision = decide(&class, action, &facts(&origin, &class, target, action));
     (origin, class, decision)
 }
 
@@ -397,10 +606,24 @@ pub(crate) fn refusal_body(code: &str, error: &str) -> Value {
     json!({"ok": false, "code": code, "error": error})
 }
 
-fn refuse(origin: &str, class: &Class, target: &Target, action: &Action, code: &str, error: String) -> Response {
+fn refused(origin: &str, class: &Class, target: &Target, action: &Action, code: &str, error: &str) -> Value {
     tracing::warn!(actor = %origin, class = %class.label(), target = %target.name(), action = %action.label(), code,
         verdict = "delegation_refused", measured = true, n_considered = 1, "a delegated change was refused");
-    (StatusCode::FORBIDDEN, Json(refusal_body(code, &error))).into_response()
+    refusal_body(code, error)
+}
+
+/// The decision as an optional #8-shaped 403 body, for callers with no
+/// `AppState` (so no max_ref can be verified: `AllowWithMaxRef` is refused
+/// here as `max_ref_missing`, naming the paths that can verify one).
+pub(crate) fn refusal_value(headers: &HeaderMap, target: &Target, action: &Action) -> Option<Value> {
+    let (origin, class, decision) = decide_for(headers, target, action);
+    let (code, error) = match decision {
+        Decision::Allow => return None,
+        Decision::AllowWithMaxRef { .. } => ("max_ref_missing", format!(
+            "{} needs proof of Max's instruction; send it through PATCH /api/sessions/<worker>/config or PUT /api/scope with max_ref", action.label())),
+        Decision::Deny { code, reason } => (code, reason),
+    };
+    Some(refused(&origin, &class, target, action, code, &error))
 }
 
 /// Proof that a non-owner change passed the table. [`Grant::commit`] appends
@@ -438,8 +661,8 @@ impl Grant {
     }
 }
 
-/// Parse the optional `max_ref` and `why` fields of a request body. A
-/// malformed `max_ref` is reported, never read as absent.
+/// The optional `max_ref` and `why` of a request body. A malformed `max_ref`
+/// is reported, never read as absent.
 fn request_meta(body: Option<&Value>) -> Result<(Option<super::max_ref::MaxRef>, Option<String>), String> {
     let Some(body) = body else { return Ok((None, None)) };
     let max_ref = match body.get("max_ref") {
@@ -452,29 +675,33 @@ fn request_meta(body: Option<&Value>) -> Result<(Option<super::max_ref::MaxRef>,
 }
 
 /// THE gate for a mutating request. `Ok(None)`: the owner, nothing to log.
-/// `Ok(Some(grant))`: a non-owner allowed through the table; call
-/// [`Grant::commit`] after the change lands. `Err(response)`: refused, in the
-/// #8 shape (`max_ref_*` codes name the missing proof).
+/// `Ok(Some(grant))`: allowed through the table; call [`Grant::commit`] after
+/// the change lands. `Err(response)`: refused in the #8 shape.
 pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, target: &Target, action: &Action, body: Option<&Value>) -> Result<Option<Grant>, Response> {
     let (origin, class, decision) = decide_for(headers, target, action);
     if class == Class::Owner {
         return Ok(None);
     }
+    let forbid = |code: &str, error: &str| (StatusCode::FORBIDDEN, Json(refused(&origin, &class, target, action, code, error))).into_response();
     let (max_ref, why) = request_meta(body).map_err(|e| (StatusCode::BAD_REQUEST, Json(refusal_body("max_ref_invalid", &e))).into_response())?;
     let evidence_row = match decision {
-        Decision::Deny { code, reason } => return Err(refuse(&origin, &class, target, action, code, reason)),
+        Decision::Deny { code, reason } => return Err(forbid(code, &reason)),
         Decision::Allow => None,
-        Decision::AllowWithMaxRef => {
+        Decision::AllowWithMaxRef { terms } => {
             let names = max_ref_targets(target);
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
-            match super::max_ref::verify_max_ref(state, max_ref.as_ref(), &names, crate::config::now_f64()) {
-                Ok(ev) => Some(ev.row_id),
-                Err(r) => {
-                    let error = format!("{} needs proof of Max's instruction (max_ref: {{session, time}} naming {}): {}",
-                        action.label(), names.join(" or "), r.message());
-                    return Err(refuse(&origin, &class, target, action, r.code(), error));
+            let mut row = None;
+            for t in &terms {
+                match super::max_ref::verify_max_ref_terms(state, max_ref.as_ref(), &names, t, crate::config::now_f64()) {
+                    Ok(ev) => row = Some(ev.row_id),
+                    Err(r) => {
+                        let error = format!("{} needs proof of Max's instruction: max_ref {{session, time}} pointing at a message Max typed that names {} and one of {:?}: {}",
+                            action.label(), if names.is_empty() { "the change".to_string() } else { names.join(" or ") }, t, r.message());
+                        return Err(forbid(r.code(), &error));
+                    }
                 }
             }
+            row
         }
     };
     tracing::info!(actor = %origin, class = %class.label(), target = %target.name(), action = %action.label(),
@@ -490,6 +717,17 @@ fn max_ref_targets(target: &Target) -> Vec<String> {
         Target::Group(g) => vec![g.clone()],
         Target::NewWorker | Target::Fleet => vec![],
     }
+}
+
+/// Log an allowed non-owner change decided elsewhere (a create through
+/// `worker_create_refusal`): re-derives the grant, commits it.
+pub(crate) fn record_allowed(state: &AppState, headers: &HeaderMap, target: &Target, action: &Action, before: Value, after: Value) {
+    let (origin, class, decision) = decide_for(headers, target, action);
+    if class == Class::Owner || decision != Decision::Allow {
+        return;
+    }
+    Grant { actor: origin, class, action: action.label(), target: target.name(), max_ref: None, evidence_row: None, why: None }
+        .commit(state, before, after);
 }
 
 /// A worker env file as a JSON object (for before/after; the log redacts).
@@ -510,8 +748,8 @@ pub(crate) fn changed_only(before: &Value, after: &Value) -> (Value, Value) {
     (Value::Object(ob), Value::Object(oa))
 }
 
-/// The action a config PATCH body asks for (one setting per PATCH is enforced
-/// by the handler; every named field is classified here regardless).
+/// The action a config PATCH body asks for. Every named field is classified;
+/// the handler still enforces one setting per PATCH.
 pub(crate) fn config_action(target: &str, body: &Value) -> Action {
     if let Some(v) = body.get("tags") {
         let to = super::session_verbs::tags_of(Some(v)).unwrap_or_else(|_| vec!["!invalid".into()]);
@@ -521,21 +759,19 @@ pub(crate) fn config_action(target: &str, body: &Value) -> Action {
     if let Some(to) = body.get("rename").and_then(Value::as_str) {
         return Action::RenameWorker { to: to.trim().to_string() };
     }
-    if body.get("send_allow").is_some() || body.get("spans_groups").is_some() {
-        return Action::SetRouting;
-    }
     let keys: Vec<String> = body.as_object().map(|o| o.keys().filter(|k| !META_FIELDS.contains(&k.as_str())).cloned().collect()).unwrap_or_default();
     Action::SetConfig { keys }
 }
 
-/// A non-owner may not give a worker the name the mrpopo class keys on.
-pub(crate) fn rename_refusal(headers: &HeaderMap, to: &str) -> Option<Response> {
-    let origin = super::session_verbs::worker_origin(headers);
-    if origin.is_empty() || super::session_verbs::norm_label(to) != MRPOPO {
+/// H11: nobody but the owner gives a worker a reserved name, on any path.
+pub(crate) fn reserved_name_refusal(headers: &HeaderMap, name: &str) -> Option<Response> {
+    let origin = verified_origin(headers);
+    if origin.is_empty() || !reserved_name(name) {
         return None;
     }
-    Some(refuse(&origin, &Class::Worker, &Target::Worker(to.into()), &Action::RenameWorker { to: to.into() },
-        "rename_reserved_identity", format!("'{MRPOPO}' is the owner agent's identity; only the owner may give a worker that name")))
+    let action = Action::RenameWorker { to: name.into() };
+    Some((StatusCode::FORBIDDEN, Json(refused(&origin, &Class::Worker, &Target::Worker(name.into()), &action, "reserved_name",
+        &format!("'{name}' is a reserved identity; only the owner may give a worker that name")))).into_response())
 }
 
 /// PATCH config, gated and logged: `PATCH /api/sessions/<w>/config` and
@@ -543,7 +779,7 @@ pub(crate) fn rename_refusal(headers: &HeaderMap, to: &str) -> Option<Response> 
 pub(crate) async fn guarded_config_patch(state: &AppState, headers: &HeaderMap, name: &str, body: &Value) -> Response {
     let action = config_action(name, body);
     if let Action::RenameWorker { to } = &action {
-        if let Some(r) = rename_refusal(headers, to) {
+        if let Some(r) = reserved_name_refusal(headers, to) {
             return r;
         }
     }
@@ -564,12 +800,39 @@ pub(crate) async fn guarded_config_patch(state: &AppState, headers: &HeaderMap, 
     resp
 }
 
+/// The settings a `POST /api/sessions` body writes besides name and tags:
+/// every field with a set (truthy, non-empty) value, as `create:<field>`.
+/// The chat type is the caller's `owner_only`; `start` is not a setting.
+pub(crate) fn create_body_settings(body: &Value) -> Vec<String> {
+    let set = |v: &Value| match v {
+        Value::Null | Value::Bool(false) => false,
+        Value::String(s) => !s.trim().is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        _ => true,
+    };
+    body.as_object().into_iter().flatten()
+        .filter(|(k, v)| !matches!(k.as_str(), "name" | "tags" | "start" | "worker_type" | "max_ref" | "why") && set(v))
+        .map(|(k, _)| format!("create:{k}"))
+        .collect()
+}
+
+/// The settings a copy of `source` (duplicate/clone) writes: its env keys
+/// other than identity/group bookkeeping, so a copy of a yolo worker is a
+/// create with yolo.
+pub(crate) fn copy_settings(source: &str) -> Vec<String> {
+    super::session_verbs::parse_env(source).pairs().iter()
+        .map(|(k, _)| k.as_str())
+        .filter(|k| !matches!(*k, "CC_TAGS" | "CC_WORKER_TYPE" | "CC_CREATOR"))
+        .map(|k| format!("env:{k}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn lead(t: &str) -> Class {
-        Class::Lead { team: t.into() }
+        Class::Lead { team: t.into(), teams: vec![t.into()] }
     }
     fn cfg(keys: &[&str]) -> Action {
         Action::SetConfig { keys: keys.iter().map(|k| k.to_string()).collect() }
@@ -577,117 +840,181 @@ mod tests {
     fn tags(from: &[&str], to: &[&str]) -> Action {
         Action::SetTags { from: from.iter().map(|s| s.to_string()).collect(), to: to.iter().map(|s| s.to_string()).collect() }
     }
-    fn code(d: Decision) -> &'static str {
+    fn create(tags: &[&str], settings: &[&str]) -> Action {
+        Action::CreateWorker { tags: tags.iter().map(|s| s.to_string()).collect(), settings: settings.iter().map(|s| s.to_string()).collect(), owner_only: None }
+    }
+    const TEAM: TargetFacts = TargetFacts { in_team: true, privileged: false, is_actor: false };
+    const PEER_LEAD: TargetFacts = TargetFacts { in_team: true, privileged: true, is_actor: false };
+    const OTHER: TargetFacts = TargetFacts { in_team: false, privileged: false, is_actor: false };
+    const ME: TargetFacts = TargetFacts { in_team: false, privileged: false, is_actor: true };
+    fn code(d: Decision) -> String {
         match d {
-            Decision::Deny { code, .. } => code,
-            Decision::Allow => "allow",
-            Decision::AllowWithMaxRef => "max_ref",
+            Decision::Deny { code, .. } => code.into(),
+            Decision::Allow => "allow".into(),
+            Decision::AllowWithMaxRef { terms } => format!("max_ref:{}", terms.iter().map(|t| t[0]).collect::<Vec<_>>().join("+")),
         }
     }
 
     #[test]
     fn delegation_owner_may_do_anything() {
-        for a in [cfg(&["toggle_yolo"]), Action::SetSecret { key: "GITHUB_TOKEN".into() }, tags(&[], &["leads"]), Action::SetRouting, Action::CreateGroup { group: "x".into() }] {
-            assert_eq!(decide(&Class::Owner, &a, None), Decision::Allow, "{a:?}");
+        for a in [cfg(&["toggle_yolo"]), Action::SetSecret { key: "GITHUB_TOKEN".into() }, tags(&[], &["leads"]), Action::SetRouting,
+            Action::CreateGroup { group: "x".into() }, cfg(&["env:AMUX_CONTRACT_DONE"]), Action::RenameWorker { to: "mrpopo".into() }] {
+            assert_eq!(decide(&Class::Owner, &a, &OTHER), Decision::Allow, "{a:?}");
         }
     }
 
     #[test]
     fn delegation_lead_same_team_allowed_other_team_refused() {
         let l = lead("dev");
-        assert_eq!(code(decide(&l, &Action::CreateWorker { tags: vec!["dev".into()], owner_only: None }, None)), "allow");
-        assert_eq!(code(decide(&l, &Action::CreateWorker { tags: vec!["leads".into()], owner_only: None }, None)), "worker_create_tags_outside_team");
-        assert_eq!(code(decide(&l, &Action::CreateWorker { tags: vec!["ops".into()], owner_only: None }, None)), "worker_create_tags_outside_team");
-        assert_eq!(code(decide(&l, &Action::CreateWorker { tags: vec!["dev".into()], owner_only: Some("the chat worker type") }, None)), "worker_create_tags_outside_team");
-        for a in [Action::RenameWorker { to: "x".into() }, Action::StopWorker, cfg(&["model"]), cfg(&["effort"])] {
-            assert_eq!(code(decide(&l, &a, Some("dev"))), "allow", "{a:?}");
-            assert_eq!(code(decide(&l, &a, None)), "peer_config_owner_only", "other team {a:?}");
+        assert_eq!(code(decide(&l, &create(&["dev"], &["create:dir", "create:desc", "create:model"]), &OTHER)), "allow");
+        for (t, why) in [(&["leads"][..], "leads"), (&["ops"][..], "other team"), (&[][..], "untagged")] {
+            assert_eq!(code(decide(&l, &create(t, &[]), &OTHER)), "worker_create_tags_outside_team", "{why}");
         }
-        assert_eq!(code(decide(&l, &Action::SetGroupRules { group: "dev".into() }, None)), "allow");
-        assert_eq!(code(decide(&l, &Action::SetGroupRules { group: "ops".into() }, None)), "delegation_not_allowed");
-        assert_eq!(code(decide(&l, &Action::SetGroupRules { group: "leads".into() }, None)), "delegation_not_allowed");
+        let chat = Action::CreateWorker { tags: vec!["dev".into()], settings: vec![], owner_only: Some("the chat worker type") };
+        assert_eq!(code(decide(&l, &chat, &OTHER)), "worker_create_tags_outside_team");
+        for a in [Action::StopWorker, Action::Lifecycle { verb: "start".into() }, cfg(&["model"]), cfg(&["effort"])] {
+            assert_eq!(code(decide(&l, &a, &TEAM)), "allow", "{a:?}");
+            assert_eq!(code(decide(&l, &a, &OTHER)), "peer_config_owner_only", "other team {a:?}");
+            assert_eq!(code(decide(&l, &a, &PEER_LEAD)), "peer_config_owner_only", "peer lead {a:?}");
+        }
+        assert_eq!(code(decide(&l, &Action::SetGroupRules { group: "dev".into() }, &OTHER)), "allow");
+        assert_eq!(code(decide(&l, &Action::SetGroupConfig { group: "dev".into() }, &OTHER)), "allow");
+        assert_eq!(code(decide(&l, &Action::SetGroupRules { group: "ops".into() }, &OTHER)), "delegation_not_allowed");
+        assert_eq!(code(decide(&l, &Action::SetGroupRules { group: "leads".into() }, &OTHER)), "delegation_not_allowed");
+    }
+
+    #[test]
+    fn delegation_lead_in_two_teams_creates_with_any_subset() {
+        let l = Class::Lead { team: "dev".into(), teams: vec!["dev".into(), "ops".into()] };
+        assert_eq!(code(decide(&l, &create(&["dev", "ops"], &[]), &OTHER)), "allow");
+        assert_eq!(code(decide(&l, &create(&["ops"], &[]), &OTHER)), "allow");
+        assert_eq!(code(decide(&l, &create(&["ops", "infra"], &[]), &OTHER)), "worker_create_tags_outside_team");
+    }
+
+    #[test]
+    fn delegation_lead_create_classifies_every_setting() {
+        let l = lead("dev");
+        for k in ["create:yolo", "create:flags", "create:isolated", "create:creator", "env:CC_FLAGS", "env:CC_ISOLATED", "row:permissions", "row:environment", "env:CC_VERIFY"] {
+            assert_eq!(code(decide(&l, &create(&["dev"], &[k]), &OTHER)), "worker_create_setting_refused", "{k}");
+        }
+    }
+
+    #[test]
+    fn delegation_lead_rename_waits_for_token_move() {
+        assert_eq!(code(decide(&lead("dev"), &Action::RenameWorker { to: "dev-b".into() }, &TEAM)), "lead_rename_pending");
     }
 
     #[test]
     fn delegation_lead_may_not_change_a_team_workers_non_model_field() {
         let l = lead("dev");
-        for k in ["desc", "dir", "toggle_yolo", "external_email_allowed", "isolated", "worktree_verify", "env:CC_MODEL", "mcp"] {
-            assert_eq!(code(decide(&l, &cfg(&[k]), Some("dev"))), "peer_config_owner_only", "{k}");
+        for k in ["desc", "dir", "toggle_yolo", "external_email_allowed", "isolated", "worktree_verify", "env:CC_MODEL", "mcp", "keys"] {
+            assert_eq!(code(decide(&l, &cfg(&[k]), &TEAM)), "peer_config_owner_only", "{k}");
         }
     }
 
     #[test]
-    fn delegation_lead_tags_within_team_free_widening_needs_max_ref() {
+    fn delegation_lead_tags_only_within_its_team() {
         let l = lead("dev");
-        // Removing T from a team worker narrows: allowed.
-        assert_eq!(code(decide(&l, &tags(&["dev", "infra"], &["infra"]), Some("dev"))), "allow");
-        assert_eq!(code(decide(&l, &tags(&["dev"], &["dev"]), Some("dev"))), "allow");
-        // Leads, another team, or pulling a worker in: membership change.
-        assert_eq!(code(decide(&l, &tags(&["dev"], &["dev", "leads"]), Some("dev"))), "max_ref");
-        assert_eq!(code(decide(&l, &tags(&["dev"], &["dev", "ops"]), Some("dev"))), "max_ref");
-        assert_eq!(code(decide(&l, &tags(&["ops"], &["ops", "dev"]), None)), "max_ref");
-        assert_eq!(code(decide(&l, &tags(&["dev", "ops"], &["dev"]), Some("dev"))), "max_ref");
+        assert_eq!(code(decide(&l, &tags(&["dev"], &[]), &TEAM)), "allow", "removing T narrows");
+        assert_eq!(code(decide(&l, &tags(&["dev"], &["dev"]), &TEAM)), "allow");
+        for (from, to, f) in [(&["dev"][..], &["dev", "leads"][..], TEAM), (&["dev"][..], &["dev", "ops"][..], TEAM),
+            (&["ops"][..], &["ops", "dev"][..], OTHER), (&["dev", "infra"][..], &["dev"][..], TEAM),
+            (&["dev", "leads"][..], &["dev"][..], PEER_LEAD), (&["dev"][..], &[][..], PEER_LEAD)] {
+            assert_eq!(code(decide(&l, &tags(from, to), &f)), "worker_group_membership_refused", "{from:?} -> {to:?}");
+        }
     }
 
     #[test]
-    fn delegation_mrpopo_needs_max_ref_and_only_for_leads_routing_and_toggles() {
+    fn delegation_mrpopo_needs_a_specific_max_ref_per_row() {
         let m = Class::Mrpopo;
-        assert_eq!(code(decide(&m, &Action::SetGroupRules { group: "leads".into() }, None)), "max_ref");
-        assert_eq!(code(decide(&m, &Action::SetMembership { group: "leads".into() }, None)), "max_ref");
-        assert_eq!(code(decide(&m, &tags(&["dev"], &["dev", "leads"]), None)), "max_ref");
-        assert_eq!(code(decide(&m, &Action::SetRouting, None)), "max_ref");
-        for k in ["toggle_yolo", "external_email_allowed", "isolated", "env:CC_FLAGS", "env:AMUX_EMAIL_EXTERNAL_ALLOW"] {
-            assert_eq!(code(decide(&m, &cfg(&[k]), None)), "max_ref", "{k}");
+        assert_eq!(code(decide(&m, &cfg(&["env:CC_ORCHESTRATOR"]), &OTHER)), "max_ref:make lead");
+        assert_eq!(code(decide(&m, &tags(&["dev"], &["dev", "leads"]), &OTHER)), "max_ref:leads");
+        assert_eq!(code(decide(&m, &Action::SetGroupRules { group: "leads".into() }, &OTHER)), "max_ref:rule");
+        assert_eq!(code(decide(&m, &Action::SetRouting, &OTHER)), "max_ref:routing");
+        assert_eq!(code(decide(&m, &Action::SetGroupConfig { group: "dev".into() }, &OTHER)), "max_ref:goal");
+        for (k, first) in [("toggle_yolo", "yolo"), ("external_email_allowed", "external email"), ("isolated", "isolated"),
+            ("toggle_auto_continue", "auto-continue"), ("env:AMUX_NEEDS_INPUT_AUTO_PROD_DATA", "auto-approve"),
+            ("env:AMUX_NEEDS_INPUT_AUTO_OUTBOUND", "auto-approve"), ("env:AMUX_BROWSER_PROFILES_ALLOW", "browser profile"),
+            ("env:AMUX_APPROVAL_TYPES", "approval type"), ("scope:gates", "gate"), ("scope:connectors", "connector"),
+            ("row:permissions", "permission"), ("settings:commit-guard", "commit guard"), ("settings:task-guard", "task guard"),
+            ("settings:default-model", "default model"), ("instance:apply", "config apply"), ("send_allow", "routing")] {
+            assert_eq!(code(decide(&m, &cfg(&[k]), &OTHER)), format!("max_ref:{first}"), "{k}");
         }
-        assert_eq!(code(decide(&m, &tags(&["dev"], &["dev", "ops"]), None)), "delegation_not_allowed");
-        assert_eq!(code(decide(&m, &Action::SetGroupRules { group: "dev".into() }, None)), "delegation_not_allowed");
-        assert_eq!(code(decide(&m, &cfg(&["model"]), None)), "peer_config_owner_only");
-        assert_eq!(code(decide(&m, &Action::CreateWorker { tags: vec![], owner_only: None }, None)), "worker_create_requires_lead");
+        assert_eq!(code(decide(&m, &tags(&["dev"], &["dev", "ops"]), &OTHER)), "worker_group_membership_refused");
+        assert_eq!(code(decide(&m, &Action::SetGroupRules { group: "dev".into() }, &OTHER)), "delegation_not_allowed");
+        assert_eq!(code(decide(&m, &cfg(&["model"]), &OTHER)), "delegation_not_allowed");
+        assert_eq!(code(decide(&m, &cfg(&["toggle_yolo", "desc"]), &OTHER)), "delegation_not_allowed");
+        assert_eq!(code(decide(&m, &create(&[], &[]), &OTHER)), "worker_create_requires_lead");
+        assert_eq!(code(decide(&m, &Action::StopWorker, &OTHER)), "delegation_not_allowed");
+    }
+
+    #[test]
+    fn delegation_held_for_max_is_refused_even_for_mrpopo() {
+        for c in [Class::Mrpopo, lead("dev"), Class::SelfWorker, Class::Worker] {
+            for k in ["env:AMUX_CONTRACT_DONE", "env:AMUX_PANE_PROMPT_HISTORY", "env:AMUX_NEEDS_INPUT_AUTO_MONEY", "env:AMUX_NEEDS_INPUT_AUTO_MONEY_CAP", "env:AMUX_CARD_MAX_USD"] {
+                assert_eq!(code(decide(&c, &cfg(&[k]), &TEAM)), "held_for_max", "{c:?} {k}");
+            }
+        }
+        assert_eq!(code(decide(&Class::Mrpopo, &cfg(&["toggle_yolo"]), &ME)), "held_for_max", "mrpopo's own config");
+        assert_eq!(code(decide(&Class::SelfWorker, &Action::RenameWorker { to: "mrpopo".into() }, &ME)), "reserved_name");
+        assert_eq!(code(decide(&Class::SelfWorker, &Action::RenameWorker { to: " Owner ".into() }, &ME)), "reserved_name");
+        assert!(reserved_name("MRPOPO") && !reserved_name("mr-popo"));
+    }
+
+    #[test]
+    fn delegation_make_lead_is_mrpopo_with_max_ref_only() {
+        let k = cfg(&["env:CC_ORCHESTRATOR"]);
+        assert_eq!(code(decide(&lead("dev"), &k, &TEAM)), "peer_config_owner_only");
+        assert_eq!(code(decide(&Class::SelfWorker, &k, &ME)), "owner_only_key");
+        assert_eq!(code(decide(&Class::Worker, &k, &OTHER)), "peer_config_owner_only");
+        assert_eq!(code(decide(&lead("dev"), &tags(&["dev"], &["dev", "leads"]), &TEAM)), "worker_group_membership_refused");
     }
 
     #[test]
     fn delegation_self_non_privileged_only() {
         let s = Class::SelfWorker;
-        for k in ["model", "effort", "desc", "task_summary", "env:CC_MODEL", "scope:memory"] {
-            assert_eq!(code(decide(&s, &cfg(&[k]), None)), "allow", "{k}");
+        for k in ["model", "effort", "desc", "task_summary", "env:CC_MODEL", "env:CC_DESC", "scope:memory", "keys"] {
+            assert_eq!(code(decide(&s, &cfg(&[k]), &ME)), "allow", "{k}");
         }
-        // ai-config #160's gap: these were 200 on self before this table.
+        // ai-config #160's gap, and H4's default-allowed env keys.
         for k in ["external_email_allowed", "toggle_yolo", "toggle_auto_continue", "isolated", "worktree_verify",
             "env:CC_FLAGS", "env:AMUX_EMAIL_EXTERNAL_ALLOW", "env:AMUX_NEEDS_INPUT_AUTO_OUTBOUND", "env:CC_ORCHESTRATOR",
-            "send_allow", "scope:gates", "scope:rules", "row:environment", "an_unclassified_field"] {
-            assert_eq!(code(decide(&s, &cfg(&[k]), None)), "owner_only_key", "{k}");
+            "env:CC_VERIFY", "env:CC_DEPLOY_CHECK", "env:CC_WORKTREE_AUTO_MERGE", "env:AMUX_YOLO_AUTO_YES", "env:CC_PROJECT_LEAD",
+            "env:CC_COMPANION_OF", "env:CC_RECEIVE_DENY", "send_allow", "scope:gates", "scope:rules", "row:environment", "an_unclassified_field"] {
+            assert_eq!(code(decide(&s, &cfg(&[k]), &ME)), "owner_only_key", "{k}");
         }
-        assert_eq!(code(decide(&s, &cfg(&["worker_type"]), None)), "worker_group_membership_refused");
-        assert_eq!(code(decide(&s, &tags(&["dev"], &["dev", "leads"]), None)), "worker_group_membership_refused");
+        assert_eq!(code(decide(&s, &cfg(&["worker_type"]), &ME)), "worker_group_membership_refused");
+        assert_eq!(code(decide(&s, &tags(&["dev"], &["dev", "leads"]), &ME)), "worker_group_membership_refused");
+        assert_eq!(code(decide(&s, &cfg(&[]), &ME)), "delegation_not_allowed", "N8: no vacuous allow");
     }
 
     #[test]
     fn delegation_other_worker_refused_everything() {
         let w = Class::Worker;
-        assert_eq!(code(decide(&w, &cfg(&["model"]), None)), "peer_config_owner_only");
-        assert_eq!(code(decide(&w, &Action::StopWorker, None)), "peer_config_owner_only");
-        assert_eq!(code(decide(&w, &Action::CreateWorker { tags: vec![], owner_only: None }, None)), "worker_create_requires_lead");
-        assert_eq!(code(decide(&w, &tags(&[], &["dev"]), None)), "worker_group_membership_refused");
-        assert_eq!(code(decide(&w, &Action::SetGroupRules { group: "dev".into() }, None)), "delegation_not_allowed");
-        assert_eq!(code(decide(&w, &Action::SetRouting, None)), "delegation_not_allowed");
+        for a in [cfg(&["model"]), Action::StopWorker, Action::Lifecycle { verb: "keys".into() }, Action::RenameWorker { to: "x".into() }] {
+            assert_eq!(code(decide(&w, &a, &OTHER)), "peer_config_owner_only", "{a:?}");
+        }
+        assert_eq!(code(decide(&w, &create(&[], &[]), &OTHER)), "worker_create_requires_lead");
+        assert_eq!(code(decide(&w, &tags(&[], &["dev"]), &OTHER)), "worker_group_membership_refused");
+        assert_eq!(code(decide(&w, &Action::SetGroupRules { group: "dev".into() }, &OTHER)), "delegation_not_allowed");
+        assert_eq!(code(decide(&w, &Action::SetRouting, &OTHER)), "delegation_not_allowed");
     }
 
     #[test]
     fn delegation_secrets_are_never_delegable() {
         for c in [lead("dev"), Class::Mrpopo, Class::SelfWorker, Class::Worker] {
             for a in [Action::SetSecret { key: "X".into() }, cfg(&["env:GITHUB_TOKEN"]), cfg(&["env:AMUX_WORKER_TOKEN"]),
-                cfg(&["env:AMUX_CONTRACT_DONE"]), cfg(&["env:OPENAI_API_KEY"]), cfg(&["model", "env:DB_PASSWORD"])] {
-                assert_eq!(code(decide(&c, &a, Some("dev"))), "secret_owner_only", "{c:?} {a:?}");
+                cfg(&["env:OPENAI_API_KEY"]), cfg(&["model", "env:DB_PASSWORD"]), cfg(&["group:env:SLACK_SECRET"]), create(&["dev"], &["env:API_TOKEN"])] {
+                assert_eq!(code(decide(&c, &a, &TEAM)), "secret_owner_only", "{c:?} {a:?}");
             }
         }
     }
 
     #[test]
     fn delegation_every_config_patch_field_is_classified() {
-        // The sweep: each field config_patch reads has a row, so a new field
-        // falls to OwnerOnly only because nobody classified it, and fails here.
         for k in super::super::session_verbs::config_patch_fields_for_delegation() {
-            assert!(CONFIG_FIELDS.iter().any(|(f, _)| *f == k), "config PATCH field '{k}' has no delegation row");
+            assert!(FIELDS.iter().any(|(f, _)| *f == k) || MAXREF_ROWS.iter().any(|(f, _)| *f == k),
+                "config PATCH field '{k}' has no delegation row");
         }
     }
 }

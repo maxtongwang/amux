@@ -1037,6 +1037,7 @@ async fn put_scope(state: AppState, req: Request) -> Response {
         &actor,
         member.as_ref(),
         grant.is_some(),
+        grant.as_ref().is_some_and(|g| g.class == crate::api::delegation::Class::Mrpopo && g.evidence_row.is_some()),
     )
     .await;
     if let Some(g) = grant.filter(|_| resp.status().is_success()) {
@@ -1097,6 +1098,7 @@ async fn scope_write(
     actor: &str,
     member: Option<&super::org::MemberScope>,
     delegated: bool,
+    max_ref_verified: bool,
 ) -> Response {
     let Some(cap) = cap_by_key(key) else {
         return j(400, json!({"error": format!("unknown capability '{key}'")}));
@@ -1145,7 +1147,10 @@ async fn scope_write(
     };
 
     let value = value.cloned().unwrap_or(Value::Null);
-    if key == "env" && !actor.is_empty() && !delegated {
+    // Defense in depth (design review N16): kept after the table allowed,
+    // except for mrpopo's grant backed by a verified max_ref, whose rows ARE
+    // these keys.
+    if key == "env" && !actor.is_empty() && !max_ref_verified {
         if let Some(k) = owner_only_key_changed(&home, level, name, &value) {
             tracing::warn!(actor = %actor, level, name, key = %k, verdict = "scope_owner_only_key_refused",
                 "a session tried to change an owner-only scope key");

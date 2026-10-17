@@ -156,6 +156,13 @@ struct WorkerSpec {
     prompt: String,
 }
 
+/// The settings an env-spec worker create writes besides name and groups,
+/// for the delegation table (design review B3).
+fn env_spec_settings(w: &WorkerSpec) -> Vec<String> {
+    [("dir", &w.dir), ("desc", &w.desc), ("model", &w.model), ("provider", &w.provider), ("prompt", &w.prompt)]
+        .iter().filter(|(_, v)| !v.is_empty()).map(|(k, _)| format!("create:{k}")).collect()
+}
+
 /// An env apply creates workers with groups and had no caller check, so a
 /// worker could mint group members (fix/worker-membership-create). Each worker
 /// the spec CREATES goes through the shared create rule (only leads, only
@@ -198,7 +205,7 @@ fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Optio
             }
         } else if let Some(r) = crate::api::session_verbs::worker_create_refusal(
             headers,
-            &crate::api::session_verbs::CreateRequest { name: None, tags: &w.groups, owner_only: None },
+            &crate::api::session_verbs::CreateRequest { name: Some(&name), tags: &w.groups, owner_only: None, settings: env_spec_settings(w) },
         ) {
             return Some(r);
         }

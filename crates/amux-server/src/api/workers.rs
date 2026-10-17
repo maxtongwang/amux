@@ -607,12 +607,21 @@ pub async fn create_worker(
     };
     if let Some(refusal) = crate::api::session_verbs::worker_create_refusal(
         &headers,
-        &crate::api::session_verbs::CreateRequest { name: requested, tags: &[], owner_only },
+        &crate::api::session_verbs::CreateRequest { name: requested, tags: &[], owner_only, settings: [
+            ("row:cwd", body.cwd.is_some()), ("row:provider", body.provider.is_some()), ("row:model", body.model.is_some()),
+            ("row:backend", body.backend.is_some()), ("row:environment", body.environment.is_some()), ("row:permissions", body.permissions.is_some()),
+        ].iter().filter(|(_, on)| *on).map(|(k, _)| k.to_string()).collect() },
     ) {
         return refusal;
     }
+    let summary = json!({"name": requested, "cwd": body.cwd, "provider": body.provider, "model": body.model});
+    let action = crate::api::delegation::Action::CreateWorker { tags: vec![], settings: vec![], owner_only: None };
+    let st = state.0.clone();
     let out = create_worker_inner(state, Json(body)).await;
     crate::api::sessions_legacy::invalidate_sessions_cache();
+    if out.status().is_success() {
+        crate::api::delegation::record_allowed(&st, &headers, &crate::api::delegation::Target::NewWorker, &action, Value::Null, summary);
+    }
     out
 }
 
@@ -817,15 +826,16 @@ pub async fn patch_worker(
             Ok(n) => n,
             Err(r) => return r,
         };
-        let authority = body.group.is_some() || body.worker_type.as_deref().is_some_and(crate::api::session_verbs::is_chat_type);
-        let action = if authority {
-            crate::api::delegation::Action::SetMembership { group: body.group.clone().unwrap_or_default() }
-        } else {
-            let fields = [("display_name", body.display_name.is_some()), ("name", body.name.is_some()), ("cwd", body.cwd.is_some()),
-                ("provider", body.provider.is_some()), ("model", body.model.is_some()), ("backend", body.backend.is_some()),
-                ("worker_type", body.worker_type.is_some())];
-            crate::api::delegation::Action::SetConfig { keys: fields.iter().filter(|(_, on)| *on).map(|(k, _)| format!("row:{k}")).collect() }
-        };
+        // Every field in the body is judged; one refused field refuses the
+        // request (design review M15). A row rename to a reserved name is the
+        // owner's (H11).
+        for n in [body.display_name.as_deref(), body.name.as_deref()].into_iter().flatten() {
+            if let Some(r) = crate::api::delegation::reserved_name_refusal(&headers, n) { return r; }
+        }
+        let fields = [("display_name", body.display_name.is_some()), ("name", body.name.is_some()), ("cwd", body.cwd.is_some()),
+            ("provider", body.provider.is_some()), ("model", body.model.is_some()), ("backend", body.backend.is_some()),
+            ("worker_type", body.worker_type.is_some()), ("group", body.group.is_some())];
+        let action = crate::api::delegation::Action::SetConfig { keys: fields.iter().filter(|(_, on)| *on).map(|(k, _)| format!("row:{k}")).collect() };
         match crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Worker(target.clone()), &action, None) {
             Ok(g) => g.map(|g| (g, target)),
             Err(r) => return r,
@@ -1149,7 +1159,14 @@ pub async fn start_worker(
     State(state): State<AppState>,
     admission: Option<Extension<AdmissionOverride>>,
     Path(key): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
+    if !crate::api::session_verbs::worker_origin(&headers).is_empty() {
+        match resolve_key(&state, key.clone()).await {
+            Ok(name) => if let Err(r) = lifecycle_gate(&state, &headers, &name, "start") { return r; },
+            Err(r) => return r,
+        }
+    }
     // Lifecycle refusal is independent of host capacity and must remain stable.
     match state
         .store
@@ -2391,17 +2408,36 @@ pub async fn wake_worker(State(state): State<AppState>, Path(key): Path<String>)
 }
 
 /// `POST /api/workers/{id}/reset`
-pub async fn reset_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+pub async fn reset_worker(State(state): State<AppState>, Path(key): Path<String>, headers: axum::http::HeaderMap) -> Response {
     match resolve_key(&state, key).await {
-        Ok(name) => crate::api::session_verbs::reset_verb(&state, &name).await,
+        Ok(name) => {
+            if let Err(r) = lifecycle_gate(&state, &headers, &name, "reset") { return r; }
+            crate::api::session_verbs::reset_verb(&state, &name).await
+        }
         Err(r) => r,
     }
 }
 
+/// Lifecycle verbs on another worker go through the delegation table
+/// (ai-config #160): self, or a lead for a non-lead worker in its team.
+fn lifecycle_gate(state: &AppState, headers: &axum::http::HeaderMap, name: &str, verb: &str) -> Result<(), Response> {
+    let action = crate::api::delegation::Action::Lifecycle { verb: verb.to_string() };
+    match crate::api::delegation::authorize(state, headers, &crate::api::delegation::Target::Worker(name.to_string()), &action, None)? {
+        Some(g) => {
+            g.commit(state, json!({"name": name}), json!({"lifecycle": verb}));
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
 /// `POST /api/workers/{id}/clear`
-pub async fn clear_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+pub async fn clear_worker(State(state): State<AppState>, Path(key): Path<String>, headers: axum::http::HeaderMap) -> Response {
     match resolve_key(&state, key).await {
-        Ok(name) => crate::api::session_verbs::clear_verb(&name).await,
+        Ok(name) => {
+            if let Err(r) = lifecycle_gate(&state, &headers, &name, "clear") { return r; }
+            crate::api::session_verbs::clear_verb(&name).await
+        }
         Err(r) => r,
     }
 }
@@ -2429,6 +2465,7 @@ pub async fn resize_worker(
 pub async fn keys_worker(
     State(state): State<AppState>,
     Path(key): Path<String>,
+    headers: axum::http::HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Response {
     let name = match resolve_key(&state, key).await {
@@ -2439,6 +2476,11 @@ pub async fn keys_worker(
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
+    // Keys into a pane: a worker's own pane only (ai-config #160).
+    if let Err(r) = crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Worker(name.clone()),
+        &crate::api::delegation::Action::SetConfig { keys: vec!["keys".into()] }, Some(&body)) {
+        return r;
+    }
     crate::api::session_verbs::keys_verb(&name, &body).await
 }
 
@@ -2819,7 +2861,9 @@ mod tests {
         let s = home.join("sessions");
         std::fs::create_dir_all(&s).unwrap();
         for (n, t) in [("review-dev-lead", "leads,dev"), ("review-ops-lead", "leads,ops"), ("review-dev-a", "dev"), ("review-ops-a", "ops")] {
-            std::fs::write(s.join(format!("{n}.env")), format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{t}\"\n")).unwrap();
+            // A lead is CC_ORCHESTRATOR=1 plus `leads` (ai-config #160).
+            let orch = if t.starts_with("leads") { "CC_ORCHESTRATOR=\"1\"\n" } else { "" };
+            std::fs::write(s.join(format!("{n}.env")), format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{t}\"\n{orch}")).unwrap();
         }
     }
 

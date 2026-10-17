@@ -49,6 +49,17 @@ impl MaxRefRefusal {
 pub(crate) const MAX_REF_WINDOW_S: f64 = 600.0;
 pub(crate) const MAX_REF_MAX_AGE_S: f64 = 86_400.0;
 
+/// One human-typed row naming a target AND one of `terms` (stub: refuses).
+pub(crate) fn verify_max_ref_terms(
+    state: &AppState,
+    r: Option<&MaxRef>,
+    targets: &[&str],
+    _terms: &[&str],
+    now: f64,
+) -> Result<MaxRefEvidence, MaxRefRefusal> {
+    verify_max_ref(state, r, targets, now)
+}
+
 pub(crate) fn verify_max_ref(
     _state: &AppState,
     r: Option<&MaxRef>,
