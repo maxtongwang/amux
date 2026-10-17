@@ -4,6 +4,7 @@
 //! This is a lexical guard, not whole-program dataflow: computed addresses and
 //! parameters still need review (notably libc sockaddr construction).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -137,37 +138,55 @@ fn wildcard(expr: &str) -> bool {
 // Follow simple `let addr = ...; bind(addr)` chains, using the nearest preceding
 // declaration. Stop at parameters/other computed values; never read fixture text
 // as Rust. No runtime sockets are opened by this audit.
-fn address_expr(ts: &[Token<'_>], before: usize, expr: &[Token<'_>], depth: usize) -> String {
-    let mut value = compact(expr);
-    assert!(depth < 16, "address alias chain is too deep to audit");
-    for token in expr {
-        if !token
-            .text
-            .starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-        {
-            continue;
-        }
-        if let Some(start) = (0..before.saturating_sub(2)).rev().find(|&i| {
-            matches!(ts[i].text, "let" | "const" | "static")
-                && (ts[i + 1].text == token.text
-                    || (ts[i + 1].text == "mut" && ts[i + 2].text == token.text))
-        }) {
-            let tail = &ts[start..before];
-            let mut nesting = 0;
-            let end = tail
-                .iter()
-                .position(|t| {
-                    match t.text {
-                        "(" | "[" | "{" => nesting += 1,
-                        ")" | "]" | "}" => nesting -= 1,
-                        ";" if nesting == 0 => return true,
-                        _ => {}
-                    }
-                    false
-                })
-                .unwrap_or(tail.len());
-            if let Some(eq) = tail[..end].iter().position(|t| t.text == "=") {
-                value.push_str(&address_expr(ts, start, &tail[eq + 1..end], depth + 1));
+fn address_expr<'a>(ts: &'a [Token<'a>], before: usize, expr: &'a [Token<'a>]) -> String {
+    let mut value = String::new();
+    let mut pending = vec![(before, expr)];
+    let mut visited = HashSet::new();
+    while let Some((before, expr)) = pending.pop() {
+        value.push_str(&compact(expr));
+        for (index, token) in expr.iter().enumerate() {
+            if !token
+                .text
+                .starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            {
+                continue;
+            }
+            // Calls and path qualifiers are computed values, not address aliases.
+            // In particular, do not trace a local closure's body as an address
+            // or mistake `*const libc::...` for a constant named `libc`.
+            if expr.get(index + 1).is_some_and(|t| t.text == "(")
+                || (expr.get(index + 1).is_some_and(|t| t.text == ":")
+                    && expr.get(index + 2).is_some_and(|t| t.text == ":"))
+            {
+                continue;
+            }
+            if let Some(start) = (0..before.saturating_sub(2)).rev().find(|&i| {
+                matches!(ts[i].text, "let" | "const" | "static")
+                    && (ts[i + 1].text == token.text
+                        || (ts[i + 1].text == "mut" && ts[i + 2].text == token.text))
+            }) {
+                if !visited.insert((token.text, start)) {
+                    continue;
+                }
+                let tail = &ts[start..before];
+                let mut nesting = 0;
+                let end = tail
+                    .iter()
+                    .position(|t| {
+                        match t.text {
+                            "(" | "[" | "{" => nesting += 1,
+                            ")" | "]" | "}" => nesting -= 1,
+                            ";" if nesting == 0 => return true,
+                            _ => {}
+                        }
+                        false
+                    })
+                    .unwrap_or(tail.len());
+                if let Some(eq) = tail[..end].iter().position(|t| t.text == "=") {
+                    // An initializer sees only declarations strictly before its own.
+                    // Unresolved names remain computed addresses requiring review.
+                    pending.push((start, &tail[eq + 1..end]));
+                }
             }
         }
     }
@@ -198,7 +217,7 @@ fn scan(src: &str) -> Vec<(usize, String)> {
             }
         }
         assert_eq!(depth, 0, "unclosed bind/listen call");
-        let expr = address_expr(&ts, i, &ts[i + 2..end], 0);
+        let expr = address_expr(&ts, i, &ts[i + 2..end]);
         if wildcard(&expr) {
             bad.push((ts[i].at, compact(&ts[i..=end])));
         }
@@ -301,5 +320,68 @@ fn audit_detects_address_forms_and_aliases_but_ignores_comments_and_fixtures() {
     assert_eq!(
         scan("// ignored\nTcpListener::bind(\"0.0.0.0:0\");")[0].0,
         24
+    );
+}
+
+#[test]
+fn audit_stops_at_unresolved_shadowing_and_cycles() {
+    for src in [
+        "let addr = addr; TcpListener::bind(addr);",
+        "let addr = other; let other = addr; TcpListener::bind(other);",
+        "let addr = addr.clone(); TcpListener::bind(addr);",
+        "for addr in addresses { let addr = normalize(addr); TcpListener::bind(addr); }",
+    ] {
+        assert!(scan(src).is_empty(), "computed address needs review: {src}");
+    }
+}
+
+#[test]
+fn audit_follows_shadowing_back_to_a_wildcard() {
+    let src = r#"
+        let addr = "0.0.0.0:0";
+        let other = addr;
+        let addr = other;
+        let addr = addr.clone();
+        TcpListener::bind(addr);
+    "#;
+    assert_eq!(scan(src).len(), 1, "wildcard behind shadowing was missed");
+    let unresolved = r#"let addr = combine(addr, "0.0.0.0:0"); socket.bind(addr);"#;
+    assert_eq!(scan(unresolved).len(), 1, "unresolved alias hid a wildcard");
+}
+
+#[test]
+fn audit_follows_deep_finite_alias_chains() {
+    for address in ["127.0.0.1:0", "0.0.0.0:0"] {
+        let mut src = format!("let addr0 = {address:?};");
+        for i in 1..128 {
+            src.push_str(&format!("let addr{i} = addr{};", i - 1));
+        }
+        src.push_str("TcpListener::bind(addr127);");
+        assert_eq!(scan(&src).len(), usize::from(address == "0.0.0.0:0"));
+    }
+}
+
+#[test]
+fn audit_leaves_closure_bodies_computed_but_checks_their_arguments() {
+    let computed = r#"
+        let sin = |ip, port| SockAddr { ip, port, padding: [0; 8] };
+        let local = sin(local_ip, local_port);
+        let len = size_of::<libc::sockaddr_in>();
+        libc::bind(fd, (&local as *const libc::sockaddr_in).cast(), len);
+    "#;
+    assert!(
+        scan(computed).is_empty(),
+        "sockaddr construction needs review"
+    );
+    let wildcard_argument = r#"
+        let sin = |ip, port| SockAddr { ip, port, padding: [0; 8] };
+        let ip = "0.0.0.0";
+        let local = sin(ip, 0);
+        socket.bind(local);
+    "#;
+    assert_eq!(
+        scan(wildcard_argument).len(),
+        1,
+        "wildcard argument was missed"
     );
 }
