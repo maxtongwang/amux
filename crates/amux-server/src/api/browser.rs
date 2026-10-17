@@ -2605,7 +2605,7 @@ async fn profiles(headers: HeaderMap, Query(q): Query<ProfilesQuery>) -> Respons
     let home = chrome::amux_home();
     // Size walks touch a few hundred files per profile — off the runtime.
     let list =
-        match tokio::task::spawn_blocking(move || chrome::list_profiles(&home, with_sizes)).await {
+        match tokio::task::spawn_blocking(move || chrome::list_profiles_with_discovery(&home, with_sizes)).await {
             Ok(l) => l,
             Err(e) => {
                 return err(
@@ -2614,7 +2614,9 @@ async fn profiles(headers: HeaderMap, Query(q): Query<ProfilesQuery>) -> Respons
                 )
             }
         };
-    let chrome_profiles = chrome::list_chrome_profiles();
+    let (list, saved_discovery) = list;
+    let chrome_discovery = chrome::discover_chrome_profiles();
+    let chrome_profiles: Vec<_> = chrome_discovery.profiles.iter().map(|p| &p.name).collect();
     // THE TTL AND THE COUNTDOWN, BESIDE THE THING THEY DELETE. A reaper whose
     // only trace is a log line is one nobody knows about until a profile is
     // gone; `reap_in_days` on each row makes the schedule readable before it
@@ -2727,6 +2729,8 @@ async fn profiles(headers: HeaderMap, Query(q): Query<ProfilesQuery>) -> Respons
         "how_to_choose": "GET /api/browser/profile-for?url=<url> (or `amux browser for <url>`) names the one profile to use for a site, whether it is signed in there, and why. With no profile, /api/browser/start uses default_profile.",
         "backends": ["native"],
         "chrome_profiles": chrome_profiles,
+        "discovery": chrome_discovery.discovery,
+        "saved_discovery": saved_discovery,
         "profile_ttl_days": ttl_days,
         "profile_ttl_note": "unregistered profiles unused for this many days are deleted by the \
                              reaper. Registered profiles (a deliberate save with domains/label) \

@@ -63,28 +63,17 @@ pub fn chrome_user_data_dir() -> PathBuf {
     }
 }
 
-/// Chrome user profiles from `Local State` → `profile.info_cache`.
-/// Returns directory names ("Default", "Profile 11", …) sorted.
+#[path = "browser_profile_discovery.rs"]
+mod profile_discovery;
+pub use profile_discovery::{discover_chrome_profiles_in, DiscoveryStatus};
+
+pub fn discover_chrome_profiles() -> profile_discovery::ChromeDiscovery {
+    discover_chrome_profiles_in(&chrome_user_data_dir())
+}
+
+/// Compatibility for name-only consumers; failures still emit a diagnostic WARN.
 pub fn list_chrome_profiles() -> Vec<String> {
-    let local_state = chrome_user_data_dir().join("Local State");
-    let data = match std::fs::read_to_string(&local_state) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&data) {
-        Ok(v) => v,
-        Err(_) => return vec![],
-    };
-    let Some(cache) = parsed
-        .get("profile")
-        .and_then(|p| p.get("info_cache"))
-        .and_then(|c| c.as_object())
-    else {
-        return vec![];
-    };
-    let mut names: Vec<String> = cache.keys().cloned().collect();
-    names.sort();
-    names
+    discover_chrome_profiles().profiles.into_iter().map(|p| p.name).collect()
 }
 
 /// Python `_bu_profile_dir`: where a profile name lives on disk. Pure in its
@@ -345,7 +334,7 @@ fn copy_profile_tree(src: &Path, dst: &Path, stats: &mut (u64, u64)) -> anyhow::
         if import_entry_is_volatile(&label) {
             continue;
         }
-        let ty = match entry.file_type() {
+        let ty = match std::fs::metadata(entry.path()) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
@@ -491,36 +480,88 @@ pub fn dir_size_bytes(root: &Path) -> u64 {
 }
 
 /// Registry metadata (Python `_bu_registry_load`): name -> {domains, label}.
-pub fn registry_load(home: &Path) -> serde_json::Map<String, serde_json::Value> {
+fn registry_read(
+    home: &Path,
+) -> Result<serde_json::Map<String, serde_json::Value>, DiscoveryStatus> {
     let path = home.join("playwright-auth").join("profiles.json");
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default()
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(DiscoveryStatus::io_failure(&e, &path)),
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| DiscoveryStatus::failed("parse_failure", &path))?;
+    value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| DiscoveryStatus::failed("invalid_registry", &path))
+}
+
+pub fn registry_load(home: &Path) -> serde_json::Map<String, serde_json::Value> {
+    registry_read(home).unwrap_or_default()
 }
 
 /// Inventory of amux-owned profiles: a directory that exists IS a profile
 /// (the Python listing's hard-won rule — the registry adds metadata, it is
 /// not the source of truth for existence).
 pub fn list_profiles(home: &Path, with_sizes: bool) -> Vec<BrowserProfile> {
-    let registry = registry_load(home);
+    list_profiles_with_discovery(home, with_sizes).0
+}
+
+pub fn list_profiles_with_discovery(
+    home: &Path,
+    with_sizes: bool,
+) -> (Vec<BrowserProfile>, DiscoveryStatus) {
+    let (registry, mut failure) = match registry_read(home) {
+        Ok(registry) => (registry, None),
+        Err(status) => (Default::default(), Some(status)),
+    };
     let mut names: std::collections::BTreeSet<String> = registry.keys().cloned().collect();
     let profiles_dir = home.join("playwright-auth").join("profiles");
-    if let Ok(entries) = std::fs::read_dir(&profiles_dir) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if e.path().is_dir() && !name.starts_with('.') {
-                names.insert(name);
+    match std::fs::read_dir(&profiles_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        failure = Some(DiscoveryStatus::io_failure(&e, &profiles_dir));
+                        continue;
+                    }
+                };
+                let name = entry.file_name().to_string_lossy().into_owned();
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() && !name.starts_with('.') => {
+                        names.insert(name);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        failure = Some(DiscoveryStatus::io_failure(&e, &entry.path()));
+                    }
+                }
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            failure = Some(DiscoveryStatus::io_failure(&e, &profiles_dir));
+        }
     }
-    if home.join("playwright-auth").join("profile").is_dir() {
-        names.insert("default".into());
+    let default_dir = home.join("playwright-auth").join("profile");
+    match std::fs::metadata(&default_dir) {
+        Ok(meta) if meta.is_dir() => {
+            names.insert("default".into());
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            failure = Some(DiscoveryStatus::io_failure(&e, &default_dir));
+        }
     }
-
+    let n = names.len();
+    let mut discovery =
+        failure.unwrap_or_else(|| DiscoveryStatus::measured(n, "no_saved_profiles_configured"));
+    discovery.n_considered = n;
     let chrome_dir = chrome_user_data_dir();
-    names
+    let profiles = names
         .into_iter()
         .map(|name| {
             let dir = resolve_profile_dir(home, &chrome_dir, &name);
@@ -589,7 +630,38 @@ pub fn list_profiles(home: &Path, with_sizes: bool) -> Vec<BrowserProfile> {
                 );
             }
         })
-        .collect()
+        .collect();
+    (profiles, discovery)
+}
+
+#[cfg(test)]
+mod profile_inventory_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn missing_saved_inventory_is_a_measured_empty() {
+        let home = tempfile::tempdir().unwrap();
+        let (profiles, status) = list_profiles_with_discovery(home.path(), false);
+        assert!(profiles.is_empty());
+        assert!(status.measured);
+        assert_eq!(status.n_considered, 0);
+        assert_eq!(status.empty_reason.as_deref(), Some("no_saved_profiles_configured"));
+    }
+
+    #[test]
+    fn malformed_registry_preserves_disk_profiles_and_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("playwright-auth");
+        std::fs::create_dir_all(root.join("profiles/synthetic")).unwrap();
+        std::fs::write(root.join("profiles.json"), b"{malformed").unwrap();
+        let (profiles, status) = list_profiles_with_discovery(home.path(), false);
+        assert!(!status.measured);
+        assert_eq!(status.n_considered, 1);
+        assert!(status.why_unmeasured.unwrap().starts_with("parse_failure: "));
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "synthetic");
+        assert!(profiles[0].on_disk);
+    }
 }
 
 // ---- lock files -----------------------------------------------------------
