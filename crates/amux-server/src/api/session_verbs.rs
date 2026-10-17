@@ -6681,6 +6681,8 @@ pub(crate) fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Resu
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN repeat_of INTEGER", []);
     // Migration 0123: the send's message ID, the only key its receipt reads.
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN msg_id TEXT", []);
+    // Same migration: set when a row's delivery was inferred from its TEXT.
+    let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN reconciled_at INTEGER", []);
     // Dead-lettered vs delivered must be distinguishable in history
     // (AMUX-3110; migration 0024 carries the same ADDCOL for migrated DBs,
     // this covers a DB bootstrapped through this legacy path).
@@ -9610,7 +9612,14 @@ pub(crate) enum HistoryFate {
     Waiting(i64),
 }
 
-pub(crate) fn history_fate_of(row: i64, delivery: &str, verdict: &str, delivered: bool) -> HistoryFate {
+/// `reconciled` is a row whose delivery was inferred from its TEXT (a matching
+/// submitted prompt, or a queue drain that could not find the row by its queue
+/// ID). Text can belong to a different send with the same words, so such a row
+/// reads as it did before the inference: never Delivered (PR #9 round 4, B3).
+pub(crate) fn history_fate_of(row: i64, delivery: &str, verdict: &str, delivered: bool, reconciled: bool) -> HistoryFate {
+    if reconciled {
+        return if delivery == "queued" { HistoryFate::Waiting(row) } else { HistoryFate::InTheBox(row) };
+    }
     match (delivery, verdict) {
         (_, "confirmed" | "retried") => HistoryFate::Delivered(row),
         ("queued", _) if delivered => HistoryFate::Delivered(row),
@@ -9627,10 +9636,10 @@ fn history_fate_by_msg_id(state: &AppState, name: &str, msg_id: &str) -> Option<
     }
     let c = state.store.read().ok()?;
     c.query_row(
-        "SELECT id, COALESCE(delivery,''), COALESCE(submit_verdict,''), delivered_at IS NOT NULL \
-         FROM cmd_history WHERE session=?1 AND msg_id=?2 ORDER BY id DESC LIMIT 1",
+        "SELECT id, COALESCE(delivery,''), COALESCE(submit_verdict,''), delivered_at IS NOT NULL, \
+         reconciled_at IS NOT NULL FROM cmd_history WHERE session=?1 AND msg_id=?2 ORDER BY id DESC LIMIT 1",
         rusqlite::params![name, msg_id],
-        |r| Ok(history_fate_of(r.get(0)?, &r.get::<_, String>(1)?, &r.get::<_, String>(2)?, r.get(3)?)),
+        |r| Ok(history_fate_of(r.get(0)?, &r.get::<_, String>(1)?, &r.get::<_, String>(2)?, r.get(3)?, r.get(4)?)),
     )
     .ok()
 }
@@ -9650,10 +9659,6 @@ async fn note_history_msg_id(state: &AppState, row_id: i64, msg_id: &str) {
         })
         .await;
 }
-
-
-
-
 
 /// Recent `cmd_history` rows recorded as stuck whose text is the prompt the
 /// provider just reported submitted. Pure over the candidate rows.
@@ -9679,8 +9684,12 @@ pub(crate) fn stuck_rows_matching(prompt: &str, candidates: &[(i64, String)]) ->
 /// submitted a minute later by one Enter: nothing ever revisited a stuck row.
 /// The provider's UserPromptSubmit (the passive lifecycle hook) carries the
 /// prompt text, so a stuck row whose text matches is now marked confirmed and
-/// given its delivery time. This is a delivery receipt for the owner's own
+/// given its delivery time. This is the Messages tab's view of the owner's own
 /// message, which isolated lanes preserve too. Returns rows reconciled.
+///
+/// It is NOT a send receipt: the match is by text, and a different send with
+/// the same words can be what went in. `reconciled_at` marks the inference, and
+/// `history_fate_of` reads such a row as it was before (PR #9 round 4, B3).
 ///
 /// A row recorded `queued` that went in by another path is the same case
 /// (Ethan, 2026-10-14, "these are getting lost"): MSG-89451/89452 were sent
@@ -9718,8 +9727,8 @@ pub(crate) async fn reconcile_stuck_on_submit(state: &AppState, session: &str, p
             let mut events = vec![];
             for id in &write_ids {
                 let n = conn.execute(
-                    "UPDATE cmd_history SET submit_verdict='confirmed', delivered_at=COALESCE(delivered_at, ?2) \
-                     WHERE id=?1 AND (submit_verdict='stuck' OR (delivery='queued' AND delivered_at IS NULL))",
+                    "UPDATE cmd_history SET submit_verdict='confirmed', delivered_at=COALESCE(delivered_at, ?2), \
+                     reconciled_at=?2 WHERE id=?1 AND (submit_verdict='stuck' OR (delivery='queued' AND delivered_at IS NULL))",
                     rusqlite::params![id, at],
                 )?;
                 if n == 1 {
@@ -21906,16 +21915,31 @@ pub(crate) fn mark_schedule_run_delivered(
 /// load 26 (gs12-compute, 2026-10-04).
 pub(crate) const WORKER_SYSTEM_PATH_RC: &str = "for __d in /usr/sbin /sbin; do case \":$PATH:\" in *\":$__d:\"*) ;; *) PATH=\"$PATH:$__d\" ;; esac; done; unset __d; export PATH; ";
 
+/// Stamp the history row of the queue item just delivered. The row linked to
+/// `queue_id` is the send's own record, so its stamp is authoritative and also
+/// clears an earlier text inference on it. A row never linked (the link write
+/// failed, or the row predates queue IDs) falls back to the oldest unlinked
+/// row with the same text, marked `reconciled_at` so no receipt reads it as
+/// delivered (PR #9 round 4, B3).
 pub(crate) fn stamp_queued_delivery(
     conn: &rusqlite::Connection,
     session: &str,
+    queue_id: &str,
     text: &str,
     at_ms: i64,
 ) -> rusqlite::Result<usize> {
+    let by_id = conn.execute(
+        "UPDATE cmd_history SET delivered_at=COALESCE(delivered_at, ?1), reconciled_at=NULL \
+         WHERE session=?2 AND queue_id=?3 AND delivery='queued'",
+        rusqlite::params![at_ms, session, queue_id],
+    )?;
+    if by_id > 0 {
+        return Ok(by_id);
+    }
     conn.execute(
-        "UPDATE cmd_history SET delivered_at=?1 \
+        "UPDATE cmd_history SET delivered_at=?1, reconciled_at=?1 \
          WHERE id = (SELECT id FROM cmd_history \
-                     WHERE session=?2 AND text=?3 \
+                     WHERE session=?2 AND text=?3 AND queue_id IS NULL \
                        AND delivery='queued' AND delivered_at IS NULL \
                      ORDER BY ts LIMIT 1)",
         rusqlite::params![at_ms, session, text],
@@ -22871,12 +22895,11 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                 // Same write as the two statements above, so a crash cannot
                 // record the delivery in one place and not the other.
                 //
-                // Matched on (session, text) because the queue id is minted
-                // independently of the cmd_history row and there is no shared
-                // key. Oldest unstamped match wins, so two identical sends stamp
-                // in the order they were made. The text here is the RAW text;
-                // only steering_history stores the redacted form.
-                let stamped = stamp_queued_delivery(conn, &sess2, &text2, now_i64() * 1000)?;
+                // Matched on the queue id the send linked to its row; only an
+                // unlinked row falls back to its text, and that stamp never
+                // counts as a receipt. The text here is the RAW text; only
+                // steering_history stores the redacted form.
+                let stamped = stamp_queued_delivery(conn, &sess2, &id2, &text2, now_i64() * 1000)?;
                 if stamped == 0 {
                     // COUNTABLE, not silent. Zero means the join missed — the
                     // send recorded different text, or the row was never
@@ -43228,6 +43251,80 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         }
     }
 
+    /// PR #9 round 4, B3. A delivery inferred from TEXT never settles a
+    /// receipt: send A stuck, then a different send with the same words goes
+    /// in, and the reconcile marks A's row delivered for the Messages tab. A's
+    /// receipt must still read not submitted. A queued row settles only when
+    /// the drain stamps it by its own queue ID; a text-fallback stamp does not.
+    #[tokio::test]
+    async fn text_reconciliation_never_settles_a_receipt() {
+        let (state, _dir) = state();
+        let name = "receipt-reconcile-fixture";
+        async fn read(r: Response) -> Value {
+            serde_json::from_slice(&axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap()).unwrap()
+        }
+        let row = |msg_id: &'static str, text: &'static str, delivery: &'static str,
+                   verdict: Option<&'static str>, queue_id: Option<&'static str>| {
+            let st = state.store.clone();
+            async move {
+                st.write_async(move |c| {
+                    ensure_fleet_tables(c)?;
+                    c.execute("INSERT INTO cmd_history (text, type, session, ts, origin, delivery, submit_verdict, msg_id, queue_id) \
+                               VALUES (?1, 'session', ?2, ?3, '', ?4, ?5, ?6, ?7)",
+                        rusqlite::params![text, name, now_i64() * 1000, delivery, verdict, msg_id, queue_id])?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                }).await.unwrap();
+            }
+        };
+        let drain = |queue_id: &'static str, text: &'static str| {
+            let st = state.store.clone();
+            async move {
+                let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let seen = n.clone();
+                st.write_async(move |c| {
+                    seen.store(stamp_queued_delivery(c, name, queue_id, text, now_i64() * 1000)?, std::sync::atomic::Ordering::SeqCst);
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                }).await.unwrap();
+                n.load(std::sync::atomic::Ordering::SeqCst)
+            }
+        };
+        let receipt = |id: &'static str| {
+            let state = &state;
+            async move { read(send_receipt_resolving(state, name, id, "").await).await }
+        };
+        // A stuck send, then another send with the same words is submitted.
+        row("stuck-a", "deploy the fix to the staging lane", "direct", Some("stuck"), None).await;
+        assert_eq!(reconcile_stuck_on_submit(&state, name, "deploy the fix to the staging lane").await, 1);
+        let shown: (String, bool) = state.store.read().unwrap().query_row(
+            "SELECT submit_verdict, delivered_at IS NOT NULL FROM cmd_history WHERE msg_id='stuck-a'", [],
+            |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(shown, ("confirmed".to_string(), true), "the Messages tab still shows the inference");
+        let v = receipt("stuck-a").await;
+        assert_eq!((v["accepted"].clone(), v["stranded"].clone()), (json!(false), json!(true)),
+            "a text match is not this send's receipt: {v}");
+        // A queued send reconciled by text waits; its own queue ID settles it.
+        row("queued-a", "run the nightly report again", "queued", None, None).await;
+        assert_eq!(reconcile_stuck_on_submit(&state, name, "run the nightly report again").await, 1);
+        let v = receipt("queued-a").await;
+        assert_eq!((v["accepted"].clone(), v["queued"].clone()), (json!(false), json!(true)), "{v}");
+        state.store.write_async(|c| {
+            c.execute("UPDATE cmd_history SET queue_id='Q-A' WHERE msg_id='queued-a'", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        assert_eq!(drain("Q-A", "run the nightly report again").await, 1);
+        assert_eq!(receipt("queued-a").await["accepted"], true, "stamped by its own queue ID");
+        // Two queued sends with the same text: the drain of one settles only it.
+        row("queued-c", "same queued words here", "queued", None, Some("Q-C")).await;
+        row("queued-d", "same queued words here", "queued", None, Some("Q-D")).await;
+        assert_eq!(drain("Q-D", "same queued words here").await, 1);
+        assert_eq!(receipt("queued-d").await["accepted"], true);
+        assert_eq!(receipt("queued-c").await["queued"], true, "the twin's drain does not settle it");
+        // An unlinked row stamped by its text shows delivered and settles no receipt.
+        row("queued-e", "an unlinked queued message", "queued", None, None).await;
+        assert_eq!(drain("Q-MISSING", "an unlinked queued message").await, 1);
+        assert_eq!(receipt("queued-e").await["queued"], true, "a text-fallback stamp is not a receipt");
+    }
+
     /// AMUX-4589. The client leaves while the send is parked on the lane lock,
     /// after the ID was reserved. The ID must still settle: a retry reads a
     /// receipt or a clean slate, never "pending" until the two-minute cutoff.
@@ -53623,7 +53720,8 @@ mod spawn_argv_secret_tests {
             "CREATE TABLE cmd_history(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL,
                 type TEXT NOT NULL DEFAULT 'direct', session TEXT NOT NULL DEFAULT '',
-                ts INTEGER NOT NULL, delivery TEXT, delivered_at INTEGER);",
+                ts INTEGER NOT NULL, delivery TEXT, delivered_at INTEGER,
+                queue_id TEXT, reconciled_at INTEGER);",
         )
         .expect("schema");
         let add = |text: &str, sess: &str, ts: i64, delivery: Option<&str>| {
@@ -53650,7 +53748,7 @@ mod spawn_argv_secret_tests {
 
         // First delivery stamps the OLDEST match and nothing else.
         assert_eq!(
-            crate::api::session_verbs::stamp_queued_delivery(&conn, "amux", "hello", 9_000)
+            crate::api::session_verbs::stamp_queued_delivery(&conn, "amux", "unlinked", "hello", 9_000)
                 .unwrap(),
             1
         );
@@ -53673,7 +53771,7 @@ mod spawn_argv_secret_tests {
 
         // Second delivery takes the next one, in order.
         assert_eq!(
-            crate::api::session_verbs::stamp_queued_delivery(&conn, "amux", "hello", 9_100)
+            crate::api::session_verbs::stamp_queued_delivery(&conn, "amux", "unlinked", "hello", 9_100)
                 .unwrap(),
             1
         );
@@ -53681,7 +53779,7 @@ mod spawn_argv_secret_tests {
 
         // Nothing left: the caller reports 0 rather than believing it stamped.
         assert_eq!(
-            crate::api::session_verbs::stamp_queued_delivery(&conn, "amux", "hello", 9_200)
+            crate::api::session_verbs::stamp_queued_delivery(&conn, "amux", "unlinked", "hello", 9_200)
                 .unwrap(),
             0,
             "a third delivery with no unstamped row must report 0, which is what the \
