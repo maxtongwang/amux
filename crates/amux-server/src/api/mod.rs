@@ -238,6 +238,7 @@ pub fn router_with_connector_transport(
         .nest("/api/criteria", criteria::routes())
         .nest("/api/metrics", metrics::routes())
         .nest("/api/reclaim", reclaim::routes())
+        .route("/api/fleet/restore", axum::routing::post(crate::runtime_jobs::tmux_watch::restore_handler))
         .nest("/api/usage", usage::routes())
         .nest("/api/review", review::routes())
         .nest("/api/channels", channels::routes())
