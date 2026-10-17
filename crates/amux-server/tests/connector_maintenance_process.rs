@@ -106,6 +106,9 @@ impl Rig {
             .env("AMUX_MAINTENANCE_CHILD_HOME", &self.home)
             .env("AMUX_MAINTENANCE_PROVIDER", &self.provider)
             .env("AMUX_HOME", &self.home)
+            // This child shares the default tmux server; a run from inside a
+            // worker pane must not attribute the test client to that pane.
+            .env("AMUX_PROCESS_ATTRIBUTION", "0")
             .env("AMUX_AUTOFIX_SECS", "0")
             .stdout(log.try_clone().unwrap())
             .stderr(log)

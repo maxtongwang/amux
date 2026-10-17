@@ -93,6 +93,7 @@ pub(crate) mod pane_prompts;
 pub mod pinned;
 pub mod planning;
 pub mod policy;
+pub mod process_identity;
 pub mod prefs;
 pub mod projects;
 pub mod proxies;
@@ -690,6 +691,12 @@ pub fn router_with_connector_transport(
     // with the RAW path the client sent. Never blocks or fails a request
     // (rows ride a bounded channel to the single-writer store).
     let app = request_log::layer(app, store_for_reqlog);
+
+    // Who opened the socket, by process ancestry (api/process_identity.rs).
+    // Inside member identity, so it can drop a member marker from a worker
+    // process; outside auth, rule 10, the request log and every handler, so
+    // each of them reads the attributed identity rather than a claimed one.
+    let app = app.layer(axum::middleware::from_fn(process_identity::attribute));
 
     // Outermost so verified member headers exist before BOTH auth and the
     // request logger inspect the request. The middleware strips its internal

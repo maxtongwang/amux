@@ -2782,6 +2782,96 @@ mod tests {
         assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_start_prompt_refused")), "same group too: {v}");
     }
 
+    // ---- process attribution (api/process_identity.rs) --------------------
+
+    /// One request over a "real socket" from client port `port`: the
+    /// ConnectInfo extension is what the served router carries, and the fake
+    /// resolver answers by port.
+    async fn send_from(
+        app: &axum::Router,
+        port: u16,
+        method: &str,
+        path: &str,
+        body: Value,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Value) {
+        let mut b = Request::builder().method(method).uri(path).header(header::CONTENT_TYPE, "application/json");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let mut req = b.body(Body::from(body.to_string())).unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], port))));
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    const CLAUDE_PANE: u16 = 40001; // a worker process in amux-dev-a's pane
+    const OWNER_TERMINAL: u16 = 40002; // a process outside every amux pane
+    const UNTRACEABLE: u16 = 40003; // loopback, owner/ancestry unknown
+
+    fn attribution_resolver() -> crate::api::process_identity::test_support::ResolverGuard {
+        use crate::api::process_identity::{test_support, Origin};
+        test_support::set_resolver(std::sync::Arc::new(test_support::ByPort(std::collections::HashMap::from([
+            (CLAUDE_PANE, Origin::Worker("dev-a".into())),
+            (OWNER_TERMINAL, Origin::Outside),
+            (UNTRACEABLE, Origin::Unattributed("test: no owner".into())),
+        ]))))
+    }
+
+    /// The impersonation repro (2026-10-16): a worker's request with its
+    /// identity headers stripped (Codex `inherit="core"`, or `env -i`) was
+    /// the owner. Attributed by its pane, it is refused across the group
+    /// boundary exactly like the Claude-style request that sends headers, and
+    /// a header naming another worker is overridden. The owner's terminal,
+    /// with the same request, is still the owner.
+    #[tokio::test]
+    async fn a_worker_process_is_that_worker_with_or_without_headers() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        membership_fleet(home.path());
+        let _resolver = attribution_resolver();
+        let (app, _db) = app();
+        let claude = [("X-Amux-Session", "dev-a")];
+        let codex: [(&str, &str); 0] = [];
+        let impostor = [("X-Amux-Session", "lead")];
+        for (style, headers) in [("claude", &claude[..]), ("codex", &codex[..]), ("impostor", &impostor[..])] {
+            let (st, v) = send_from(&app, CLAUDE_PANE, "POST", "/api/sessions/lead/keys", json!({"keys": "y"}), headers).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "{style} keys: {v}");
+            let (st, v) = send_from(&app, CLAUDE_PANE, "POST", "/api/sessions/lead/send", json!({"text": "identity probe"}), headers).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{style} send across groups: {v}");
+            let (st, v) = send_from(&app, CLAUDE_PANE, "PATCH", "/api/sessions/dev-a/config", json!({"tags": ["dev", "leads"]}), headers).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(MEMBERSHIP_CODE)), "{style} self-join: {v}");
+        }
+        assert_eq!(crate::api::session_verbs::lane_groups("dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
+        // Owner control: same requests from outside every pane.
+        let (st, v) = send_from(&app, OWNER_TERMINAL, "POST", "/api/sessions/lead/keys", json!({"keys": "y"}), &[]).await;
+        assert_ne!(st, StatusCode::FORBIDDEN, "owner keys reach the verb: {v}");
+        let (st, v) = send_from(&app, OWNER_TERMINAL, "PATCH", "/api/sessions/dev-a/config", json!({"tags": ["dev", "leads"]}), &[]).await;
+        assert_eq!(st, StatusCode::OK, "owner membership edit: {v}");
+    }
+
+    /// A loopback request whose process cannot be traced is not the owner:
+    /// with no worker header it is refused with its own code; with one it is
+    /// that (restricted) worker; a genuinely outside process is unaffected.
+    #[tokio::test]
+    async fn an_untraceable_local_request_is_never_owner_input() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        membership_fleet(home.path());
+        let _resolver = attribution_resolver();
+        let (app, _db) = app();
+        let (st, v) = send_from(&app, UNTRACEABLE, "POST", "/api/sessions/lead/keys", json!({"keys": "y"}), &[]).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_origin_unattributed")), "{v}");
+        let (st, v) = send_from(&app, UNTRACEABLE, "GET", "/api/sessions/lead/config", Value::Null, &[]).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_origin_unattributed")), "reads too: {v}");
+        let (st, v) = send_from(&app, UNTRACEABLE, "POST", "/api/sessions/lead/keys", json!({"keys": "y"}), &[("X-Amux-Session", "dev-a")]).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "{v}");
+        let (st, v) = send_from(&app, OWNER_TERMINAL, "POST", "/api/sessions/lead/keys", json!({"keys": "y"}), &[]).await;
+        assert_ne!(st, StatusCode::FORBIDDEN, "{v}");
+    }
+
     // ---- RR-0034 test list ----------------------------------------------
 
     /// The UI contract for the shared catalog: the route is really mounted,
