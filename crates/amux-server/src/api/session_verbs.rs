@@ -33062,34 +33062,7 @@ async fn apply_live_config_change(
     }
 }
 
-/// THE membership rule: a worker-originated request may not set or change a
-/// worker's messaging authority. Every path that writes group membership calls
-/// this one predicate, so the rule and its error code have one definition.
-///
-/// Messaging authority is group membership (`CC_TAGS`, `_amux_workers.group`)
-/// plus the two settings that act as membership of every group: the chat
-/// worker type, which speaks for the owner (`chat_speaks_for_owner`), and a
-/// group's open-inbound switch. `membership_named` is the caller's statement
-/// that the request would set one of those.
-///
-/// This governs EXISTING workers: no worker may change any worker's groups,
-/// its own included. Creating a worker is [`worker_create_refusal`]'s rule.
-/// Owners, the dashboard and verified human members are unaffected.
-pub(crate) fn membership_patch_refusal(headers: &HeaderMap, membership_named: bool) -> Option<Response> {
-    membership_refusal_body(headers, membership_named).map(|body| jresp(StatusCode::FORBIDDEN, body))
-}
 
-/// [`membership_patch_refusal`]'s decision and 403 body, for a handler whose
-/// return type is not a `Response`.
-pub(crate) fn membership_refusal_body(headers: &HeaderMap, membership_named: bool) -> Option<Value> {
-    if !membership_named { return None; }
-    // Through the delegation table (ai-config #160). An unnamed membership
-    // change has no group to scope a grant to, so no non-owner row allows it;
-    // the paths that DO delegate membership (config/scope tags) call
-    // `delegation::authorize` with the real before/after tags.
-    super::delegation::refusal_value(headers, &super::delegation::Target::Fleet,
-        &super::delegation::Action::SetMembership { group: String::new() })
-}
 
 
 /// The worker this request speaks for, from the one verified identity
@@ -33239,11 +33212,6 @@ pub(crate) fn requests_chat_type(body: &Value) -> bool {
     body.get("worker_type").and_then(Value::as_str).is_some_and(is_chat_type)
 }
 
-/// Whether a config-style body names messaging authority: a `tags` edit of any
-/// shape (clearing counts, as before) or a switch to the chat worker type.
-pub(crate) fn names_messaging_authority(body: &Value) -> bool {
-    body.get("tags").is_some() || requests_chat_type(body)
-}
 
 /// The create rule for a copy of `source` (duplicate/clone): the copy carries
 /// the source's groups and worker type, so it is a create with those.

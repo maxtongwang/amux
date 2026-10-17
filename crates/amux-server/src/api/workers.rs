@@ -3221,13 +3221,17 @@ mod tests {
             assert_eq!((st, v["code"].clone()), (StatusCode::BAD_REQUEST, json!("env_text_noncanonical")), "owner {p:?}: {v}");
         }
         assert_eq!(crate::api::session_verbs::lane_groups("review-dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
-        // The guard itself reads what the reader reads: both shapes are a change.
+        // The delegation input reads what the reader reads: every shape is a
+        // tags change or non-canonical text, and the table refuses both.
         for p in payloads {
-            assert!(crate::api::scope::membership_key_changed(home.path(), "worker", "review-dev-a", &json!(p)).is_some(), "{p:?}");
+            let keys = crate::api::scope::env_keys_changed(home.path(), "worker", "review-dev-a", &json!(p));
+            assert!(keys.iter().any(|k| k == "CC_TAGS" || k.starts_with("(non-canonical")), "{p:?}: {keys:?}");
         }
-        // Typed keys: membership and the contract/token keys stay refused.
+        // Typed keys: membership stays refused, the contract switch is hands-only.
+        let (st, _, v) = send_with(&app, "PUT", "/api/scope", Some(scope(json!({"CC_TAGS": "dev,leads"}))), &worker).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_membership_refused")), "{v}");
         let (st, _, v) = send_with(&app, "PUT", "/api/scope", Some(scope(json!({"AMUX_CONTRACT_DONE": "0"}))), &worker).await;
-        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("owner_only_key")), "{v}");
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("held_for_max")), "{v}");
         // Owner control: canonical text writes and is read back as written.
         let (st, _, v) = send(&app, "PUT", "/api/scope", Some(scope(json!("CC_DIR=\"/tmp\"\nCC_TAGS=\"dev,ops\"\n")))).await;
         assert_eq!(st, StatusCode::OK, "owner canonical text: {v}");

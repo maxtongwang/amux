@@ -1279,26 +1279,12 @@ pub(crate) fn is_owner_only_env_key(k: &str) -> bool {
     OWNER_ONLY_ENV_PREFIXES.iter().any(|p| k.starts_with(p))
 }
 
-/// Env keys that ARE messaging authority (session_verbs::membership_patch_refusal):
-/// a worker's groups, its worker type (chat speaks for the owner) and a
-/// group's open-inbound switch. A worker's own worker layer is writable by
-/// that worker, so without this `PUT /api/scope {CC_TAGS: "leads"}` was a
-/// self-join of any group.
-const MEMBERSHIP_ENV_KEYS: &[&str] = &[
-    "CC_TAGS",
-    "CC_WORKER_TYPE",
-    crate::api::worker_messaging::OPEN_INBOUND_KEY,
-];
 
 /// The first owner-only key whose value this write would change, if any.
 pub(crate) fn owner_only_key_changed(home: &Path, level: &str, name: &str, value: &Value) -> Option<String> {
     env_key_changed(home, level, name, value, is_owner_only_env_key)
 }
 
-/// The first messaging-authority key whose value this write would change.
-pub(crate) fn membership_key_changed(home: &Path, level: &str, name: &str, value: &Value) -> Option<String> {
-    env_key_changed(home, level, name, value, |k| MEMBERSHIP_ENV_KEYS.contains(&k))
-}
 
 /// The first key matching `guarded` whose value this write would change.
 /// Handles both write shapes: a full-text replace and a key/value merge.
