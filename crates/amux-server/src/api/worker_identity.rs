@@ -33,7 +33,7 @@ pub const TOKEN_ENV: &str = "AMUX_WORKER_TOKEN";
 pub const TOKEN_HEADER: &str = "x-amux-worker-token";
 pub const RULE: &str = "10";
 
-fn hash_path(home: &Path, lane: &str) -> PathBuf {
+pub(crate) fn hash_path(home: &Path, lane: &str) -> PathBuf {
     home.join("worker-tokens").join(format!("{lane}.sha256"))
 }
 
@@ -97,7 +97,7 @@ pub fn mint(home: &Path, lane: &str) -> Option<String> {
 // with the server is ignored and removed after RUN_TOKEN_MAX_AGE_S.
 const RUN_TOKEN_MAX_AGE_S: u64 = 6 * 3600;
 
-fn runs_dir(home: &Path, lane: &str) -> PathBuf {
+pub(crate) fn runs_dir(home: &Path, lane: &str) -> PathBuf {
     home.join("worker-tokens").join(format!("{lane}.runs"))
 }
 
