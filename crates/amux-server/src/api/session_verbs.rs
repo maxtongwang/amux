@@ -53734,7 +53734,7 @@ mod spawn_argv_secret_tests {
         assert!(scanned > 50, "scanned only {scanned} source files");
         let tmux = code(include_str!("../backend/tmux.rs"));
         assert!(tmux.contains("Self { bin: \"tmux\".into() }"), "the tmux backend no longer resolves a bare tmux from the server env");
-        let install = include_str!("../../../../install.sh");
+        let install = &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.sh")).expect("install.sh is readable");
         let launchd = install.lines().find(|l| l.starts_with("LAUNCHD_PATH=")).expect("install.sh LAUNCHD_PATH is gone");
         assert!(!launchd.contains("worker-bin"), "the server's launchd PATH contains worker-bin: {launchd}");
         assert!(install.contains("\"scripts/worker-bin/tmux\""), "install.sh no longer installs the worker tmux guard");
