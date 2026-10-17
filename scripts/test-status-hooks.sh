@@ -604,7 +604,15 @@ for codex_home_mode in default custom; do
   printf '%s\n' '{"hooks":{"Notification":[{"hooks":[{"type":"command","command":"bash \"$HOME/.amux/hook-report.sh\" blocked notification-hook"}]}]}}' > "$FAKE_HOME/.claude/settings.json"
   cp "$FAKE_HOME/.claude/settings.json" "$TMP/claude-before.json"
   if [ "$codex_home_mode" = custom ]; then want="$TMP/custom-codex/hooks.json"; ch="$TMP/custom-codex"; else want="$FAKE_HOME/.codex/hooks.json"; ch=""; fi
-  env HOME="$FAKE_HOME" ${ch:+CODEX_HOME="$ch"} /usr/bin/python3 scripts/hooks/install-claude-status-hooks.py --provider codex >/dev/null
+  # An inherited CODEX_HOME must never reach the default case: it would point the installer at the
+  # caller's real Codex hooks (PR #6 review). The sentinel proves nothing outside the fixture is written.
+  SENTINEL="$TMP/inherited-codex"; mkdir -p "$SENTINEL"; printf '{"hooks":{}}\n' > "$SENTINEL/hooks.json"
+  if [ -n "$ch" ]; then
+    env CODEX_HOME="$ch" HOME="$FAKE_HOME" /usr/bin/python3 scripts/hooks/install-claude-status-hooks.py --provider codex >/dev/null
+  else
+    CODEX_HOME="$SENTINEL" env -u CODEX_HOME HOME="$FAKE_HOME" /usr/bin/python3 scripts/hooks/install-claude-status-hooks.py --provider codex >/dev/null
+  fi
+  [ "$(cat "$SENTINEL/hooks.json")" = '{"hooks":{}}' ] || { echo "FAIL the test wrote an inherited CODEX_HOME ($codex_home_mode)" >&2; exit 1; }
   cmp -s "$FAKE_HOME/.claude/settings.json" "$TMP/claude-before.json" || { echo "FAIL --provider codex rewrote Claude's settings ($codex_home_mode)" >&2; exit 1; }
   [ -f "$want" ] || { echo "FAIL --provider codex did not write $want" >&2; exit 1; }
   /usr/bin/python3 -c 'import json,sys; h=json.load(open(sys.argv[1]))["hooks"]; assert "SubagentStart" in h and "Notification" not in h' "$want"
