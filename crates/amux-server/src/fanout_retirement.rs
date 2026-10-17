@@ -103,6 +103,7 @@ pub(crate) async fn retire<F: Fleet>(
         if std::fs::read(&active).ok().as_deref()!=Some(env_bytes.as_slice()) {return Ok(Outcome::Deferred);}
         std::fs::rename(&active,&expired).map_err(|e|e.to_string())?;
         crate::api::session_verbs::dispose_verified_worker_terminal(name).await;
+        crate::api::rename_identity::forget_logged(home, name);
         crate::api::sessions_legacy::invalidate_sessions_cache();
         tracing::info!(project,session=name,worktree_removed=removed,verdict="project.lead_expired",measured=true,n_considered=1,"approved project lead expired; transcript and evidence retained");
         return Ok(Outcome::Expired);
@@ -197,6 +198,7 @@ pub(crate) async fn retire<F: Fleet>(
         return match finalized {
             Ok(outcome) if outcome.applied => {
                 crate::api::session_verbs::dispose_verified_worker_terminal(name).await;
+                crate::api::rename_identity::forget_logged(home, name);
                 crate::api::sessions_legacy::invalidate_sessions_cache();
                 tracing::info!(session=name,verdict="project_executor_decommissioned",measured=true,worktree_removed,mode=checkout_mode,
                     "fully verified project executor expired after confirming integration and review");
@@ -346,6 +348,7 @@ pub(crate) async fn retire<F: Fleet>(
     match finalized {
         Ok(outcome) if outcome.applied => {
             crate::api::session_verbs::dispose_verified_worker_terminal(name).await;
+            crate::api::rename_identity::forget_logged(home, name);
             crate::api::sessions_legacy::invalidate_sessions_cache();
             tracing::info!(session=name,verdict="fanout_decommissioned",measured=true,worktree_removed=true,
                 "fully verified worker expired after confirming remote main and removing its worktree");

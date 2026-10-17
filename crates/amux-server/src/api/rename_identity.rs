@@ -25,6 +25,14 @@
 //!   live worker. A chain that ends nowhere live leaves the header unchanged.
 //! - A cycle (a -> b -> a with neither live) is detected and logged
 //!   (`rename_alias_cycle`), and the header is left unchanged.
+//! - A worker that held a name and then leaves it (deleted, or expired by
+//!   retirement) drops that name's records ([`forget`]). Without this, a new
+//!   `a` created after a -> b and later deleted re-activated the old record:
+//!   the deleted `a`'s leftover processes and card callbacks went to `b`.
+//!   The accepted cost: if the original `a`'s process (now `b`) still claims
+//!   `a` after that, the claim is no longer resolved. That process was told
+//!   its new name (the rename notice and a server-delivered `/rename`), and it
+//!   relaunches under the new name.
 //! - Known limit: if a name is renamed away twice by two different workers
 //!   (a -> b, then a new `a` is created and renamed a -> c), a process still
 //!   claiming `a` resolves to the newest holder, `c`.
@@ -44,6 +52,10 @@ fn record_path(home: &Path) -> PathBuf {
     home.join("renames.jsonl")
 }
 
+/// Serialises writers of the record file (the append and the [`forget`]
+/// rewrite), so a rewrite cannot drop a line appended while it ran.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn worker_exists(home: &Path, name: &str) -> bool {
     home.join("sessions").join(format!("{name}.env")).exists()
 }
@@ -60,12 +72,61 @@ pub(crate) fn record(home: &Path, old: &str, new: &str) -> std::io::Result<()> {
         ));
     }
     let line = json!({"old": old, "new": new, "at": chrono::Utc::now().timestamp()});
+    let _w = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(record_path(home))?;
     // One write per line keeps concurrent appends from interleaving.
     f.write_all(format!("{line}\n").as_bytes())
+}
+
+/// Drop every record that redirects `name`, because the worker holding `name`
+/// is releasing it (delete or expiry). Called only when the name is released,
+/// so a record for it can only describe an EARLIER holder. Returns how many
+/// records were dropped. The rewrite is atomic (temp file + rename) and keeps
+/// every other line byte for byte.
+pub(crate) fn forget(home: &Path, name: &str) -> std::io::Result<usize> {
+    let _w = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = record_path(home);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut dropped = 0;
+    let kept: String = text
+        .split_inclusive('\n')
+        .filter(|line| {
+            let names_it = serde_json::from_str::<Value>(line.trim_end())
+                .ok()
+                .is_some_and(|v| v["old"].as_str() == Some(name));
+            dropped += usize::from(names_it);
+            !names_it
+        })
+        .collect();
+    if dropped == 0 {
+        return Ok(0);
+    }
+    let tmp = path.with_extension(format!("jsonl.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, kept)
+        .and_then(|_| std::fs::rename(&tmp, &path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
+    Ok(dropped)
+}
+
+/// [`forget`], logged. Called by every path that releases a worker's name.
+pub(crate) fn forget_logged(home: &Path, name: &str) {
+    match forget(home, name) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(name, dropped = n, verdict = "rename_records_forgotten", measured = true,
+            n_considered = n, "a worker released its name; earlier holders' rename records for it were dropped"),
+        Err(e) => tracing::warn!(name, error = %e, verdict = "rename_records_forget_failed", measured = true,
+            n_considered = 1, "a worker released its name but its rename records could not be dropped; \
+             a stale record can redirect that name"),
+    }
 }
 
 /// old -> new, the newest record per old name (later lines win).
@@ -172,6 +233,24 @@ mod tests {
         // Renaming back makes the original name live again: the other resolves to it.
         std::fs::write(d.path().join("sessions/a.env"), "").unwrap();
         assert_eq!(current_name(d.path(), "b").as_deref(), Some("a"));
+    }
+
+    /// Note 1 variant (review of c003491): a -> b, then a new `a` is created
+    /// and released. The released name must not start resolving to `b`.
+    #[test]
+    fn a_released_name_stops_resolving_to_an_earlier_holder() {
+        let d = home_with(&["b", "x"]);
+        record(d.path(), "a", "b").unwrap();
+        record(d.path(), "q", "x").unwrap();
+        std::fs::write(d.path().join("sessions/a.env"), "").unwrap();
+        assert_eq!(current_name(d.path(), "a"), None, "the new `a` is live");
+        std::fs::remove_file(d.path().join("sessions/a.env")).unwrap();
+        assert_eq!(forget(d.path(), "a").unwrap(), 1);
+        assert_eq!(current_name(d.path(), "a"), None, "a released name resolves nowhere");
+        assert_eq!(current_name(d.path(), "q").as_deref(), Some("x"), "other records are kept");
+        assert_eq!(forget(d.path(), "a").unwrap(), 0, "idempotent");
+        let none = home_with(&[]);
+        assert_eq!(forget(none.path(), "a").unwrap(), 0, "no record file");
     }
 
     #[test]

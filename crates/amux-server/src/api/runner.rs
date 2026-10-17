@@ -103,7 +103,13 @@ pub fn text_hash(text: &str) -> String {
 
 fn pane_alive(lane: &str) -> bool {
     let st = crate::backend::tmux::session_target(&format!("amux-{lane}"));
-    std::process::Command::new("tmux").args(["has-session", "-t", &st]).status().is_ok_and(|s| s.success())
+    // The guarded builder: in a test build this reaches only a private tmux
+    // socket (the rule-10 rename test reached the default one through here).
+    crate::api::session_verbs::tmux_command()
+        .args(["has-session", "-t", &st])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn provider_limited(lane: &str) -> bool {
