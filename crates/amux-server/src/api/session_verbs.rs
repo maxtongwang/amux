@@ -18231,6 +18231,7 @@ async fn wake_session(state: &AppState, name: &str) -> (bool, String) {
             axum::extract::State(state.clone()),
             None,
             axum::extract::Path(name.to_string()),
+            axum::http::HeaderMap::new(),
         )
         .await;
         let ok = resp.status().is_success();

@@ -1161,12 +1161,7 @@ pub async fn start_worker(
     Path(key): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    if !crate::api::session_verbs::worker_origin(&headers).is_empty() {
-        match resolve_key(&state, key.clone()).await {
-            Ok(name) => if let Err(r) = lifecycle_gate(&state, &headers, &name, "start") { return r; },
-            Err(r) => return r,
-        }
-    }
+    if let Err(r) = lifecycle_gate_key(&state, &headers, &key, "start").await { return r; }
     // Lifecycle refusal is independent of host capacity and must remain stable.
     match state
         .store
@@ -1576,7 +1571,8 @@ pub(crate) fn lifecycle_lock(name: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-pub async fn pause_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+pub async fn pause_worker(State(state): State<AppState>, Path(key): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = lifecycle_gate_key(&state, &headers, &key, "pause").await { return r; }
     change_pause(state, key, true, None).await
 }
 
@@ -1584,8 +1580,20 @@ pub async fn resume_worker(
     State(state): State<AppState>,
     admission: Option<Extension<AdmissionOverride>>,
     Path(key): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
+    if let Err(r) = lifecycle_gate_key(&state, &headers, &key, "resume").await { return r; }
     change_pause(state, key, false, admission).await
+}
+
+/// [`lifecycle_gate`] for a store key; the owner skips the lookup. The inner
+/// stop/start calls then run with no worker headers: already authorized here.
+async fn lifecycle_gate_key(state: &AppState, headers: &axum::http::HeaderMap, key: &str, verb: &str) -> Result<(), Response> {
+    if crate::api::session_verbs::worker_origin(headers).is_empty() {
+        return Ok(());
+    }
+    let name = resolve_key(state, key.to_string()).await?;
+    lifecycle_gate(state, headers, &name, verb)
 }
 
 /// `admission` only matters on Resume, which starts the worker through
@@ -1726,7 +1734,7 @@ async fn change_pause(
         } else if paused {
             let row = row.as_ref().unwrap();
             // End the durable session first so bootstrap cannot re-adopt it.
-            let response = stop_worker(State(state.clone()), Path(row.id.clone())).await;
+            let response = stop_worker(State(state.clone()), Path(row.id.clone()), axum::http::HeaderMap::new()).await;
             anyhow::ensure!(
                 response.status().is_success(),
                 "could not end worker session"
@@ -1759,7 +1767,7 @@ async fn change_pause(
             );
             Ok(json!({"running":false,"session":"stopped"}))
         } else {
-            let response = start_worker(State(state.clone()), admission, Path(key.clone())).await;
+            let response = start_worker(State(state.clone()), admission, Path(key.clone()), axum::http::HeaderMap::new()).await;
             if !response.status().is_success() {
                 let bytes = axum::body::to_bytes(response.into_body(), 65536).await?;
                 let body: Value = serde_json::from_slice(&bytes)?;

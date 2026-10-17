@@ -4542,7 +4542,7 @@ pub async fn create_session_legacy(
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let body = body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null);
-    let resp = create_session_legacy_inner(headers.clone(), body.clone()).await;
+    let resp = create_session_legacy_inner(state.clone(), headers.clone(), body.clone()).await;
     // A worker's create passed the delegation table: log it (ai-config #160).
     if resp.status().is_success() {
         let tags = create_tags(&body).unwrap_or_default();
@@ -4554,7 +4554,7 @@ pub async fn create_session_legacy(
     resp
 }
 
-async fn create_session_legacy_inner(headers: HeaderMap, body: serde_json::Value) -> Response {
+async fn create_session_legacy_inner(_state: AppState, headers: HeaderMap, body: serde_json::Value) -> Response {
     let s = |k: &str| {
         body.get(k)
             .and_then(serde_json::Value::as_str)
