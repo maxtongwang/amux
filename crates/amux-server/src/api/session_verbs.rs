@@ -45946,6 +45946,58 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         );
     }
 
+    /// Review of 3f5ab3df, B1: x -> y -> z, then z is deleted and an unrelated
+    /// worker is created as z. Neither x nor y may attach to the new z, through
+    /// either consumer of the rename records: the request-header rewrite and
+    /// the card-callback target.
+    #[tokio::test]
+    async fn review_a_deleted_alias_target_passes_no_alias_to_the_next_holder_of_its_name() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _dir) = state();
+        rename_fixture_env("review-x", "CC_NAME=\"review-x\"\nCC_TAGS=dev\nCC_AUTO_START=0\n");
+        let app: Router = Router::new().merge(routes()).with_state(state.clone());
+        for (from, to) in [("review-x", "review-y"), ("review-y", "review-z")] {
+            let (st, v) = call(&app, "PATCH", &format!("/api/sessions/{from}/config"), Some(json!({"rename": to}))).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+        }
+        let echo: Router = Router::new()
+            .route(
+                "/who",
+                axum::routing::post(|h: HeaderMap| async move {
+                    h.get("x-amux-worker").and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
+                }),
+            )
+            .layer(axum::middleware::from_fn(crate::api::rename_identity::resolve_headers));
+        let header_as = |claim: &'static str| {
+            let echo = echo.clone();
+            async move {
+                let req = Request::builder().method("POST").uri("/who").header("x-amux-worker", claim)
+                    .body(Body::empty()).unwrap();
+                let res = echo.oneshot(req).await.unwrap();
+                String::from_utf8(axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap()
+            }
+        };
+        // Control: while z holds the name, both old names resolve to it.
+        assert_eq!(header_as("review-x").await, "review-z");
+        assert_eq!(crate::api::board::callback_target(home.path(), "review-y".into()), "review-z");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amux-ui-token", ui_token(&state).parse().unwrap());
+        assert_eq!(delete_post(&state, "review-z", &headers).await.status(), StatusCode::OK);
+        // An unrelated worker takes the name.
+        rename_fixture_env("review-z", "CC_NAME=\"review-z\"\nCC_TAGS=other\nCC_AUTO_START=0\n");
+        for old in ["review-x", "review-y"] {
+            assert_eq!(header_as(old).await, old, "{old}'s header must not attach to the new review-z");
+            assert_eq!(
+                crate::api::board::callback_target(home.path(), old.into()),
+                old,
+                "{old}'s callbacks must not go to the new review-z"
+            );
+        }
+    }
+
     /// dev-lead: renaming a running Claude worker through the API delivers
     /// Claude's `/rename <new>` to it as an amux server job (origin amux, not
     /// a peer), so the Claude session title follows. An isolated worker

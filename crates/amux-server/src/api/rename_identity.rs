@@ -26,9 +26,11 @@
 //! - A cycle (a -> b -> a with neither live) is detected and logged
 //!   (`rename_alias_cycle`), and the header is left unchanged.
 //! - A worker that held a name and then leaves it (deleted, or expired by
-//!   retirement) drops that name's records ([`forget`]). Without this, a new
-//!   `a` created after a -> b and later deleted re-activated the old record:
-//!   the deleted `a`'s leftover processes and card callbacks went to `b`.
+//!   retirement) drops that name's records ([`forget`]): the ones redirecting
+//!   the name (an earlier holder's) and, transitively, the aliases resolving
+//!   into it (its own). Without this, a new `a` created after a -> b and later
+//!   deleted re-activated the old record, and a new worker created under a
+//!   released `b` inherited `a`'s headers and card callbacks.
 //!   The accepted cost: if the original `a`'s process (now `b`) still claims
 //!   `a` after that, the claim is no longer resolved. That process was told
 //!   its new name (the rename notice and a server-delivered `/rename`), and it
@@ -81,11 +83,21 @@ pub(crate) fn record(home: &Path, old: &str, new: &str) -> std::io::Result<()> {
     f.write_all(format!("{line}\n").as_bytes())
 }
 
-/// Drop every record that redirects `name`, because the worker holding `name`
-/// is releasing it (delete or expiry). Called only when the name is released,
-/// so a record for it can only describe an EARLIER holder. Returns how many
-/// records were dropped. The rewrite is atomic (temp file + rename) and keeps
-/// every other line byte for byte.
+/// Drop the rename records tied to the worker that is releasing `name`
+/// (delete or expiry), in both directions:
+///
+/// - OUTGOING: records with `old == name`. They describe an EARLIER holder of
+///   the name, and must not redirect it once the current holder leaves.
+/// - INCOMING, transitively: records whose `new` is `name`, or is an old name
+///   that already resolves into it (a -> b -> c: releasing c drops b -> c and
+///   a -> b). Those aliases belonged to this worker incarnation. Left in place,
+///   a later, unrelated worker created under `name` would inherit them
+///   (review of 3f5ab3df, B1): a's lingering headers and card callbacks would
+///   attach to the new holder.
+///
+/// Returns how many records were dropped. Runs under the writer lock; the
+/// rewrite is atomic (temp file + rename) and keeps every other line byte for
+/// byte.
 pub(crate) fn forget(home: &Path, name: &str) -> std::io::Result<usize> {
     let _w = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = record_path(home);
@@ -94,15 +106,33 @@ pub(crate) fn forget(home: &Path, name: &str) -> std::io::Result<usize> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e),
     };
+    let pair = |line: &str| -> Option<(String, String)> {
+        let v = serde_json::from_str::<Value>(line.trim_end()).ok()?;
+        Some((v["old"].as_str()?.to_string(), v["new"].as_str()?.to_string()))
+    };
+    // The redirect each old name follows today: its newest record, exactly as
+    // `current_name` reads it.
+    let newest: HashMap<String, String> = text.lines().filter_map(pair).collect();
+    // `name` and every old name whose chain reaches it.
+    let mut released = HashSet::from([name.to_string()]);
+    loop {
+        let before = released.len();
+        for (old, new) in &newest {
+            if released.contains(new) {
+                released.insert(old.clone());
+            }
+        }
+        if released.len() == before {
+            break;
+        }
+    }
     let mut dropped = 0;
     let kept: String = text
         .split_inclusive('\n')
         .filter(|line| {
-            let names_it = serde_json::from_str::<Value>(line.trim_end())
-                .ok()
-                .is_some_and(|v| v["old"].as_str() == Some(name));
-            dropped += usize::from(names_it);
-            !names_it
+            let tied = pair(line).is_some_and(|(old, _)| released.contains(&old));
+            dropped += usize::from(tied);
+            !tied
         })
         .collect();
     if dropped == 0 {
@@ -251,6 +281,23 @@ mod tests {
         assert_eq!(forget(d.path(), "a").unwrap(), 0, "idempotent");
         let none = home_with(&[]);
         assert_eq!(forget(none.path(), "a").unwrap(), 0, "no record file");
+    }
+
+    /// Review of 3f5ab3df, B1: releasing the END of a chain drops every alias
+    /// that resolves into it, transitively, and nothing else.
+    #[test]
+    fn releasing_an_alias_target_drops_the_chain_into_it() {
+        let d = home_with(&["c", "x"]);
+        record(d.path(), "a", "b").unwrap();
+        record(d.path(), "b", "c").unwrap();
+        record(d.path(), "q", "x").unwrap();
+        assert_eq!(current_name(d.path(), "a").as_deref(), Some("c"));
+        std::fs::remove_file(d.path().join("sessions/c.env")).unwrap();
+        assert_eq!(forget(d.path(), "c").unwrap(), 2, "b -> c and a -> b");
+        std::fs::write(d.path().join("sessions/c.env"), "").unwrap();
+        assert_eq!(current_name(d.path(), "a"), None, "a new c inherits nothing");
+        assert_eq!(current_name(d.path(), "b"), None);
+        assert_eq!(current_name(d.path(), "q").as_deref(), Some("x"), "unrelated chain kept");
     }
 
     #[test]

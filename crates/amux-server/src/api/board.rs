@@ -2760,6 +2760,13 @@ pub(crate) struct CallbackDispatch {
 /// other harness messages. `only` is used by the interactive PATCH path for an
 /// immediate response; the board-drive tick passes None and recovers any item
 /// left pending by a crash or by a non-HTTP transition producer.
+/// Where a card callback armed for `stored` is delivered: a requester renamed
+/// after the card was armed answers to its current name; a live worker
+/// holding the stored name keeps it.
+pub(crate) fn callback_target(home: &std::path::Path, stored: String) -> String {
+    super::rename_identity::current_name(home, &stored).unwrap_or(stored)
+}
+
 pub(crate) async fn dispatch_pending_callbacks(
     state: &AppState,
     only: Option<&str>,
@@ -2845,10 +2852,7 @@ pub(crate) async fn dispatch_pending_callbacks(
         let Some(target) = row.callback_session.clone() else {
             continue;
         };
-        // A requester renamed after the card was armed answers to its current
-        // name; a live worker holding the stored name keeps it.
-        let target = super::rename_identity::current_name(&super::session_verbs::home(), &target)
-            .unwrap_or(target);
+        let target = callback_target(&super::session_verbs::home(), target);
         let sender = row.session.clone().unwrap_or_else(|| "board".into());
         // Derive the return address from the durable dependency graph, never
         // from remembered prose. A callback must resume the requester's task,
