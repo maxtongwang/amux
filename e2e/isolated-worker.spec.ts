@@ -148,8 +148,16 @@ test('LC-ISOLATED-OWNER: owner queue survives reload and UI isolation toggles in
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({ id: receipt.id, text });
       expect(rows[0].delivered_at || 0).toBe(0);
-      await restored.scrollIntoViewIfNeeded();
-      await expect(restored).toBeInViewport();
+      // The peek overlay re-renders on live updates after a reload, which can
+      // detach the switch mid-scroll; scrollIntoViewIfNeeded does not retry a
+      // detached element. Re-query it and retry until it is attached and shown.
+      await expect(async () => {
+        const current = page.locator('[data-worker-config="isolated"]').getByRole('switch');
+        await expect(current).toBeAttached({ timeout: 2_000 });
+        await current.scrollIntoViewIfNeeded({ timeout: 2_000 });
+        await expect(current).toBeInViewport({ timeout: 2_000 });
+        await expect(current).toHaveAttribute('aria-checked', String(enabled), { timeout: 2_000 });
+      }).toPass({ timeout: 20_000 });
       await checkpoint(page, info, `isolated-${enabled}-configuration`);
     }
     // A retry of the same owner operation keeps its original queue identity.
