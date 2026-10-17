@@ -12,6 +12,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -292,15 +293,180 @@ def mutate(action, path, destination, targets, protected=(), dry_run=False,
                 'measured': bool(touched), 'n_considered': considered}
 
 
+# AUTOMATIC RECLAIM (DMIW-7). The budget in cargo-budget.py REFUSED a build when
+# the shared target was over its cap, and nothing ever shrank it: debug/ reached
+# 60 GB (deps 44, incremental 14) with the disk at 99%, and every lane's local
+# gate failed with exit 75 until a human cleared it. A refusal that cannot clear
+# itself is ethos rule 3. These two actions are the clearing half, under the
+# same exclusive lease, Cargo locks and process probe as every other mutation.
+#
+# PROTECTED: deploy/ (the auto-builder's live server build) and release/. Only
+# the other profiles (debug/, custom test profiles) are ever reclaimed.
+PROTECTED_PROFILES = ('deploy', 'release')
+GB = 1024 ** 3
+SWEEP_IDLE_S = int(os.environ.get('AMUX_CARGO_SWEEP_IDLE_S', str(2 * 86400)))
+# A Cargo output's unit: `<crate>-<16 hex>` before its extension or codegen-unit
+# suffix. `lib` is a prefix only on library outputs, so `libc-<hash>.d` and
+# `liblibc-<hash>.rlib` are one unit.
+UNIT = re.compile(r'^(.+?-[0-9a-f]{16})(?:[.-]|$)')
+LIB_SUFFIXES = ('.rlib', '.rmeta', '.a', '.so', '.dylib', '.dll', '.lib')
+
+
+def unit_key(name):
+    if name.startswith('lib') and name.endswith(LIB_SUFFIXES):
+        name = name[3:]
+    match = UNIT.match(name)
+    return match.group(1) if match else name
+
+
+def entry_bytes(path):
+    """Allocated bytes under path, never following a symlink (st_blocks, as du counts)."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return 0
+    if not path.is_dir() or path.is_symlink():
+        return st.st_blocks * 512
+    total = st.st_blocks * 512
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def last_used(path):
+    """Newest access or modification under path. Reading an artifact updates its
+    atime on APFS and relatime Linux, so a dependency read by every build but not
+    rebuilt for days still counts as used."""
+    newest = 0.0
+    paths = [path]
+    if path.is_dir() and not path.is_symlink():
+        paths += [Path(r) / n for r, ds, fs in os.walk(path) for n in ds + fs]
+    for item in paths:
+        try:
+            st = item.lstat()
+        except OSError:
+            continue
+        newest = max(newest, st.st_atime, st.st_mtime)
+    return newest
+
+
+def reclaimable_profiles(target):
+    if not target.is_dir():
+        return []
+    return sorted(p for p in target.iterdir()
+                  if p.is_dir() and not p.is_symlink() and not p.name.startswith('.')
+                  and p.name not in PROTECTED_PROFILES and (p / 'deps').is_dir() | (p / 'incremental').is_dir())
+
+
+def dep_units(profiles):
+    """{(profile, unit key): [paths]} for every output under <profile>/deps."""
+    units = {}
+    for profile in profiles:
+        deps = profile / 'deps'
+        if deps.is_dir():
+            for entry in deps.iterdir():
+                units.setdefault((profile, unit_key(entry.name)), []).append(entry)
+    return units
+
+
+def remove(path, locks):
+    if path.exists() or path.is_symlink():
+        clear_preserving_locks(path, locks)
+
+
+def reclaim(targets, max_bytes, to_bytes, *, now=None, process_probe=active_processes):
+    """Over max_bytes of reclaimable profiles: clear incremental/ first, then the
+    least recently used dependency units, until at or under to_bytes."""
+    with exclusive(targets, process_probe) as (locks, considered):
+        profiles = [p for t in targets for p in reclaimable_profiles(t)]
+        before = sum(entry_bytes(p) for p in profiles)
+        result = {'measured': True, 'n_considered': considered, 'before_bytes': before,
+                  'max_bytes': max_bytes, 'to_bytes': to_bytes,
+                  'protected': list(PROTECTED_PROFILES), 'profiles': [str(p) for p in profiles]}
+        if before <= max_bytes:
+            return {'verdict': 'cargo_reclaim_not_needed', 'after_bytes': before, **result}
+        size, cleared = before, 0
+        for profile in profiles:
+            incremental = profile / 'incremental'
+            if incremental.is_dir():
+                freed = entry_bytes(incremental)
+                remove(incremental, locks)
+                size, cleared = size - freed, cleared + freed
+        units = sorted(dep_units(profiles).items(),
+                       key=lambda kv: max(last_used(p) for p in kv[1]))
+        removed = 0
+        for _, paths in units:
+            if size <= to_bytes:
+                break
+            freed = sum(entry_bytes(p) for p in paths)
+            for path in paths:
+                remove(path, locks)
+            size, removed = size - freed, removed + 1
+        after = sum(entry_bytes(p) for p in profiles)
+        return {'verdict': 'cargo_reclaimed', 'after_bytes': after, 'incremental_bytes': cleared,
+                'units_removed': removed, 'reached_goal': after <= to_bytes, **result}
+
+
+def sweep(targets, idle_s=SWEEP_IDLE_S, *, now=None, process_probe=active_processes):
+    """Remove incremental sessions and dependency units unused for idle_s."""
+    now = time.time() if now is None else now
+    cutoff = now - idle_s
+    with exclusive(targets, process_probe) as (locks, considered):
+        profiles = [p for t in targets for p in reclaimable_profiles(t)]
+        before = sum(entry_bytes(p) for p in profiles)
+        swept = []
+        for profile in profiles:
+            incremental = profile / 'incremental'
+            if incremental.is_dir():
+                swept += [[s] for s in incremental.iterdir() if last_used(s) < cutoff]
+        swept += [paths for paths in dep_units(profiles).values()
+                  if max(last_used(p) for p in paths) < cutoff]
+        for paths in swept:
+            for path in paths:
+                remove(path, locks)
+        after = sum(entry_bytes(p) for p in profiles)
+        return {'verdict': 'cargo_swept', 'measured': True, 'n_considered': considered,
+                'before_bytes': before, 'after_bytes': after, 'idle_s': idle_s,
+                'units_removed': len(swept), 'protected': list(PROTECTED_PROFILES),
+                'profiles': [str(p) for p in profiles]}
+
+
+def test_probe(targets, mutation_paths):
+    """The temporary-fixture process-probe seam, or None. Tests may isolate host
+    processes ONLY for throwaway target trees; locks still run, and no real shared
+    target can pass these constraints."""
+    fixture = os.environ.get('AMUX_CARGO_GUARD_TEST_FIXTURE')
+    if not fixture:
+        return None
+    fixture = Path(fixture).resolve()
+    temp_roots = [Path(tempfile.gettempdir()).resolve(), Path('/tmp').resolve()]
+    if (os.environ.get('AMUX_RS_DISK_CLEAR_ONLY') != '1'
+            or not fixture.name.startswith('amux-cargo-guard-test.')
+            or not any(root in fixture.parents for root in temp_roots)
+            or not all(fixture in root.parents for root in targets)
+            or not all(fixture in path.parents for path in mutation_paths)):
+        raise Deferred('invalid temporary fixture process-probe seam')
+    return lambda _: ([], 1)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['run', 'clear', 'move', 'purge'])
+    parser.add_argument('action', choices=['run', 'clear', 'move', 'purge', 'reclaim', 'sweep'])
     parser.add_argument('--target', action='append', required=True)
     parser.add_argument('--path')
     parser.add_argument('--destination')
     parser.add_argument('--protected-path', action='append', default=[])
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--exclusive-run', action='store_true', help='run a target-mutating command only when no consumer lease is held')
+    parser.add_argument('--max-gb', type=float, default=float(os.environ.get('AMUX_CARGO_MAX_TARGET_GB', 40)),
+                        help='reclaim: act only when the reclaimable profiles exceed this')
+    parser.add_argument('--to-gb', type=float, default=float(os.environ.get('AMUX_CARGO_RECLAIM_TO_GB', 25)),
+                        help='reclaim: stop at or under this')
+    parser.add_argument('--idle-s', type=int, default=SWEEP_IDLE_S, help='sweep: unused for this long')
     # Parse command separately: argparse REMAINDER would swallow guard options.
     argsv = sys.argv[1:]
     command = []
@@ -321,25 +487,19 @@ def main():
                 fd = open_lock(lease_path(target), shared=not args.exclusive_run, wait=not args.exclusive_run)
                 os.set_inheritable(fd, True)
             os.execvp(command[0], command)
+        if args.action in ('reclaim', 'sweep'):
+            probe = test_probe(targets, []) or active_processes
+            result = (reclaim(targets, int(args.max_gb * GB), int(args.to_gb * GB), process_probe=probe)
+                      if args.action == 'reclaim' else sweep(targets, args.idle_s, process_probe=probe))
+            clear_streak(targets)
+            print(json.dumps(result))
+            return 0
         if not args.path or (args.action == 'move' and not args.destination):
             raise Deferred('missing mutation path or destination')
-        probe = active_processes
-        fixture = os.environ.get('AMUX_CARGO_GUARD_TEST_FIXTURE')
-        if fixture:
-            fixture = Path(fixture).resolve()
-            temp_roots = [Path(tempfile.gettempdir()).resolve(), Path('/tmp').resolve()]
-            mutation_paths = [Path(args.path).resolve(),
-                              *[Path(p).resolve() for p in args.protected_path],
-                              *([Path(args.destination).resolve()] if args.destination else [])]
-            if (os.environ.get('AMUX_RS_DISK_CLEAR_ONLY') != '1'
-                    or not fixture.name.startswith('amux-cargo-guard-test.')
-                    or not any(root in fixture.parents for root in temp_roots)
-                    or not all(fixture in root.parents for root in targets)
-                    or not all(fixture in path.parents for path in mutation_paths)):
-                raise Deferred('invalid temporary fixture process-probe seam')
-            # Tests may isolate host processes ONLY for throwaway target trees.
-            # Locks still run; no real shared target can pass these constraints.
-            probe = lambda _: ([], 1)
+        mutation_paths = [Path(args.path).resolve(),
+                          *[Path(p).resolve() for p in args.protected_path],
+                          *([Path(args.destination).resolve()] if args.destination else [])]
+        probe = test_probe(targets, mutation_paths) or active_processes
         result = mutate(args.action, Path(args.path),
                         Path(args.destination) if args.destination else None, targets,
                         [Path(p).resolve() for p in args.protected_path], args.dry_run, probe)
