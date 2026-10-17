@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """ATE-92: real process/lock lifetimes, preserved artifacts, and idle retry."""
+import contextlib
 import importlib.util
+import io
+import json
 import os
 from pathlib import Path
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).with_name('cargo-target-guard.py').resolve()
 spec = importlib.util.spec_from_file_location('guard', SCRIPT)
@@ -510,6 +517,347 @@ class SafeCargoReclaimTests(unittest.TestCase):
         self.assertIn('refusal stands', done.stderr)
         self.assertFalse(self.runs.exists())
         self.assertEqual(len(list((self.root / 'debug' / 'deps').iterdir())), 3)
+
+    def test_a_pending_reclaim_holds_the_wrapper_build_until_it_clears(self):
+        """safe-cargo's build waits behind a pending reclaim, then runs."""
+        reclaimer = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.readline()'],
+                                     stdin=subprocess.PIPE, text=True)
+        pending = self.root.parent / ('.' + self.root.name + '.reclaim.pending')
+        pending.write_text(json.dumps({'pid': reclaimer.pid, 'since': time.time(), 'deferral_streak': 3}))
+        env = {**self.env, 'AMUX_CARGO_MAX_TARGET_MB': '1024', 'AMUX_CARGO_RECLAIM_POLL_S': '0.05',
+               'AMUX_CARGO_RECLAIM_BUILD_WAIT_S': '60'}
+        wrapper = subprocess.Popen(['bash', str(SCRIPT.with_name('safe-cargo.sh')), 'check'], env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        err = Lines(wrapper.stderr)
+        try:
+            err.wait_for('cargo_reclaim_pending:')
+            self.assertFalse(self.runs.exists(), 'the build waits while the reclaim is pending')
+        finally:
+            reclaimer.communicate('done\n', timeout=10)  # the reclaimer ends; its marker is now inert
+        wrapper.wait(timeout=60)
+        self.assertEqual(wrapper.returncode, 0, err.rest())
+        self.assertIn('cargo_reclaim_pending_ignored', err.rest())
+        self.assertEqual(self.runs.read_text().count('run'), 1)
+
+
+class Lines:
+    """Every line a fixture process writes, read on a thread, so a test can wait
+    for one with a bound instead of hanging on a pipe that never speaks."""
+
+    def __init__(self, stream):
+        self.lines = queue.Queue()
+        self.seen = []
+        threading.Thread(target=self._pump, args=(stream,), daemon=True).start()
+
+    def _pump(self, stream):
+        for line in stream:
+            self.lines.put(line.rstrip('\n'))
+
+    def wait_for(self, needle, timeout=15):
+        deadline = time.monotonic() + timeout
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise AssertionError('no line containing %r within %ss; saw %r' % (needle, timeout, self.seen))
+            try:
+                line = self.lines.get(timeout=left)
+            except queue.Empty:
+                continue
+            self.seen.append(line)
+            if needle in line:
+                return line
+
+    def rest(self):
+        while True:
+            try:
+                self.seen.append(self.lines.get_nowait())
+            except queue.Empty:
+                return '\n'.join(self.seen)
+
+
+HOLDER = 'import sys; print("ready", flush=True); sys.stdin.readline()'
+
+
+class FixtureBuild:
+    """A build through the guard's real `run`: it takes (or waits for) the shared
+    lease, then execs into a holder that keeps the inherited lease until told."""
+
+    def __init__(self, root, env, extra_targets=()):
+        targets = [arg for t in (root, *extra_targets) for arg in ('--target', str(t))]
+        self.proc = subprocess.Popen(
+            [sys.executable, str(SCRIPT), 'run', *targets, '--', sys.executable, '-c', HOLDER],
+            env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.out = Lines(self.proc.stdout)
+        self.err = Lines(self.proc.stderr)
+
+    def ready(self, timeout=15):
+        self.out.wait_for('ready', timeout)
+
+    def finish(self):
+        """End the build normally: it was never interrupted, so it exits 0."""
+        self.proc.stdin.write('done\n')
+        self.proc.stdin.close()
+        self.proc.wait(timeout=15)
+        return self.proc.returncode
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.finish()
+
+
+class FakeClock:
+    """Stands in for the guard's `time` module: time() reads it, sleep() advances
+    it and runs the scenario's next step, so a wait of minutes costs nothing."""
+
+    def __init__(self, start, on_sleep=None):
+        self.now = float(int(start))  # whole seconds: waited_s and the sleeps compare exactly
+        self.on_sleep = on_sleep
+        self.sleeps = []
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+        if self.on_sleep:
+            self.on_sleep(self)
+
+
+class ReclaimPriorityTests(unittest.TestCase):
+    """DMIW-7 follow-up to PR #11: back-to-back builds starved the exclusive reclaim.
+
+    flock has no writer preference, so new shared leases kept arriving while the
+    reclaim's LOCK_EX|LOCK_NB kept failing: deferral_streak 15, the debug target
+    40.1 GiB over its 40 budget, and every new build refused with 734 GB free.
+    Fake target, fake leases held by fixture processes, fake clock.
+    """
+
+    def setUp(self):
+        # The guard's temporary-fixture probe seam needs this prefix under tmp, so
+        # the host's real cargo/rustc processes cannot defer a fixture reclaim.
+        self.base = Path(tempfile.mkdtemp(prefix='amux-cargo-guard-test.')).resolve()
+        self.addCleanup(lambda: subprocess.run(['rm', '-rf', str(self.base)]))
+        self.root = self.base / 'rust-build-target'
+        self.units = [put(self.root / 'debug' / 'deps' / ('libdep%d-%016x.rlib' % (i, i)), MB, NOW - (5 - i) * DAY)
+                      for i in range(3)]
+        self.keep = put(self.root / 'release' / 'amux-server', MB, NOW - 30 * DAY)
+        self.env = {**os.environ,
+                    'AMUX_CARGO_GUARD_TEST_FIXTURE': str(self.base), 'AMUX_RS_DISK_CLEAR_ONLY': '1',
+                    'AMUX_CARGO_RECLAIM_PRIORITY_AFTER': '3',
+                    'AMUX_CARGO_RECLAIM_PRIORITY_WAIT_S': '600',
+                    'AMUX_CARGO_RECLAIM_PENDING_MAX_AGE_S': '1200',
+                    'AMUX_CARGO_RECLAIM_BUILD_WAIT_S': '60',
+                    'AMUX_CARGO_RECLAIM_POLL_S': '0.05'}
+        self.env.pop('AMUX_CARGO_GUARD_LEASED', None)
+        self.builds = []
+        self.addCleanup(lambda: [b.close() for b in self.builds])
+
+    def build(self, **env):
+        build = FixtureBuild(self.root, {**self.env, **env})
+        self.builds.append(build)
+        return build
+
+    def reclaim(self, clock, **env):
+        """One `cargo-target-guard.py reclaim` through the shipped main(), on the fake clock."""
+        out, err = io.StringIO(), io.StringIO()
+        argv = [str(SCRIPT), 'reclaim', '--target', str(self.root),
+                '--max-gb', str(2 / 1024), '--to-gb', str(1.5 / 1024)]
+        with mock.patch.dict(os.environ, {**self.env, **env}, clear=True), \
+                mock.patch.object(guard, 'time', clock), mock.patch.object(sys, 'argv', argv), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = guard.main()
+        return code, json.loads(out.getvalue()), err.getvalue()
+
+    def pending(self):
+        return self.root.parent / ('.' + self.root.name + '.reclaim.pending')
+
+    def assert_untouched(self):
+        self.assertTrue(all(u.exists() for u in self.units), 'a deferred reclaim removes nothing')
+        self.assertTrue(self.keep.exists())
+
+    def test_back_to_back_builds_no_longer_starve_the_reclaim(self):
+        """THE BUG. Every attempt finds a lease held, because the next build always
+        takes its lease before the previous one releases. Before the fix this
+        defers on every attempt; after it, the Nth deferral marks a reclaim
+        pending, a new build waits behind it, the running build drains, the
+        reclaim runs, and the waiting build then proceeds."""
+        current = self.build()
+        current.ready()
+        late = []
+
+        def drain(clock):
+            if late:
+                return
+            # A NEW build arrives while the reclaim is pending: it must wait, not lease.
+            arrival = self.build()
+            late.append(arrival)
+            arrival.err.wait_for('cargo_reclaim_pending:')
+            self.assertTrue(self.pending().exists())
+            # The build that already held a lease runs to its normal end.
+            self.assertEqual(current.finish(), 0, 'a leased build is never interrupted')
+
+        clock = FakeClock(time.time(), drain)
+        verdicts = []
+        for _ in range(8):
+            code, verdict, _ = self.reclaim(clock)
+            verdicts.append(verdict['verdict'])
+            if code == 0:
+                break
+            self.assert_untouched()
+            # No gap: the next build leases before the previous one releases.
+            nxt = self.build()
+            nxt.ready()
+            self.assertEqual(current.finish(), 0)
+            current = nxt
+        self.assertEqual(verdict['verdict'], 'cargo_reclaimed',
+                         'writer starvation: deferred on %d of %d attempts %r'
+                         % (verdicts.count('cargo_reclaim_deferred'), len(verdicts), verdicts))
+        self.assertEqual(len(verdicts), 3, 'the reclaim that reached the streak got through')
+        self.assertIs(verdict['priority'], True)
+        self.assertGreater(verdict['waited_s'], 0)
+        self.assertTrue(verdict['reached_goal'])
+        self.assertTrue(self.keep.exists(), 'release/ is protected')
+        self.assertFalse(self.pending().exists(), 'the marker is cleared after the reclaim')
+        # Only now does the build that arrived during the pending reclaim start.
+        late[0].ready()
+        late[0].err.wait_for('cargo_reclaim_pending_cleared')
+        self.assertEqual(late[0].finish(), 0)
+
+    def test_below_the_streak_a_busy_lease_still_defers_at_once(self):
+        holder = self.build()
+        holder.ready()
+        clock = FakeClock(time.time())
+        for streak in (1, 2):
+            code, verdict, _ = self.reclaim(clock)
+            self.assertEqual(code, 75)
+            self.assertEqual(verdict['deferral_streak'], streak)
+            self.assertIn('lock busy', verdict['reason'])
+            self.assertIs(verdict.get('priority', False), False)
+            self.assertFalse(self.pending().exists())
+        self.assertEqual(clock.sleeps, [], 'below the streak nothing waits')
+        self.assert_untouched()
+
+    def test_the_streak_threshold_and_the_reclaimer_wait_are_configurable(self):
+        holder = self.build()
+        holder.ready()
+        clock = FakeClock(time.time())
+        env = {'AMUX_CARGO_RECLAIM_PRIORITY_AFTER': '5', 'AMUX_CARGO_RECLAIM_PRIORITY_WAIT_S': '7',
+               'AMUX_CARGO_RECLAIM_POLL_S': '2'}
+        for _ in range(4):
+            code, verdict, _ = self.reclaim(clock, **env)
+            self.assertEqual((code, clock.sleeps), (75, []))
+            self.assertFalse(self.pending().exists())
+        code, verdict, err = self.reclaim(clock, **env)
+        self.assertEqual(code, 75)
+        self.assertEqual(verdict['deferral_streak'], 5)
+        self.assertIs(verdict['priority'], True)
+        self.assertEqual(verdict['waited_s'], 7)
+        self.assertEqual(clock.sleeps, [2, 2, 2, 1], 'a bounded wait: polls up to exactly the limit')
+        self.assertIn('cargo_reclaim_priority', err)
+        self.assertFalse(self.pending().exists(), 'a reclaim that gives up clears its marker too')
+        self.assertIsNone(holder.proc.poll(), 'the running build was not interrupted')
+        self.assertEqual(holder.finish(), 0)
+        self.assert_untouched()
+
+    def test_zero_disables_the_priority(self):
+        holder = self.build()
+        holder.ready()
+        clock = FakeClock(time.time())
+        for _ in range(4):
+            code, verdict, _ = self.reclaim(clock, AMUX_CARGO_RECLAIM_PRIORITY_AFTER='0')
+            self.assertEqual(code, 75)
+        self.assertEqual(clock.sleeps, [])
+        self.assertFalse(self.pending().exists())
+
+    def test_a_held_exclusive_lease_is_never_broken(self):
+        # Another writer (cargo clean --exclusive-run, a sweep) holds the lease exclusively.
+        fd = guard.open_lock(guard.lease_path(self.root))
+        try:
+            clock = FakeClock(time.time())
+            code, verdict, _ = self.reclaim(clock, AMUX_CARGO_RECLAIM_PRIORITY_AFTER='1',
+                                            AMUX_CARGO_RECLAIM_PRIORITY_WAIT_S='30',
+                                            AMUX_CARGO_RECLAIM_POLL_S='5')
+            self.assertEqual(code, 75)
+            self.assertIs(verdict['priority'], True)
+            self.assertIn('lock busy', verdict['reason'])
+            self.assertEqual((sum(clock.sleeps), verdict['waited_s']), (30, 30))
+            with self.assertRaisesRegex(guard.Deferred, 'lock busy'):
+                os.close(guard.open_lock(guard.lease_path(self.root), shared=True))
+        finally:
+            os.close(fd)
+        self.assertFalse(self.pending().exists())
+        self.assert_untouched()
+
+    def write_marker(self, pid, since):
+        self.pending().write_text(json.dumps({'pid': pid, 'since': since, 'deferral_streak': 3}))
+
+    def test_a_fresh_marker_holds_a_new_build_only_up_to_its_bound(self):
+        self.write_marker(os.getpid(), time.time())
+        started = time.monotonic()
+        build = self.build(AMUX_CARGO_RECLAIM_BUILD_WAIT_S='0.5')
+        build.err.wait_for('cargo_reclaim_pending:')
+        build.ready()
+        self.assertGreaterEqual(time.monotonic() - started, 0.5)
+        build.err.wait_for('cargo_reclaim_pending_timeout')
+        self.assertEqual(build.finish(), 0)
+
+    def test_a_build_of_two_targets_holds_no_lease_while_it_waits(self):
+        """Holding the first target's lease while waiting on the second's marker
+        would stall a reclaimer of both until its own bound ran out."""
+        other = self.base / 'rust-build-target-e2e-head'
+        other.mkdir()
+        marker = other.parent / ('.' + other.name + '.reclaim.pending')
+        marker.write_text(json.dumps({'pid': os.getpid(), 'since': time.time(), 'deferral_streak': 3}))
+        build = FixtureBuild(self.root, self.env, extra_targets=[other])
+        self.builds.append(build)
+        build.err.wait_for('cargo_reclaim_pending:')
+        for target in (self.root, other):
+            os.close(guard.open_lock(guard.lease_path(target)))  # exclusive: no lease is held
+        marker.unlink()
+        build.ready()
+        build.err.wait_for('cargo_reclaim_pending_cleared')
+        self.assertEqual(build.finish(), 0)
+
+    def test_a_stale_marker_is_ignored(self):
+        self.write_marker(os.getpid(), time.time() - 1200 - 60)
+        build = self.build()
+        build.ready()
+        self.assertIn('stale', build.err.wait_for('cargo_reclaim_pending_ignored'))
+        self.assertEqual(build.finish(), 0)
+
+    def test_a_reclaimer_that_dies_leaves_no_block(self):
+        # The real marker writer, in a process that then dies without its cleanup.
+        crash = ('import importlib.util, os, sys, time; from pathlib import Path\n'
+                 'spec = importlib.util.spec_from_file_location("guard", sys.argv[1])\n'
+                 'guard = importlib.util.module_from_spec(spec); spec.loader.exec_module(guard)\n'
+                 'guard.write_pending([Path(sys.argv[2])], {"deferral_streak": 3}, time.time())\n'
+                 'os._exit(9)\n')
+        died = subprocess.run([sys.executable, '-c', crash, str(SCRIPT), str(self.root)], env=self.env)
+        self.assertEqual(died.returncode, 9)
+        self.assertTrue(self.pending().exists(), 'the crash left its marker behind')
+        build = self.build()
+        build.ready()
+        self.assertIn('gone', build.err.wait_for('cargo_reclaim_pending_ignored'))
+        self.assertEqual(build.finish(), 0)
+
+    def test_a_build_nested_in_a_leased_build_does_not_wait_on_its_own_ancestor(self):
+        """A test spawning safe-cargo on the same target already runs under a lease;
+        making it wait would hold that lease until the reclaimer gave up."""
+        self.write_marker(os.getpid(), time.time())
+        build = self.build(AMUX_CARGO_GUARD_LEASED=str(self.root))
+        build.ready()
+        self.assertEqual(build.finish(), 0)
+        clock = FakeClock(time.time())
+        fd = guard.open_lock(guard.lease_path(self.root), shared=True)
+        try:
+            code, verdict, _ = self.reclaim(clock, AMUX_CARGO_GUARD_LEASED=str(self.root),
+                                            AMUX_CARGO_RECLAIM_PRIORITY_AFTER='1')
+        finally:
+            os.close(fd)
+        self.assertEqual(code, 75)
+        self.assertIs(verdict.get('priority', False), False)
+        self.assertEqual(clock.sleeps, [], 'a reclaim inside a leased build cannot wait for that lease')
 
 
 if __name__ == '__main__':

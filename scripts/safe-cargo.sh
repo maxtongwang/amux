@@ -205,6 +205,11 @@ rc=0
 # AMUX_CARGO_RECLAIM_TO_GB; deploy/ and release/ are never touched. The build
 # is retried once only when the reclaim reached its goal; a deferral (another
 # build holds the lease or is running) or too little freed keeps the refusal.
+# Back-to-back builds used to starve that exclusive lease forever (deferral
+# streak 15 at 40.1 GiB with 734 GB free). After AMUX_CARGO_RECLAIM_PRIORITY_AFTER
+# (3) consecutive busy deferrals the guard marks the reclaim pending, new builds
+# wait behind it, and it waits (bounded) for the running ones; its progress lines
+# go to stderr, so they are not discarded here.
 _reason=""
 if [ "$rc" -eq 75 ] && [ -s "${_SC_VERDICT:-}" ]; then
   _reason=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("reason",""))' "$_SC_VERDICT" 2>/dev/null || true)
@@ -213,7 +218,7 @@ if [ "$_reason" = target_size ] || [ "$_reason" = disk_reserve ]; then
   _to_gb="${AMUX_CARGO_RECLAIM_TO_GB:-25}"
   _reclaim_cmd=(python3 "$_target_guard" reclaim --max-gb "$_to_gb" --to-gb "$_to_gb")
   for _t in "${_guard_cmd[@]:4}"; do [ "$_t" = --target ] || [ "$_t" = --exclusive-run ] || _reclaim_cmd+=(--target "$_t"); done
-  _reclaimed=$("${_reclaim_cmd[@]}" 2>/dev/null) || true
+  _reclaimed=$("${_reclaim_cmd[@]}") || true
   echo "safe-cargo.sh: budget refused ($_reason); reclaim: ${_reclaimed:-<no output>}" >&2
   if printf '%s' "$_reclaimed" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("verdict") in ("cargo_reclaimed","cargo_reclaim_not_needed") and d.get("after_bytes",1) <= d.get("to_bytes",0) else 1)' 2>/dev/null; then
     : > "$_SC_VERDICT"

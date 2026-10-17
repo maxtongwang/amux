@@ -8,6 +8,7 @@ probes/locks defer cleanup, regardless of free disk; the next idle tick retries.
 """
 import argparse
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -21,10 +22,13 @@ import time
 
 
 class Deferred(Exception):
-    def __init__(self, reason, measured=False, considered=0):
+    def __init__(self, reason, measured=False, considered=0, contended=False):
         super().__init__(reason)
         self.measured = measured
         self.considered = considered
+        # True only when a lock was measured as HELD by someone else, as opposed
+        # to unopenable or unmeasured: the one condition waiting can resolve.
+        self.contended = contended
 
 
 def overlaps(left, right):
@@ -92,10 +96,175 @@ def open_lock(path, shared=False, wait=False):
     try:
         fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
                     | (0 if wait else fcntl.LOCK_NB))
-    except OSError:
+    except OSError as error:
         os.close(fd)
-        raise Deferred('lock busy or unmeasured: ' + str(path))
+        raise Deferred('lock busy or unmeasured: ' + str(path),
+                       contended=error.errno in (errno.EWOULDBLOCK, errno.EAGAIN)) from error
     return fd
+
+
+# WRITER PREFERENCE FOR A STARVED RECLAIM (DMIW-7 follow-up to PR #11).
+#
+# flock has no writer preference. Builds take the lease SHARED and back-to-back
+# builds overlap, so the reclaim's LOCK_EX|LOCK_NB found it held on every try:
+# deferral_streak 15, debug/ at 40.1 GiB over its 40 budget, and every new build
+# refused with exit 75 while the disk had 734 GB free. A reclaim that can never
+# run is a refusal that can never clear (ethos rule 3).
+#
+# So once a reclaim has deferred on a HELD lock PRIORITY_AFTER times in a row, it
+# writes a pending marker beside the lease and waits, bounded, for the running
+# builds to drain. New builds (`run`) see the fresh marker and wait, bounded,
+# instead of taking a shared lease. Nothing already holding a lease is touched.
+# The marker names its pid and time: a dead pid or an age over PENDING_MAX_AGE_S
+# makes it inert, so a crashed reclaimer cannot block builds past either bound.
+#
+# Settings are read per call so a caller's environment (and a test) controls them.
+# PRIORITY_AFTER 0 turns the preference off.
+PRIORITY_SETTINGS = {
+    'after': ('AMUX_CARGO_RECLAIM_PRIORITY_AFTER', 3),
+    'wait_s': ('AMUX_CARGO_RECLAIM_PRIORITY_WAIT_S', 1800),  # the reclaimer's wait for running builds
+    'build_wait_s': ('AMUX_CARGO_RECLAIM_BUILD_WAIT_S', 3600),  # a new build's wait behind the marker
+    'max_age_s': ('AMUX_CARGO_RECLAIM_PENDING_MAX_AGE_S', 3600),  # older markers are ignored
+    'poll_s': ('AMUX_CARGO_RECLAIM_POLL_S', 2),
+}
+# The targets an ancestor `run` already leases. A build or reclaim nested inside
+# that build must not wait for a lease its own ancestor holds.
+LEASED_ENV = 'AMUX_CARGO_GUARD_LEASED'
+
+
+def priority_setting(key):
+    name, default = PRIORITY_SETTINGS[key]
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError:
+        raise Deferred('invalid %s: %r' % (name, os.environ.get(name))) from None
+    if value < 0:
+        raise Deferred('invalid %s: must not be negative' % name)
+    return value
+
+
+def inherited_leases():
+    return {Path(p) for p in os.environ.get(LEASED_ENV, '').split(os.pathsep) if p}
+
+
+def pending_path(target):
+    return target.parent / ('.' + target.name + '.reclaim.pending')
+
+
+def write_pending(targets, streak, now):
+    """Mark a reclaim pending beside each target's lease, atomically (rename)."""
+    payload = json.dumps({'pid': os.getpid(), 'since': now,
+                          'deferral_streak': (streak or {}).get('deferral_streak')})
+    for target in targets:
+        path = pending_path(target)
+        fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name + '.')
+        try:
+            with os.fdopen(fd, 'w') as handle:
+                handle.write(payload)
+            os.replace(temporary, path)
+        except BaseException:
+            Path(temporary).unlink(missing_ok=True)
+            raise
+
+
+def clear_pending(targets):
+    """Remove the markers this process wrote; a peer reclaimer's stay its own."""
+    for target in targets:
+        path = pending_path(target)
+        try:
+            if json.loads(path.read_text()).get('pid') == os.getpid():
+                path.unlink()
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)  # signal 0: an existence probe, nothing is delivered
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def read_pending(target, now, max_age_s):
+    """(marker, None) for a marker that holds builds back, else (None, why it does not)."""
+    path = pending_path(target)
+    try:
+        marker = json.loads(path.read_text())
+        pid, since = int(marker['pid']), float(marker['since'])
+    except FileNotFoundError:
+        return None, None
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return None, 'unreadable %s: %s' % (path, error)
+    age = now - since
+    if abs(age) > max_age_s:
+        return None, 'stale %s: age %ds is beyond %ds' % (path, age, max_age_s)
+    if pid <= 0 or not pid_alive(pid):
+        return None, 'reclaimer pid %d of %s is gone' % (pid, path)
+    return marker, None
+
+
+def acquire_build_leases(targets):
+    """A new build's shared leases, taken only once no target has a fresh pending reclaim.
+
+    Every target is checked before ANY lease is taken: holding one lease while
+    waiting on another target's marker would stall a reclaimer of both. Bounded
+    by build_wait_s: past it the build leases anyway and says so. Markers are
+    re-read AFTER the leases are held, so a reclaim marked between the look and
+    the lease still gets this build to back off.
+    """
+    inherited = inherited_leases()
+    watched = [t for t in targets if t not in inherited]
+    wait_s, poll_s, max_age_s = (priority_setting(k) for k in ('build_wait_s', 'poll_s', 'max_age_s'))
+    started = time.time()
+    waited = False
+    reported = set()
+
+    def fresh():
+        markers = []
+        for target in watched:
+            marker, ignored = read_pending(target, time.time(), max_age_s)
+            if ignored and ignored not in reported:
+                reported.add(ignored)
+                print('cargo_reclaim_pending_ignored: ' + ignored, file=sys.stderr)
+            if marker:
+                markers.append((target, marker))
+        return markers
+
+    while True:
+        markers = fresh()
+        elapsed = time.time() - started
+        if markers and elapsed < wait_s:
+            if not waited:
+                print('cargo_reclaim_pending: %s; waiting up to %ds before taking a shared lease'
+                      % ('; '.join('reclaim pid %s marked %s after %s busy deferrals'
+                                   % (m.get('pid'), pending_path(t), m.get('deferral_streak'))
+                                   for t, m in markers), wait_s), file=sys.stderr)
+                waited = True
+            time.sleep(min(poll_s, wait_s - elapsed))
+            continue
+        if markers:
+            print('cargo_reclaim_pending_timeout: waited %.1fs for reclaim pid(s) %s; '
+                  'taking a shared lease anyway'
+                  % (elapsed, ','.join(str(m.get('pid')) for _, m in markers)), file=sys.stderr)
+        fds = []
+        try:
+            for target in targets:
+                fds.append(open_lock(lease_path(target), shared=True, wait=True))
+        except BaseException:
+            for fd in fds:
+                os.close(fd)
+            raise
+        if not markers and fresh() and time.time() - started < wait_s:
+            for fd in fds:  # a reclaim was marked while these leases were being taken: yield
+                os.close(fd)
+            continue
+        if waited and not markers:
+            print('cargo_reclaim_pending_cleared: waited %.1fs; building'
+                  % (time.time() - started), file=sys.stderr)
+        return fds
 
 
 def native_locks(target):
@@ -419,6 +588,51 @@ def reclaim(targets, max_bytes, to_bytes, *, process_probe=active_processes):
                 'units_removed': removed, 'reached_goal': after <= to_bytes, **result}
 
 
+def prioritized_reclaim(targets, max_bytes, to_bytes, *, process_probe=active_processes):
+    """reclaim(), which after PRIORITY_AFTER consecutive deferrals on a HELD lock
+    marks itself pending and waits, bounded, for the running builds to drain.
+
+    Every attempt is the ordinary reclaim: the same lease, Cargo locks, process
+    probe and protected profiles. The wait only stops NEW builds from joining;
+    it never breaks or bypasses a lock someone holds. A deferral raised from
+    here carries its streak (counted once per invocation) and, when it waited,
+    the priority fields for the verdict.
+    """
+    after = priority_setting('after')
+    try:
+        return {**reclaim(targets, max_bytes, to_bytes, process_probe=process_probe), 'priority': False}
+    except Deferred as error:
+        if not error.contended:
+            raise
+        error.streak = streak = bump_streak(targets, str(error), now=int(time.time()))
+        nested = inherited_leases() & set(targets)
+        if after <= 0 or not streak or streak['deferral_streak'] < after or nested:
+            raise
+    wait_s, poll_s = priority_setting('wait_s'), priority_setting('poll_s')
+    started = time.time()
+    write_pending(targets, streak, started)
+    print('cargo_reclaim_priority: %d consecutive deferrals on a held lock; marked %s pending, '
+          'new builds wait; waiting up to %ds for running builds to finish'
+          % (streak['deferral_streak'], ', '.join(str(pending_path(t)) for t in targets), wait_s),
+          file=sys.stderr)
+    try:
+        while True:
+            try:
+                result = reclaim(targets, max_bytes, to_bytes, process_probe=process_probe)
+            except Deferred as error:
+                waited = time.time() - started
+                if waited < wait_s:
+                    time.sleep(min(poll_s, wait_s - waited))
+                    continue
+                error.streak = streak
+                error.priority = {'priority': True, 'waited_s': round(waited, 3)}
+                raise
+            return {**result, 'priority': True, 'waited_s': round(time.time() - started, 3),
+                    'pending_streak': streak['deferral_streak']}
+    finally:
+        clear_pending(targets)
+
+
 def sweep(targets, idle_s=SWEEP_IDLE_S, *, now=None, process_probe=active_processes):
     """Remove incremental sessions and dependency units unused for idle_s."""
     now = time.time() if now is None else now
@@ -495,15 +709,18 @@ def main():
                 raise Deferred('no build command')
             # Acquired inside the systemd scope, and inherited by cargo and its
             # children. No parent polling window between build and test binaries.
-            for target in targets:
-                # cargo clean is a mutation too. A shared lease let it delete
-                # the next test executable after Cargo released its build lock.
-                fd = open_lock(lease_path(target), shared=not args.exclusive_run, wait=not args.exclusive_run)
+            # cargo clean is a mutation too. A shared lease let it delete
+            # the next test executable after Cargo released its build lock.
+            fds = ([open_lock(lease_path(target)) for target in targets] if args.exclusive_run
+                   else acquire_build_leases(targets))
+            for fd in fds:
                 os.set_inheritable(fd, True)
+            os.environ[LEASED_ENV] = os.pathsep.join(
+                sorted(str(p) for p in inherited_leases() | set(targets)))
             os.execvp(command[0], command)
         if args.action in ('reclaim', 'sweep'):
             probe = test_probe(targets, []) or active_processes
-            result = (reclaim(targets, int(args.max_gb * GB), int(args.to_gb * GB), process_probe=probe)
+            result = (prioritized_reclaim(targets, int(args.max_gb * GB), int(args.to_gb * GB), process_probe=probe)
                       if args.action == 'reclaim' else sweep(targets, args.idle_s, now=args.now, process_probe=probe))
             clear_streak(targets)
             print(json.dumps(result))
@@ -522,7 +739,10 @@ def main():
     except (Deferred, OSError) as error:
         payload = {'verdict': 'cargo_reclaim_deferred', 'measured': getattr(error, 'measured', False),
                    'n_considered': getattr(error, 'considered', 0), 'reason': str(error)}
-        payload.update(bump_streak(targets, str(error)) or {})
+        # A prioritized reclaim already counted this invocation's deferral.
+        streak = error.streak if hasattr(error, 'streak') else bump_streak(targets, str(error))
+        payload.update(streak or {})
+        payload.update(getattr(error, 'priority', None) or {})
         print(json.dumps(payload))
         return 75
     return 0
