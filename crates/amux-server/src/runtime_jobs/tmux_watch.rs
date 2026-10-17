@@ -41,6 +41,12 @@ pub(crate) struct WatchState {
     pub keeper_failures: u32,
     pub keeper_next_at: Option<f64>,
     pub keeper_alerted_at: Option<f64>,
+    /// Workers still to bring back after a loss, persisted so a failed start, a server restart
+    /// or a second loss never drops them; retried with backoff until each is back or ineligible.
+    pub pending: Vec<String>,
+    pub pending_attempts: u32,
+    pub pending_next_at: Option<f64>,
+    pub pending_alerted_at: Option<f64>,
     /// amux workers whose tmux session existed at the last reading while the server was up.
     pub workers: Vec<String>,
     pub lost_at: Option<f64>,
@@ -91,13 +97,25 @@ pub(crate) fn observe(st: &mut WatchState, census: &Census, now: f64, boot_at: O
     if !matches!(census, Census::Up(_)) {
         st.lost_at = Some(now);
     }
+    // Storm safety: a loss soon after the last one keeps the retry backoff growing instead of
+    // restarting it, so a tmux that keeps dying is alarmed about, not restarted in a loop.
     let restore = st.last_restore_at.is_none_or(|t| now - t >= RESTORE_GAP_SECS);
+    st.last_restore_at = Some(now);
     if restore {
-        st.last_restore_at = Some(now);
+        st.pending_attempts = 0;
+        st.pending_next_at = None;
+    } else {
+        st.pending_attempts += 1;
+        st.pending_next_at = Some(now + keeper_backoff(st.pending_attempts));
     }
     // Restore what was running before and is not running now.
     let running: &[String] = if let Census::Up(w) = census { w } else { &[] };
-    let workers = before.iter().filter(|w| !running.contains(w)).cloned().collect();
+    let workers: Vec<String> = before.iter().filter(|w| !running.contains(w)).cloned().collect();
+    for w in &workers {
+        if !st.pending.contains(w) {
+            st.pending.push(w.clone());
+        }
+    }
     Decision::Lost { workers, before, restore, rebooted }
 }
 
@@ -225,6 +243,25 @@ pub(crate) fn record_keeper(st: &mut WatchState, started: bool, now: f64) {
         st.keeper_failures += 1;
         st.keeper_next_at = Some(now + keeper_backoff(st.keeper_failures));
     }
+}
+
+/// Is a pending-restore pass due now?
+pub(crate) fn pending_due(st: &WatchState, now: f64) -> bool {
+    !st.pending.is_empty() && st.pending_next_at.is_none_or(|t| now >= t)
+}
+
+/// Settle one pending pass: started and no-longer-eligible workers leave the set; failures stay
+/// and the next pass backs off (same 30s..10m curve as the keeper). Returns true when done.
+pub(crate) fn settle_pending(st: &mut WatchState, r: &Restore, now: f64) -> bool {
+    st.pending.retain(|w| !r.restored.contains(w) && !r.skipped.iter().any(|(n, _)| n == w));
+    if st.pending.is_empty() {
+        st.pending_attempts = 0;
+        st.pending_next_at = None;
+        return true;
+    }
+    st.pending_attempts += 1;
+    st.pending_next_at = Some(now + keeper_backoff(st.pending_attempts));
+    false
 }
 
 /// The running set shared with boot recovery (#141): `~/.amux/running-set.json`,
@@ -362,10 +399,18 @@ async fn keep_alive(state: &AppState, home: &Path, st: &mut WatchState, census: 
     };
     for keeper in keepers() {
         let env = home.join("sessions").join(format!("{keeper}.env"));
-        if !env.is_file() || crate::api::session_verbs::env_flag_on(crate::config::parse_env_file(&env).get("CC_ARCHIVED").map(String::as_str)) {
+        if !env.is_file() {
             continue;
         }
-        if !keeper_due(st, running.contains(&keeper), now) {
+        let cfg = crate::config::parse_env_file(&env);
+        let on = |k: &str| crate::api::session_verbs::env_flag_on(cfg.get(k).map(String::as_str));
+        if on("CC_ARCHIVED") || on("CC_PAUSED") || cfg.get("CC_REVIEW_HELD").map(String::as_str) == Some("1") {
+            continue;
+        }
+        // A tmux session can outlive the agent (a pane left at its shell prompt), so liveness is
+        // the process-aware check, not the session name.
+        let alive = running.contains(&keeper) && crate::api::session_verbs::is_running(&keeper).await;
+        if !keeper_due(st, alive, now) {
             continue;
         }
         let (ok, msg) = start(state, &keeper).await;
@@ -404,71 +449,91 @@ async fn tick(state: AppState) {
     if st != before {
         save_state(&home, &st);
     }
-    let Decision::Lost { workers, before, restore, rebooted } = decision else { return };
-    let boot_at = crate::runtime_jobs::heartbeat::machine_boot_at();
-    if !snapshot_prev(&home, &before, boot_at, now) {
-        tracing::warn!(target: "tmux_watch", verdict = "running_set_prev_kept", "an unrestored pre-outage snapshot already exists; keeping it");
+    let mut loss = None;
+    if let Decision::Lost { workers, before, restore, rebooted } = decision {
+        let boot_at = crate::runtime_jobs::heartbeat::machine_boot_at();
+        if !snapshot_prev(&home, &before, boot_at, now) {
+            tracing::warn!(target: "tmux_watch", verdict = "running_set_prev_kept", "an unrestored pre-outage snapshot already exists; keeping it");
+        }
+        let at = chrono::Utc::now().to_rfc3339();
+        let verdict = if rebooted { "host_rebooted" } else { "tmux_server_lost" };
+        tracing::error!(target: "tmux_watch", measured = true, n_considered = workers.len(), verdict,
+            lost_at = %at, workers = workers.len(), restore,
+            "the tmux server is gone ({verdict}): {} worker(s) were running in it", workers.len());
+        if !rebooted {
+            let body = if restore {
+                format!("The tmux server was lost at {at} with {} worker(s) running. amux is restarting them now.", workers.len())
+            } else {
+                format!("The tmux server was lost again at {at} with {} worker(s) running, the second loss within 10 minutes. amux is restoring them with backoff, not in a loop.", workers.len())
+            };
+            push_owner(&state, "amux: every worker stopped", &body, "tmux-server-lost").await;
+        }
+        if !restore {
+            tracing::warn!(target: "tmux_watch", measured = true, n_considered = workers.len(), verdict = "fleet_restore_rate_limited",
+                attempts = st.pending_attempts, "a loss within {RESTORE_GAP_SECS}s of the last one; restoring with backoff, not in a loop");
+        }
+        loss = Some((at, rebooted, workers.len()));
     }
-    let at = chrono::Utc::now().to_rfc3339();
-    let verdict = if rebooted { "host_rebooted" } else { "tmux_server_lost" };
-    tracing::error!(target: "tmux_watch", measured = true, n_considered = workers.len(), verdict,
-        lost_at = %at, workers = workers.len(), restore,
-        "the tmux server is gone ({verdict}): {} worker(s) were running in it", workers.len());
-    if !rebooted {
-        let body = if restore {
-            format!("The tmux server was lost at {at} with {} worker(s) running. amux is restarting them now.", workers.len())
-        } else {
-            format!("The tmux server was lost again at {at} with {} worker(s) running. A restore ran in the last 10 minutes, so amux is not restarting them; start them from the dashboard.", workers.len())
-        };
-        push_owner(&state, "amux: every worker stopped", &body, "tmux-server-lost").await;
+    // The pending set (persisted) is retried on every readable tick, not only at the loss, so a
+    // failed start, a restart mid-restore or a second loss never leaves a worker down for good.
+    if !matches!(census, Census::Unreadable(_)) {
+        drive_pending(&state, &home, &mut st, &kept, now, loss).await;
     }
-    if !restore {
-        tracing::warn!(target: "tmux_watch", measured = true, n_considered = workers.len(), verdict = "fleet_restore_rate_limited",
-            "a restore already ran within {RESTORE_GAP_SECS}s; not restarting");
+}
+
+/// One pending-restore pass when due. State is saved BEFORE any start so a crash mid-pass
+/// re-runs it (a start is idempotent: a running worker reads "already running").
+async fn drive_pending(state: &AppState, home: &Path, st: &mut WatchState, kept: &[String], now: f64,
+    loss: Option<(String, bool, usize)>) {
+    let keep = keepers();
+    st.pending.retain(|w| !kept.contains(w) && !keep.contains(w));
+    if !pending_due(st, now) {
+        save_state(home, st);
         return;
     }
-    let rest: Vec<String> = workers.iter().filter(|w| !kept.contains(w)).cloned().collect();
-    let Restore { mut restored, failed, skipped } = restore_fleet(&home, &rest, |name| {
-        let st = state.clone();
-        async move { start(&st, &name).await }
+    save_state(home, st);
+    let todo = st.pending.clone();
+    let r = restore_fleet(home, &todo, |name| {
+        let s = state.clone();
+        async move { start(&s, &name).await }
     })
     .await;
-    restored.splice(0..0, kept.iter().filter(|k| workers.contains(k)).cloned());
-    if failed.is_empty() {
-        mark_prev_restored(&home, now);
+    let done = settle_pending(st, &r, now);
+    save_state(home, st);
+    let failures = r.failed.iter().map(|(n, e)| format!("{n}: {e}")).collect::<Vec<_>>().join("; ");
+    let skipped = r.skipped.iter().map(|(n, why)| format!("{n} ({why})")).collect::<Vec<_>>().join(", ");
+    tracing::warn!(target: "tmux_watch", measured = true, n_considered = todo.len(),
+        verdict = if done { "fleet_restored" } else { "fleet_restore_incomplete" },
+        restored = r.restored.len(), failed = r.failed.len(), skipped = r.skipped.len(), still_pending = st.pending.len(),
+        order = %r.restored.join(","), %failures, skipped_workers = %skipped, retry_in_s = st.pending_next_at.map(|t| t - now),
+        "fleet restore pass: {} restored, {} failed, {} skipped, {} still pending", r.restored.len(), r.failed.len(), r.skipped.len(), st.pending.len());
+    if done {
+        mark_prev_restored(home, now);
+    } else if st.pending_attempts >= 3 && st.pending_alerted_at.is_none_or(|t| now - t >= 3600.0) {
+        st.pending_alerted_at = Some(now);
+        save_state(home, st);
+        push_owner(state, "amux: workers are not coming back",
+            &format!("{} worker(s) still down after {} restore attempts ({failures}). amux keeps retrying every 10 minutes.", st.pending.len(), st.pending_attempts),
+            "fleet-restore-stuck").await;
     }
-    tracing::warn!(target: "tmux_watch", measured = true, n_considered = workers.len(), verdict = "fleet_restored",
-        cause = verdict, restored = restored.len(), failed = failed.len(), skipped = skipped.len(),
-        order = %restored.join(","), failures = %failed.iter().map(|(n, e)| format!("{n}: {e}")).collect::<Vec<_>>().join("; "),
-        skipped_workers = %skipped.iter().map(|(n, why)| format!("{n} ({why})")).collect::<Vec<_>>().join(", "),
-        "fleet restore after the lost tmux server: {} restored, {} failed, {} skipped", restored.len(), failed.len(), skipped.len());
+    if r.restored.is_empty() {
+        return;
+    }
+    let (at, rebooted, total) = loss.unwrap_or_else(|| (chrono::Utc::now().to_rfc3339(), false, todo.len()));
     let note = format!(
-        "[amux] The tmux server was lost at {at}{}; amux restarted {} of {} running worker(s){}{}. Check your team's workers.",
+        "[amux] The tmux server was lost at {at}{}; amux restarted {} of {} worker(s){}{}{}. Check your team's workers.",
         if rebooted { " (host reboot)" } else { "" },
-        restored.len(),
-        workers.len(),
-        if failed.is_empty() { String::new() } else { format!("; failed: {}", failed.iter().map(|(n, e)| format!("{n}: {e}")).collect::<Vec<_>>().join("; ")) },
-        if skipped.is_empty() { String::new() } else { format!("; not restarted: {}", skipped.iter().map(|(n, why)| format!("{n} ({why})")).collect::<Vec<_>>().join(", ")) },
+        r.restored.len() + kept.len(), total + kept.len(),
+        if failures.is_empty() { String::new() } else { format!("; failed: {failures}") },
+        if skipped.is_empty() { String::new() } else { format!("; not restarted: {skipped}") },
+        if st.pending.is_empty() { String::new() } else { format!("; {} still pending, retrying", st.pending.len()) },
     );
-    for lead in leads(&home, &restored) {
-        let (sent, why) = crate::api::session_verbs::send_text(&state, &lead, &note, true, crate::api::session_verbs::SendOrigin::Automation).await;
+    for lead in leads(home, &r.restored) {
+        let (sent, why) = crate::api::session_verbs::send_text(state, &lead, &note, true, crate::api::session_verbs::SendOrigin::Automation).await;
         if !sent {
             tracing::warn!(target: "tmux_watch", session = %lead, %why, verdict = "fleet_restored_lead_unnotified", "a lead was not told about the restore");
         }
     }
-}
-
-/// A lead may restore one named worker of its own team: the caller carries `leads`, and the two
-/// share at least one other tag (the team).
-pub(crate) fn lead_may_restore(home: &Path, lead: &str, target: &str) -> bool {
-    let tags = |n: &str| -> std::collections::BTreeSet<String> {
-        crate::config::parse_env_file(&home.join("sessions").join(format!("{n}.env")))
-            .get("CC_TAGS")
-            .map(|t| t.split(',').map(|x| x.trim().trim_matches('"').to_lowercase()).filter(|x| !x.is_empty()).collect())
-            .unwrap_or_default()
-    };
-    let (mine, theirs) = (tags(lead), tags(target));
-    mine.contains("leads") && mine.iter().any(|t| t != "leads" && theirs.contains(t))
 }
 
 /// `POST /api/fleet/restore {"only": NAME?, "dry_run": bool}`: start the recorded running set in
@@ -680,6 +745,42 @@ mod tests {
         mark_prev_restored(d.path(), 700.0);
         assert_eq!(read_prev(d.path()), None);
         assert!(snapshot_prev(d.path(), &["x".into()], None, 800.0), "a restored snapshot may be replaced by the next loss");
+    }
+
+    #[test]
+    fn a_loss_is_pending_work_that_survives_a_restart_and_retries_until_done() {
+        let d = tempfile::tempdir().unwrap();
+        let mut st = WatchState::default();
+        observe(&mut st, &up(&["a", "b"]), 0.0, None);
+        observe(&mut st, &Census::NoServer, 10.0, None);
+        save_state(d.path(), &st);
+        // The server restarts here, before any start was attempted.
+        let mut st = load_state(d.path());
+        assert_eq!(st.pending, vec!["a".to_string(), "b".to_string()]);
+        assert!(pending_due(&st, 25.0), "the restored process still owes the restore");
+        let r = Restore { restored: vec!["a".into()], failed: vec![("b".into(), "busy".into())], skipped: vec![] };
+        assert!(!settle_pending(&mut st, &r, 25.0));
+        assert_eq!(st.pending, vec!["b".to_string()]);
+        assert!(!pending_due(&st, 54.0) && pending_due(&st, 55.0), "a failed start retries after backoff");
+        let r = Restore { restored: vec![], failed: vec![], skipped: vec![("b".into(), "paused")] };
+        assert!(settle_pending(&mut st, &r, 60.0), "a worker that became ineligible leaves the set");
+        assert_eq!((st.pending_attempts, st.pending_next_at), (0, None));
+    }
+
+    #[test]
+    fn a_second_loss_inside_the_gap_backs_off_instead_of_looping() {
+        let mut st = WatchState::default();
+        observe(&mut st, &up(&["a"]), 0.0, None);
+        observe(&mut st, &Census::NoServer, 10.0, None);
+        assert!(pending_due(&st, 10.0), "the first loss restores at once");
+        settle_pending(&mut st, &Restore { restored: vec!["a".into()], ..Default::default() }, 12.0);
+        observe(&mut st, &up(&["a"]), 20.0, None);
+        assert!(matches!(observe(&mut st, &Census::NoServer, 40.0, None), Decision::Lost { restore: false, .. }));
+        assert_eq!(st.pending, vec!["a".to_string()], "the worker is still owed a restore");
+        assert!(!pending_due(&st, 40.0) && pending_due(&st, 70.0), "but after backoff, not immediately");
+        observe(&mut st, &up(&[]), 75.0, None);
+        observe(&mut st, &Census::NoServer, 80.0, None);
+        assert!(st.pending_next_at.unwrap() >= 140.0, "each repeat within the gap grows the backoff");
     }
 
     #[test]
