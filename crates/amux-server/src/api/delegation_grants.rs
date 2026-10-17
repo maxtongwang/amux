@@ -415,6 +415,63 @@ mod tests {
         }
     }
 
+    fn put_row(state: &AppState, session: &str, text: &str, process_origin: &str) -> i64 {
+        let (session, text, po) = (session.to_string(), text.to_string(), process_origin.to_string());
+        let id = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let idw = id.clone();
+        state.store.write(move |c| {
+            crate::api::session_verbs::ensure_fleet_tables(c)?;
+            c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,process_origin,ts) VALUES(?1,?2,'user','','direct',?3,?4)",
+                rusqlite::params![session, text, po, (now() * 1000.0) as i64])?;
+            idw.store(c.last_insert_rowid(), std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        id.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn put_grant(state: &AppState, code: &str) {
+        let (code, t) = (code.to_string(), now());
+        state.store.write(move |c| {
+            c.execute(
+                "INSERT INTO _amux_delegation_grants (code, actor, class, action, target, method, path, body, sentence, created_at, expires_at, status) \
+                 VALUES (?1,'mrpopo','mrpopo','set_config:toggle_yolo','test-dev-a','PATCH','/api/sessions/test-dev-a/config','{\"toggle_yolo\":true}','s',?2,?3,'pending')",
+                rusqlite::params![code, t, t + GRANT_TTL_S],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+    }
+
+    /// The session rule on typed approvals, with the verdicts only a real
+    /// socket produces: in mrpopo's OWN lane an Outside owner send does not
+    /// approve (a worker reaches Outside with `launchctl submit`); a Remote one
+    /// does, and applies the stored change.
+    #[tokio::test]
+    async fn in_the_actors_own_lane_only_a_remote_owner_send_approves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        std::fs::write(tmp.path().join("sessions/test-dev-a.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\n").unwrap();
+        std::fs::write(tmp.path().join("sessions/mrpopo.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads\"\n").unwrap();
+        let state = AppState {
+            store: std::sync::Arc::new(crate::db::Store::open(&tmp.path().join("t.db")).unwrap()),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        put_grant(&state, "7K3Q");
+        let outside = put_row(&state, "mrpopo", "amux grant 7K3Q", "outside");
+        on_row(&state, outside, "amux grant 7K3Q").await;
+        assert_eq!(load(&state, "7K3Q").unwrap().status, "pending", "own-lane Outside does not approve");
+        let remote = put_row(&state, "mrpopo", "ok, amux grant 7K3Q", "remote");
+        on_row(&state, remote, "ok, amux grant 7K3Q").await;
+        let g = load(&state, "7K3Q").unwrap();
+        assert_eq!(g.status, "applied", "own-lane Remote approves");
+        assert_eq!(g.evidence_row, Some(remote));
+        let env = std::fs::read_to_string(tmp.path().join("sessions/test-dev-a.env")).unwrap();
+        assert!(env.contains("dangerously") || env.contains("CC_AUTO_CONTINUE=\"1\""), "the stored change applied: {env}");
+    }
+
     #[test]
     fn approve_requires_a_remote_owner() {
         let tmp = tempfile::tempdir().unwrap();

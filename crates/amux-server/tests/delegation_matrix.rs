@@ -140,7 +140,7 @@ async fn cc_orchestrator_is_never_a_leads_or_a_workers_to_set() {
         assert_refused_regardless_of_max_ref(st, &v, &format!("{who} sets CC_ORCHESTRATOR with max_ref"));
     }
     let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(body)).await;
-    assert_code(st, &v, "max_ref_missing", "mrpopo sets CC_ORCHESTRATOR without max_ref");
+    assert_grant_pending(st, &v, "mrpopo asks to set CC_ORCHESTRATOR: a pending grant, not a change");
     assert!(!e.env_text(DEV_A).contains("CC_ORCHESTRATOR"), "{}", e.env_text(DEV_A));
 }
 

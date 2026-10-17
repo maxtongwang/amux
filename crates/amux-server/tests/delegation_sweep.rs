@@ -190,15 +190,13 @@ async fn every_config_mutating_route_consults_delegation() {
             let (st, v) = e.call(Who::Owner, "POST", "/api/workers", Some(json!({"name": DEV_B, "cwd": "/tmp"}))).await;
             assert!(st.is_success(), "fixture: owner registers {DEV_B}'s store row: {st} {v}");
         }
-        let body = if c.needs_ref {
-            let t = now_s() - 60.0;
-            let target = c.path.split('/').nth(3).filter(|s| s.starts_with("review-")).unwrap_or(DEV_B);
-            e.seed_pane_prompt(c.allowed_as, &format!("add {target} to the leads group and set its send allow routing"), t);
-            with_ref(c.allowed.clone(), max_ref(c.allowed_as, t), "Max asked")
-        } else {
-            c.allowed.clone()
-        };
-        let (st, v) = e.call(Who::Worker(c.allowed_as), c.method, &c.path, Some(body)).await;
+        // A grant row (mrpopo) consults the table too: it answers 202 with a
+        // pending grant and logs the request.
+        let (st, v) = e.call(Who::Worker(c.allowed_as), c.method, &c.path, Some(c.allowed.clone())).await;
+        if c.needs_ref && st != axum::http::StatusCode::ACCEPTED {
+            failures.push(format!("{} as {}: expected a pending grant (202), got {st} {v}", c.name, c.allowed_as));
+            continue;
+        }
         if !st.is_success() {
             failures.push(format!("{} as {}: {st} {v}", c.name, c.allowed_as));
             continue;

@@ -185,13 +185,24 @@ pub fn max_ref(session: &str, time: f64) -> Value {
     json!({"session": session, "time": time})
 }
 
-/// `body` plus `max_ref` and `why`, the spec's request shape for a widening
-/// change.
-pub fn with_ref(mut body: Value, r: Value, why: &str) -> Value {
-    body["max_ref"] = r;
+/// `body` plus `why`. max_ref citations were replaced by structured grants
+/// (api/delegation_grants.rs); `r` is ignored and kept so older call sites
+/// read the same.
+pub fn with_ref(mut body: Value, _r: Value, why: &str) -> Value {
     body["why"] = json!(why);
     body
 }
+
+/// 202 with a pending grant: returns its code, checking the sentence names it.
+#[track_caller]
+pub fn assert_grant_pending(st: StatusCode, v: &Value, ctx: &str) -> String {
+    assert_eq!(st, StatusCode::ACCEPTED, "{ctx}: expected 202 pending grant, got {st}: {v}");
+    let code = v["grant_code"].as_str().unwrap_or_else(|| panic!("{ctx}: no grant_code: {v}")).to_string();
+    assert!(v["sentence"].as_str().is_some_and(|s| s.starts_with(&format!("amux grant {code}: "))), "{ctx}: sentence: {v}");
+    code
+}
+
+static PANE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Env {
     pub fn home(&self) -> &Path {
@@ -336,6 +347,48 @@ impl Env {
             .unwrap()
             .flatten()
             .collect()
+    }
+
+    /// A person typing `text` into `lane`'s pane, through the real path: the
+    /// provider's UserPromptSubmit hook posting to the lane's own /report.
+    pub async fn type_in_pane(&self, lane: &str, text: &str) -> (StatusCode, Value) {
+        let now = now_s();
+        let env = self.env_path(lane);
+        if !env.exists() {
+            std::fs::write(&env, "CC_DIR=\"/tmp\"\n").unwrap();
+        }
+        let dir = self.home().join("status-events").join(lane);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = format!("review-run-{lane}");
+        if !dir.join("current.json").exists() {
+            std::fs::write(dir.join("current.json"), json!({"run_id": run, "provider": "claude", "started": now - 100.0}).to_string()).unwrap();
+        }
+        let seq = PANE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let report = json!({"native_status": true, "event": "UserPromptSubmit", "run_id": run, "provider": "claude",
+            "sequence": seq, "event_ts": now - 0.5, "turn_id": format!("t{seq}"), "prompt": text});
+        self.call(Who::Worker(lane), "POST", &format!("/api/sessions/{lane}/report"), Some(report)).await
+    }
+
+    /// A stored grant's status, or "" when there is no such grant.
+    pub fn grant_status(&self, code: &str) -> String {
+        let conn = self.store.read().unwrap();
+        conn.query_row("SELECT status FROM _amux_delegation_grants WHERE code=?1", [code], |r| r.get(0)).unwrap_or_default()
+    }
+
+    /// Move a grant's expiry into the past.
+    pub fn expire_grant(&self, code: &str) {
+        let code = code.to_string();
+        self.store.write(move |conn| {
+            conn.execute("UPDATE _amux_delegation_grants SET expires_at=1 WHERE code=?1", [code])?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+    }
+
+    /// Steering-queue texts for `lane` (the leads feed lands here).
+    pub fn queued_for(&self, lane: &str) -> Vec<String> {
+        let conn = self.store.read().unwrap();
+        let mut st = conn.prepare("SELECT text FROM steering_queue WHERE session=?1").unwrap();
+        st.query_map([lane], |r| r.get(0)).unwrap().flatten().collect()
     }
 
     pub fn max_row_id(&self) -> i64 {

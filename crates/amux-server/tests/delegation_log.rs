@@ -35,19 +35,26 @@ async fn each_allowed_delegated_change_appends_exactly_one_entry() {
     assert_eq!(entries.len(), 2, "{entries:?}");
     assert_entry_shape(&entries[1], DEV_A, "self", DEV_A);
 
-    let t = now_s() - 60.0;
-    let row = e.seed_pane_prompt(MAX_PANE, &format!("add {DEV_B} to leads"), t);
+    // mrpopo's membership change is a grant: requested (logged), then applied
+    // once Max types its code in another lane (approved, the change, applied).
     let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &format!("/api/sessions/{DEV_B}/config"),
-        Some(with_ref(json!({"tags": "dev,leads"}), max_ref(MAX_PANE, t), "Max asked for a second lead"))).await;
-    assert_allowed(st, &v, "mrpopo membership");
+        Some(with_ref(json!({"tags": "dev,leads"}), json!(null), "Max asked for a second lead"))).await;
+    let code = assert_grant_pending(st, &v, "mrpopo membership");
     let entries = e.log_entries();
     assert_eq!(entries.len(), 3, "{entries:?}");
-    let m = &entries[2];
+    assert_eq!(entries[2]["action"], json!("grant:requested"), "{}", entries[2]);
+    assert_eq!(entries[2]["grant"], json!(code), "{}", entries[2]);
+    assert_eq!(entries[2]["why"], json!("Max asked for a second lead"), "{}", entries[2]);
+    let (st, v) = e.type_in_pane(MAX_PANE, &format!("amux grant {code}")).await;
+    assert_allowed(st, &v, "Max types the code");
+    assert_eq!(e.grant_status(&code), "applied");
+    let entries = e.log_entries();
+    let actions: Vec<&str> = entries.iter().filter_map(|m| m["action"].as_str()).collect();
+    assert_eq!(&actions[3..], ["grant:approved", "set_tags", "grant:applied"], "{entries:?}");
+    let m = &entries[4];
     assert_entry_shape(m, MRPOPO, "mrpopo", DEV_B);
-    assert_eq!(m["max_ref"]["session"], json!(MAX_PANE), "{m}");
-    assert!(m["max_ref"]["time"].as_f64().is_some_and(|x| (x - t).abs() < 0.01), "{m}");
-    assert_eq!(m["evidence_row"], json!(row), "{m}");
-    assert_eq!(m["why"], json!("Max asked for a second lead"), "{m}");
+    assert_eq!(m["grant"], json!(code), "{m}");
+    assert!(m["evidence_row"].as_i64().is_some(), "the typed row is the evidence: {m}");
 }
 
 #[tokio::test]
@@ -55,8 +62,6 @@ async fn refused_attempts_and_owner_changes_add_no_entries() {
     let e = setup().await;
     let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &format!("/api/sessions/{OPS_A}/config"), Some(json!({"model": "sonnet"}))).await;
     assert_refused(st, &v, "lead on another team");
-    let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &format!("/api/sessions/{DEV_A}/config"), Some(json!({"tags": "dev,leads"}))).await;
-    assert_refused(st, &v, "mrpopo without max_ref");
     let (st, v) = e.call(Who::Worker(DEV_A), "PATCH", &format!("/api/sessions/{DEV_B}/config"), Some(json!({"model": "sonnet"}))).await;
     assert_refused(st, &v, "peer");
     assert!(e.log_entries().is_empty(), "refusals are not changes: {:?}", e.log_entries());

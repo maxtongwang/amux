@@ -1,17 +1,15 @@
-//! mrpopo, the owner agent (maxtongwang/ai-config#160, piece d).
+//! mrpopo, the owner agent (maxtongwang/ai-config#160, piece d; structured grants).
 //!
-//! With a verified, SPECIFIC max_ref (one typed row naming both the target and
-//! the setting) mrpopo may make any non-secret change that was owner-only.
-//! Each delegable class is driven three ways:
-//! - allowed with a specific max_ref;
-//! - refused with an unspecific one (names the target, not the setting):
-//!   `max_ref_does_not_name_setting`;
-//! - refused with none: `max_ref_missing`.
+//! Every non-secret change that was owner-only is mrpopo's to ASK for: the
+//! server stores it as a pending grant (202 with a code and the exact
+//! sentence) and applies it only when Max approves, exactly once. Each
+//! delegable class is driven: request -> pending and unapplied -> Max types
+//! `amux grant <code>` in another lane -> applied.
 //!
-//! Hands-only changes are refused even with a specific max_ref: secret
-//! values, AMUX_CONTRACT_*, AMUX_PANE_PROMPT_HISTORY, the reserved names,
-//! mrpopo's own config, and the money cap / auto-approve spending limit.
-//! Leads and self never get these classes (delegation_matrix.rs).
+//! Hands-only changes never even become a grant: secret values,
+//! AMUX_CONTRACT_*, AMUX_PANE_PROMPT_HISTORY, the reserved names, mrpopo's own
+//! config, and the money cap / auto-approve spending limit. Leads and self
+//! never get these classes.
 
 mod delegation_support;
 
@@ -24,126 +22,95 @@ struct Class {
     path: String,
     body: Value,
     /// One typed row naming the target and the setting.
-    specific: String,
     /// Names the target only.
-    unspecific: String,
 }
 
 fn classes() -> Vec<Class> {
     let cfg = format!("/api/sessions/{DEV_A}/config");
-    let vague = format!("{DEV_A}: go ahead with what we discussed");
     vec![
         Class {
             name: "make lead",
             method: "PUT",
             path: "/api/scope".into(),
             body: scope_body("worker", DEV_A, "env", json!({"CC_TAGS": "dev,leads", "CC_ORCHESTRATOR": "1"})),
-            specific: format!("make {DEV_A} lead of dev"),
-            unspecific: vague.clone(),
         },
         Class {
             name: "leads rules",
             method: "PUT",
             path: "/api/scope".into(),
             body: scope_body("group", "leads", "rules", json!("Leads: report blockers first.")),
-            specific: "update the leads rules: report blockers first".into(),
-            unspecific: "leads: go ahead with what we discussed".into(),
         },
         Class {
             name: "leads membership",
             method: "PATCH",
             path: cfg.clone(),
             body: json!({"tags": "dev,leads"}),
-            specific: format!("add {DEV_A} to the leads group"),
-            unspecific: vague.clone(),
         },
         Class {
             name: "routing",
             method: "PATCH",
             path: cfg.clone(),
-            body: json!({"send_allow": OPS_A}),
-            specific: format!("set {DEV_A} send allow routing so it can message {OPS_A}"),
-            unspecific: vague.clone(),
+            body: json!({"send_allow": ""}),
         },
         Class {
             name: "yolo",
             method: "PATCH",
             path: cfg.clone(),
             body: json!({"toggle_yolo": true}),
-            specific: format!("turn on yolo for {DEV_A}"),
-            unspecific: vague.clone(),
         },
         Class {
             name: "external email",
             method: "PATCH",
             path: cfg.clone(),
             body: json!({"external_email_allowed": true}),
-            specific: format!("allow external email for {DEV_A}"),
-            unspecific: vague.clone(),
         },
         Class {
             name: "isolated",
             method: "PATCH",
             path: cfg.clone(),
             body: json!({"isolated": true}),
-            specific: format!("make {DEV_A} isolated"),
-            unspecific: vague.clone(),
         },
         Class {
             name: "gates",
             method: "PUT",
             path: "/api/scope".into(),
             body: scope_body("worker", DEV_A, "gates", json!({"review": true})),
-            specific: format!("set the gates config for {DEV_A}: review on"),
-            unspecific: vague.clone(),
         },
         Class {
             name: "connectors",
             method: "PUT",
             path: "/api/scope".into(),
             body: scope_body("worker", DEV_A, "connectors", json!({"google-gmail": true})),
-            specific: format!("enable gmail in the connectors for {DEV_A}"),
-            unspecific: vague.clone(),
         },
         Class {
             name: "outbound approval",
             method: "PUT",
             path: "/api/scope".into(),
             body: scope_body("worker", DEV_A, "env", json!({"AMUX_APPROVAL_TYPES": "budget"})),
-            specific: format!("set {DEV_A} outbound approval types to budget"),
-            unspecific: vague.clone(),
         },
         Class {
             name: "group config",
             method: "PATCH",
             path: "/api/groups/dev/config".into(),
             body: json!({"goal": "ship delegation"}),
-            specific: "set the dev group config goal to ship delegation".into(),
-            unspecific: "dev: go ahead with what we discussed".into(),
         },
         Class {
             name: "commit guard",
             method: "PATCH",
             path: "/api/settings/commit-guard".into(),
             body: json!({"enabled": false}),
-            specific: "turn off the commit guard".into(),
-            unspecific: "go ahead with what we discussed".into(),
         },
         Class {
             name: "task guard",
             method: "PATCH",
             path: "/api/settings/task-guard".into(),
             body: json!({"enabled": true}),
-            specific: "turn on the task guard".into(),
-            unspecific: "go ahead with what we discussed".into(),
         },
         Class {
             name: "default model",
             method: "PATCH",
             path: "/api/settings/default-model".into(),
             body: json!({"model": "sonnet"}),
-            specific: "set the default model to sonnet".into(),
-            unspecific: "go ahead with what we discussed".into(),
         },
         Class {
             // The real mutating route for browser-profile access is the
@@ -152,162 +119,114 @@ fn classes() -> Vec<Class> {
             method: "PUT",
             path: "/api/scope".into(),
             body: scope_body("worker", DEV_A, "env", json!({"AMUX_BROWSER_PROFILES_ALLOW": "review-profile"})),
-            specific: format!("allow browser profile review-profile for {DEV_A}"),
-            unspecific: vague.clone(),
+        },
+        Class {
+            name: "alerts config (ai-config #175)",
+            method: "PATCH",
+            path: "/api/alerts/config".into(),
+            body: json!({"phone": "+15550100"}),
         },
     ]
 }
 
-/// Each class in its own fresh home, every leg collected so one run names
-/// every class that misbehaves.
+/// Each class in its own fresh home.
 #[tokio::test]
-async fn each_delegable_class_needs_a_specific_max_ref() {
+async fn each_delegable_class_is_a_pending_grant_until_max_approves() {
     let mut failures = Vec::new();
     for i in 0..classes().len() {
         let c = classes().remove(i);
         let e = setup().await;
-        let t = now_s() - 60.0;
-
         let before = e.snapshot();
         let (st, v) = e.call(Who::Worker(MRPOPO), c.method, &c.path, Some(c.body.clone())).await;
-        if (st.as_u16(), v["code"].as_str()) != (403, Some("max_ref_missing")) {
-            failures.push(format!("{}: without max_ref expected 403 max_ref_missing, got {st} {v}", c.name));
+        if st.as_u16() != 202 || v["grant_code"].as_str().is_none() {
+            failures.push(format!("{}: expected 202 with a grant_code, got {st} {v}", c.name));
+            continue;
         }
-        e.seed_pane_prompt(MAX_PANE, &c.unspecific, t - 120.0);
-        let (st, v) = e.call(Who::Worker(MRPOPO), c.method, &c.path, Some(with_ref(c.body.clone(), max_ref(MAX_PANE, t - 120.0), "Max asked"))).await;
-        if (st.as_u16(), v["code"].as_str()) != (403, Some("max_ref_does_not_name_setting")) {
-            failures.push(format!("{}: unspecific max_ref expected 403 max_ref_does_not_name_setting, got {st} {v}", c.name));
-        }
+        let code = v["grant_code"].as_str().unwrap().to_string();
         if e.snapshot() != before {
-            failures.push(format!("{}: a refused leg wrote a file", c.name));
+            failures.push(format!("{}: a pending grant changed a file", c.name));
         }
-        if !e.log_entries().is_empty() {
-            failures.push(format!("{}: a refused leg was logged", c.name));
+        if e.grant_status(&code) != "pending" {
+            failures.push(format!("{}: grant {code} is {}, not pending", c.name, e.grant_status(&code)));
         }
-
-        e.seed_pane_prompt(MAX_PANE, &c.specific, t);
-        let (st, v) = e.call(Who::Worker(MRPOPO), c.method, &c.path, Some(with_ref(c.body.clone(), max_ref(MAX_PANE, t), "Max asked"))).await;
+        let (st, v) = e.type_in_pane(MAX_PANE, &format!("ok amux grant {code}")).await;
         if !st.is_success() {
-            failures.push(format!("{}: specific max_ref expected 2xx, got {st} {v}", c.name));
-        } else if e.log_entries().len() != 1 {
-            failures.push(format!("{}: allowed change logged {} entries", c.name, e.log_entries().len()));
+            failures.push(format!("{}: typing the code failed: {st} {v}", c.name));
+        }
+        if e.grant_status(&code) != "applied" {
+            failures.push(format!("{}: after Max typed the code the grant is {}", c.name, e.grant_status(&code)));
         }
     }
-    assert!(failures.is_empty(), "{} failing legs:\n{}", failures.len(), failures.join("\n"));
+    assert!(failures.is_empty(), "{} failing classes:\n{}", failures.len(), failures.join("\n"));
 }
 
+/// Hands-only: refused outright (403), never stored as a grant.
 #[tokio::test]
-async fn target_and_setting_must_be_in_the_same_typed_row() {
+async fn hands_only_changes_never_become_a_grant() {
     let e = setup().await;
-    let t = now_s() - 60.0;
-    e.seed_pane_prompt(MAX_PANE, &format!("about {DEV_A}"), t);
-    e.seed_pane_prompt(MAX_PANE, "turn on yolo", t + 5.0);
-    for at in [t, t + 5.0] {
-        let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &format!("/api/sessions/{DEV_A}/config"),
-            Some(with_ref(json!({"toggle_yolo": true}), max_ref(MAX_PANE, at), "Max asked"))).await;
-        assert_refused(st, &v, &format!("target and setting split across rows (cited {at})"));
-        assert!(v["code"].as_str().is_some_and(|c| c.starts_with("max_ref_")), "{v}");
-    }
-    assert!(!e.env_text(DEV_A).to_lowercase().contains("yolo"), "{}", e.env_text(DEV_A));
-}
-
-#[tokio::test]
-async fn setting_phrases_match_on_word_boundaries() {
-    let e = setup().await;
-    let t = now_s() - 60.0;
-    // "misleading" contains "lead" but does not ask to make a lead.
-    e.seed_pane_prompt(MAX_PANE, &format!("the {DEV_A} report is misleading"), t);
-    let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope",
-        Some(with_ref(scope_body("worker", DEV_A, "env", json!({"CC_TAGS": "dev,leads", "CC_ORCHESTRATOR": "1"})), max_ref(MAX_PANE, t), "Max asked"))).await;
-    assert_code(st, &v, "max_ref_does_not_name_setting", "'misleading' is not 'make lead'");
-    assert!(!e.env_text(DEV_A).contains("CC_ORCHESTRATOR"));
-}
-
-/// Refused for mrpopo even with a specific max_ref.
-#[tokio::test]
-async fn hands_only_changes_are_refused_even_with_a_specific_max_ref() {
-    let e = setup().await;
-    let t = now_s() - 60.0;
-    let cases: Vec<(&str, &str, String, Value, String)> = vec![
-        ("worker token", "PUT", "/api/scope".into(), scope_body("worker", DEV_A, "env", json!({"AMUX_WORKER_TOKEN": "review-x"})), format!("set {DEV_A} AMUX_WORKER_TOKEN worker token")),
-        ("credential", "PUT", "/api/scope".into(), scope_body("worker", DEV_A, "env", json!({"GITHUB_TOKEN": "review-x"})), format!("set {DEV_A} GITHUB_TOKEN credential")),
-        ("provider API key", "PATCH", "/api/settings/env".into(), json!({"ANTHROPIC_API_KEY": "review-x"}), "set the ANTHROPIC_API_KEY provider api key".into()),
-        ("contract", "PUT", "/api/scope".into(), scope_body("worker", DEV_A, "env", json!({"AMUX_CONTRACT_DONE": "1"})), format!("set {DEV_A} AMUX_CONTRACT_DONE contract")),
-        ("pane prompt history", "PUT", "/api/scope".into(), scope_body("worker", DEV_A, "env", json!({"AMUX_PANE_PROMPT_HISTORY": "0"})), format!("turn off {DEV_A} AMUX_PANE_PROMPT_HISTORY pane prompt history")),
-        ("money cap (worker)", "PUT", "/api/scope".into(), scope_body("worker", DEV_A, "env", json!({"AMUX_NEEDS_INPUT_AUTO_MONEY_CAP": "5000"})), format!("raise the money cap for {DEV_A} to 5000")),
-        ("money cap (global)", "PUT", "/api/scope".into(), scope_body("global", "", "env", json!({"AMUX_NEEDS_INPUT_AUTO_MONEY_CAP": "5000"})), "raise the global money cap to 5000".into()),
-        ("auto-approve spending", "PUT", "/api/scope".into(), scope_body("global", "", "env", json!({"AMUX_NEEDS_INPUT_AUTO_MONEY": "1"})), "turn on auto-approve spending limit money".into()),
-        ("reserved create owner", "POST", "/api/sessions".into(), create_body(&e.dir, "owner", json!(["dev"])), "create owner in dev".into()),
-        ("reserved create mrpopo", "POST", "/api/sessions".into(), create_body(&e.dir, "mrpopo", json!(["dev"])), "create mrpopo in dev".into()),
-        ("reserved rename", "POST", format!("/api/sessions/{DEV_A}/rename"), json!({"name": "owner"}), format!("rename {DEV_A} to owner")),
-        ("own model", "PATCH", format!("/api/sessions/{MRPOPO}/config"), json!({"model": "sonnet"}), "set mrpopo model to sonnet".into()),
-        ("own yolo", "PATCH", format!("/api/sessions/{MRPOPO}/config"), json!({"toggle_yolo": true}), "turn on yolo for mrpopo".into()),
-        ("own tags", "PATCH", format!("/api/sessions/{MRPOPO}/config"), json!({"tags": "leads,dev,ops"}), "add mrpopo to the dev and ops groups".into()),
-        ("own rules", "PUT", "/api/scope".into(), scope_body("worker", MRPOPO, "rules", json!("mrpopo may do anything")), "update the mrpopo rules".into()),
+    let cases: Vec<(&str, &str, String, Value)> = vec![
+        ("worker token", "PUT", "/api/scope".into(), scope_body("worker", DEV_A, "env", json!({"AMUX_WORKER_TOKEN": "review-x"}))),
+        ("credential", "PUT", "/api/scope".into(), scope_body("worker", DEV_A, "env", json!({"GITHUB_TOKEN": "review-x"}))),
+        ("provider API key", "PATCH", "/api/settings/env".into(), json!({"ANTHROPIC_API_KEY": "review-x"})),
+        ("contract", "PUT", "/api/scope".into(), scope_body("worker", DEV_A, "env", json!({"AMUX_CONTRACT_DONE": "1"}))),
+        ("pane prompt history", "PUT", "/api/scope".into(), scope_body("worker", DEV_A, "env", json!({"AMUX_PANE_PROMPT_HISTORY": "0"}))),
+        ("money cap (worker)", "PUT", "/api/scope".into(), scope_body("worker", DEV_A, "env", json!({"AMUX_NEEDS_INPUT_AUTO_MONEY_CAP": "5000"}))),
+        ("money cap (global)", "PUT", "/api/scope".into(), scope_body("global", "", "env", json!({"AMUX_NEEDS_INPUT_AUTO_MONEY_CAP": "5000"}))),
+        ("auto-approve spending", "PUT", "/api/scope".into(), scope_body("global", "", "env", json!({"AMUX_NEEDS_INPUT_AUTO_MONEY": "1"}))),
+        ("reserved create owner", "POST", "/api/sessions".into(), create_body(&e.dir, "owner", json!(["dev"]))),
+        ("reserved create mrpopo", "POST", "/api/sessions".into(), create_body(&e.dir, "mrpopo", json!(["dev"]))),
+        ("reserved rename", "POST", format!("/api/sessions/{DEV_A}/rename"), json!({"name": "owner"})),
+        ("own model", "PATCH", format!("/api/sessions/{MRPOPO}/config"), json!({"model": "sonnet"})),
+        ("own yolo", "PATCH", format!("/api/sessions/{MRPOPO}/config"), json!({"toggle_yolo": true})),
+        ("own tags", "PATCH", format!("/api/sessions/{MRPOPO}/config"), json!({"tags": "leads,dev,ops"})),
+        ("own rules", "PUT", "/api/scope".into(), scope_body("worker", MRPOPO, "rules", json!("mrpopo may do anything"))),
     ];
     let mut failures = Vec::new();
-    for (i, (name, method, path, body, text)) in cases.into_iter().enumerate() {
-        let at = t - i as f64;
-        e.seed_pane_prompt(MAX_PANE, &text, at);
+    for (name, method, path, body) in cases {
         let before = e.snapshot();
-        let (st, v) = e.call(Who::Worker(MRPOPO), method, &path, Some(with_ref(body, max_ref(MAX_PANE, at), "Max asked"))).await;
-        let code = v["code"].as_str().unwrap_or("");
-        if st.as_u16() != 403 || v["ok"] != json!(false) || code.is_empty() || MAX_REF_CODES.contains(&code) {
-            failures.push(format!("{name}: expected a non-max_ref 403, got {st} {v}"));
+        let (st, v) = e.call(Who::Worker(MRPOPO), method, &path, Some(body)).await;
+        if st.as_u16() != 403 || v["ok"] != json!(false) || v["code"].as_str().unwrap_or("").is_empty() || v.get("grant_code").is_some() {
+            failures.push(format!("{name}: expected a 403 and no grant, got {st} {v}"));
         }
         if e.snapshot() != before {
             failures.push(format!("{name}: refused request wrote a file"));
         }
     }
-    assert!(e.log_entries().is_empty(), "hands-only refusals are not logged as changes: {:?}", e.log_entries());
+    assert!(e.log_entries().is_empty(), "hands-only refusals are not logged: {:?}", e.log_entries());
     assert!(failures.is_empty(), "{} hands-only changes not refused:\n{}", failures.len(), failures.join("\n"));
 }
 
-/// The classes above are mrpopo's alone: a lead or self with the same
-/// specific max_ref is refused.
+/// The classes above are mrpopo's alone: a lead or self is refused, and no
+/// grant is created for them.
 #[tokio::test]
 async fn leads_and_self_never_get_mrpopos_classes() {
     let mut failures = Vec::new();
     for c in classes() {
         for who in [DEV_LEAD, DEV_A] {
             let e = setup().await;
-            let t = now_s() - 60.0;
-            e.seed_pane_prompt(who, &c.specific, t);
-            let (st, v) = e.call(Who::Worker(who), c.method, &c.path, Some(with_ref(c.body.clone(), max_ref(who, t), "Max asked"))).await;
-            let code = v["code"].as_str().unwrap_or("");
-            if st.as_u16() != 403 || MAX_REF_CODES.contains(&code) {
-                failures.push(format!("{} as {who}: expected a non-max_ref 403, got {st} {v}", c.name));
+            let (st, v) = e.call(Who::Worker(who), c.method, &c.path, Some(c.body.clone())).await;
+            if st.as_u16() != 403 || v.get("grant_code").is_some() {
+                failures.push(format!("{} as {who}: expected a 403 and no grant, got {st} {v}", c.name));
             }
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// mrpopo at the group and global layers: an explicit row keeps its phrase
-/// there; an owner-only key with no row is refused even with a max_ref.
+/// mrpopo at the group and global layers: an explicit row is a grant there
+/// too; an owner-only key with no row is refused and never a grant.
 #[tokio::test]
 async fn mrpopo_at_the_group_and_global_layers() {
-    let t = now_s() - 60.0;
-    // Group layer, explicit row (external email), naming the group and the setting.
-    let e = setup().await;
-    e.seed_pane_prompt(MAX_PANE, "allow external email for the dev group", t);
-    let body = with_ref(scope_body("group", "dev", "env", json!({"AMUX_EMAIL_EXTERNAL_ALLOW": "1"})), max_ref(MAX_PANE, t), "Max asked");
-    let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(body)).await;
-    assert_allowed(st, &v, "mrpopo group-layer external email with a specific max_ref");
-    // Global layer, explicit row: no target to name, the setting is enough.
-    let e = setup().await;
-    e.seed_pane_prompt(MAX_PANE, "allow external email for everyone", t);
-    let body = with_ref(scope_body("global", "", "env", json!({"AMUX_EMAIL_EXTERNAL_ALLOW": "1"})), max_ref(MAX_PANE, t), "Max asked");
-    let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(body)).await;
-    assert_allowed(st, &v, "mrpopo global-layer external email with a specific max_ref");
-    // No explicit row: refused on both layers even when Max named the key.
-    for level in ["group", "global"] {
+    for (level, name) in [("group", "dev"), ("global", "")] {
         let e = setup().await;
-        e.seed_pane_prompt(MAX_PANE, "set CC_SOMETHING_OWNER_ONLY for the dev group", t);
-        let name = if level == "group" { "dev" } else { "" };
-        let body = with_ref(scope_body(level, name, "env", json!({"CC_SOMETHING_OWNER_ONLY": "1"})), max_ref(MAX_PANE, t), "Max asked");
+        let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(scope_body(level, name, "env", json!({"AMUX_EMAIL_EXTERNAL_ALLOW": "1"})))).await;
+        let code = assert_grant_pending(st, &v, &format!("{level}-layer external email"));
+        let (st, v) = e.type_in_pane(MAX_PANE, &format!("amux grant {code}")).await;
+        assert_allowed(st, &v, "Max types the code");
+        assert_eq!(e.grant_status(&code), "applied", "{level}");
+
         let before = e.snapshot();
-        let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(body)).await;
+        let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(scope_body(level, name, "env", json!({"CC_SOMETHING_OWNER_ONLY": "1"})))).await;
         assert_code(st, &v, "delegation_not_allowed", &format!("{level}-layer key with no row"));
         assert_eq!(before, e.snapshot(), "{level}: nothing written");
     }
