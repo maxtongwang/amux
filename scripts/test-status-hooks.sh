@@ -562,4 +562,61 @@ else
   echo "skip hook native re-exec: this run is not a translated shell on arm64 hardware, so there is no Rosetta tax to remove"
 fi
 
+# Codex: its own events in ~/.codex/hooks.json (ai-config #131). No Notification (Codex has none;
+# `blocked` comes from the passive observer's PermissionRequest), the read router on Bash only (no
+# Read tool), no ask guard (owner-ask goal detection reads Claude transcripts), unrelated hooks kept.
+CODEX_HOOKS="$TMP/codex-hooks.json"
+printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Edit|Write","hooks":[{"type":"command","command":"~/.codex/scripts/worktree-guard.sh"}]}],
+  "Stop":[{"hooks":[{"type":"command","command":"python3 /x/.amux/native-status.py codex"}]}]}}' > "$CODEX_HOOKS"
+for _ in 1 2; do
+  /usr/bin/python3 scripts/hooks/install-claude-status-hooks.py --provider codex \
+    --settings "$CODEX_HOOKS" --hook-path '$HOME/.amux/hook-report.sh' >/dev/null
+done
+/usr/bin/python3 - "$CODEX_HOOKS" <<'PY'
+import json, sys
+hooks=json.load(open(sys.argv[1]))["hooks"]
+rows=[(e, g.get("matcher"), h.get("command","")) for e, gs in hooks.items() for g in gs for h in g.get("hooks",[])]
+reports={(e, c.split()[-2]) for e, _, c in rows if "hook-report.sh" in c}
+want={("SessionStart","subagent-reset"),("UserPromptSubmit","active"),("PostToolUse","active"),("Stop","idle"),
+      ("SubagentStart","subagent-start"),("SubagentStop","subagent-stop")}
+assert reports == want, reports
+assert sum("hook-report.sh" in c for _, _, c in rows) == 6, "a second install must not duplicate reports"
+assert "Notification" not in hooks
+guards=[(e, m) for e, m, c in rows if "large-read-guard.py" in c]
+assert guards == [("PreToolUse", "Bash")], guards
+assert not any("ask-guard.py" in c for _, _, c in rows)
+assert ("PreToolUse", "Edit|Write", "~/.codex/scripts/worktree-guard.sh") in rows
+assert ("Stop", None, "python3 /x/.amux/native-status.py codex") in rows
+print("ok   codex: six native report events, Bash read router, no Notification or ask guard, unrelated hooks kept, idempotent")
+PY
+if /usr/bin/python3 scripts/hooks/install-claude-status-hooks.py --provider codex --settings "$TMP/codex-ask.json" \
+  --hook-path '$HOME/.amux/hook-report.sh' --ask-guard-path '$HOME/.amux/hooks/ask-guard.py' 2>"$TMP/codex-ask.err"; then
+  echo "FAIL codex accepted an ask guard it cannot honour" >&2; exit 1
+fi
+grep -q "Claude transcripts only" "$TMP/codex-ask.err"
+[ ! -e "$TMP/codex-ask.json" ] || { echo "FAIL a refused codex install still wrote hooks.json" >&2; exit 1; }
+echo "ok   codex: the ask guard is refused with its reason and nothing is written"
+
+# Review finding (PR #6): with --provider codex and no --settings, the default destination must be Codex's
+# hooks.json (CODEX_HOME honoured), and Claude's settings must be left exactly as they were.
+for codex_home_mode in default custom; do
+  FAKE_HOME="$TMP/home-$codex_home_mode"; mkdir -p "$FAKE_HOME/.claude"
+  printf '%s\n' '{"hooks":{"Notification":[{"hooks":[{"type":"command","command":"bash \"$HOME/.amux/hook-report.sh\" blocked notification-hook"}]}]}}' > "$FAKE_HOME/.claude/settings.json"
+  cp "$FAKE_HOME/.claude/settings.json" "$TMP/claude-before.json"
+  if [ "$codex_home_mode" = custom ]; then want="$TMP/custom-codex/hooks.json"; ch="$TMP/custom-codex"; else want="$FAKE_HOME/.codex/hooks.json"; ch=""; fi
+  # An inherited CODEX_HOME must never reach the default case: it would point the installer at the
+  # caller's real Codex hooks (PR #6 review). The sentinel proves nothing outside the fixture is written.
+  SENTINEL="$TMP/inherited-codex"; mkdir -p "$SENTINEL"; printf '{"hooks":{}}\n' > "$SENTINEL/hooks.json"
+  if [ -n "$ch" ]; then
+    env CODEX_HOME="$ch" HOME="$FAKE_HOME" /usr/bin/python3 scripts/hooks/install-claude-status-hooks.py --provider codex >/dev/null
+  else
+    CODEX_HOME="$SENTINEL" env -u CODEX_HOME HOME="$FAKE_HOME" /usr/bin/python3 scripts/hooks/install-claude-status-hooks.py --provider codex >/dev/null
+  fi
+  [ "$(cat "$SENTINEL/hooks.json")" = '{"hooks":{}}' ] || { echo "FAIL the test wrote an inherited CODEX_HOME ($codex_home_mode)" >&2; exit 1; }
+  cmp -s "$FAKE_HOME/.claude/settings.json" "$TMP/claude-before.json" || { echo "FAIL --provider codex rewrote Claude's settings ($codex_home_mode)" >&2; exit 1; }
+  [ -f "$want" ] || { echo "FAIL --provider codex did not write $want" >&2; exit 1; }
+  /usr/bin/python3 -c 'import json,sys; h=json.load(open(sys.argv[1]))["hooks"]; assert "SubagentStart" in h and "Notification" not in h' "$want"
+done
+echo "ok   codex: with no --settings the default is Codex's hooks.json (CODEX_HOME honoured); Claude settings untouched"
+
 echo "ok   all shipped status-hook durability regressions passed"
