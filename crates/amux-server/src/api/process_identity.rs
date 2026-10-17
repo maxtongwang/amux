@@ -640,6 +640,73 @@ pub(crate) fn is_front_door(remote: SocketAddr, door: &FrontDoor) -> bool {
     }
 }
 
+/// One process's fd link targets, read lazily, or why they cannot be listed.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) type FdLinks<'a> = Result<Box<dyn Iterator<Item = String> + 'a>, std::io::ErrorKind>;
+
+/// The Linux scan over parsed `/proc/net/tcp{,6}` rows (local, remote, inode)
+/// and each process's fd links, separated so its cheaper reading is tested
+/// against the eager one on fixtures, on every platform.
+///
+/// Cheaper, same answer (round 10: the eager scan readlinked every fd of every
+/// process, chromium's included, and kept draw-realtime p95 near its budget
+/// on Linux CI): a process's links are read only until its first link to this
+/// connection (it is then a holder, and front-door membership only matters
+/// when there are no holders); when the tables show neither this connection
+/// nor a front-door socket, no links are read at all and only listability is
+/// checked (uninspectable processes still matter for the forward test).
+/// Holders and uninspectable processes are exactly the eager scan's; the
+/// front-door list is too whenever there are no holders, the only case in
+/// which `decide` reads it.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn scan_procs<'a>(
+    client: SocketAddr,
+    server: SocketAddr,
+    door: &FrontDoor,
+    rows: &[(SocketAddr, SocketAddr, u64)],
+    procs: impl Iterator<Item = (u32, FdLinks<'a>)>,
+) -> Scan {
+    use std::collections::HashSet;
+    let target: HashSet<u64> = rows.iter().filter(|(l, r, _)| *l == client && *r == server).map(|(_, _, i)| *i).collect();
+    let doors: HashSet<u64> = rows.iter().filter(|(_, r, _)| is_front_door(*r, door)).map(|(_, _, i)| *i).collect();
+    let inode = |link: &str| link.strip_prefix("socket:[")?.strip_suffix(']')?.parse::<u64>().ok();
+    let mut out = Scan::default();
+    for (pid, links) in procs {
+        let links = match links {
+            Ok(links) => links,
+            Err(std::io::ErrorKind::PermissionDenied) => {
+                out.uninspectable.push(pid);
+                continue;
+            }
+            Err(_) => continue,
+        };
+        if target.is_empty() && doors.is_empty() {
+            continue;
+        }
+        let mut at_door = false;
+        let mut holds = false;
+        for link in links {
+            let Some(i) = inode(&link) else { continue };
+            if target.contains(&i) {
+                holds = true;
+                break;
+            }
+            if doors.contains(&i) {
+                at_door = true;
+                if target.is_empty() {
+                    break;
+                }
+            }
+        }
+        if holds {
+            out.holders.push(pid);
+        } else if at_door {
+            out.front_door.push(pid);
+        }
+    }
+    out
+}
+
 type Shared = Arc<dyn PeerResolver>;
 
 fn resolver_slot() -> &'static RwLock<Shared> {
@@ -1212,27 +1279,16 @@ mod linux {
 
     pub(crate) fn scan(client: SocketAddr, server: SocketAddr, door: &super::FrontDoor) -> Result<super::Scan, LookupError> {
         let rows = sockets()?;
-        let target: HashSet<u64> = rows.iter().filter(|(l, r, _)| *l == client && *r == server).map(|(_, _, i)| *i).collect();
-        let doors: HashSet<u64> = rows.iter().filter(|(_, r, _)| super::is_front_door(*r, door)).map(|(_, _, i)| *i).collect();
-        let mut out = super::Scan::default();
         let procs = std::fs::read_dir("/proc").map_err(|e| LookupError::Failed(e.to_string()))?;
-        for entry in procs.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
-            let Ok(pid) = name.parse::<u32>() else { continue };
-            match socket_inodes(&name) {
-                Ok(inodes) => {
-                    if !target.is_disjoint(&inodes) {
-                        out.holders.push(pid);
-                    }
-                    if !doors.is_disjoint(&inodes) {
-                        out.front_door.push(pid);
-                    }
-                }
-                Err(std::io::ErrorKind::PermissionDenied) => out.uninspectable.push(pid),
-                Err(_) => {}
-            }
-        }
-        Ok(out)
+        let entries = procs.flatten().filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            let links: super::FdLinks<'static> = std::fs::read_dir(format!("/proc/{pid}/fd")).map_err(|e| e.kind()).map(|fds| {
+                Box::new(fds.flatten().filter_map(|fd| std::fs::read_link(fd.path()).ok()).map(|l| l.to_string_lossy().into_owned()))
+                    as Box<dyn Iterator<Item = String>>
+            });
+            Some((pid, links))
+        });
+        Ok(super::scan_procs(client, server, door, &rows, entries))
     }
 
     pub(crate) fn holds(pid: u32, client: SocketAddr, server: SocketAddr) -> bool {
@@ -1419,6 +1475,84 @@ mod tests {
         assert!(!is_front_door(a("100.85.233.44:443"), &front_door_for(&Ok(vec![ip("127.0.0.1")]))));
         // The real interface list reads on this host.
         assert!(own_addresses().is_ok_and(|v| v.iter().any(|i| i.is_loopback())), "loopback is an own address");
+    }
+
+    /// The eager Linux scan this replaced: every link of every listable
+    /// process, then set intersections. Kept here as the reference.
+    fn eager_scan(client: SocketAddr, server: SocketAddr, door: &FrontDoor, rows: &[(SocketAddr, SocketAddr, u64)],
+                  procs: &[(u32, Result<Vec<&str>, std::io::ErrorKind>)]) -> Scan {
+        use std::collections::HashSet;
+        let target: HashSet<u64> = rows.iter().filter(|(l, r, _)| *l == client && *r == server).map(|(_, _, i)| *i).collect();
+        let doors: HashSet<u64> = rows.iter().filter(|(_, r, _)| is_front_door(*r, door)).map(|(_, _, i)| *i).collect();
+        let mut out = Scan::default();
+        for (pid, links) in procs {
+            match links {
+                Ok(links) => {
+                    let inodes: HashSet<u64> = links.iter()
+                        .filter_map(|l| l.strip_prefix("socket:[")?.strip_suffix(']')?.parse().ok()).collect();
+                    if !target.is_disjoint(&inodes) { out.holders.push(*pid); }
+                    if !doors.is_disjoint(&inodes) { out.front_door.push(*pid); }
+                }
+                Err(std::io::ErrorKind::PermissionDenied) => out.uninspectable.push(*pid),
+                Err(_) => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_cheaper_linux_scan_finds_what_the_eager_scan_found() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let (client, server) = (a("127.0.0.1:50000"), a("127.0.0.1:8824"));
+        let door = FrontDoor::Own(vec!["100.85.233.44".parse().unwrap()]);
+        let rows = vec![
+            (client, server, 11),                              // this connection
+            (a("127.0.0.1:50000"), a("192.168.1.207:8824"), 12), // same client end, other server end
+            (a("127.0.0.1:50001"), a("100.85.233.44:443"), 13),  // a front-door socket
+            (a("127.0.0.1:50002"), a("127.0.0.1:8824"), 14),     // another connection
+        ];
+        let procs: Vec<(u32, Result<Vec<&str>, std::io::ErrorKind>)> = vec![
+            (10, Ok(vec!["/dev/null", "socket:[14]", "socket:[11]", "pipe:[3]"])), // holder, link late
+            (20, Ok(vec!["socket:[12]"])),                                          // other server end
+            (30, Ok(vec!["socket:[13]", "socket:[11]"])),                           // door and holder
+            (40, Ok(vec!["socket:[13]"])),                                          // door only
+            (50, Err(std::io::ErrorKind::PermissionDenied)),                         // another uid
+            (60, Err(std::io::ErrorKind::NotFound)),                                 // exited
+            (70, Ok(vec![])),
+        ];
+        let reads = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let lazy = |procs: &[(u32, Result<Vec<&'static str>, std::io::ErrorKind>)], reads: Arc<std::sync::atomic::AtomicU32>| {
+            procs.iter().map(move |(pid, l)| {
+                let reads = reads.clone();
+                let links: FdLinks<'static> = l.clone().map(|v| Box::new(v.into_iter().map(move |x| {
+                    reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    x.to_string()
+                })) as Box<dyn Iterator<Item = String>>);
+                (*pid, links)
+            }).collect::<Vec<_>>()
+        };
+        let total_links: u32 = procs.iter().filter_map(|(_, l)| l.as_ref().ok()).map(|v| v.len() as u32).sum();
+        // With holders: the same holders and uninspectable set, fewer link reads.
+        let cheap = scan_procs(client, server, &door, &rows, lazy(&procs, reads.clone()).into_iter());
+        let eager = eager_scan(client, server, &door, &rows, &procs);
+        assert_eq!((cheap.holders.clone(), cheap.uninspectable.clone()), (eager.holders.clone(), eager.uninspectable.clone()));
+        assert_eq!(cheap.holders, vec![10, 30]);
+        assert!(reads.load(std::sync::atomic::Ordering::SeqCst) < total_links, "stopped at each holder's hit");
+        // Without holders (another server end nobody's connection matches):
+        // the front-door list is the eager scan's too.
+        let lone = a("127.0.0.1:59999");
+        let cheap = scan_procs(lone, server, &door, &rows, lazy(&procs, Arc::default()).into_iter());
+        let eager = eager_scan(lone, server, &door, &rows, &procs);
+        assert_eq!(cheap, eager);
+        assert_eq!(cheap.front_door, vec![30, 40]);
+        // Nothing in the tables to look for: no links read, listability still
+        // recorded (the forward test needs the uninspectable set).
+        let reads = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let none = FrontDoor::Own(vec![]);
+        let cheap = scan_procs(lone, server, &none, &rows, lazy(&procs, reads.clone()).into_iter());
+        assert_eq!(cheap, eager_scan(lone, server, &none, &rows, &procs));
+        assert_eq!(cheap.uninspectable, vec![50]);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0, "no readlinks when nothing can match");
     }
 
     /// Fake lookups for the shipped decision.
