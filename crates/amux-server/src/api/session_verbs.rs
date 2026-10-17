@@ -26599,7 +26599,7 @@ async fn post_dispatch(
         },
         "send" => send_post_detached(state, name, headers, body).await,
         "instructions" => instructions_post_verb(state, name, body).await,
-        "keys" => keys_verb(name, body).await,
+        "keys" => keys_verb(name, headers, body).await,
         "resize" => resize_verb(name, body).await,
         // "agent-nav" DELETED (ARE-7): it drove Claude Code's subagents panel
         // by pane-verified keystrokes, keyed on a "⏺ main" row the TUI no
@@ -26656,6 +26656,9 @@ async fn post_dispatch(
                 return jresp(StatusCode::CONFLICT, json!({"ok": false, "error": reason}));
             }
             let prompt = body_str(body, "prompt");
+            if !prompt.is_empty() {
+                if let Some(refusal) = worker_start_prompt_refusal(name, headers) { return refusal; }
+            }
             update_meta(name, &[("boot_start_scheduled", json!(true))]);
             if !prompt.is_empty() {
                 let queued = queue_boot_prompt(state, name, &prompt, SendOrigin::Owner).await;
@@ -26758,8 +26761,11 @@ async fn post_dispatch(
             )
         }
         "clear" => clear_verb(name).await,
-        "duplicate" => duplicate_verb(state, name, body),
-        "clone" => clone_post(state, name, body).await,
+        "duplicate" => duplicate_verb(state, name, headers, body),
+        "clone" => {
+            if let Some(refusal) = membership_patch_refusal(headers, copy_carries_authority(name)) { return refusal; }
+            clone_post(state, name, body).await
+        }
         "archive" => {
             if !session_destructive_allowed(state, headers) {
                 return jresp(
@@ -28680,7 +28686,8 @@ pub(crate) async fn resize_verb(name: &str, body: &Value) -> Response {
 /// `keys` as a callable verb, so the promoted `/api/workers/{id}/keys`
 /// route and the legacy `/api/sessions/{name}/keys` spelling run ONE
 /// implementation instead of a route alias and a re-implementation (AF-288).
-pub(crate) async fn keys_verb(name: &str, body: &Value) -> Response {
+pub(crate) async fn keys_verb(name: &str, headers: &HeaderMap, body: &Value) -> Response {
+    if let Some(refusal) = worker_peer_control_refusal(name, headers, "keys") { return refusal; }
     let keys = body_str(body, "keys");
     if keys.is_empty() {
         return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing 'keys'"}));
@@ -30028,7 +30035,10 @@ pub(crate) async fn peek_verb(state: &AppState, name: &str, qs: &[(String, Strin
 /// duplicate existing as an env file the worker store cannot see. A second
 /// implementation of that ordering is a second place for it to be wrong, on the
 /// error path, where nobody looks.
-pub(crate) fn duplicate_verb(state: &AppState, name: &str, body: &Value) -> Response {
+pub(crate) fn duplicate_verb(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
+    // A copy inherits the source's groups (env file and store row), so a worker
+    // duplicating a lead would mint a worker inside the lead's groups.
+    if let Some(refusal) = membership_patch_refusal(headers, copy_carries_authority(name)) { return refusal; }
     let new_name = body_str(body, "new_name").trim().to_string();
     if new_name.is_empty() {
         return jresp(
@@ -31770,7 +31780,7 @@ pub(crate) async fn report_post(
 // ---------------------------------------------------------------------------
 
 async fn patch_dispatch(state: &AppState, name: &str, action: &str, body: &Value, headers: &HeaderMap) -> Response {
-    if let Some(refusal) = membership_patch_refusal(headers, body.get("tags").is_some()) { return refusal; }
+    if let Some(refusal) = membership_patch_refusal(headers, names_messaging_authority(body)) { return refusal; }
     match action {
         "commit-guard" => commit_guard_patch_verb(name, body),
         "config" => config_patch(state, name, body).await,
@@ -32823,6 +32833,87 @@ async fn apply_live_config_change(
     }
 }
 
+/// THE membership rule: a worker-originated request may not set or change a
+/// worker's messaging authority. Every path that writes group membership calls
+/// this one predicate, so the rule and its error code have one definition.
+///
+/// Messaging authority is group membership (`CC_TAGS`, `_amux_workers.group`)
+/// plus the two settings that act as membership of every group: the chat
+/// worker type, which speaks for the owner (`chat_speaks_for_owner`), and a
+/// group's open-inbound switch. `membership_named` is the caller's statement
+/// that the request would set one of those.
+///
+/// STRICT, NOT SUBSET (fix/worker-membership-create). A worker cannot place a
+/// new or existing worker even in groups it already belongs to: the PATCH rule
+/// this generalises refused any worker tag edit, and a "subset" rule would let
+/// a worker mint unbounded same-group identities, each a fresh actor inside the
+/// boundary. Owners, the dashboard and verified human members are unaffected,
+/// and server-internal spawns (project leads/executors) never reach here
+/// because their groups come from owner-configured project policy.
+pub(crate) fn membership_patch_refusal(headers: &HeaderMap, membership_named: bool) -> Option<Response> {
+    membership_refusal_body(headers, membership_named).map(|body| jresp(StatusCode::FORBIDDEN, body))
+}
+
+/// [`membership_patch_refusal`]'s decision and 403 body, for a handler whose
+/// return type is not a `Response`.
+pub(crate) fn membership_refusal_body(headers: &HeaderMap, membership_named: bool) -> Option<Value> {
+    if !membership_named || hdr_worker(headers).is_empty() || super::org::local_member_actor(headers).is_some() { return None; }
+    tracing::warn!(verdict="worker_group_membership_refused", measured=true, n_considered=1,
+        worker = %hdr_worker(headers),
+        "worker cannot widen messaging authority by editing group membership");
+    Some(json!({"ok":false,"code":"worker_group_membership_refused",
+        "error":"Group membership changes require direct owner input."}))
+}
+
+/// The worker this request speaks for, or empty for the owner/dashboard and
+/// verified human members (the same attribution as the membership rule).
+fn worker_origin(headers: &HeaderMap) -> String {
+    if super::org::local_member_actor(headers).is_some() { return String::new(); }
+    hdr_worker(headers)
+}
+
+/// A worker driving ANOTHER worker's pane (`keys`) is input across the same
+/// boundary as `send`: refused outside a shared group with the send gate's
+/// own predicate and code. Owner input and a worker's own pane are untouched.
+pub(crate) fn worker_peer_control_refusal(target: &str, headers: &HeaderMap, verb: &str) -> Option<Response> {
+    let origin = worker_origin(headers);
+    if origin.is_empty() || origin == target { return None; }
+    let reason = cross_group_send_ok(&origin, target).err()?;
+    tracing::warn!(origin = %origin, target, verb, verdict = "worker_group_boundary", measured = true,
+        n_considered = 1, "worker pane control refused outside a shared group");
+    Some(jresp(StatusCode::FORBIDDEN, json!({"ok": false, "code": "worker_group_boundary", "error": reason})))
+}
+
+/// A `/start` prompt is queued as OWNER input with no origin stamp, so a
+/// worker may attach one only when starting itself. Peers are reached through
+/// `send`, which stamps the origin and applies the group gate.
+fn worker_start_prompt_refusal(target: &str, headers: &HeaderMap) -> Option<Response> {
+    let origin = worker_origin(headers);
+    if origin.is_empty() || origin == target { return None; }
+    tracing::warn!(origin = %origin, target, verdict = "worker_start_prompt_refused", measured = true,
+        n_considered = 1, "a worker tried to deliver a start prompt (owner input) to another worker");
+    Some(jresp(StatusCode::FORBIDDEN, json!({"ok": false, "code": "worker_start_prompt_refused",
+        "error": format!("a start prompt is owner input; {origin} may start {target} without one and use send, which stamps the origin")})))
+}
+
+/// Whether a request body asks for the chat worker type, which carries the
+/// owner's cross-group reach (see [`membership_patch_refusal`]).
+pub(crate) fn requests_chat_type(body: &Value) -> bool {
+    body.get("worker_type").and_then(Value::as_str).map(str::trim) == Some("chat")
+}
+
+/// Whether a config-style body names messaging authority: a `tags` edit of any
+/// shape (clearing counts, as before) or a switch to the chat worker type.
+pub(crate) fn names_messaging_authority(body: &Value) -> bool {
+    body.get("tags").is_some() || requests_chat_type(body)
+}
+
+/// Whether a copy of `source` (duplicate/clone) would carry messaging
+/// authority: any group membership, or the chat worker type.
+fn copy_carries_authority(source: &str) -> bool {
+    !lane_groups(source).is_empty() || crate::api::worker_exec::worker_type_of(source).as_str() == "chat"
+}
+
 /// Every config write drops the cached session list (AMUX-2926).
 ///
 /// A WRAPPER, not a call at each return: `config_patch_inner` returns from a
@@ -32835,14 +32926,6 @@ async fn apply_live_config_change(
 /// several branches write one field and then reject a second. Clearing a cache
 /// that did not need clearing costs one rebuild; NOT clearing one that did is
 /// the bug this fixes.
-pub(crate) fn membership_patch_refusal(headers: &HeaderMap, membership_named: bool) -> Option<Response> {
-    if !membership_named || hdr_worker(headers).is_empty() || super::org::local_member_actor(headers).is_some() { return None; }
-    tracing::warn!(verdict="worker_group_membership_refused", measured=true, n_considered=1,
-        "worker cannot widen messaging authority by editing group membership");
-    Some(jresp(StatusCode::FORBIDDEN,json!({"ok":false,"code":"worker_group_membership_refused",
-        "error":"Group membership changes require direct owner input."})))
-}
-
 pub(crate) async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
     let out = config_patch_inner(state, name, body).await;
     crate::api::sessions_legacy::invalidate_sessions_cache();

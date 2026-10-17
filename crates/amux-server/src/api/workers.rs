@@ -583,7 +583,15 @@ fn parse_permissions(raw: &[String]) -> Result<Vec<String>, String> {
 /// only cold when nobody is looking is how a passing test and a broken
 /// product trade places. Wrapper, not per-return calls, for the same reason
 /// as config_patch: a dozen exits, and the next one added would miss it.
-pub async fn create_worker(state: State<AppState>, body: Json<CreateWorkerBody>) -> Response {
+pub async fn create_worker(
+    state: State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: Json<CreateWorkerBody>,
+) -> Response {
+    let authority = body.group.is_some() || body.worker_type.as_deref().map(str::trim) == Some("chat");
+    if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(&headers, authority) {
+        return refusal;
+    }
     let out = create_worker_inner(state, body).await;
     crate::api::sessions_legacy::invalidate_sessions_cache();
     out
@@ -2190,7 +2198,7 @@ pub async fn config_worker(
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
-    if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(&headers, body.get("tags").is_some()) { return refusal; }
+    if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(&headers, crate::api::session_verbs::names_messaging_authority(&body)) { return refusal; }
     crate::api::session_verbs::config_patch(&state, &name, &body).await
 }
 
@@ -2314,6 +2322,7 @@ pub async fn resize_worker(
 pub async fn keys_worker(
     State(state): State<AppState>,
     Path(key): Path<String>,
+    headers: axum::http::HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Response {
     let name = match resolve_key(&state, key).await {
@@ -2324,7 +2333,7 @@ pub async fn keys_worker(
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
-    crate::api::session_verbs::keys_verb(&name, &body).await
+    crate::api::session_verbs::keys_verb(&name, &headers, &body).await
 }
 
 /// `POST /api/workers/{id}/duplicate` — copy a worker's env file and register
@@ -2336,6 +2345,7 @@ pub async fn keys_worker(
 pub async fn duplicate_worker(
     State(state): State<AppState>,
     Path(key): Path<String>,
+    headers: axum::http::HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Response {
     let store = state.store.clone();
@@ -2355,7 +2365,7 @@ pub async fn duplicate_worker(
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
-    crate::api::session_verbs::duplicate_verb(&state, &resolved, &body)
+    crate::api::session_verbs::duplicate_verb(&state, &resolved, &headers, &body)
 }
 
 #[cfg(test)]
@@ -2641,6 +2651,135 @@ mod tests {
         let (status,_,after)=send(&app,"PATCH",&format!("/api/workers/{id}"),Some(json!({"group":new_group.as_str()}))).await;
         assert_eq!(status,StatusCode::OK,"owner control: {after}");
         assert_eq!(after["group"],new_group.as_str());
+    }
+
+    // ---- fix/worker-membership-create: every membership path -------------
+
+    const MEMBERSHIP_CODE: &str = "worker_group_membership_refused";
+
+    /// A fleet of plain env-file workers in a temp home: `dev-a` (group dev),
+    /// `lead` (group leads) and `dev-b` (group dev).
+    fn membership_fleet(home: &std::path::Path) {
+        let s = home.join("sessions");
+        std::fs::create_dir_all(&s).unwrap();
+        for (n, t) in [("dev-a", "dev"), ("lead", "leads"), ("dev-b", "dev")] {
+            std::fs::write(s.join(format!("{n}.env")), format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{t}\"\n")).unwrap();
+        }
+    }
+
+    /// The reported bug. A worker-originated POST /api/sessions naming groups
+    /// created the worker inside them; it is now refused with PATCH config's
+    /// code and nothing is written. The owner's identical request still
+    /// creates the worker with its groups (the control that lets this fail).
+    #[tokio::test]
+    async fn worker_session_create_cannot_name_groups_but_owner_can() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        membership_fleet(home.path());
+        let (app, _db) = app();
+        let dir = home.path().join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = |name: &str| json!({"name": name, "dir": dir.to_str().unwrap(), "tags": ["leads"], "start": false});
+        for shape in [json!(["leads"]), json!("leads")] {
+            let mut b = body("minted");
+            b["tags"] = shape;
+            let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(b), &[("X-Amux-Session", "dev-a")]).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "worker create with tags: {v}");
+            assert_eq!(v["code"], MEMBERSHIP_CODE, "{v}");
+            assert!(!home.path().join("sessions/minted.env").exists(), "refused create still wrote an env file");
+        }
+        let (st, _, v) = send_with(&app, "POST", "/api/sessions",
+            Some(json!({"name": "chatty", "dir": dir.to_str().unwrap(), "worker_type": "chat", "start": false})),
+            &[("X-Amux-Worker", "dev-a")]).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(MEMBERSHIP_CODE)), "chat type speaks for the owner: {v}");
+        // A worker may still create an ungrouped worker.
+        let (st, _, v) = send_with(&app, "POST", "/api/sessions",
+            Some(json!({"name": "plain", "dir": dir.to_str().unwrap(), "start": false})), &[("X-Amux-Session", "dev-a")]).await;
+        assert!(st.is_success(), "ungrouped worker create: {v}");
+        // Owner control.
+        let (st, _, v) = send(&app, "POST", "/api/sessions", Some(body("owned"))).await;
+        assert!(st.is_success(), "owner create with tags: {v}");
+        assert_eq!(crate::api::session_verbs::lane_groups("owned").into_iter().collect::<Vec<_>>(), vec!["leads".to_string()]);
+    }
+
+    /// `POST /api/workers` with a group, a config switch to the chat type,
+    /// duplicate/clone of a grouped worker, a worker-layer scope write of a
+    /// membership key, and both instance-config applies: each is refused for
+    /// a worker with the shared code, and each has an owner control.
+    #[tokio::test]
+    async fn every_membership_path_refuses_worker_origin_with_one_code() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        membership_fleet(home.path());
+        let (app, _db) = app();
+        let worker = [("X-Amux-Session", "dev-a")];
+        let grp = GroupId::from_ulid(ulid::Ulid::new());
+        let cases: Vec<(&str, String, Value)> = vec![
+            ("POST", "/api/workers".into(), json!({"display_name": "w-group", "cwd": "/tmp/w", "group": grp.as_str()})),
+            ("POST", "/api/workers".into(), json!({"display_name": "w-chat", "cwd": "/tmp/w", "worker_type": "chat"})),
+            ("PATCH", "/api/sessions/dev-a/config".into(), json!({"worker_type": "chat"})),
+            ("POST", "/api/sessions/lead/duplicate".into(), json!({"new_name": "lead-twin"})),
+            ("POST", "/api/sessions/lead/clone".into(), json!({"new_name": "lead-clone"})),
+            ("POST", "/api/sessions/dev-a/duplicate".into(), json!({"new_name": "self-twin"})),
+            ("PUT", "/api/scope".into(), json!({"level": "worker", "name": "dev-a", "capability": "env", "value": {"CC_TAGS": "dev,leads"}})),
+            ("PUT", "/api/scope".into(), json!({"level": "worker", "name": "dev-a", "capability": "env", "value": "CC_TAGS=leads\n"})),
+            ("PUT", "/api/scope".into(), json!({"level": "worker", "name": "dev-a", "capability": "env", "value": {"CC_WORKER_TYPE": "chat"}})),
+            ("POST", "/api/env/apply".into(), json!({"workers": [{"name": "env-minted", "groups": ["leads"]}]})),
+            ("PUT", "/api/config/apply".into(), json!({"workers": [{"name": "iac-minted", "tags": ["leads"]}]})),
+        ];
+        for (m, path, body) in &cases {
+            let (st, _, v) = send_with(&app, m, path, Some(body.clone()), &worker).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{m} {path} {body}: {v}");
+            assert_eq!(v["code"], MEMBERSHIP_CODE, "{m} {path}: {v}");
+        }
+        // X-Amux-Worker alone used to read as the human on /api/config/apply.
+        let (st, _, v) = send_with(&app, "PUT", "/api/config/apply",
+            Some(json!({"workers": [{"name": "iac-minted", "tags": ["leads"]}]})), &[("X-Amux-Worker", "dev-a")]).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(MEMBERSHIP_CODE)), "{v}");
+        for n in ["lead-twin", "lead-clone", "self-twin", "env-minted", "iac-minted"] {
+            assert!(!home.path().join(format!("sessions/{n}.env")).exists(), "{n} was written despite the refusal");
+        }
+        assert_eq!(crate::api::session_verbs::lane_groups("dev-a").into_iter().collect::<Vec<_>>(), vec!["dev".to_string()]);
+        // Non-membership keys in the worker's own layer still write.
+        let (st, _, v) = send_with(&app, "PUT", "/api/scope",
+            Some(json!({"level": "worker", "name": "dev-a", "capability": "env", "value": {"CC_DESC": "ok"}})), &worker).await;
+        assert_eq!(st, StatusCode::OK, "own-layer non-membership write: {v}");
+        // A worker may dry-run an env plan.
+        let (st, _, v) = send_with(&app, "POST", "/api/env/apply?dry_run=1",
+            Some(json!({"workers": [{"name": "env-minted", "groups": ["leads"]}]})), &worker).await;
+        assert_eq!(st, StatusCode::OK, "worker dry-run: {v}");
+        // Owner controls.
+        let (st, _, v) = send(&app, "POST", "/api/sessions/lead/duplicate", Some(json!({"new_name": "lead-twin"}))).await;
+        assert_eq!(st, StatusCode::OK, "owner duplicate: {v}");
+        let (st, _, v) = send(&app, "PUT", "/api/scope",
+            Some(json!({"level": "worker", "name": "dev-a", "capability": "env", "value": {"CC_TAGS": "dev,leads"}}))).await;
+        assert_eq!(st, StatusCode::OK, "owner scope membership write: {v}");
+        let (st, _, v) = send(&app, "POST", "/api/workers",
+            Some(json!({"display_name": "w-group", "cwd": "/tmp/w", "group": grp.as_str()}))).await;
+        assert_eq!(st, StatusCode::CREATED, "owner create with group: {v}");
+    }
+
+    /// Pane control and owner-attributed start prompts across the boundary:
+    /// `keys` into an outside-group worker is refused with the send gate's
+    /// code on both spellings; a start prompt into another worker is refused
+    /// (it is unstamped owner input). Same-group keys reach the verb.
+    #[tokio::test]
+    async fn worker_pane_control_and_start_prompts_respect_the_group_boundary() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        membership_fleet(home.path());
+        let (app, _db) = app();
+        let worker = [("X-Amux-Session", "dev-a")];
+        for path in ["/api/sessions/lead/keys", "/api/workers/lead/keys"] {
+            let (st, _, v) = send_with(&app, "POST", path, Some(json!({"keys": "y"})), &worker).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "{path}: {v}");
+        }
+        let (st, _, v) = send_with(&app, "POST", "/api/sessions/dev-b/keys", Some(json!({"keys": "y"})), &worker).await;
+        assert_ne!(st, StatusCode::FORBIDDEN, "same-group keys must reach the verb: {v}");
+        let (st, _, v) = send_with(&app, "POST", "/api/sessions/lead/start", Some(json!({"prompt": "do it"})), &worker).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_start_prompt_refused")), "{v}");
+        let (st, _, v) = send_with(&app, "POST", "/api/sessions/dev-b/start", Some(json!({"prompt": "do it"})), &worker).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_start_prompt_refused")), "same group too: {v}");
     }
 
     // ---- RR-0034 test list ----------------------------------------------
