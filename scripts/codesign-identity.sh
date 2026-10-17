@@ -9,7 +9,8 @@ usage() { echo "usage: $0 --owner-provision | --keychain PATH"; }
 if [ "${1:-}" = --help ]; then usage; exit 0; fi
 if [ "${1:-}" = --owner-provision ] && [ "$#" -eq 1 ]; then
   cat <<'OWNER'
-Owner step (run once in an interactive Terminal; the password stays out of shell history):
+Owner step: an agent opens a Terminal window running scripts/codesign-identity-setup.sh
+(it asks only for the Mac password and verifies the result). Equivalent commands:
 bash <<'PROVISION'
 set -euo pipefail
 umask 077

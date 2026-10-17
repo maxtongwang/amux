@@ -240,9 +240,15 @@ ScheduleWakeup, or one delay sized to the job. (AF-396)
 
 The macOS auto-builder signs each staged `amux-server-rs` with the local
 `amux local code signing` certificate and identifier `com.amux.server-rs` before
-activation. `bash scripts/codesign-identity.sh --owner-provision` prints the
-one-time owner step and exits 3. Builders and tests only use disposable
-keychains. The builder never provisions an identity itself.
+activation. The one-time owner step is ONE script,
+`scripts/codesign-identity-setup.sh`: at a time Max chooses, an agent opens a
+Terminal window running it. It asks only for his Mac password, creates the
+identity in the login keychain (no trust settings are written), verifies a
+test signature, is safe to rerun, and ends by printing the Full Disk Access
+switch to flip for `amux-server-rs`. No agent runs it unattended (it refuses
+without a terminal). Builders and tests only use disposable keychains
+(`scripts/test-codesign-identity-setup.sh`); the builder never provisions an
+identity itself.
 
 Until the identity exists, the builder emits
 `verdict=codesign_identity_missing` once per build and continues adopting the
