@@ -758,12 +758,22 @@ for (const zoom of ['130', '80']) {
 // Every tab and device writes one recents file. A tab used to write only its
 // own list, so a drawing another tab had opened vanished from Recent (the
 // draw-realtime clients erased this file's Alpha entry in CI).
+//
+// This test owns its recents file. The real one is server-wide (data dir), at
+// most 12 entries, and every other draw spec in a parallel worker writes it, so
+// their newer entries pushed "OtherTab" past the cap or replaced the file
+// between this test's write and its check (main d5924f12 shard 13: the list
+// held draw-pin/draw-open entries and not OtherTab). The merge under test is
+// the same code reading and writing whatever path _drawRecentsPath returns.
 test('Draw: saving recents keeps entries another tab wrote', async ({ page, request }, info) => {
   test.setTimeout(90_000);
   await withDrawPrefs(page, request, info, 'amux-draw-recents-', async dir => {
     const mine = join(dir, 'Mine.excalidraw');
     await writeFile(mine, sceneOf([{ id: 'mine-rect', type: 'rectangle', x: 0 }]));
     await page.reload();
+    await page.waitForFunction(() => typeof (window as any)._drawRecentsPath === 'function');
+    // app.js is a classic script: its callers resolve the global at call time.
+    await page.evaluate(p => { (window as any)._drawRecentsPath = () => p; }, join(dir, 'recents.json'));
     await openDraw(page);
     await page.evaluate(p => (window as any)._drawOpen(p), mine);
     await expect.poll(() => sceneIds(page)).toEqual(['mine-rect']);
@@ -783,6 +793,8 @@ test('Draw: saving recents keeps entries another tab wrote', async ({ page, requ
       const res = await fetch('/api/file/raw?path=' + encodeURIComponent(path), { cache: 'no-store' }); const raw = res.ok ? await res.text() : ''; const cur = raw ? JSON.parse(raw) : { recents: [] };
       return cur.recents.map((x: any) => x.path);
     })).toEqual(expect.arrayContaining([mine, other]));
+    // The page used this test's file, not the shared one.
+    expect(JSON.parse(await readFile(join(dir, 'recents.json'), 'utf8')).recents.map((x: any) => x.path)).toEqual(expect.arrayContaining([mine, other]));
     await page.evaluate(() => (window as any)._drawLibRender());
     await showDrawings(page);
     await expect(page.locator(`.draw-recent[data-path="${other}"]`)).toHaveCount(1);
