@@ -437,7 +437,7 @@ if [[ -f "$SCRIPT_DIR/scripts/hooks/hook-report.sh" ]]; then
       if /usr/bin/python3 "$SCRIPT_DIR/scripts/hooks/install-claude-status-hooks.py" --provider codex \
         --settings "$_codex_home/hooks.json" --hook-path '$HOME/.amux/hook-report.sh' \
         --read-guard-path '$HOME/.amux/hooks/large-read-guard.py'; then
-        say "Codex status + read-routing hooks: $_codex_home/hooks.json (trust them once in Codex: /hooks)"
+        say "Codex labelled status + read-routing hooks: $_codex_home/hooks.json (review changed hooks once in Codex: /hooks)"
       else
         warn "could not wire Codex status hooks"
       fi
