@@ -127,46 +127,80 @@ struct OsResolver;
 impl PeerResolver for OsResolver {
     fn resolve(&self, peer: SocketAddr) -> Origin {
         let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
-        let owners = match os::socket_owners(peer) {
-            Ok(o) => o,
-            Err(os::LookupError::Unsupported(why)) => return Origin::Unavailable(why),
-            Err(os::LookupError::Failed(why)) => {
-                return if peer.ip().is_loopback() { Origin::Unattributed(why) } else { Origin::Remote };
-            }
-        };
-        if owners.is_empty() && !peer.ip().is_loopback() {
-            return Origin::Remote;
-        }
-        let panes = pane_map();
-        classify(&owners, &panes, &os::ppid_of)
+        decide(peer, os::socket_owners(peer), pane_map, &os::ppid_of)
     }
 }
 
+/// The resolver's decision from its three lookups, separated so a failed
+/// lookup is tested through the same code the server runs. The pane inventory
+/// is only consulted for a local socket, and a FAILED inventory is unproven
+/// evidence: it never classifies a worker's process as outside.
+fn decide(
+    peer: SocketAddr,
+    owners: Result<Vec<u32>, os::LookupError>,
+    panes: impl FnOnce() -> Result<HashMap<u32, String>, String>,
+    ppid_of: &dyn Fn(u32) -> Option<u32>,
+) -> Origin {
+    let owners = match owners {
+        Ok(o) => o,
+        Err(os::LookupError::Unsupported(why)) => return Origin::Unavailable(why),
+        Err(os::LookupError::Failed(why)) => {
+            return if peer.ip().is_loopback() { Origin::Unattributed(why) } else { Origin::Remote };
+        }
+    };
+    if owners.is_empty() && !peer.ip().is_loopback() {
+        return Origin::Remote;
+    }
+    match panes() {
+        Ok(panes) => classify(&owners, &panes, ppid_of),
+        Err(why) => {
+            tracing::warn!(%peer, why = %why, verdict = "process_attribution_pane_inventory_failed",
+                measured = false, why_unmeasured = %why, n_considered = owners.len(),
+                "tmux pane inventory failed; this local request cannot be proven outside amux panes");
+            Origin::Unattributed(format!("tmux pane inventory failed: {why}"))
+        }
+    }
+}
+
+type PaneCache = Mutex<Option<(Instant, HashMap<u32, String>)>>;
+
 /// `pane shell pid -> tmux session name`, cached briefly: one `tmux` spawn per
-/// window, not per request. No tmux server means no panes.
-fn pane_map() -> HashMap<u32, String> {
-    static CACHE: OnceLock<Mutex<Option<(Instant, HashMap<u32, String>)>>> = OnceLock::new();
+/// window, not per request. Only a successful inventory is cached; a failure
+/// is returned as an error every time so it can never stand in for "no panes".
+fn pane_map() -> Result<HashMap<u32, String>, String> {
+    static CACHE: OnceLock<PaneCache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     if let Ok(g) = cache.lock() {
         if let Some((at, map)) = g.as_ref() {
             if at.elapsed() < Duration::from_secs(2) {
-                return map.clone();
+                return Ok(map.clone());
             }
         }
     }
-    let map = std::process::Command::new("tmux")
+    let out = std::process::Command::new("tmux")
         .args(["list-panes", "-a", "-F", "#{pane_pid} #{session_name}"])
         .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
         .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| parse_panes(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or_default();
+        .map_err(|e| format!("could not run tmux: {e}"))?;
+    let map = panes_from_output(out.status.success(), &String::from_utf8_lossy(&out.stdout), &String::from_utf8_lossy(&out.stderr))?;
     if let Ok(mut g) = cache.lock() {
         *g = Some((Instant::now(), map.clone()));
     }
-    map
+    Ok(map)
+}
+
+/// A `tmux list-panes` result as an inventory. No running server is an
+/// authoritative empty inventory (no pane exists, so no worker does); any other
+/// failure is an error, never an empty map.
+fn panes_from_output(ok: bool, stdout: &str, stderr: &str) -> Result<HashMap<u32, String>, String> {
+    if ok {
+        return Ok(parse_panes(stdout));
+    }
+    let err = stderr.trim();
+    if err.starts_with("no server running") || err.starts_with("error connecting to") {
+        return Ok(HashMap::new());
+    }
+    Err(if err.is_empty() { "tmux list-panes failed with no message".into() } else { err.chars().take(200).collect() })
 }
 
 /// `<pane_pid> <session_name>` lines.
@@ -348,11 +382,11 @@ pub(crate) mod test_support {
 /// Platform lookups. Each answers "which local pids hold a TCP socket whose
 /// LOCAL end is `peer`" (the client end of a connection to this server) and
 /// "who is this pid's parent".
-mod os {
+pub(crate) mod os {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     use std::net::SocketAddr;
 
-    pub(super) enum LookupError {
+    pub(crate) enum LookupError {
         #[cfg_attr(any(target_os = "macos", target_os = "linux"), allow(dead_code))]
         Unsupported(&'static str),
         Failed(String),
@@ -861,6 +895,50 @@ mod tests {
         let (st, v) = post(&app(state.clone()), BAD_PANE, &[]).await;
         assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_origin_invalid")), "{v}");
         assert!(queued_senders(&state).is_empty());
+    }
+
+    /// Review B1: a failed tmux inventory is unproven evidence. A worker's
+    /// process whose pane cannot be listed must be refused, never let through
+    /// as the owner, while the same process with a working inventory is that
+    /// worker.
+    struct InventoryResolver(Result<HashMap<u32, String>, String>);
+
+    impl PeerResolver for InventoryResolver {
+        fn resolve(&self, peer: SocketAddr) -> Origin {
+            // pid 101's chain runs through pane 100 (amux-caller) when listed.
+            let chain = |pid: u32| match pid {
+                101 => Some(100),
+                100 => Some(50),
+                50 => Some(1),
+                _ => None,
+            };
+            decide(peer, Ok(vec![101]), || self.0.clone(), &chain)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_pane_inventory_refuses_instead_of_promoting_a_worker_to_owner() {
+        let (state, dir, guard) = fixture();
+        let _h = crate::api::settings::test_env::set_home(dir.path());
+        drop(guard);
+        let failed = test_support::set_resolver(Arc::new(InventoryResolver(Err("tmux exited 1".into()))));
+        let (st, v) = post(&app(state.clone()), OWNER, &[]).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_origin_unattributed")), "{v}");
+        assert!(v["why"].as_str().unwrap_or("").contains("tmux pane inventory failed"), "{v}");
+        assert!(queued_senders(&state).is_empty(), "nothing reaches the send gate as owner input");
+        drop(failed);
+        let _listed = test_support::set_resolver(Arc::new(InventoryResolver(Ok(HashMap::from([(100, "amux-caller".to_string())])))));
+        let (st, v) = post(&app(state.clone()), OWNER, &[]).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "listed: it is caller: {v}");
+    }
+
+    #[test]
+    fn tmux_output_is_an_inventory_only_when_it_succeeded_or_no_server_runs() {
+        assert_eq!(panes_from_output(true, "7 amux-a\n", "").unwrap().get(&7).map(String::as_str), Some("amux-a"));
+        assert!(panes_from_output(false, "", "no server running on /tmp/tmux-501/default\n").unwrap().is_empty());
+        assert!(panes_from_output(false, "", "error connecting to /tmp/tmux-501/default (No such file or directory)").unwrap().is_empty());
+        assert!(panes_from_output(false, "", "lost server\n").is_err());
+        assert!(panes_from_output(false, "", "").is_err(), "a silent failure is an error, not an empty fleet");
     }
 
     /// The proof header is server-set only: a client cannot assert it.
