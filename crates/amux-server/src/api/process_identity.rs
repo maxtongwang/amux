@@ -70,6 +70,9 @@ pub(crate) enum Origin {
     Remote,
     /// Local, but the owner or its ancestry could not be established.
     Unattributed(String),
+    /// The tmux pane inventory could not be read, so whether this process is
+    /// inside a worker pane is unknown. Never the owner (fail closed).
+    IdentityUnavailable(String),
     /// This platform has no resolver.
     Unavailable(&'static str),
 }
@@ -132,9 +135,12 @@ impl PeerResolver for OsResolver {
 }
 
 /// The resolver's decision from its three lookups, separated so a failed
-/// lookup is tested through the same code the server runs. The pane inventory
-/// is only consulted for a local socket, and a FAILED inventory is unproven
-/// evidence: it never classifies a worker's process as outside.
+/// lookup is tested through the same code the server runs.
+///
+/// FAIL CLOSED. Outside (and with it owner authority) is granted only on
+/// positive proof: the owning processes' whole ancestry was read AND the pane
+/// inventory was read successfully AND no ancestor is a worker pane. Any
+/// inventory failure, whatever tmux printed, is IdentityUnavailable.
 fn decide(
     peer: SocketAddr,
     owners: Result<Vec<u32>, os::LookupError>,
@@ -157,7 +163,7 @@ fn decide(
             tracing::warn!(%peer, why = %why, verdict = "process_attribution_pane_inventory_failed",
                 measured = false, why_unmeasured = %why, n_considered = owners.len(),
                 "tmux pane inventory failed; this local request cannot be proven outside amux panes");
-            Origin::Unattributed(format!("tmux pane inventory failed: {why}"))
+            Origin::IdentityUnavailable(format!("tmux pane inventory failed: {why}"))
         }
     }
 }
@@ -189,12 +195,13 @@ fn pane_map() -> Result<HashMap<u32, String>, String> {
     Ok(map)
 }
 
-/// A `tmux list-panes` result as an inventory. Only tmux reporting that no
-/// server runs is an authoritative empty inventory; any other failure is an
-/// error, never an empty map.
+/// A `tmux list-panes` result as an inventory. Default: any failure is an
+/// error. The only exception is tmux saying explicitly that no server exists,
+/// which is a real (empty) inventory. New or unknown diagnostics therefore
+/// refuse without anyone listing them.
 fn panes_from_output(ok: bool, stdout: &str, stderr: &str) -> Result<HashMap<u32, String>, String> {
     if ok {
-        return Ok(parse_panes(stdout));
+        return parse_panes(stdout);
     }
     // Absence is established only when the socket is not there: tmux says "no
     // server running", or (tmux 3.6a, measured) "error connecting to <socket>
@@ -211,13 +218,20 @@ fn panes_from_output(ok: bool, stdout: &str, stderr: &str) -> Result<HashMap<u32
 }
 
 /// `<pane_pid> <session_name>` lines.
-pub(crate) fn parse_panes(text: &str) -> HashMap<u32, String> {
-    text.lines()
-        .filter_map(|l| {
-            let (pid, sess) = l.trim().split_once(' ')?;
-            Some((pid.parse().ok()?, sess.trim().to_string()))
-        })
-        .collect()
+/// Fail closed here too: a line that does not parse could be a worker pane, so
+/// it makes the whole inventory unreadable rather than being skipped.
+pub(crate) fn parse_panes(text: &str) -> Result<HashMap<u32, String>, String> {
+    let mut map = HashMap::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let parsed = line.split_once(' ').and_then(|(pid, sess)| Some((pid.parse::<u32>().ok()?, sess.trim())));
+        match parsed {
+            Some((pid, sess)) if !sess.is_empty() => {
+                map.insert(pid, sess.to_string());
+            }
+            _ => return Err(format!("unparseable tmux pane line: {}", line.chars().take(80).collect::<String>())),
+        }
+    }
+    Ok(map)
 }
 
 type Shared = Arc<dyn PeerResolver>;
@@ -327,6 +341,22 @@ pub async fn attribute(mut req: Request, next: Next) -> Response {
                     "why": why,
                 }))).into_response();
             }
+            next.run(req).await
+        }
+        Origin::IdentityUnavailable(why) => {
+            if claimed(&req).is_empty() && req.uri().path().starts_with("/api/") {
+                tracing::warn!(%peer, path = %req.uri().path(), why = %why, verdict = "worker_identity_unavailable",
+                    measured = false, why_unmeasured = %why, n_considered = 1,
+                    "identity unavailable: the pane inventory could not be read, so this local request is not the owner");
+                return (StatusCode::FORBIDDEN, Json(json!({
+                    "ok": false,
+                    "code": "worker_identity_unavailable",
+                    "error": "identity unavailable: amux could not read its tmux pane inventory, so it cannot prove this request is from outside every worker pane; owner access requires that proof",
+                    "why": why,
+                }))).into_response();
+            }
+            // A claimed worker identity is not the owner either way; rule 10
+            // and the group policy judge the claim as they would without proof.
             next.run(req).await
         }
         Origin::Unavailable(why) => {
@@ -736,10 +766,13 @@ mod tests {
 
     #[test]
     fn tmux_pane_lines_parse() {
-        let m = parse_panes("123 amux-dev-a\n456 personal session\nbad\n");
+        let m = parse_panes("123 amux-dev-a\n456 personal session\n\n").unwrap();
         assert_eq!(m.get(&123).map(String::as_str), Some("amux-dev-a"));
         assert_eq!(m.get(&456).map(String::as_str), Some("personal session"));
         assert_eq!(m.len(), 2);
+        for bad in ["123 amux-dev-a\nbad\n", "x amux-dev-a\n", "123\n", "123 \n"] {
+            assert!(parse_panes(bad).is_err(), "an unreadable line could hide a worker pane: {bad:?}");
+        }
     }
 
     /// The real OS lookup, not a paraphrase: a loopback connection made by
@@ -930,7 +963,7 @@ mod tests {
         drop(guard);
         let failed = test_support::set_resolver(Arc::new(InventoryResolver(Err("tmux exited 1".into()))));
         let (st, v) = post(&app(state.clone()), OWNER, &[]).await;
-        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_origin_unattributed")), "{v}");
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_unavailable")), "{v}");
         assert!(v["why"].as_str().unwrap_or("").contains("tmux pane inventory failed"), "{v}");
         assert!(queued_senders(&state).is_empty(), "nothing reaches the send gate as owner input");
         drop(failed);
@@ -956,7 +989,7 @@ mod tests {
             let inv = panes_from_output(false, "", stderr);
             let r = test_support::set_resolver(Arc::new(InventoryResolver(inv)));
             let (st, v) = post(&app(state.clone()), OWNER, &[]).await;
-            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_origin_unattributed")), "{stderr:?}: {v}");
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_unavailable")), "{stderr:?}: {v}");
             drop(r);
         }
         assert!(queued_senders(&state).is_empty(), "no diagnostic lets a worker through as the owner");
@@ -965,6 +998,24 @@ mod tests {
         let r = test_support::set_resolver(Arc::new(InventoryResolver(panes_from_output(false, "", "no server running on /tmp/tmux-501/default"))));
         let (st, v) = post(&app(state.clone()), OWNER, &[]).await;
         assert!(st != StatusCode::FORBIDDEN || v["code"] != json!("worker_origin_unattributed"), "no server: {v}");
+        drop(r);
+    }
+
+    /// The default, not a list: an error string nobody has seen before (here
+    /// randomised per run, so no allow-list can anticipate it) is refused as
+    /// identity unavailable, never read as an empty inventory.
+    #[tokio::test]
+    async fn any_unknown_tmux_error_is_refused_as_identity_unavailable() {
+        let (state, dir, guard) = fixture();
+        let _h = crate::api::settings::test_env::set_home(dir.path());
+        drop(guard);
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let unknown = format!("tmux {nonce:x}: an error message no version of tmux has printed yet");
+        let r = test_support::set_resolver(Arc::new(InventoryResolver(panes_from_output(false, "", &unknown))));
+        let (st, v) = post(&app(state.clone()), OWNER, &[]).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_unavailable")), "{v}");
+        assert!(v["error"].as_str().unwrap_or("").starts_with("identity unavailable"), "{v}");
+        assert!(queued_senders(&state).is_empty());
         drop(r);
     }
 
