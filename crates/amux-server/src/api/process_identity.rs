@@ -196,6 +196,47 @@ pub(crate) trait Lookups {
     fn panes(&self, fresh: bool) -> Result<Panes, String>;
     fn ppid_of(&self, pid: u32) -> Option<u32>;
     fn tty_of(&self, pid: u32) -> Option<u64>;
+    /// The process's short name, or None when it cannot be read.
+    fn comm_of(&self, pid: u32) -> Option<String>;
+    /// Whether the process has any pseudo-terminal open (master or slave).
+    fn holds_pty(&self, pid: u32) -> bool;
+}
+
+/// Whether the holders could be tied to a tmux pane at all, so that proving
+/// them outside needs the pane inventory. A holder needs it when it has a
+/// controlling tty or holds any pty, or when any ancestor is a tmux server (or
+/// has a name that cannot be read). A holder with none of these cannot be in a
+/// pane whatever the inventory says (a detached `setsid` daemon reads outside
+/// either way: the same-user limit), so it is proven outside without running
+/// tmux. The walk itself must succeed: a chain that breaks or runs out of steps
+/// is an error, never a shortcut (round 9, dev-lead; the per-request tmux
+/// spawn put draw-realtime p95 at 150-157ms against 118-128ms on main).
+fn needs_inventory(holders: &[u32], l: &dyn Lookups) -> Result<bool, String> {
+    for &h in holders {
+        if l.tty_of(h).is_some() || l.holds_pty(h) {
+            return Ok(true);
+        }
+        let mut cur = h;
+        let mut reached_root = false;
+        for _ in 0..4096 {
+            match l.comm_of(cur) {
+                Some(name) if name != "tmux" && !name.starts_with("tmux:") => {}
+                _ => return Ok(true),
+            }
+            if cur <= 1 {
+                reached_root = true;
+                break;
+            }
+            match l.ppid_of(cur) {
+                Some(p) if p != cur => cur = p,
+                _ => break,
+            }
+        }
+        if !reached_root {
+            return Err(format!("ancestry of pid {h} could not be walked to the root (stopped at pid {cur})"));
+        }
+    }
+    Ok(false)
 }
 
 /// The resolver's decision.
@@ -244,6 +285,11 @@ fn decide(conn: Conn, l: &dyn Lookups) -> Origin {
             return Origin::Remote;
         }
         return forwarded(peer, &scan, l);
+    }
+    match needs_inventory(&scan.holders, l) {
+        Ok(false) => return classify(&scan.holders, &Panes::default(), &|p| l.ppid_of(p), &|p| l.tty_of(p)),
+        Ok(true) => {}
+        Err(why) => return Origin::Unattributed(why),
     }
     if let Ok(panes) = l.panes(false) {
         if let worker @ Origin::Worker(_) = classify(&scan.holders, &panes, &|p| l.ppid_of(p), &|p| l.tty_of(p)) {
@@ -315,6 +361,12 @@ impl Lookups for OsLookups {
     }
     fn tty_of(&self, pid: u32) -> Option<u64> {
         os::tty_of(pid)
+    }
+    fn comm_of(&self, pid: u32) -> Option<String> {
+        os::comm_of(pid)
+    }
+    fn holds_pty(&self, pid: u32) -> bool {
+        os::holds_pty(pid)
     }
 }
 
@@ -756,9 +808,9 @@ pub(crate) mod os {
     }
 
     #[cfg(target_os = "macos")]
-    pub(super) use super::macos::{holds, ppid_of, root_tailscaled, scan, tty_of};
+    pub(super) use super::macos::{comm_of, holds, holds_pty, ppid_of, root_tailscaled, scan, tty_of};
     #[cfg(target_os = "linux")]
-    pub(super) use super::linux::{holds, ppid_of, root_tailscaled, scan, tty_of};
+    pub(super) use super::linux::{comm_of, holds, holds_pty, ppid_of, root_tailscaled, scan, tty_of};
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub(super) fn scan(_client: SocketAddr, _server: SocketAddr, _door: &super::FrontDoor) -> Result<super::Scan, LookupError> {
@@ -775,6 +827,14 @@ pub(crate) mod os {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub(super) fn holds(_pid: u32, _client: SocketAddr, _server: SocketAddr) -> bool {
         false
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(super) fn comm_of(_pid: u32) -> Option<String> {
+        None
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(super) fn holds_pty(_pid: u32) -> bool {
+        true
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub(super) fn root_tailscaled() -> Result<Vec<u32>, String> {
@@ -1030,6 +1090,55 @@ mod macos {
         bsdinfo(pid).map(|i| i.e_tdev).filter(|&d| d != NODEV && d != 0).map(u64::from)
     }
 
+    pub(crate) fn comm_of(pid: u32) -> Option<String> {
+        let info = bsdinfo(pid)?;
+        let bytes: Vec<u8> = info.pbi_comm.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+        (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+    #[repr(C)]
+    struct VnodeFdInfoWithPath {
+        pfi: ProcFileInfo,
+        pvip: libc::vnode_info_path,
+    }
+
+    /// Any open fd that is a pseudo-terminal (/dev/ttys*, /dev/ptmx, /dev/pty*).
+    /// An fd list that cannot be read counts as holding one: the inventory is
+    /// then consulted, which is the safe side.
+    pub(crate) fn holds_pty(pid: u32) -> bool {
+        let pid = pid as i32;
+        // SAFETY: as in socket_fds; whole proc_fdinfo records are written.
+        let need = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+        if need <= 0 {
+            return true;
+        }
+        let size = std::mem::size_of::<libc::proc_fdinfo>();
+        let mut buf: Vec<libc::proc_fdinfo> = Vec::with_capacity(need as usize / size + 16);
+        let cap = (buf.capacity() * size) as libc::c_int;
+        let got = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, buf.as_mut_ptr().cast(), cap) };
+        if got <= 0 {
+            return true;
+        }
+        // SAFETY: `got` bytes of initialised records were written.
+        unsafe { buf.set_len(got as usize / size) };
+        buf.iter().filter(|f| f.proc_fdtype as libc::c_int == libc::PROX_FDTYPE_VNODE).any(|f| {
+            // SAFETY: zeroed POD; the kernel writes at most size_of bytes.
+            let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+            let sz = std::mem::size_of::<VnodeFdInfoWithPath>() as libc::c_int;
+            let got = unsafe {
+                libc::proc_pidfdinfo(pid, f.proc_fd, PROC_PIDFDVNODEPATHINFO, (&mut info as *mut VnodeFdInfoWithPath).cast(), sz)
+            };
+            if got <= 0 {
+                return false;
+            }
+            let raw: Vec<u8> = info.pvip.vip_path.iter().flatten().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+            let path = String::from_utf8_lossy(&raw);
+            path.starts_with("/dev/ttys") || path == "/dev/ptmx" || path.starts_with("/dev/pty")
+        })
+    }
+
     pub(crate) fn root_tailscaled() -> Result<Vec<u32>, String> {
         let (ok, out, err) = super::run_bounded(
             std::process::Command::new("/bin/ps").args(["-A", "-o", "pid=,uid=,ucomm="]),
@@ -1145,6 +1254,20 @@ mod linux {
 
     pub(crate) fn tty_of(pid: u32) -> Option<u64> {
         stat_fields(pid)?.get(4)?.parse::<u64>().ok().filter(|&t| t != 0)
+    }
+
+    pub(crate) fn comm_of(pid: u32) -> Option<String> {
+        std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|c| c.trim().to_string()).filter(|c| !c.is_empty())
+    }
+
+    /// Any open fd that is a pseudo-terminal (/dev/pts/*, /dev/ptmx, /dev/tty*).
+    /// An unreadable fd list counts as holding one (the safe side).
+    pub(crate) fn holds_pty(pid: u32) -> bool {
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { return true };
+        fds.flatten().filter_map(|fd| std::fs::read_link(fd.path()).ok()).any(|l| {
+            let l = l.to_string_lossy();
+            l.starts_with("/dev/pts/") || l == "/dev/ptmx" || l.starts_with("/dev/tty")
+        })
     }
 
     pub(crate) fn root_tailscaled() -> Result<Vec<u32>, String> {
@@ -1306,6 +1429,11 @@ mod tests {
         tailscaled: Result<Vec<u32>, String>,
         cached: Result<Panes, String>,
         fresh: Result<Panes, String>,
+        /// Pids holding a pty; pids whose name cannot be read.
+        pty: Vec<u32>,
+        nameless: Vec<u32>,
+        /// Pane inventory reads (each is a tmux spawn in production).
+        reads: Arc<std::sync::atomic::AtomicU32>,
     }
 
     impl Fake {
@@ -1316,6 +1444,9 @@ mod tests {
                 tailscaled: Ok(vec![]),
                 cached: Ok(panes()),
                 fresh: Ok(panes()),
+                pty: vec![],
+                nameless: vec![],
+                reads: Arc::default(),
             }
         }
         /// The deployed phone path: nobody visible holds the connection, root
@@ -1327,7 +1458,13 @@ mod tests {
                 tailscaled: Ok(vec![416]),
                 cached: Ok(panes()),
                 fresh: Ok(panes()),
+                pty: vec![],
+                nameless: vec![],
+                reads: Arc::default(),
             }
+        }
+        fn reads(&self) -> u32 {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -1346,6 +1483,7 @@ mod tests {
             self.tailscaled.clone()
         }
         fn panes(&self, fresh: bool) -> Result<Panes, String> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if fresh { self.fresh.clone() } else { self.cached.clone() }
         }
         fn ppid_of(&self, pid: u32) -> Option<u32> {
@@ -1353,6 +1491,19 @@ mod tests {
         }
         fn tty_of(&self, pid: u32) -> Option<u64> {
             tty(pid)
+        }
+        fn comm_of(&self, pid: u32) -> Option<String> {
+            if self.nameless.contains(&pid) {
+                return None;
+            }
+            Some(match pid {
+                50 => "tmux",
+                1 => "launchd",
+                _ => "proc",
+            }.to_string())
+        }
+        fn holds_pty(&self, pid: u32) -> bool {
+            self.pty.contains(&pid)
         }
     }
 
@@ -1368,8 +1519,8 @@ mod tests {
         let stale = Fake { cached: Ok(Panes::default()), ..Fake::holders(&[101]) };
         assert_eq!(decide(lo(1), &stale), Origin::Worker("dev-a".into()));
         // The fresh read fails: identity unavailable, whatever the cache said.
-        let failed = Fake { cached: Ok(Panes::default()), fresh: Err("tmux gone".into()), ..Fake::holders(&[301]) };
-        assert!(matches!(decide(lo(1), &failed), Origin::IdentityUnavailable(_)));
+        let failed = Fake { cached: Ok(Panes::default()), fresh: Err("tmux gone".into()), ..Fake::holders(&[201]) };
+        assert!(matches!(decide(lo(1), &failed), Origin::IdentityUnavailable(_)), "a tmux-descended holder needs the read");
         // The server end unknown on a loopback connection: never owner.
         assert!(matches!(decide(Conn { server: None, ..lo(1) }, &Fake::holders(&[301])), Origin::Unattributed(_)));
         // A genuinely remote peer (no local holder, not an own address).
@@ -1386,6 +1537,66 @@ mod tests {
         // Interfaces unreadable: no peer can be shown to be elsewhere.
         let blind = Fake { own: Err("getifaddrs failed".into()), ..Fake::holders(&[]) };
         assert!(matches!(decide(remote, &blind), Origin::Unattributed(_)));
+    }
+
+    /// Round 9 (draw-realtime p95 150-157ms vs 118-128ms on main): a holder
+    /// that cannot be tied to any pane is proven outside without reading the
+    /// pane inventory (no tmux spawn); anything that could be tied still reads it.
+    #[test]
+    fn the_inventory_is_read_only_when_a_holder_could_be_in_a_pane() {
+        // A launchd child with no tty and no pty (the dashboard browser).
+        let f = Fake::holders(&[301]);
+        assert_eq!(decide(lo(1), &f), Origin::Outside);
+        assert_eq!(f.reads(), 0, "no tmux spawn for a holder no pane can contain");
+        // The same holder with a pty open: the fresh inventory decides.
+        let f = Fake { pty: vec![301], ..Fake::holders(&[301]) };
+        assert_eq!(decide(lo(1), &f), Origin::Outside);
+        assert!(f.reads() >= 1, "a pty holder reads the inventory");
+        let f = Fake { pty: vec![301], fresh: Err("tmux gone".into()), ..Fake::holders(&[301]) };
+        assert!(matches!(decide(lo(1), &f), Origin::IdentityUnavailable(_)), "and fails closed when it cannot");
+        // A controlling tty (reparented worker) reads it and is the worker.
+        let f = Fake::holders(&[501]);
+        assert_eq!(decide(lo(1), &f), Origin::Worker("dev-a".into()));
+        assert!(f.reads() >= 1);
+        // A tmux-server ancestor reads it (the owner's own tmux: still outside).
+        let f = Fake::holders(&[201]);
+        assert_eq!(decide(lo(1), &f), Origin::Outside);
+        assert!(f.reads() >= 1);
+        // An ancestor whose name cannot be read: the inventory decides.
+        let f = Fake { nameless: vec![300], ..Fake::holders(&[301]) };
+        assert_eq!(decide(lo(1), &f), Origin::Outside);
+        assert!(f.reads() >= 1);
+        // The walk must succeed: a broken chain or a cycle is refused.
+        assert!(matches!(decide(lo(1), &Fake::holders(&[401])), Origin::Unattributed(_)));
+        assert!(matches!(decide(lo(1), &Fake::holders(&[601])), Origin::Unattributed(_)));
+        // Any holder needing it makes the whole connection read it.
+        let f = Fake::holders(&[301, 101]);
+        assert_eq!(decide(lo(1), &f), Origin::Worker("dev-a".into()));
+        assert!(f.reads() >= 1);
+    }
+
+    /// The real pty and name lookups this shortcut rests on.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn os_reads_pty_holding_and_process_names() {
+        let (mut master, mut slave) = (0, 0);
+        // SAFETY: openpty fills two fds this test closes below.
+        let rc = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
+        assert_eq!(rc, 0, "openpty");
+        assert!(os::holds_pty(std::process::id()), "a process holding a pty pair");
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        let mut child = std::process::Command::new("/bin/sleep").arg("5")
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let pid = child.id();
+        assert!(!os::holds_pty(pid), "a child with no terminal fds");
+        assert_eq!(os::comm_of(pid).as_deref(), Some("sleep"));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// Review B1 (6c98cf27), dev-lead's tests 1-3.
@@ -1688,8 +1899,8 @@ mod tests {
         drop(guard);
         let worker_panes = Panes { by_pid: HashMap::from([(100, "amux-caller".to_string())]), by_tty: HashMap::new() };
         let cases: Vec<(&str, Fake, &str)> = vec![
-            ("failed inventory", Fake { cached: Err("x".into()), fresh: Err("tmux exited 1".into()), ..Fake::holders(&[301]) }, "worker_identity_unavailable"),
-            ("unknown tmux error", Fake { fresh: panes_from_output(false, "", "tmux: something new"), ..Fake::holders(&[301]) }, "worker_identity_unavailable"),
+            ("failed inventory", Fake { cached: Err("x".into()), fresh: Err("tmux exited 1".into()), ..Fake::holders(&[201]) }, "worker_identity_unavailable"),
+            ("unknown tmux error", Fake { fresh: panes_from_output(false, "", "tmux: something new"), ..Fake::holders(&[201]) }, "worker_identity_unavailable"),
             ("stale cache, fresh finds the worker", Fake { cached: Ok(Panes::default()), fresh: Ok(worker_panes.clone()), ..Fake::holders(&[101]) }, "worker_group_boundary"),
             ("worker at the front door", Fake { fresh: Ok(worker_panes.clone()), ..Fake::forwarded(&[101]) }, "worker_identity_unavailable"),
             ("no forwarder", Fake { tailscaled: Ok(vec![]), ..Fake::forwarded(&[]) }, "worker_origin_unattributed"),
