@@ -32870,6 +32870,9 @@ pub(crate) const LEADS_GROUP: &str = "leads";
 
 /// What a worker-originated create asks for.
 pub(crate) struct CreateRequest<'a> {
+    /// The name the request would register, when it names one. Equal to the
+    /// caller's own verified identity it may be SELF-REGISTRATION (below).
+    pub name: Option<&'a str>,
     /// The new worker's groups (any case; compared lowercased).
     pub tags: &'a [String],
     /// Something only the owner may grant at create: the chat worker type
@@ -32886,6 +32889,19 @@ pub(crate) struct CreateRequest<'a> {
 /// - A lead: allowed, giving the new worker only tags drawn from its own team
 ///   tags, never `leads` (`worker_create_tags_outside_team`).
 ///
+/// SELF-REGISTRATION is not creation: a worker registering a row for its OWN
+/// existing session (`POST /api/workers {"name": <itself>}`) makes no new
+/// worker. It is allowed only when the requested name equals the caller's
+/// verified identity, that session's env file exists, and the request adds no
+/// group: its tags are a subset of the session's existing groups and it sets
+/// nothing owner-only. Anything else is a create and takes the rule above.
+///
+/// "Verified identity" is [`worker_origin`]: the header identity that
+/// `worker_identity::enforce` (rule 10) has already checked against the
+/// lane's token before any handler runs. Process attribution (the separate
+/// `fix/worker-attribution` work) slots in by rewriting that identity before
+/// this point, so this predicate needs no change for it.
+///
 /// Server-internal spawns (project leads/executors) never reach here: their
 /// groups come from owner-configured project policy, not from a request.
 pub(crate) fn worker_create_refusal(headers: &HeaderMap, req: &CreateRequest) -> Option<Response> {
@@ -32898,6 +32914,13 @@ pub(crate) fn worker_create_refusal_body(headers: &HeaderMap, req: &CreateReques
     let origin = worker_origin(headers);
     if origin.is_empty() { return None; }
     let caller = lane_groups(&origin);
+    let adds_no_group = req.owner_only.is_none()
+        && req.tags.iter().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).all(|t| caller.contains(&t));
+    if req.name == Some(origin.as_str()) && adds_no_group && env_path(&origin).exists() {
+        tracing::info!(worker = %origin, verdict = "worker_self_registration", measured = true, n_considered = 1,
+            "a worker registered its own existing session; not a worker creation");
+        return None;
+    }
     if !caller.contains(LEADS_GROUP) {
         tracing::warn!(worker = %origin, verdict = "worker_create_requires_lead", measured = true, n_considered = 1,
             "a worker outside the leads group tried to create a worker");
@@ -32944,7 +32967,7 @@ pub(crate) fn names_messaging_authority(body: &Value) -> bool {
 fn copy_refusal(source: &str, headers: &HeaderMap) -> Option<Response> {
     let tags: Vec<String> = lane_groups(source).into_iter().collect();
     let chat = crate::api::worker_exec::worker_type_of(source).as_str() == "chat";
-    worker_create_refusal(headers, &CreateRequest { tags: &tags, owner_only: chat.then_some("the chat worker type") })
+    worker_create_refusal(headers, &CreateRequest { name: None, tags: &tags, owner_only: chat.then_some("the chat worker type") })
 }
 
 /// Every config write drops the cached session list (AMUX-2926).

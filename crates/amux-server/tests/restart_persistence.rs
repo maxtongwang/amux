@@ -258,11 +258,25 @@ impl Rig {
     }
 
     async fn send(&self, method: reqwest::Method, path: &str, body: Value) -> (u16, Value) {
-        let r = self
+        self.send_as(Some("rr0150-suite"), method, path, body).await
+    }
+
+    /// The owner's request (no worker header). Creating a NEW worker is the
+    /// owner's (or a lead's) act, and this suite tests restart durability, not
+    /// authorization, so its worker creates are made as the owner.
+    async fn post_owner(&self, path: &str, body: Value) -> (u16, Value) {
+        self.send_as(None, reqwest::Method::POST, path, body).await
+    }
+
+    async fn send_as(&self, worker: Option<&str>, method: reqwest::Method, path: &str, body: Value) -> (u16, Value) {
+        let mut req = self
             .client
             .request(method, self.url(path))
-            .header("content-type", "application/json")
-            .header("x-amux-session", "rr0150-suite")
+            .header("content-type", "application/json");
+        if let Some(w) = worker {
+            req = req.header("x-amux-session", w);
+        }
+        let r = req
             .json(&body)
             .send()
             .await
@@ -390,7 +404,7 @@ async fn every_durable_subsystem_survives_a_hard_restart() {
     let board_id = board["id"].as_str().expect("board id").to_string();
 
     let worker_name = uniq("rr0150-worker");
-    let (c, worker) = rig.post("/api/workers", json!({"name": worker_name})).await;
+    let (c, worker) = rig.post_owner("/api/workers", json!({"name": worker_name})).await;
     assert!((200..300).contains(&c), "worker create: {worker}");
     let worker_id = worker["id"].as_str().expect("worker id").to_string();
 

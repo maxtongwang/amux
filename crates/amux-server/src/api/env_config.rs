@@ -180,7 +180,7 @@ fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Optio
             }
         } else if let Some(r) = crate::api::session_verbs::worker_create_refusal(
             headers,
-            &crate::api::session_verbs::CreateRequest { tags: &w.groups, owner_only: None },
+            &crate::api::session_verbs::CreateRequest { name: None, tags: &w.groups, owner_only: None },
         ) {
             return Some(r);
         }

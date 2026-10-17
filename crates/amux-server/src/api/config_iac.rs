@@ -178,7 +178,7 @@ pub async fn apply(
             let tags = super::session_verbs::tags_of(w.get("tags"));
             super::session_verbs::worker_create_refusal_body(
                 &headers,
-                &super::session_verbs::CreateRequest { tags: &tags, owner_only: None },
+                &super::session_verbs::CreateRequest { name: None, tags: &tags, owner_only: None },
             )
         };
         if let Some(body) = refusal {

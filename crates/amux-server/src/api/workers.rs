@@ -589,7 +589,9 @@ pub async fn create_worker(
     body: Json<CreateWorkerBody>,
 ) -> Response {
     // Only leads create workers (session_verbs::worker_create_refusal). A store
-    // group id or the chat type is the owner's to grant at create.
+    // group id or the chat type is the owner's to grant at create. A worker
+    // registering its own existing session's row is self-registration.
+    let requested = body.display_name.as_deref().or(body.name.as_deref()).map(str::trim);
     let owner_only = if body.group.is_some() {
         Some("a store group")
     } else if body.worker_type.as_deref().map(str::trim) == Some("chat") {
@@ -599,7 +601,7 @@ pub async fn create_worker(
     };
     if let Some(refusal) = crate::api::session_verbs::worker_create_refusal(
         &headers,
-        &crate::api::session_verbs::CreateRequest { tags: &[], owner_only },
+        &crate::api::session_verbs::CreateRequest { name: requested, tags: &[], owner_only },
     ) {
         return refusal;
     }
@@ -2735,6 +2737,60 @@ mod tests {
         assert!(st.is_success(), "owner create with any tags: {v}");
         let owned: Vec<String> = crate::api::session_verbs::lane_groups("owned").into_iter().collect();
         assert_eq!(owned, vec!["leads".to_string(), "ops".to_string()]);
+    }
+
+    /// Self-registration is not creation, and only an exact one qualifies:
+    /// the caller's own verified name, its existing session, no new group.
+    /// Under rule 10 a claimed name without that lane's token never reaches
+    /// the create rule at all.
+    #[tokio::test]
+    async fn only_an_exact_self_registration_escapes_the_create_rule() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        membership_fleet(home.path());
+        let (app, _db) = app();
+        let me = [("X-Amux-Session", "dev-a")];
+        let dir = home.path().join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Exact: its own name, no group.
+        let (st, _, v) = send_with(&app, "POST", "/api/workers", Some(json!({"name": "dev-a", "cwd": "/tmp"})), &me).await;
+        assert_eq!(st, StatusCode::CREATED, "exact self-registration: {v}");
+        // A different name is a create.
+        let (st, _, v) = send_with(&app, "POST", "/api/workers", Some(json!({"name": "dev-a2", "cwd": "/tmp"})), &me).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(NEEDS_LEAD)), "other name: {v}");
+        // Its own name but a group field, or tags it does not have: a create.
+        let grp = GroupId::from_ulid(ulid::Ulid::new());
+        let (st, _, v) = send_with(&app, "POST", "/api/workers", Some(json!({"name": "dev-a", "cwd": "/tmp", "group": grp.as_str()})), &me).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(NEEDS_LEAD)), "self + group: {v}");
+        for tags in [json!(["leads"]), json!(["dev", "ops"])] {
+            let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, "dev-a", tags.clone())), &me).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(NEEDS_LEAD)), "self + {tags}: {v}");
+        }
+        // Its own name with its existing tags passes the rule and meets the
+        // ordinary "already exists" answer, so nothing new is made either way.
+        let (st, _, v) = send_with(&app, "POST", "/api/sessions", Some(create_body(&dir, "dev-a", json!(["dev"]))), &me).await;
+        assert_eq!(st, StatusCode::CONFLICT, "self with existing tags reaches the existing-session check: {v}");
+        // Rule 10: dev-b is a contract lane with a minted token. Claiming it
+        // over a socket without that token is refused before the create rule;
+        // with the token the exact self-registration proceeds.
+        std::fs::write(home.path().join("sessions/dev-b.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\nAMUX_CONTRACT_DONE=1\n").unwrap();
+        let token = crate::api::worker_identity::mint(home.path(), "dev-b").expect("rule 10 mints for dev-b");
+        let over_socket = |tok: Option<&str>| {
+            let mut b = Request::builder().method("POST").uri("/api/workers")
+                .header(header::CONTENT_TYPE, "application/json").header("X-Amux-Session", "dev-b");
+            if let Some(t) = tok {
+                b = b.header(crate::api::worker_identity::TOKEN_HEADER, t);
+            }
+            let mut req = b.body(Body::from(json!({"name": "dev-b", "cwd": "/tmp"}).to_string())).unwrap();
+            req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 9))));
+            app.clone().oneshot(req)
+        };
+        let res = over_socket(None).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let body: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["code"], "worker_identity_refused", "{body}");
+        let res = over_socket(Some(&token)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED, "rule 10 with the lane's token");
     }
 
     /// Every other path that makes a worker applies the same create rule,

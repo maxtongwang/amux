@@ -4572,6 +4572,7 @@ pub async fn create_session_legacy(
     if let Some(refusal) = crate::api::session_verbs::worker_create_refusal(
         &headers,
         &crate::api::session_verbs::CreateRequest {
+            name: Some(&name),
             tags: &tag_list,
             owner_only: chat.then_some("the chat worker type"),
         },
