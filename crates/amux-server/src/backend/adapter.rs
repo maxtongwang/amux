@@ -1133,6 +1133,7 @@ pub(crate) fn provider_picker_reason(clean: &str, provider: &str) -> Option<&'st
         && !tail.contains("press enter to confirm")
         && !tail.contains("enter to select")
         && !tail.contains("esc to cancel")
+        && !tail.contains("enter confirm \u{b7} esc skip")
     {
         return None;
     }
@@ -1229,6 +1230,10 @@ fn codex_model_bar(line: &str) -> bool {
         && (location == "~" || location.starts_with("~/") || location.starts_with('/'))
 }
 
+fn codex_shortcut_hint_row(line: &str) -> bool {
+    line.trim_start().starts_with("? for shortcuts")
+}
+
 fn codex_active_status_line(line: &str) -> bool {
     let low = line.trim().to_ascii_lowercase();
     low.starts_with("• working (")
@@ -1281,8 +1286,13 @@ fn codex_structured_active_line_clean(clean: &str) -> Option<Option<&str>> {
     // Provider identity must be the CURRENT footer, not a Codex-looking frame
     // pasted into another provider's prompt. The model/path bar is Codex's
     // final non-empty row and its prompt glyph is `›` (not Claude's `❯`).
-    let model_i = tail
-        .len()
+    // Before its first turn Codex paints a `? for shortcuts` hint row below
+    // the model bar; it is chrome, not a different frame (DMIW-1).
+    let footer_end = match tail.last() {
+        Some(last) if codex_shortcut_hint_row(last) => tail.len() - 1,
+        _ => tail.len(),
+    };
+    let model_i = footer_end
         .checked_sub(1)
         .filter(|i| codex_model_bar(tail[*i]))?;
     let prompt_i = tail[..model_i].iter().rposition(|s| s.starts_with('›'))?;
@@ -1641,6 +1651,19 @@ gemini-2.5-pro";
             Some("hook_trust_prompt")
         );
         assert_eq!(provider_picker_reason(&format!("{pane}\n›"), "codex"), None);
+    }
+
+    /// codex-cli 0.163's launch dialog for an untrusted hook, captured
+    /// 2026-10-16 (DMIW-1). Its footer reads `enter confirm · esc skip`, none
+    /// of the older footers, so a worker sitting on it read as unknown rather
+    /// than waiting on the owner.
+    #[test]
+    fn codex_launch_hook_review_dialog_is_a_hook_trust_prompt() {
+        let pane = "  \u{1b}[1mHooks need review\u{1b}[0m\n  \u{1b}[38;5;3m1 hook is new or changed.\u{1b}[39m\n  \u{1b}[2mHooks can run outside the sandbox after you trust them.\u{1b}[0m\n\u{1b}[1;7m\u{203a} 1. Review hooks\n\u{1b}[0m  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n  \u{1b}[1menter\u{1b}[0;2m confirm \u{b7} \u{1b}[0;1mesc\u{1b}[0;2m skip\n";
+        assert_eq!(
+            provider_picker_reason(&strip_ansi(pane), "codex"),
+            Some("hook_trust_prompt")
+        );
     }
 
     #[test]

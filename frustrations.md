@@ -6008,7 +6008,7 @@ FIX: The CLI corrects AMUX_WORKER with the same narrow test as AMUX-4033 (claime
 ## A fresh Codex worker never receives its first peer message
 AREA: notices
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-10-16
 SESSION: dev-merging-installing-worker
 CARD: DMIW-1
@@ -6022,6 +6022,11 @@ COST: Two probe relaunches and two owner keystrokes from dev-lead to finish one 
   worker started and handed work by a peer sits idle until a human types.
 FIX: For a Codex lane whose current run has no status events yet, treat an empty, visible Codex composer
   as the boot boundary instead of refusing on unmeasured state.
+FIXED: maxtongwang/amux#12. Measured root cause (codex-cli 0.163 captures): before its first turn Codex
+  paints a `? for shortcuts` row BELOW the model bar, and the Codex frame parser required the model bar
+  to be the last row, so the empty composer was not a boundary. Separately, 0.163's launch "Hooks need
+  review" dialog (footer `enter confirm · esc skip`) was not a hook_trust_prompt; it now reads waiting
+  (input-required) and logs verdict=hook_trust_prompt_needs_owner. amux grants no hook trust.
 
 ## Every amux CLI call from a Codex worker goes unacknowledged
 AREA: cli
