@@ -358,14 +358,17 @@ pub(crate) fn load_state(home: &Path) -> WatchState {
         .unwrap_or_default()
 }
 
-pub(crate) fn save_state(home: &Path, st: &WatchState) {
+/// Persist the watch state; a failed write is logged (the pending restore is only durable once
+/// this returns true).
+pub(crate) fn save_state(home: &Path, st: &WatchState) -> bool {
     let path = state_path(home);
     let tmp = path.with_extension("json.tmp");
-    if let Ok(body) = serde_json::to_vec(st) {
-        if std::fs::write(&tmp, body).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
+    let ok = serde_json::to_vec(st).is_ok_and(|body| std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &path).is_ok());
+    if !ok {
+        tracing::error!(target: "tmux_watch", path = %path.display(), pending = st.pending.len(), verdict = "tmux_watch_state_unsaved",
+            "could not persist the tmux watch state; a pending restore is not durable until it saves");
     }
+    ok
 }
 
 fn now_secs() -> f64 {
@@ -786,6 +789,28 @@ mod tests {
         let r = Restore { restored: vec![], failed: vec![], skipped: vec![("b".into(), "paused")] };
         assert!(settle_pending(&mut st, &r, 60.0), "a worker that became ineligible leaves the set");
         assert_eq!((st.pending_attempts, st.pending_next_at), (0, None));
+    }
+
+    #[test]
+    fn a_loss_saved_before_the_keeper_survives_a_crash_after_mrpopo_starts() {
+        // The boundary review round 2 named: the loss is saved, the keeper starts mrpopo, amux
+        // dies before anything else, and on restart tmux shows only mrpopo on the same boot.
+        let d = tempfile::tempdir().unwrap();
+        let mut st = WatchState::default();
+        observe(&mut st, &up(&["a", "mrpopo"]), 0.0, Some(-10.0));
+        observe(&mut st, &Census::NoServer, 10.0, Some(-10.0));
+        assert!(save_state(d.path(), &st), "saved before any start");
+        let mut st = load_state(d.path());
+        assert_eq!(observe(&mut st, &up(&["mrpopo"]), 25.0, Some(-10.0)), Decision::Quiet);
+        assert!(st.pending.contains(&"a".to_string()), "a is still owed a restore: {:?}", st.pending);
+        assert!(pending_due(&st, 25.0));
+    }
+
+    #[test]
+    fn an_unwritable_state_file_is_reported_not_assumed_durable() {
+        let d = tempfile::tempdir().unwrap();
+        let missing = d.path().join("no-such-dir");
+        assert!(!save_state(&missing, &WatchState::default()));
     }
 
     #[test]
