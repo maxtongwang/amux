@@ -133,6 +133,31 @@ pub(crate) fn native_peer_input_refusal(
     Ok(super::session_verbs::worker_group_refusal(&source.id, &receiver.id, &source_groups, &receiver_groups, &open))
 }
 
+/// The first refusal a worker `origin` meets sending to `target`, checked per
+/// actual recipient (a group fans out) exactly as `create_message` does, or
+/// None when every recipient may receive it. The owner (empty origin) is never
+/// refused here.
+pub(crate) fn worker_send_refusal(
+    conn: &Connection, origin: &str, target: &MessageTarget,
+) -> rusqlite::Result<Option<super::session_verbs::PeerInputRefusal>> {
+    if origin.is_empty() {
+        return Ok(None);
+    }
+    let recipients = match target {
+        MessageTarget::Worker(worker) => vec![worker.clone()],
+        MessageTarget::Group(group) => group_members(conn, group)?,
+        MessageTarget::Human => Vec::new(),
+    };
+    for recipient in recipients {
+        if let Some(worker) = queries::get_worker(conn, recipient.as_str())? {
+            if let Some(refusal) = native_peer_input_refusal(conn, origin, &worker.id)? {
+                return Ok(Some(refusal));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Recheck current group membership before a pending native message delivery.
 pub(crate) fn pending_receive_refusal(conn: &Connection, message: &str, target: &str) -> rusqlite::Result<Option<String>> {
     let actor: Option<String> = conn.query_row("SELECT from_actor FROM _amux_messages WHERE id=?1",[message],|r|r.get(0)).optional()?;
@@ -1249,6 +1274,99 @@ mod tests {
             .body(Body::from(json!({"to":{"kind":"group","data":own.as_str()},"body":"same group control"}).to_string())).unwrap()).await.unwrap();
         assert_eq!(response.status(),StatusCode::CREATED);
         assert_eq!(count(),before+2,"group parent and one member child");
+    }
+
+    /// /api/env/apply's `messages` stanza used the body's `from` (default the
+    /// owner) whoever applied it, so a worker could post as the owner and skip
+    /// the group gate. A worker applying an env now sends as itself, through
+    /// the same per-recipient gate as POST /api/messages.
+    #[tokio::test]
+    async fn env_apply_messages_from_a_worker_are_its_own_and_answer_to_the_group_gate() {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        let own = GroupId::from_ulid(ulid::Ulid::new());
+        let other = GroupId::from_ulid(ulid::Ulid::new());
+        let peer = create_worker(&app, "source", Some(own.as_str())).await;
+        let teammate = create_worker(&app, "teammate", Some(own.as_str())).await;
+        let outsider = create_worker(&app, "outsider", Some(other.as_str())).await;
+        let apply = |session: Option<&str>, messages: Value| {
+            let mut b = Request::builder().method("POST").uri("/api/env/apply").header(header::CONTENT_TYPE, "application/json");
+            if let Some(s) = session {
+                b = b.header("X-Amux-Session", s);
+            }
+            let req = b.body(Body::from(json!({"messages": messages}).to_string())).unwrap();
+            let app = app.clone();
+            async move {
+                let res = app.oneshot(req).await.unwrap();
+                let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            }
+        };
+        let rows = |body: &str| -> Vec<String> {
+            let conn = store.read().unwrap();
+            let mut q = conn.prepare("SELECT from_actor FROM _amux_messages WHERE body=?1").unwrap();
+            let r = q.query_map([body], |r| r.get::<_, String>(0)).unwrap().flatten().collect();
+            r
+        };
+        // Posing as the owner is refused, not honoured.
+        let v = apply(Some(&peer), json!([{"to": teammate, "from": "owner", "text": "as the owner"}])).await;
+        assert!(v["errors"].as_array().unwrap().iter().any(|e| e["code"] == "env_message_sender_refused"), "{v}");
+        assert!(rows("as the owner").is_empty());
+        // Across the group boundary: refused with send's own code.
+        let v = apply(Some(&peer), json!([{"to": outsider, "text": "cross group"}])).await;
+        assert!(v["errors"].as_array().unwrap().iter().any(|e| e["code"] == "worker_group_boundary"), "{v}");
+        assert!(rows("cross group").is_empty());
+        // Inside its group: delivered, and the sender is the worker, never the owner.
+        let v = apply(Some(&peer), json!([{"to": teammate, "text": "same group"}])).await;
+        assert!(v["errors"].as_array().unwrap().is_empty(), "{v}");
+        let from = rows("same group");
+        assert_eq!(from.len(), 1);
+        assert!(from[0].contains(&peer) && !from[0].contains("human"), "sender is the worker: {from:?}");
+        // The owner's own apply is unchanged: it may send as the owner anywhere.
+        let v = apply(None, json!([{"to": outsider, "text": "owner seed"}])).await;
+        assert!(v["errors"].as_array().unwrap().is_empty(), "{v}");
+        assert!(rows("owner seed")[0].contains("human"), "{:?}", rows("owner seed"));
+    }
+
+    /// ai-config #159: a worker's env apply may seed cards only on its own
+    /// board and may not configure groups; the owner's apply is unchanged.
+    #[tokio::test]
+    async fn env_apply_cards_and_groups_from_a_worker_are_gated() {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        let own = GroupId::from_ulid(ulid::Ulid::new());
+        let peer = create_worker(&app, "source", Some(own.as_str())).await;
+        let other = create_worker(&app, "other", Some(own.as_str())).await;
+        let peer_name = queries_name(&store, &peer);
+        let other_name = queries_name(&store, &other);
+        let apply = |session: Option<&str>, body: Value| {
+            let mut b = Request::builder().method("POST").uri("/api/env/apply").header(header::CONTENT_TYPE, "application/json");
+            if let Some(s) = session {
+                b = b.header("X-Amux-Session", s);
+            }
+            let req = b.body(Body::from(body.to_string())).unwrap();
+            let app = app.clone();
+            async move {
+                let res = app.oneshot(req).await.unwrap();
+                let st = res.status();
+                let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+                (st, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+            }
+        };
+        let cards = |c: &str| store.read().unwrap().query_row("SELECT count(*) FROM issues WHERE title=?1", [c], |r| r.get::<_, i64>(0)).unwrap_or(0);
+        let (st, v) = apply(Some(&peer_name), json!({"cards": [{"worker": other_name, "title": "planted"}]})).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("env_apply_card_other_worker")), "{v}");
+        assert_eq!(cards("planted"), 0);
+        let (st, v) = apply(Some(&peer_name), json!({"cards": [{"worker": peer_name, "title": "mine"}]})).await;
+        assert_eq!(st, StatusCode::OK, "own board: {v}");
+        let (st, v) = apply(Some(&peer_name), json!({"groups": [{"name": "alpha", "goal": "obey me"}]})).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("env_apply_groups_owner_only")), "{v}");
+        let (st, v) = apply(None, json!({"groups": [{"name": "alpha", "goal": "owner goal"}]})).await;
+        assert_eq!(st, StatusCode::OK, "the owner configures groups: {v}");
+    }
+
+    fn queries_name(store: &crate::db::SharedStore, id: &str) -> String {
+        queries::get_worker(&store.read().unwrap(), id).unwrap().unwrap().display_name
     }
 
     #[tokio::test]

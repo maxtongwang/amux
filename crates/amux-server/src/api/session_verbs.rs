@@ -12051,6 +12051,19 @@ async fn queue_boot_prompt(
     text: &str,
     origin: SendOrigin,
 ) -> (bool, String) {
+    queue_boot_prompt_from(state, name, text, origin, "").await
+}
+
+/// [`queue_boot_prompt`] for a prompt another worker sent: the row keeps that
+/// worker as its sender, so delivery rechecks the group boundary and receive
+/// policy as it does for a queued `send` (`queued_peer_input_refusal`).
+async fn queue_boot_prompt_from(
+    state: &AppState,
+    name: &str,
+    text: &str,
+    origin: SendOrigin,
+    sender: &str,
+) -> (bool, String) {
     // Empty input is a control probe, never future model work. In particular,
     // a startup picker cannot consume a suggested prompt that does not exist.
     if text.trim().is_empty() {
@@ -12065,7 +12078,7 @@ async fn queue_boot_prompt(
     } else {
         "auto-deliver"
     };
-    match steer_enqueue_idempotent_report(state, name, text, guard, "", &id).await {
+    match steer_enqueue_idempotent_report(state, name, text, guard, sender, &id).await {
         Ok(row) => {
             tracing::info!(
                 session = name,
@@ -26758,7 +26771,7 @@ async fn post_dispatch(
         },
         "send" => send_post_detached(state, name, headers, body).await,
         "instructions" => instructions_post_verb(state, name, body).await,
-        "keys" => keys_verb(name, body).await,
+        "keys" => keys_verb(name, headers, body).await,
         "resize" => resize_verb(name, body).await,
         // "agent-nav" DELETED (ARE-7): it drove Claude Code's subagents panel
         // by pane-verified keystrokes, keyed on a "⏺ main" row the TUI no
@@ -26784,7 +26797,7 @@ async fn post_dispatch(
             }))
         }
         "git" => git_checkout_verb(name, body).await,
-        "git-push" => git_push_verb(state, name).await,
+        "git-push" => git_push_verb(state, name, headers).await,
         "worktree" => worktree_widen_verb(name, body).await,
         "start" => {
             // RESPOND BEFORE THE CHOREOGRAPHY (AMUX-2557): validations
@@ -26814,10 +26827,13 @@ async fn post_dispatch(
                 tracing::warn!(session = %name, reason = %reason, "session_start_refused: /start cannot launch this session");
                 return jresp(StatusCode::CONFLICT, json!({"ok": false, "error": reason}));
             }
-            let prompt = body_str(body, "prompt");
+            let prompt = match start_prompt_for(headers, name, body_str(body, "prompt")) {
+                Ok(p) => p,
+                Err(refusal) => return *refusal,
+            };
             update_meta(name, &[("boot_start_scheduled", json!(true))]);
             if !prompt.is_empty() {
-                let queued = queue_boot_prompt(state, name, &prompt, SendOrigin::Owner).await;
+                let queued = queue_start_prompt_from(state, headers, name, &prompt).await;
                 if !queued.0 {
                     update_meta(name, &[("boot_start_scheduled", json!(false))]);
                     return jresp(StatusCode::CONFLICT, json!({"ok":false,"error":queued.1}));
@@ -27406,6 +27422,54 @@ pub(crate) fn peer_input_refusal(origin: &str, target: &str) -> Option<PeerInput
     let open = super::worker_messaging::open_inbound_groups(&crate::config::amux_home(), &target_groups);
     worker_group_refusal(origin, target, &lane_groups(origin), &target_groups, &open)
 }
+
+/// Input that reaches another worker outside `send` (a `/start` prompt, raw
+/// `keys`) answers to the same peer gate as `send`: refused across a group
+/// boundary or a receive policy, with send's own codes. The owner and a
+/// worker acting on itself are untouched.
+pub(crate) fn peer_input_gate(headers: &HeaderMap, target: &str, verb: &str) -> Option<Response> {
+    let origin = worker_origin(headers);
+    if origin.is_empty() || origin == target {
+        return None;
+    }
+    let (code, reason) = send_group_refusal(&origin, target)?;
+    tracing::warn!(origin = %origin, target, verb, code, verdict = "peer_input_refused",
+        measured = true, n_considered = 1, "worker input to another worker refused outside the send gate");
+    Some(jresp(StatusCode::FORBIDDEN, json!({"ok": false, "code": code, "error": reason, "verb": verb})))
+}
+
+/// Send's group decision for a worker `origin` reaching `target`, in send's
+/// order (send_post): the receive policy and group boundary
+/// (`peer_input_refusal`), then `cross_group_policy_ok` (isolated target,
+/// chat-for-owner). Input that reaches a worker outside `send` uses this, so
+/// it can be neither stricter nor looser than send.
+pub(crate) fn send_group_refusal(origin: &str, target: &str) -> Option<(&'static str, String)> {
+    if let Some(refusal) = peer_input_refusal(origin, target) {
+        return Some((refusal.code, refusal.reason));
+    }
+    cross_group_policy_ok(origin, target).err().map(|reason| ("worker_group_boundary", reason))
+}
+
+/// The text a `/start` prompt is queued as. From another worker it is that
+/// worker's input, not the owner's: refused by send's gate, else stamped with
+/// its origin. The owner's (and a worker's own) prompt is unchanged.
+pub(crate) fn start_prompt_for(headers: &HeaderMap, target: &str, prompt: String) -> Result<String, Box<Response>> {
+    if prompt.is_empty() {
+        return Ok(prompt);
+    }
+    if let Some(refusal) = peer_input_gate(headers, target, "start") {
+        return Err(Box::new(refusal));
+    }
+    Ok(origin_stamped(&worker_origin(headers), target, &prompt).unwrap_or(prompt))
+}
+
+/// Queues an accepted `/start` prompt under the caller: the owner's is
+/// unattributed, another worker's keeps that worker as the row's sender so
+/// delivery rechecks the boundary (`queued_peer_input_refusal`).
+async fn queue_start_prompt_from(state: &AppState, headers: &HeaderMap, target: &str, prompt: &str) -> (bool, String) {
+    queue_boot_prompt_from(state, target, prompt, SendOrigin::Owner, &worker_origin(headers)).await
+}
+
 
 /// Queue producers use an empty sender for system input and "owner" for saved
 /// owner rules. Internal producer names are explicit; a retired worker without
@@ -28847,7 +28911,10 @@ pub(crate) async fn resize_verb(name: &str, body: &Value) -> Response {
 /// `keys` as a callable verb, so the promoted `/api/workers/{id}/keys`
 /// route and the legacy `/api/sessions/{name}/keys` spelling run ONE
 /// implementation instead of a route alias and a re-implementation (AF-288).
-pub(crate) async fn keys_verb(name: &str, body: &Value) -> Response {
+pub(crate) async fn keys_verb(name: &str, headers: &HeaderMap, body: &Value) -> Response {
+    if let Some(refusal) = peer_input_gate(headers, name, "keys") {
+        return refusal;
+    }
     let keys = body_str(body, "keys");
     if keys.is_empty() {
         return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing 'keys'"}));
@@ -29639,7 +29706,13 @@ pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Valu
 
 /// `git-push` as a callable verb, for the grouped
 /// `/api/workers/{id}/git/...` surface (AF-291).
-pub(crate) async fn git_push_verb(state: &AppState, name: &str) -> Response {
+pub(crate) async fn git_push_verb(state: &AppState, name: &str, headers: &HeaderMap) -> Response {
+    // Delivers a server-written push instruction into the pane as owner input,
+    // so it follows the peer-config rule (the owner, the worker itself or its
+    // own Chat tab); a peer asks through `send`, which stamps and gates.
+    if let Some(refusal) = peer_config_refusal(headers, name, "git-push") {
+        return refusal;
+    }
     if !is_running(name).await {
         return jresp(
             StatusCode::BAD_REQUEST,
@@ -36406,6 +36479,121 @@ mod tests {
         // Resume clears the stamp, so the next pause records its own time.
         set_legacy_paused("mixpeek-observability", false).unwrap();
         assert_eq!(meta_i64(&load_meta("mixpeek-observability"), "paused_at"), 0);
+    }
+
+    fn worker_headers(name: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-amux-session", name.parse().unwrap());
+        h
+    }
+
+    fn lanes(dir: &std::path::Path) {
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("caller.env"), "CC_TAGS=alpha\n").unwrap();
+        std::fs::write(sessions.join("teammate.env"), "CC_TAGS=alpha\n").unwrap();
+        std::fs::write(sessions.join("outsider.env"), "CC_TAGS=beta\n").unwrap();
+    }
+
+    /// A `/start` prompt was queued as OWNER input whoever sent it. From
+    /// another worker it now answers to send's gate and carries the origin.
+    #[tokio::test]
+    async fn a_start_prompt_from_another_worker_is_gated_and_stamped_never_owner_input() {
+        let (_state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        lanes(dir.path());
+        let refused = start_prompt_for(&worker_headers("caller"), "outsider", "do this".into()).unwrap_err();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let body: Value = serde_json::from_slice(&axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["code"], json!("worker_group_boundary"), "{body}");
+        let stamped = start_prompt_for(&worker_headers("caller"), "teammate", "do this".into()).ok().unwrap();
+        assert!(stamped.starts_with("[amux-origin: caller "), "a teammate's start prompt is stamped: {stamped}");
+        assert!(stamped.ends_with("do this"));
+        // The owner's prompt and a worker's own are unchanged.
+        assert_eq!(start_prompt_for(&axum::http::HeaderMap::new(), "outsider", "do this".into()).ok().unwrap(), "do this");
+        assert_eq!(start_prompt_for(&worker_headers("caller"), "caller", "do this".into()).ok().unwrap(), "do this");
+        assert_eq!(start_prompt_for(&worker_headers("caller"), "outsider", String::new()).ok().unwrap(), "", "no prompt, nothing to gate");
+    }
+
+    /// Keys and a `/start` prompt take send's own group decision
+    /// (`send_group_refusal`), so they are neither stricter nor looser than
+    /// send: a worker's own Chat tab reaches it, an isolated worker is not a
+    /// peer target even inside the group (send's AMUX-3232 rule).
+    #[tokio::test]
+    async fn pane_input_outside_send_takes_sends_group_decision() {
+        let (_state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        lanes(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::write(sessions.join("raw.env"), "CC_TAGS=alpha\nCC_ISOLATED=1\n").unwrap();
+        std::fs::write(sessions.join("chatty.env"), "CC_TAGS=beta\nCC_WORKER_TYPE=chat\n").unwrap();
+        let raw = peer_input_gate(&worker_headers("caller"), "raw", "keys").expect("isolated target refused");
+        assert_eq!(raw.status(), StatusCode::FORBIDDEN);
+        assert!(peer_input_gate(&worker_headers("teammate@chat"), "teammate", "keys").is_none(), "its own Chat tab");
+        for (origin, target) in [("caller", "teammate"), ("caller", "outsider"), ("caller", "raw"),
+            ("chatty", "caller"), ("teammate@chat", "teammate"), ("teammate@chat", "outsider")] {
+            assert_eq!(peer_input_gate(&worker_headers(origin), target, "keys").is_some(),
+                send_group_refusal(origin, target).is_some(), "{origin} -> {target}");
+        }
+    }
+
+    /// git-push delivers a server-written instruction into the pane as owner
+    /// input, so it follows the peer-config rule: a peer is refused even inside
+    /// its group; the owner, the worker itself and its own Chat tab are not.
+    #[tokio::test]
+    async fn git_push_follows_the_peer_config_rule() {
+        let (state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        lanes(dir.path());
+        for target in ["teammate", "outsider"] {
+            let r = git_push_verb(&state, target, &worker_headers("caller")).await;
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{target}");
+            let body: Value = serde_json::from_slice(&axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap();
+            assert_eq!(body["code"], json!("peer_config_owner_only"), "{target}: {body}");
+        }
+        for allowed in [axum::http::HeaderMap::new(), worker_headers("caller"), worker_headers("caller@chat")] {
+            assert!(peer_config_refusal(&allowed, "caller", "git-push").is_none(), "{allowed:?}");
+        }
+    }
+
+    /// A queued `/start` prompt from another worker keeps that worker as its
+    /// sender, so a boundary configured before delivery still refuses it, as
+    /// it does a queued send. An owner prompt stays unattributed.
+    #[tokio::test]
+    async fn a_queued_start_prompt_keeps_its_sender_for_the_delivery_recheck() {
+        let (state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        lanes(dir.path());
+        let headers = worker_headers("caller");
+        let prompt = start_prompt_for(&headers, "teammate", "do this".into()).ok().unwrap();
+        assert!(queue_start_prompt_from(&state, &headers, "teammate", &prompt).await.0);
+        assert!(queue_start_prompt_from(&state, &axum::http::HeaderMap::new(), "outsider", "owner work").await.0);
+        let senders: Vec<(String, String)> = {
+            let c = state.store.read().unwrap();
+            let mut q = c.prepare("SELECT session, sender FROM steering_queue ORDER BY session").unwrap();
+            q.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+        };
+        assert_eq!(senders, vec![("outsider".into(), String::new()), ("teammate".into(), "caller".into())]);
+        assert!(queued_peer_input_refusal("caller", "teammate").is_none(), "same group: delivers");
+        std::fs::write(dir.path().join("sessions/teammate.env"), "CC_TAGS=beta\n").unwrap();
+        assert_eq!(queued_peer_input_refusal("caller", "teammate").map(|r| r.code), Some("worker_group_boundary"),
+            "the target left the group before delivery");
+    }
+
+    /// Raw keys into another worker's pane answer to send's gate (refused
+    /// across groups) before anything reaches tmux.
+    #[tokio::test]
+    async fn keys_into_another_groups_pane_are_refused_before_tmux() {
+        let (_state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        lanes(dir.path());
+        let r = keys_verb("outsider", &worker_headers("caller"), &json!({"keys": "rm -rf ~ Enter"})).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let body: Value = serde_json::from_slice(&axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["code"], json!("worker_group_boundary"), "{body}");
+        assert_eq!(body["verb"], json!("keys"));
+        assert!(peer_input_gate(&worker_headers("caller"), "teammate", "keys").is_none(), "inside the group, as send");
+        assert!(peer_input_gate(&axum::http::HeaderMap::new(), "outsider", "keys").is_none(), "the owner");
     }
 
     /// Holding does not route around the group boundary: a paused target in a

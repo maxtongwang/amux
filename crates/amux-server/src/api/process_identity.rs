@@ -25,10 +25,12 @@
 //!   stronger evidence, and a sandbox can strip the token's env var too).
 //!
 //! FAIL CLOSED. The owner is allowed only on positive proof: the holders were
-//! found by a full scan, their ancestry reached the root, a pane inventory read
-//! now succeeded, and none is in a worker pane (the dashboard browser, the
-//! owner's terminal, launchd jobs). A cached inventory or a remembered holder
-//! may confirm a worker, never the owner. Anything unproven is refused for a
+//! found by a full scan, their ancestry reached the root, and none is in a
+//! worker pane (the dashboard browser, the owner's terminal, launchd jobs).
+//! "None is in a pane" is proven either by a pane inventory read now, or, for
+//! holders that no pane can contain (no controlling tty, no pty open, no tmux
+//! server ancestor: see `needs_inventory`), without one. A cached inventory or
+//! a remembered holder may confirm a worker, never the owner. Anything unproven is refused for a
 //! headerless `/api/` request: `worker_origin_unattributed`, or
 //! `worker_identity_unavailable` when the pane inventory cannot be read.
 //!
@@ -203,12 +205,19 @@ pub(crate) trait Lookups {
 }
 
 /// Whether the holders could be tied to a tmux pane at all, so that proving
-/// them outside needs the pane inventory. A holder needs it when it has a
-/// controlling tty or holds any pty, or when any ancestor is a tmux server (or
-/// has a name that cannot be read). A holder with none of these cannot be in a
-/// pane whatever the inventory says (a detached `setsid` daemon reads outside
-/// either way: the same-user limit), so it is proven outside without running
-/// tmux. The walk itself must succeed: a chain that breaks or runs out of steps
+/// them outside needs the pane inventory. What makes skipping it sound: a
+/// pane's processes descend from the tmux server (`classify` walks to a pane
+/// shell) or carry the pane's tty as controlling tty (`classify`'s tty match);
+/// a holder with no tmux-server ancestor and no controlling tty matches neither
+/// whatever the inventory says (a detached `setsid` daemon reads outside either
+/// way: the same-user limit). An open pty, or an ancestor whose name cannot be
+/// read, also forces the read: extra caution, not part of that argument.
+///
+/// Coupling: the tmux server is recognised by its process name (`tmux`, or a
+/// `tmux:` title). A tmux binary running under another name is not; its panes'
+/// processes are still caught by their controlling tty, and only a holder that
+/// both runs under a renamed tmux and has dropped its tty would be missed,
+/// which is the same-user detach limit again. The walk itself must succeed: a chain that breaks or runs out of steps
 /// is an error, never a shortcut (round 9, dev-lead; the per-request tmux
 /// spawn put draw-realtime p95 at 150-157ms against 118-128ms on main).
 fn needs_inventory(holders: &[u32], l: &dyn Lookups) -> Result<bool, String> {
