@@ -28,7 +28,11 @@ async function fakeMessagesApi() {
     for await (const chunk of req) body += chunk;
     if (req.method !== 'POST' || !req.url?.endsWith('/v1/messages')) { res.writeHead(404).end(); return; }
     const prompt = JSON.parse(body).messages?.[0]?.content || '';
-    prompts.push(prompt);
+    // `mdai_api_base` is a server-wide pref, so other model callers in a spec
+    // running alongside this one (skill example inference on a skill save)
+    // reach this stand-in too. Count only this spec's node: every node prompt
+    // carries its instruction. Others get an answer and are not counted.
+    if (String(prompt).includes('"Where I Left Off" dashboard')) prompts.push(prompt);
     const { delayMs, fail } = mode;
     setTimeout(() => {
       if (res.destroyed) return;

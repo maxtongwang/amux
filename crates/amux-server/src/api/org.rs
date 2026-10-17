@@ -92,6 +92,14 @@ pub(crate) fn local_member_actor(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+/// Drop every verified-member marker: a request attributed to a worker process
+/// (api/process_identity.rs) is that worker, never a human member.
+pub(crate) fn strip_member_headers(headers: &mut HeaderMap) {
+    for h in [VERIFIED_MEMBER_HEADER, MEMBER_ACTOR_HEADER, MEMBER_SCOPE_LEVEL_HEADER, MEMBER_SCOPE_NAME_HEADER] {
+        headers.remove(h);
+    }
+}
+
 /// Stamp a verified member identity onto headers for an INTERNAL call made on
 /// that member's behalf (a Messages post delivered to a worker). Inbound copies
 /// of these headers are stripped by the middleware, so only server code can

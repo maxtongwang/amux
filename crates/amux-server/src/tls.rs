@@ -356,7 +356,7 @@ where
     S: Send + 'static,
 {
     type Stream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
-    type Service = S;
+    type Service = WithServerLocal<S>;
     type Future = std::pin::Pin<
         Box<
             dyn std::future::Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send,
@@ -367,6 +367,10 @@ where
         let inner = self.inner.clone();
         let fallback = self.fallback_host.clone();
         Box::pin(async move {
+            // The server's end of this connection, for process attribution
+            // (api/process_identity.rs): with the peer it names the exact
+            // connection, which the peer alone cannot on a 0.0.0.0 listener.
+            let local = stream.local_addr().ok();
             let mut first = [0u8; 1];
             let n = stream.peek(&mut first).await?;
             if n == 1 && first[0] != 0x16 {
@@ -426,8 +430,38 @@ where
                     "plain http redirected",
                 ));
             }
-            axum_server::accept::Accept::accept(&inner, stream, service).await
+            axum_server::accept::Accept::accept(&inner, stream, service)
+                .await
+                .map(|(stream, inner)| (stream, WithServerLocal { inner, local }))
         })
+    }
+}
+
+/// A connection's service that stamps the server's end of the connection on
+/// every request as a [`crate::api::process_identity::ServerLocal`] extension.
+#[derive(Clone)]
+pub struct WithServerLocal<S> {
+    inner: S,
+    local: Option<std::net::SocketAddr>,
+}
+
+impl<S, B> tower::Service<axum::http::Request<B>> for WithServerLocal<S>
+where
+    S: tower::Service<axum::http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: axum::http::Request<B>) -> Self::Future {
+        if let Some(local) = self.local {
+            req.extensions_mut().insert(crate::api::process_identity::ServerLocal(local));
+        }
+        self.inner.call(req)
     }
 }
 

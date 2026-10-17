@@ -351,6 +351,8 @@ impl Rig {
             .args(["--exact", "fixture_server_child", "--nocapture"])
             .env("AMUX_MATRIX_CHILD_HOME", &self.home)
             .env("AMUX_HOME", &self.home)
+            // Shares the default tmux server; see process_identity.rs.
+            .env("AMUX_PROCESS_ATTRIBUTION", "0")
             .env("AMUX_RS_PORT", self.port.to_string())
             .env("AMUX_MATRIX_CHILD_PORT", self.port.to_string())
             .env("AMUX_MATRIX_PROVIDER", &self.provider)
