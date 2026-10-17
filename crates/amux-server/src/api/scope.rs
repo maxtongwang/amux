@@ -995,7 +995,9 @@ async fn put_scope(state: AppState, req: Request) -> Response {
     // the env reader will read.
     let is_worker = member.is_none() && !actor.is_empty();
     let raw_env = capability == "env" && body.get("value").is_some_and(Value::is_string);
-    if is_worker && (raw_env || capability == "rules") {
+    // Group rules are a delegation row (ai-config #160: a lead's own team,
+    // mrpopo's `leads` with max_ref); every other rules layer stays the owner's.
+    if is_worker && (raw_env || (capability == "rules" && level != "group")) {
         tracing::warn!(actor = %actor, level = %level, name = %name, capability = %capability,
             verdict = "scope_raw_text_refused", measured = true, n_considered = 1,
             "a worker tried to write free text into an env or rules file");
@@ -1007,22 +1009,26 @@ async fn put_scope(state: AppState, req: Request) -> Response {
             return j(400, json!({"ok": false, "code": "env_text_noncanonical", "error": why}));
         }
     }
-    // Messaging-authority keys stay the owner's even under
-    // AMUX_SCOPE_WRITE_AGENTS=1, with the same predicate and code as every
-    // other membership path (session_verbs::membership_patch_refusal).
-    if capability == "env" {
-        let home = super::groups::amux_home();
-        let value = body.get("value").cloned().unwrap_or(Value::Null);
-        if let Some(k) = membership_key_changed(&home, &level, &name, &value) {
-            if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(&headers, true) {
-                tracing::warn!(actor = %actor, level = %level, name = %name, key = %k,
-                    verdict = "scope_membership_key_refused", measured = true, n_considered = 1,
-                    "a session tried to change a messaging-authority scope key");
-                return refusal;
-            }
+    // A worker's scope write is decided by the delegation table, not by
+    // `scope_write_allowed` or AMUX_SCOPE_WRITE_AGENTS: one place answers
+    // "may X do Y to Z" (ai-config #160).
+    let home = super::groups::amux_home();
+    let value = body.get("value").cloned().unwrap_or(Value::Null);
+    let grant = if is_worker {
+        let (target, action) = scope_action(&home, &level, &name, &capability, &value);
+        match crate::api::delegation::authorize(&state, &headers, &target, &action, Some(&body)) {
+            Ok(g) => g,
+            Err(r) => return r,
         }
-    }
-    scope_write(
+    } else {
+        None
+    };
+    let read_now = || {
+        let conn = state.store.read().ok();
+        read_cap_value(conn.as_deref(), &home, &level, &name, &capability).map(|(v, _)| v).unwrap_or(Value::Null)
+    };
+    let before = grant.as_ref().map(|_| read_now());
+    let resp = scope_write(
         &state,
         &level,
         &name,
@@ -1030,8 +1036,54 @@ async fn put_scope(state: AppState, req: Request) -> Response {
         body.get("value"),
         &actor,
         member.as_ref(),
+        grant.is_some(),
     )
-    .await
+    .await;
+    if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+        let (b, a) = crate::api::delegation::changed_only(&before.unwrap_or(Value::Null), &read_now());
+        g.commit(&state, b, a);
+    }
+    resp
+}
+
+/// The delegation target and action of a worker's `/api/scope` write.
+/// Worker layer: a tags change is SetTags, other env keys `env:KEY`, other
+/// capabilities `scope:<cap>`. Group layer: rules are SetGroupRules, the
+/// open-inbound switch is SetRouting, anything else is an unclassified (so
+/// owner-only) `group:` setting. Global: an owner-only `global:` setting.
+fn scope_action(home: &Path, level: &str, name: &str, capability: &str, value: &Value) -> (crate::api::delegation::Target, crate::api::delegation::Action) {
+    use crate::api::delegation::{Action, Target};
+    let env_keys = || if capability == "env" { env_keys_changed(home, level, name, value) } else { vec![] };
+    let named = |prefix: &str, keys: Vec<String>| -> Vec<String> {
+        if capability == "env" { keys.into_iter().map(|k| format!("{prefix}env:{k}")).collect() } else { vec![format!("{prefix}scope:{capability}")] }
+    };
+    match level {
+        "worker" => {
+            let target = Target::Worker(name.to_string());
+            let keys = env_keys();
+            if keys.len() == 1 && keys[0] == "CC_TAGS" {
+                let from: Vec<String> = crate::api::session_verbs::lane_groups(name).into_iter().collect();
+                let to = match value.get("CC_TAGS") {
+                    None | Some(Value::Null) => vec![],
+                    Some(other) => crate::api::session_verbs::tags_of(Some(other)).unwrap_or_else(|_| vec!["!invalid".into()]),
+                };
+                return (target, Action::SetTags { from, to });
+            }
+            (target, Action::SetConfig { keys: named("", keys) })
+        }
+        "group" => {
+            let target = Target::Group(name.to_string());
+            if capability == "rules" {
+                return (target, Action::SetGroupRules { group: crate::api::session_verbs::norm_label(name) });
+            }
+            let keys = env_keys();
+            if capability == "env" && !keys.is_empty() && keys.iter().all(|k| k == crate::api::worker_messaging::OPEN_INBOUND_KEY) {
+                return (target, Action::SetRouting);
+            }
+            (target, Action::SetConfig { keys: named("group:", keys) })
+        }
+        _ => (Target::Fleet, Action::SetConfig { keys: named("global:", env_keys()) }),
+    }
 }
 
 /// Python `_scope_write`: validate → authorize → before-read → storage write
@@ -1044,6 +1096,7 @@ async fn scope_write(
     value: Option<&Value>,
     actor: &str,
     member: Option<&super::org::MemberScope>,
+    delegated: bool,
 ) -> Response {
     let Some(cap) = cap_by_key(key) else {
         return j(400, json!({"error": format!("unknown capability '{key}'")}));
@@ -1077,6 +1130,8 @@ async fn scope_write(
                 "'{actor}' is a member with {} access ({}) and may configure only workers inside it, not the {level} layer for '{name}'.",
                 m.level(), if m.name().is_empty() { "global" } else { m.name() }))
         }
+        // A worker's write already passed the delegation table (put_scope).
+        None if delegated => (true, format!("'{actor}' through the delegation table (ai-config #160)")),
         None => scope_write_allowed(level, name, actor),
     };
     if !ok {
@@ -1090,7 +1145,7 @@ async fn scope_write(
     };
 
     let value = value.cloned().unwrap_or(Value::Null);
-    if key == "env" && !actor.is_empty() {
+    if key == "env" && !actor.is_empty() && !delegated {
         if let Some(k) = owner_only_key_changed(&home, level, name, &value) {
             tracing::warn!(actor = %actor, level, name, key = %k, verdict = "scope_owner_only_key_refused",
                 "a session tried to change an owner-only scope key");
@@ -1215,7 +1270,7 @@ const OWNER_ONLY_ENV_PREFIXES: &[&str] = &[
     "AMUX_WORKER_TOKEN",
 ];
 
-fn is_owner_only_env_key(k: &str) -> bool {
+pub(crate) fn is_owner_only_env_key(k: &str) -> bool {
     OWNER_ONLY_ENV_PREFIXES.iter().any(|p| k.starts_with(p))
 }
 
@@ -1259,12 +1314,20 @@ fn scope_env_value(v: &Value) -> Option<String> {
 /// object). A second parser here was review round 3's blocker. Text that is
 /// not canonical is reported as a change, so a guard never passes it.
 fn env_key_changed(home: &Path, level: &str, name: &str, value: &Value, guarded: impl Fn(&str) -> bool) -> Option<String> {
+    env_keys_changed(home, level, name, value).into_iter().find(|k| k == NONCANONICAL || guarded(k))
+}
+
+const NONCANONICAL: &str = "(non-canonical env text)";
+
+/// Every key whose value the env reader would see change if this write
+/// landed, in key order; [`NONCANONICAL`] alone for text that is not canonical.
+pub(crate) fn env_keys_changed(home: &Path, level: &str, name: &str, value: &Value) -> Vec<String> {
     let current: std::collections::BTreeMap<String, String> =
         crate::api::session_verbs::EnvFile::load(&env_file(home, level, name)).pairs().iter().cloned().collect();
     let next: std::collections::BTreeMap<String, String> = match value {
         Value::String(text) => match crate::api::session_verbs::EnvFile::parse_canonical(text) {
             Ok(pairs) => pairs.into_iter().collect(),
-            Err(_) => return Some("(non-canonical env text)".into()),
+            Err(_) => return vec![NONCANONICAL.into()],
         },
         Value::Object(obj) => {
             let mut merged = current.clone();
@@ -1276,10 +1339,10 @@ fn env_key_changed(home: &Path, level: &str, name: &str, value: &Value, guarded:
             }
             merged
         }
-        _ => return None,
+        _ => return vec![],
     };
     let keys: BTreeSet<String> = current.keys().chain(next.keys()).cloned().collect();
-    keys.into_iter().find(|k| guarded(k) && current.get(k) != next.get(k))
+    keys.into_iter().filter(|k| current.get(k) != next.get(k)).collect()
 }
 
 fn write_env(home: &Path, level: &str, name: &str, value: &Value) -> Result<(), (u16, String)> {

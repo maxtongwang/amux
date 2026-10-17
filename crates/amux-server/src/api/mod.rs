@@ -150,6 +150,9 @@ pub mod workers;
 mod worker_messaging;
 mod mention_grants;
 pub mod workers_deadletters;
+pub(crate) mod delegation;
+pub(crate) mod delegation_log;
+pub(crate) mod max_ref;
 
 use crate::db::SharedStore;
 use axum::Router;

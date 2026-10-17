@@ -803,21 +803,48 @@ pub async fn patch_worker(
     // own row; `group` and the chat type are messaging authority; the free-form
     // `environment` map and `permissions` are the owner's.
     let origin = crate::api::session_verbs::worker_origin(&headers);
-    if !origin.is_empty() && origin != key {
-        let target = match resolve_key(&state, key.clone()).await {
-            Ok(n) => n,
-            Err(r) => return r,
-        };
-        if let Some(refusal) = crate::api::session_verbs::peer_config_refusal(&headers, &target, "the worker row") { return refusal; }
-    }
-    let authority = body.group.is_some() || body.worker_type.as_deref().is_some_and(crate::api::session_verbs::is_chat_type);
-    if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(&headers, authority) { return refusal; }
     if !origin.is_empty() && (body.environment.is_some() || body.permissions.is_some()) {
         tracing::warn!(worker = %origin, verdict = "raw_text_owner_only", measured = true, n_considered = 1,
             "a worker tried to set a worker row's environment or permissions");
         return err(StatusCode::FORBIDDEN, json!({"ok": false, "code": "raw_text_owner_only",
             "error": "a worker row's environment and permissions are the owner's to set"}));
     }
+    // Every other row field goes through the delegation table (ai-config #160).
+    let grant = if origin.is_empty() {
+        None
+    } else {
+        let target = match resolve_key(&state, key.clone()).await {
+            Ok(n) => n,
+            Err(r) => return r,
+        };
+        let authority = body.group.is_some() || body.worker_type.as_deref().is_some_and(crate::api::session_verbs::is_chat_type);
+        let action = if authority {
+            crate::api::delegation::Action::SetMembership { group: body.group.clone().unwrap_or_default() }
+        } else {
+            let fields = [("display_name", body.display_name.is_some()), ("name", body.name.is_some()), ("cwd", body.cwd.is_some()),
+                ("provider", body.provider.is_some()), ("model", body.model.is_some()), ("backend", body.backend.is_some()),
+                ("worker_type", body.worker_type.is_some())];
+            crate::api::delegation::Action::SetConfig { keys: fields.iter().filter(|(_, on)| *on).map(|(k, _)| format!("row:{k}")).collect() }
+        };
+        match crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Worker(target.clone()), &action, None) {
+            Ok(g) => g.map(|g| (g, target)),
+            Err(r) => return r,
+        }
+    };
+    let summary = json!({"display_name": body.display_name, "name": body.name, "cwd": body.cwd, "provider": body.provider,
+        "model": body.model, "backend": body.backend, "worker_type": body.worker_type, "group": body.group});
+    let resp = patch_worker_inner(State(state.clone()), Path(key), body).await;
+    if let Some((g, target)) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(&state, json!({"name": target}), summary);
+    }
+    resp
+}
+
+async fn patch_worker_inner(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    body: PatchWorkerBody,
+) -> Response {
     let display_name = match resolve_name_fields(body.display_name.clone(), body.name.clone()) {
         Ok(n) => n,
         Err(resp) => return *resp,
@@ -1297,7 +1324,30 @@ pub async fn start_worker(
 
 /// POST /api/workers/{id}/stop — worker -> Stopped; the live session row (if
 /// any) is ended as Killed. Stopping a stopped worker is an honest no-op.
-pub async fn stop_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+pub async fn stop_worker(State(state): State<AppState>, Path(key): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    // Stop goes through the delegation table (ai-config #160): a worker stops
+    // itself, a lead a worker in its team; every other worker is refused.
+    let grant = if crate::api::session_verbs::worker_origin(&headers).is_empty() {
+        None
+    } else {
+        let name = match resolve_key(&state, key.clone()).await {
+            Ok(n) => n,
+            Err(r) => return r,
+        };
+        match crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Worker(name.clone()),
+            &crate::api::delegation::Action::StopWorker, None) {
+            Ok(g) => g.map(|g| (g, name)),
+            Err(r) => return r,
+        }
+    };
+    let resp = stop_worker_inner(&state, key).await;
+    if let Some((g, name)) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(&state, json!({"name": name}), json!({"stopping": true}));
+    }
+    resp
+}
+
+async fn stop_worker_inner(state: &AppState, key: String) -> Response {
     let slot: Arc<Mutex<Option<StepOutcome>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
     let key_w = key.clone();
@@ -2068,12 +2118,20 @@ pub async fn instructions_worker(
     if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
         return crate::api::session_verbs::instructions_get_verb(&name);
     }
-    if let Some(refusal) = crate::api::session_verbs::peer_config_refusal(&headers, &name, "instructions") { return refusal; }
     let body = match crate::api::fs::parse_body(&body_bytes) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
-    crate::api::session_verbs::instructions_post_verb(&state, &name, &body).await
+    let grant = match crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Worker(name.clone()),
+        &crate::api::delegation::Action::SetConfig { keys: vec!["instructions".into()] }, Some(&body)) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    let resp = crate::api::session_verbs::instructions_post_verb(&state, &name, &body).await;
+    if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(&state, json!({"name": name}), json!({"updated": "instructions"}));
+    }
+    resp
 }
 
 /// `GET|POST /api/workers/{id}/memory` — the worker's memory file.
@@ -2094,12 +2152,20 @@ pub async fn memory_worker(
     if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
         return crate::api::session_verbs::memory_get_verb(&name);
     }
-    if let Some(refusal) = crate::api::session_verbs::peer_config_refusal(&headers, &name, "memory") { return refusal; }
     let body = match crate::api::fs::parse_body(&body_bytes) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
-    crate::api::session_verbs::memory_post_verb(&name, &body)
+    let grant = match crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Worker(name.clone()),
+        &crate::api::delegation::Action::SetConfig { keys: vec!["memory".into()] }, Some(&body)) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    let resp = crate::api::session_verbs::memory_post_verb(&name, &body);
+    if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(&state, json!({"name": name}), json!({"updated": "memory"}));
+    }
+    resp
 }
 
 /// The read sub-verbs of the git group: `commits`, `commit-detail`, `diff`.
@@ -2239,9 +2305,8 @@ pub async fn config_worker(
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
-    if let Some(refusal) = crate::api::session_verbs::peer_config_refusal(&headers, &name, "config") { return refusal; }
-    if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(&headers, crate::api::session_verbs::names_messaging_authority(&body)) { return refusal; }
-    crate::api::session_verbs::config_patch(&state, &name, &body).await
+    // The same gate and log as PATCH /api/sessions/<w>/config (ai-config #160).
+    crate::api::delegation::guarded_config_patch(&state, &headers, &name, &body).await
 }
 
 /// `ANY /api/workers/{id}/share` — the share family, whose method split is its

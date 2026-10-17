@@ -26748,9 +26748,47 @@ async fn post_dispatch(
     // The verbs that rewrite who a worker is (its name, its instructions, its
     // memory) follow the peer-config rule; the rename alias and PATCH config
     // must not differ.
-    if matches!(action, "rename" | "instructions" | "memory") {
-        if let Some(refusal) = peer_config_refusal(headers, name, action) { return refusal; }
+    // Through the delegation table (ai-config #160); `stop` joined these: a
+    // worker stops itself, a lead its team, anyone else is refused.
+    if matches!(action, "rename" | "instructions" | "memory" | "stop") {
+        use super::delegation::{authorize, rename_refusal, Action, Target};
+        let act = match action {
+            "rename" => {
+                let to = body_str(body, "name");
+                let to = if to.is_empty() { body_str(body, "rename") } else { to };
+                if let Some(r) = rename_refusal(headers, &to) { return r; }
+                Action::RenameWorker { to }
+            }
+            "stop" => Action::StopWorker,
+            other => Action::SetConfig { keys: vec![other.to_string()] },
+        };
+        let grant = match authorize(state, headers, &Target::Worker(name.to_string()), &act, Some(body)) {
+            Ok(g) => g,
+            Err(r) => return r,
+        };
+        if let Some(g) = grant {
+            let resp = post_dispatch_inner(state, name, action, headers, body).await;
+            if resp.status().is_success() {
+                let after = match &act {
+                    Action::RenameWorker { to } => json!({"name": to}),
+                    Action::StopWorker => json!({"stopping": true}),
+                    _ => json!({"updated": action}),
+                };
+                g.commit(state, json!({"name": name}), after);
+            }
+            return resp;
+        }
     }
+    post_dispatch_inner(state, name, action, headers, body).await
+}
+
+async fn post_dispatch_inner(
+    state: &AppState,
+    name: &str,
+    action: &str,
+    headers: &HeaderMap,
+    body: &Value,
+) -> Response {
     match action {
         "transcripts" => match backup_session_jsonl(name, "manual") {
             Some(path) => j200(json!({"ok": true, "path": path})),
@@ -31940,13 +31978,33 @@ pub(crate) async fn report_post(
 // ---------------------------------------------------------------------------
 
 async fn patch_dispatch(state: &AppState, name: &str, action: &str, body: &Value, headers: &HeaderMap) -> Response {
-    if let Some(refusal) = peer_config_refusal(headers, name, action) { return refusal; }
-    if let Some(refusal) = membership_patch_refusal(headers, names_messaging_authority(body)) { return refusal; }
+    // Both verbs go through the delegation table (ai-config #160).
     match action {
-        "commit-guard" => commit_guard_patch_verb(name, body),
-        "config" => config_patch(state, name, body).await,
+        "commit-guard" => {
+            let target = super::delegation::Target::Worker(name.to_string());
+            let act = super::delegation::Action::SetConfig { keys: vec!["commit-guard".into()] };
+            let grant = match super::delegation::authorize(state, headers, &target, &act, Some(body)) {
+                Ok(g) => g,
+                Err(r) => return r,
+            };
+            let resp = commit_guard_patch_verb(name, body);
+            if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+                g.commit(state, Value::Null, body.clone());
+            }
+            resp
+        }
+        "config" => super::delegation::guarded_config_patch(state, headers, name, body).await,
         _ => not_found(),
     }
+}
+
+/// Every key a config PATCH reads, for the delegation sweep test: the
+/// operations table, `create`, and the modifiers handled inside a branch.
+#[cfg(test)]
+pub(crate) fn config_patch_fields_for_delegation() -> Vec<&'static str> {
+    let mut v = config_patch_operations_keys();
+    v.extend(["force", "toggle_auto_continue"]);
+    v
 }
 
 /// The provider/model/effort/yolo restart choreography shared by four config
@@ -33014,13 +33072,30 @@ pub(crate) fn membership_patch_refusal(headers: &HeaderMap, membership_named: bo
 /// [`membership_patch_refusal`]'s decision and 403 body, for a handler whose
 /// return type is not a `Response`.
 pub(crate) fn membership_refusal_body(headers: &HeaderMap, membership_named: bool) -> Option<Value> {
-    let origin = worker_origin(headers);
-    if !membership_named || origin.is_empty() { return None; }
-    tracing::warn!(verdict="worker_group_membership_refused", measured=true, n_considered=1,
-        worker = %origin,
-        "worker cannot widen messaging authority by editing group membership");
-    Some(json!({"ok":false,"code":"worker_group_membership_refused",
-        "error":"Group membership changes require direct owner input."}))
+    if !membership_named { return None; }
+    // Through the delegation table (ai-config #160). An unnamed membership
+    // change has no group to scope a grant to, so no non-owner row allows it;
+    // the paths that DO delegate membership (config/scope tags) call
+    // `delegation::authorize` with the real before/after tags.
+    delegation_refusal(headers, &super::delegation::Target::Fleet,
+        &super::delegation::Action::SetMembership { group: String::new() })
+}
+
+/// A delegation decision as an optional #8-shaped 403 body, for the #8
+/// wrappers whose callers have no `AppState` (so no max_ref can be checked:
+/// `AllowWithMaxRef` is refused here, naming the path that can verify it).
+fn delegation_refusal(headers: &HeaderMap, target: &super::delegation::Target, action: &super::delegation::Action) -> Option<Value> {
+    use super::delegation::Decision;
+    let (origin, class, decision) = super::delegation::decide_for(headers, target, action);
+    let (code, error) = match decision {
+        Decision::Allow => return None,
+        Decision::AllowWithMaxRef => ("max_ref_missing",
+            format!("{} needs proof of Max's instruction; send it through PATCH /api/sessions/<worker>/config or PUT /api/scope with max_ref", action.label())),
+        Decision::Deny { code, reason } => (code, reason),
+    };
+    tracing::warn!(actor = %origin, class = %class.label(), ?target, action = %action.label(), code,
+        verdict = "delegation_refused", measured = true, n_considered = 1, "a delegated change was refused");
+    Some(super::delegation::refusal_body(code, &error))
 }
 
 /// The worker this request speaks for, from the one verified identity
@@ -33046,14 +33121,20 @@ pub(crate) fn peer_config_refusal(headers: &HeaderMap, target: &str, what: &str)
 /// [`peer_config_refusal`]'s decision and 403 body, for a handler whose return
 /// type is not a `Response`.
 pub(crate) fn peer_config_refusal_body(headers: &HeaderMap, target: &str, what: &str) -> Option<Value> {
-    let origin = worker_origin(headers);
-    if origin.is_empty() || origin == target || super::chat_worker::companion_parent(&origin) == Some(target) {
+    // Through the delegation table (ai-config #160). A worker acting on itself
+    // passes here; which of its own settings it may change is decided per key
+    // where the keys are known (`delegation::guarded_config_patch`, scope).
+    use super::delegation::{classify, Action, Class, Target};
+    let action = match what {
+        "rename" => Action::RenameWorker { to: String::new() },
+        "stop" => Action::StopWorker,
+        _ => Action::SetConfig { keys: vec![what.to_string()] },
+    };
+    let t = Target::Worker(target.to_string());
+    if classify(&worker_origin(headers), &t, &action) == Class::SelfWorker {
         return None;
     }
-    tracing::warn!(origin = %origin, target, what, verdict = "peer_config_owner_only", measured = true,
-        n_considered = 1, "a worker tried to configure another worker");
-    Some(json!({"ok": false, "code": "peer_config_owner_only",
-        "error": format!("'{origin}' may not change {what} of '{target}'; configuring another worker is the owner's")}))
+    delegation_refusal(headers, &t, &action)
 }
 
 /// The group whose members may create workers (Max, 2026-10-16: "Only leads
@@ -33113,24 +33194,10 @@ pub(crate) fn worker_create_refusal_body(headers: &HeaderMap, req: &CreateReques
             "a worker registered its own existing session; not a worker creation");
         return None;
     }
-    if !caller.contains(LEADS_GROUP) {
-        tracing::warn!(worker = %origin, verdict = "worker_create_requires_lead", measured = true, n_considered = 1,
-            "a worker outside the leads group tried to create a worker");
-        return Some(json!({"ok": false, "code": "worker_create_requires_lead",
-            "error": format!("Only leads can create workers; '{origin}' is not in the '{LEADS_GROUP}' group.")}));
-    }
-    let team: std::collections::BTreeSet<String> = caller.iter().filter(|g| *g != LEADS_GROUP).cloned().collect();
-    let outside: Vec<String> = req.tags.iter().map(|t| norm_label(t)).filter(|t| !t.is_empty() && !team.contains(t)).collect();
-    if outside.is_empty() && req.owner_only.is_none() { return None; }
-    tracing::warn!(worker = %origin, ?outside, owner_only = req.owner_only.unwrap_or(""), ?team,
-        verdict = "worker_create_tags_outside_team", measured = true, n_considered = 1,
-        "a lead tried to create a worker outside its own team");
-    let what = match req.owner_only {
-        Some(o) => format!("{o} is the owner's to grant"),
-        None => format!("tags {outside:?} are outside the lead's team {team:?} ('{LEADS_GROUP}' is the owner's to grant)"),
-    };
-    Some(json!({"ok": false, "code": "worker_create_tags_outside_team",
-        "error": format!("A lead may create workers only inside its own team: {what}."), "team": team}))
+    // The create rule is a delegation-table row (ai-config #160): only a lead
+    // (CC_ORCHESTRATOR=1 and `leads`), only with its own team tag.
+    delegation_refusal(headers, &super::delegation::Target::NewWorker,
+        &super::delegation::Action::CreateWorker { tags: req.tags.to_vec(), owner_only: req.owner_only })
 }
 
 /// The groups a create request names, from a `tags` array or a comma string,
