@@ -11,9 +11,11 @@
 //! `env -i ... amux send re-ops-lead` from a `dev` worker's pane did the same.
 //!
 //! THE RULE. For every request over a real socket the server finds the local
-//! process that owns the client end of the connection and walks its parent
-//! chain. If an ancestor is the shell of a tmux pane in session `amux-<worker>`,
-//! the request IS that worker, whatever it sent:
+//! processes holding the client end of THAT connection (both ends matched: the
+//! server listens on 0.0.0.0, so a client end alone can belong to two
+//! connections). A holder is a worker when its controlling tty is a worker
+//! pane's tty, or an ancestor is the shell of a tmux pane in session
+//! `amux-<worker>`. Then the request IS that worker, whatever it sent:
 //!
 //! - a missing worker header is filled with that worker, a different one is
 //!   overridden (logged `worker_identity_overridden`), and a member marker is
@@ -22,23 +24,35 @@
 //!   which accepts it in place of the rule-10 token (process ancestry is the
 //!   stronger evidence, and a sandbox can strip the token's env var too).
 //!
-//! A loopback request whose owning process or ancestry cannot be established is
-//! NOT given the owner's authority: with no worker header, an `/api/` request is
-//! refused 403 `worker_origin_unattributed`. The owner is allowed only when the
-//! process is provably outside every amux pane (the dashboard browser, the
-//! owner's own terminal, launchd jobs) or the peer is genuinely remote (no
-//! local process owns the socket and the address is not loopback: the phone).
+//! FAIL CLOSED. The owner is allowed only on positive proof: the holders were
+//! found by a full scan, their ancestry reached the root, a pane inventory read
+//! now succeeded, and none is in a worker pane (the dashboard browser, the
+//! owner's terminal, launchd jobs). A cached inventory or a remembered holder
+//! may confirm a worker, never the owner. Anything unproven is refused for a
+//! headerless `/api/` request: `worker_origin_unattributed`, or
+//! `worker_identity_unavailable` when the pane inventory cannot be read.
+//!
+//! REMOTE. The owner's phone is remote two ways: a non-loopback peer that no
+//! local process holds (LAN), or `tailscale serve`, a raw TCP forward by root
+//! `tailscaled` to 127.0.0.1, whose sockets this user cannot list. A loopback
+//! connection with no visible holder is that forward only when a root
+//! tailscaled is among the unlistable processes and no worker (or unprovable
+//! process) is connected to this host's own tailnet front door (its tailnet
+//! address, port 443), the one way a local worker could ride the forward.
 //!
 //! On a platform without a resolver the layer does nothing and says so once
 //! (`process_attribution_unavailable`, measured=false): that is today's
 //! behaviour, reported instead of silently assumed.
 //!
 //! WHAT THIS DOES NOT STOP. Workers run as the owner's uid. A process that
-//! daemonizes out of its pane (double fork, `setsid`, its own tmux server) is
-//! re-parented to launchd and reads as outside; a worker can also drive tmux or
-//! edit `~/.amux` files without the server at all. This closes the accidental
-//! and naive paths (stripped env, `env -i`), which are the measured ones; a
-//! hostile same-uid process needs an OS sandbox, not an HTTP check.
+//! daemonizes out of its pane AND drops its controlling tty (`setsid`, its own
+//! tmux server) reads as outside. A hostile same-uid process can also remove
+//! tmux's socket (tmux then reports no server), rename a session out of the
+//! `amux-` prefix, drive the owner's browser, edit `~/.amux` directly, or reach
+//! the front door from another tailnet host. This closes the accidental and
+//! naive paths (stripped env, `env -i`, a backgrounded send), which are the
+//! measured ones; a hostile same-uid process needs an OS sandbox, not an HTTP
+//! check.
 //!
 //! COMPOSITION. This runs before auth and before any rename-alias resolution
 //! (maxtongwang/amux#3): identity comes from the process first, and an alias
@@ -59,6 +73,20 @@ use std::time::{Duration, Instant};
 /// inbound request first, so a client cannot assert it.
 pub(crate) const PROCESS_WORKER_HEADER: &str = "x-amux-process-worker";
 
+/// The server's own end of an accepted connection, stamped on every request by
+/// the TLS acceptor (tls.rs). With the peer from ConnectInfo it names the exact
+/// connection: the server listens on 0.0.0.0, so one client end can be
+/// connected to two server addresses at once (review B2, 6c98cf27).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ServerLocal(pub SocketAddr);
+
+/// One TCP connection: the client's end (`peer`) and the server's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Conn {
+    pub peer: SocketAddr,
+    pub server: Option<SocketAddr>,
+}
+
 /// Who opened the connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Origin {
@@ -66,7 +94,9 @@ pub(crate) enum Origin {
     Worker(String),
     /// A local process whose whole ancestry is outside every amux pane.
     Outside,
-    /// No local process owns the client end and the peer is not loopback.
+    /// The owner's remote device: no local process owns the client end and the
+    /// peer is not loopback, or the connection was forwarded by this host's root
+    /// `tailscaled` (tailscale serve) with no worker at the tailnet front door.
     Remote,
     /// Local, but the owner or its ancestry could not be established.
     Unattributed(String),
@@ -77,45 +107,57 @@ pub(crate) enum Origin {
     Unavailable(&'static str),
 }
 
-/// Resolves a peer address to an [`Origin`]. A trait so the attribution policy
-/// is tested with a fake while the OS lookups are tested for what they read.
+/// Resolves a connection to an [`Origin`]. A trait so the attribution policy is
+/// tested with a fake while the OS lookups are tested for what they read.
 pub(crate) trait PeerResolver: Send + Sync {
-    fn resolve(&self, peer: SocketAddr) -> Origin;
+    fn resolve(&self, conn: Conn) -> Origin;
 }
 
-/// The pure classification: walk each owning process's parent chain until a
-/// pane pid (`panes`: pane shell pid -> tmux session name) or the root.
-///
-/// A pane of a tmux session NOT named `amux-*` is the owner's own tmux and the
-/// walk continues past it. A chain that breaks before the root (an unreadable
-/// ancestor) is unattributed, never outside: outside must be proven.
+/// The pane inventory: worker sessions by pane shell pid, and by pane tty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Panes {
+    pub by_pid: HashMap<u32, String>,
+    pub by_tty: HashMap<u64, String>,
+}
+
+/// The pure classification. A process is a worker when its controlling tty is
+/// a worker pane's tty (it stays so when reparented to launchd: `amux send &`
+/// from a one-shot shell, review N1), or when an ancestor is a worker pane's
+/// shell. A pane of a tmux session NOT named `amux-*` is the owner's own tmux
+/// and the walk continues past it. A chain that breaks, or runs out of steps,
+/// is unattributed, never outside: outside must be proven.
 pub(crate) fn classify(
     owners: &[u32],
-    panes: &HashMap<u32, String>,
+    panes: &Panes,
     ppid_of: &dyn Fn(u32) -> Option<u32>,
+    tty_of: &dyn Fn(u32) -> Option<u64>,
 ) -> Origin {
     if owners.is_empty() {
         return Origin::Unattributed("no local process owns the client socket".into());
     }
+    let worker_of = |session: &String| session.strip_prefix("amux-").filter(|w| !w.is_empty()).map(str::to_string);
     let mut broken = None;
     for &owner in owners {
+        if let Some(worker) = tty_of(owner).and_then(|t| panes.by_tty.get(&t)).and_then(worker_of) {
+            return Origin::Worker(worker);
+        }
         let mut cur = owner;
+        let mut proven = false;
         for _ in 0..4096 {
-            if let Some(worker) = panes.get(&cur).and_then(|s| s.strip_prefix("amux-")) {
-                if !worker.is_empty() {
-                    return Origin::Worker(worker.to_string());
-                }
+            if let Some(worker) = panes.by_pid.get(&cur).and_then(worker_of) {
+                return Origin::Worker(worker);
             }
             if cur <= 1 {
+                proven = true;
                 break;
             }
             match ppid_of(cur) {
                 Some(p) if p != cur => cur = p,
-                _ => {
-                    broken = Some(format!("ancestry of pid {owner} breaks at pid {cur}"));
-                    break;
-                }
+                _ => break,
             }
+        }
+        if !proven {
+            broken = Some(format!("ancestry of pid {owner} could not be walked to the root (stopped at pid {cur})"));
         }
     }
     match broken {
@@ -124,93 +166,193 @@ pub(crate) fn classify(
     }
 }
 
-/// The OS resolver: socket owner lookup, parent lookups, and the tmux pane map.
-struct OsResolver;
-
-impl PeerResolver for OsResolver {
-    fn resolve(&self, peer: SocketAddr) -> Origin {
-        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
-        decide(peer, socket_owners_checked(peer), || pane_map(false), || pane_map(true), &os::ppid_of)
-    }
+/// What one full scan of the process table found for a connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Scan {
+    /// Pids holding a socket whose local end is the connection's client end and
+    /// whose remote end is the connection's server end: this exact connection.
+    pub holders: Vec<u32>,
+    /// Pids whose sockets this user may not list (EPERM): another uid's.
+    pub uninspectable: Vec<u32>,
+    /// Inspectable pids holding a connection to this host's own tailnet front
+    /// door (remote = this host's tailnet address, port 443).
+    pub front_door: Vec<u32>,
 }
 
-type OwnerCache = Mutex<HashMap<SocketAddr, (Instant, Vec<u32>)>>;
-
-/// The pids holding the client end of `peer`, memoised per connection so a
-/// keep-alive connection does not rescan every process per request. A memo is
-/// used only after re-checking that each remembered pid STILL holds a socket
-/// with that local end (a cheap per-pid check): a port the first holder closed
-/// and another process reused is rescanned, never inherited.
-fn socket_owners_checked(peer: SocketAddr) -> Result<Vec<u32>, os::LookupError> {
-    static CACHE: OnceLock<OwnerCache> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let memo = cache.lock().ok().and_then(|c| c.get(&peer).filter(|(at, _)| at.elapsed() < OWNER_TTL).map(|(_, o)| o.clone()));
-    if let Some(owners) = memo {
-        if !owners.is_empty() && owners.iter().all(|&pid| os::holds(pid, peer)) {
-            return Ok(owners);
-        }
-    }
-    let owners = os::socket_owners(peer)?;
-    if let Ok(mut c) = cache.lock() {
-        if c.len() > 4096 {
-            c.retain(|_, (at, _)| at.elapsed() < OWNER_TTL);
-        }
-        c.insert(peer, (Instant::now(), owners.clone()));
-    }
-    Ok(owners)
+/// The lookups [`decide`] consults, behind a trait so every branch, including
+/// the failure and forwarding ones, is tested through the shipped decision.
+pub(crate) trait Lookups {
+    fn scan(&self, client: SocketAddr, server: SocketAddr) -> Result<Scan, os::LookupError>;
+    /// Pids of root-owned processes named `tailscaled`.
+    fn root_tailscaled(&self) -> Result<Vec<u32>, String>;
+    fn panes(&self, fresh: bool) -> Result<Panes, String>;
+    fn ppid_of(&self, pid: u32) -> Option<u32>;
+    fn tty_of(&self, pid: u32) -> Option<u64>;
 }
 
-const OWNER_TTL: Duration = Duration::from_secs(30);
-
-/// The resolver's decision from its three lookups, separated so a failed
-/// lookup is tested through the same code the server runs.
+/// The resolver's decision.
 ///
 /// FAIL CLOSED. Outside (and with it owner authority) is granted only on
-/// positive proof: the owning processes' whole ancestry was read AND a pane
-/// inventory read NOW (not a cached one: review round 3, a worker pane started
-/// after the cached read would be absent from it) succeeded AND no ancestor is
-/// a worker pane. Any inventory failure, whatever tmux printed, is
-/// IdentityUnavailable. A cached inventory may only CONFIRM a worker; its
-/// absence proves nothing.
-fn decide(
-    peer: SocketAddr,
-    owners: Result<Vec<u32>, os::LookupError>,
-    cached_panes: impl FnOnce() -> Result<HashMap<u32, String>, String>,
-    fresh_panes: impl FnOnce() -> Result<HashMap<u32, String>, String>,
-    ppid_of: &dyn Fn(u32) -> Option<u32>,
-) -> Origin {
-    let owners = match owners {
-        Ok(o) => o,
+/// positive proof: the holders of THIS connection (both ends matched) were
+/// found by a full scan, their ancestry and controlling tty were read, a pane
+/// inventory read NOW succeeded, and none of them is in a worker pane. A cached
+/// inventory may only confirm a worker. Any inventory failure is
+/// IdentityUnavailable.
+///
+/// FORWARDED (review B1, 6c98cf27). `tailscale serve` here is a raw TCP
+/// forward to 127.0.0.1:<port> by root `tailscaled`, whose sockets this user
+/// cannot list, so the owner's phone arrives as a loopback connection with no
+/// visible holder. It is Remote only when that is positively the case: no
+/// visible holder, a root `tailscaled` among the uninspectable processes, and
+/// no worker (or unprovable process) connected to this host's own tailnet
+/// front door, which is the one way a local worker could ride the forward.
+fn decide(conn: Conn, l: &dyn Lookups) -> Origin {
+    let peer = SocketAddr::new(conn.peer.ip().to_canonical(), conn.peer.port());
+    let Some(server) = conn.server.map(|s| SocketAddr::new(s.ip().to_canonical(), s.port())) else {
+        return if peer.ip().is_loopback() {
+            Origin::Unattributed("the server end of this connection is unknown".into())
+        } else {
+            Origin::Remote
+        };
+    };
+    let scan = match l.scan(peer, server) {
+        Ok(s) => s,
         Err(os::LookupError::Unsupported(why)) => return Origin::Unavailable(why),
         Err(os::LookupError::Failed(why)) => {
             return if peer.ip().is_loopback() { Origin::Unattributed(why) } else { Origin::Remote };
         }
     };
-    if owners.is_empty() && !peer.ip().is_loopback() {
-        return Origin::Remote;
+    if scan.holders.is_empty() {
+        if !peer.ip().is_loopback() {
+            return Origin::Remote;
+        }
+        return forwarded(peer, &scan, l);
     }
-    if let Ok(panes) = cached_panes() {
-        if let worker @ Origin::Worker(_) = classify(&owners, &panes, ppid_of) {
+    if let Ok(panes) = l.panes(false) {
+        if let worker @ Origin::Worker(_) = classify(&scan.holders, &panes, &|p| l.ppid_of(p), &|p| l.tty_of(p)) {
             return worker;
         }
     }
-    match fresh_panes() {
-        Ok(panes) => classify(&owners, &panes, ppid_of),
-        Err(why) => {
-            tracing::warn!(%peer, why = %why, verdict = "process_attribution_pane_inventory_failed",
-                measured = false, why_unmeasured = %why, n_considered = owners.len(),
-                "tmux pane inventory failed; this local request cannot be proven outside amux panes");
-            Origin::IdentityUnavailable(format!("tmux pane inventory failed: {why}"))
-        }
+    match l.panes(true) {
+        Ok(panes) => classify(&scan.holders, &panes, &|p| l.ppid_of(p), &|p| l.tty_of(p)),
+        Err(why) => inventory_failed(peer, scan.holders.len(), &why),
     }
 }
 
-type PaneCache = Mutex<Option<(Instant, HashMap<u32, String>)>>;
+fn inventory_failed(peer: SocketAddr, n: usize, why: &str) -> Origin {
+    tracing::warn!(%peer, why = %why, verdict = "process_attribution_pane_inventory_failed",
+        measured = false, why_unmeasured = %why, n_considered = n,
+        "tmux pane inventory failed; this local request cannot be proven outside amux panes");
+    Origin::IdentityUnavailable(format!("tmux pane inventory failed: {why}"))
+}
 
-/// `pane shell pid -> tmux session name`. `fresh` always runs tmux (an owner
-/// verdict needs it); otherwise a successful read under 2s old is reused, which
-/// can only confirm a worker. A failure is never cached and never "no panes".
-fn pane_map(fresh: bool) -> Result<HashMap<u32, String>, String> {
+/// A loopback connection with no visible holder: the owner's phone through
+/// tailscale serve, or nothing provable.
+fn forwarded(peer: SocketAddr, scan: &Scan, l: &dyn Lookups) -> Origin {
+    let forwarder = match l.root_tailscaled() {
+        Ok(pids) => pids.into_iter().find(|p| scan.uninspectable.contains(p)),
+        Err(why) => return Origin::Unattributed(format!("no visible holder, and the tailscale forwarder could not be identified: {why}")),
+    };
+    let Some(forwarder) = forwarder else {
+        return Origin::Unattributed("no local process visibly owns the client socket and no root tailscaled forwarder is running".into());
+    };
+    if !scan.front_door.is_empty() {
+        let panes = match l.panes(true) {
+            Ok(p) => p,
+            Err(why) => return inventory_failed(peer, scan.front_door.len(), &why),
+        };
+        for &pid in &scan.front_door {
+            let origin = classify(&[pid], &panes, &|p| l.ppid_of(p), &|p| l.tty_of(p));
+            if origin != Origin::Outside {
+                tracing::warn!(%peer, front_door_pid = pid, origin = ?origin, verdict = "tailscale_forward_ambiguous",
+                    measured = true, n_considered = scan.front_door.len(),
+                    "a forwarded request arrived while a worker (or an unprovable process) is connected to this host's tailnet front door");
+                return Origin::IdentityUnavailable(format!(
+                    "this request was forwarded by tailscale serve while pid {pid} ({origin:?}) is connected to this host's tailnet front door, so the forward could be that process"));
+            }
+        }
+    }
+    tracing::debug!(%peer, forwarder, front_door = scan.front_door.len(), verdict = "tailscale_forward_remote",
+        measured = true, n_considered = 1, "forwarded by tailscale serve with no worker at the front door: the owner's remote device");
+    Origin::Remote
+}
+
+/// The OS lookups.
+struct OsLookups;
+
+impl Lookups for OsLookups {
+    fn scan(&self, client: SocketAddr, server: SocketAddr) -> Result<Scan, os::LookupError> {
+        os::scan(client, server)
+    }
+    fn root_tailscaled(&self) -> Result<Vec<u32>, String> {
+        root_tailscaled_cached()
+    }
+    fn panes(&self, fresh: bool) -> Result<Panes, String> {
+        pane_map(fresh)
+    }
+    fn ppid_of(&self, pid: u32) -> Option<u32> {
+        os::ppid_of(pid)
+    }
+    fn tty_of(&self, pid: u32) -> Option<u64> {
+        os::tty_of(pid)
+    }
+}
+
+/// The OS resolver: a per-connection memo that may only CONFIRM a worker (the
+/// remembered holders must still hold this exact connection, both ends, and a
+/// cached inventory must place one in a worker pane), then the full decision.
+/// An owner verdict never comes from the memo.
+struct OsResolver;
+
+type HolderMemo = Mutex<HashMap<Conn, (Instant, Vec<u32>)>>;
+const MEMO_TTL: Duration = Duration::from_secs(30);
+
+fn holder_memo() -> &'static HolderMemo {
+    static MEMO: OnceLock<HolderMemo> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+impl PeerResolver for OsResolver {
+    fn resolve(&self, conn: Conn) -> Origin {
+        let conn = Conn {
+            peer: SocketAddr::new(conn.peer.ip().to_canonical(), conn.peer.port()),
+            server: conn.server.map(|s| SocketAddr::new(s.ip().to_canonical(), s.port())),
+        };
+        if let Some(server) = conn.server {
+            let memo = holder_memo().lock().ok()
+                .and_then(|m| m.get(&conn).filter(|(at, _)| at.elapsed() < MEMO_TTL).map(|(_, h)| h.clone()));
+            if let Some(holders) = memo {
+                if !holders.is_empty() && holders.iter().all(|&p| os::holds(p, conn.peer, server)) {
+                    if let Ok(panes) = pane_map(false) {
+                        if let worker @ Origin::Worker(_) = classify(&holders, &panes, &os::ppid_of, &os::tty_of) {
+                            return worker;
+                        }
+                    }
+                }
+            }
+        }
+        let origin = decide(conn, &OsLookups);
+        if let (Origin::Worker(_), Some(server)) = (&origin, conn.server) {
+            if let Ok(scan) = os::scan(conn.peer, server) {
+                if let Ok(mut m) = holder_memo().lock() {
+                    if m.len() > 4096 {
+                        m.retain(|_, (at, _)| at.elapsed() < MEMO_TTL);
+                    }
+                    m.insert(conn, (Instant::now(), scan.holders));
+                }
+            }
+        }
+        origin
+    }
+}
+
+type PaneCache = Mutex<Option<(Instant, Panes)>>;
+
+/// The pane inventory. `fresh` always runs tmux (an owner verdict needs it);
+/// otherwise a successful read under 2s old is reused, which can only confirm a
+/// worker. A failure is never cached and never "no panes". tmux gets a bounded
+/// wait (review N3): a hung server is a failed inventory, not a stuck request.
+fn pane_map(fresh: bool) -> Result<Panes, String> {
     static CACHE: OnceLock<PaneCache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     if let (false, Ok(g)) = (fresh, cache.lock()) {
@@ -220,55 +362,142 @@ fn pane_map(fresh: bool) -> Result<HashMap<u32, String>, String> {
             }
         }
     }
-    let out = std::process::Command::new("tmux")
-        .args(["list-panes", "-a", "-F", "#{pane_pid} #{session_name}"])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("could not run tmux: {e}"))?;
-    let map = panes_from_output(out.status.success(), &String::from_utf8_lossy(&out.stdout), &String::from_utf8_lossy(&out.stderr))?;
+    let (ok, stdout, stderr) = run_bounded(
+        std::process::Command::new("tmux").args(["list-panes", "-a", "-F", "#{pane_pid} #{pane_tty} #{session_name}"]),
+        TMUX_TIMEOUT,
+    )?;
+    let map = panes_from_output(ok, &stdout, &stderr)?;
     if let Ok(mut g) = cache.lock() {
         *g = Some((Instant::now(), map.clone()));
     }
     Ok(map)
 }
 
-/// A `tmux list-panes` result as an inventory. Default: any failure is an
-/// error. The only exception is tmux saying explicitly that no server exists,
-/// which is a real (empty) inventory. New or unknown diagnostics therefore
-/// refuse without anyone listing them.
-fn panes_from_output(ok: bool, stdout: &str, stderr: &str) -> Result<HashMap<u32, String>, String> {
-    if ok {
-        return parse_panes(stdout);
+const TMUX_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Run a command with a deadline: (exit ok, stdout, stderr), or an error when
+/// it cannot start or outlives `limit` (it is then killed).
+fn run_bounded(cmd: &mut std::process::Command, limit: Duration) -> Result<(bool, String, String), String> {
+    use std::io::Read;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run {:?}: {e}", cmd.get_program()))?;
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{:?} did not answer within {}ms", cmd.get_program(), limit.as_millis()));
+            }
+            Err(e) => return Err(format!("could not wait for {:?}: {e}", cmd.get_program())),
+        }
+    };
+    let (mut out, mut err) = (String::new(), String::new());
+    if let Some(mut o) = child.stdout.take() {
+        let _ = o.read_to_string(&mut out);
     }
-    // Absence is established only when the socket is not there: tmux says "no
-    // server running", or (tmux 3.6a, measured) "error connecting to <socket>
-    // (No such file or directory)". The backend launches every worker on this
-    // same default socket, so no socket means no worker pane. Any other
-    // connection error (review round 2: "Permission denied" can hide a running
-    // server; "Connection refused") is a FAILED lookup and an error.
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_string(&mut err);
+    }
+    Ok((status.success(), out, err))
+}
+
+/// A `tmux list-panes` result as an inventory. Default: any failure is an
+/// error. The only exception is tmux saying explicitly that no server exists:
+/// "no server running", or (tmux 3.6a, measured) a connection error ending
+/// "(No such file or directory)", the socket being absent. New or unknown
+/// diagnostics therefore refuse without anyone listing them.
+fn panes_from_output(ok: bool, stdout: &str, stderr: &str) -> Result<Panes, String> {
+    if ok {
+        return parse_panes(stdout, &|path| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).map(|m| m.rdev()).map_err(|e| format!("cannot stat pane tty {path}: {e}"))
+        });
+    }
     let err = stderr.trim();
     let socket_missing = err.starts_with("error connecting to") && err.ends_with("(No such file or directory)");
     if err.starts_with("no server running") || socket_missing {
-        return Ok(HashMap::new());
+        return Ok(Panes::default());
     }
     Err(if err.is_empty() { "tmux list-panes failed with no message".into() } else { err.chars().take(200).collect() })
 }
 
-/// `<pane_pid> <session_name>` lines.
-/// Fail closed here too: a line that does not parse could be a worker pane, so
+/// `<pane_pid> <pane_tty> <session name>` lines. Fail closed: a line that does
+/// not parse, or a pane tty that cannot be read, could hide a worker pane, so
 /// it makes the whole inventory unreadable rather than being skipped.
-pub(crate) fn parse_panes(text: &str) -> Result<HashMap<u32, String>, String> {
-    let mut map = HashMap::new();
+pub(crate) fn parse_panes(text: &str, rdev: &dyn Fn(&str) -> Result<u64, String>) -> Result<Panes, String> {
+    let mut panes = Panes::default();
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let parsed = line.split_once(' ').and_then(|(pid, sess)| Some((pid.parse::<u32>().ok()?, sess.trim())));
-        match parsed {
-            Some((pid, sess)) if !sess.is_empty() => {
-                map.insert(pid, sess.to_string());
+        let mut parts = line.splitn(3, ' ');
+        let (pid, tty, sess) = (parts.next(), parts.next(), parts.next().map(str::trim));
+        match (pid.and_then(|p| p.parse::<u32>().ok()), tty, sess) {
+            (Some(pid), Some(tty), Some(sess)) if !sess.is_empty() && tty.starts_with('/') => {
+                panes.by_tty.insert(rdev(tty)?, sess.to_string());
+                panes.by_pid.insert(pid, sess.to_string());
             }
             _ => return Err(format!("unparseable tmux pane line: {}", line.chars().take(80).collect::<String>())),
         }
     }
-    Ok(map)
+    Ok(panes)
+}
+
+type ForwarderCache = Mutex<Option<(Instant, Vec<u32>)>>;
+
+/// Root `tailscaled` pids, from the process table. libproc refuses another
+/// uid's name and uid (EPERM, measured for pid 416), but `ps` reads them from
+/// sysctl(KERN_PROC). Consulted only for a connection no visible process
+/// holds; a successful answer is reused for 10s.
+fn root_tailscaled_cached() -> Result<Vec<u32>, String> {
+    static CACHE: OnceLock<ForwarderCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(g) = cache.lock() {
+        if let Some((at, pids)) = g.as_ref() {
+            if at.elapsed() < Duration::from_secs(10) {
+                return Ok(pids.clone());
+            }
+        }
+    }
+    let pids = os::root_tailscaled()?;
+    if let Ok(mut g) = cache.lock() {
+        *g = Some((Instant::now(), pids.clone()));
+    }
+    Ok(pids)
+}
+
+/// `ps -A -o pid=,uid=,ucomm=` rows naming root `tailscaled`.
+pub(crate) fn parse_root_tailscaled(text: &str) -> Vec<u32> {
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.len() == 3 && f[1] == "0" && f[2] == "tailscaled").then(|| f[0].parse().ok()).flatten()
+        })
+        .collect()
+}
+
+/// This host's tailnet ranges (100.64.0.0/10, fd7a:115c:a1e0::/48).
+pub(crate) fn is_tailnet(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 100 && (o[1] & 0xc0) == 64
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
+        }
+    }
+}
+
+/// A socket connected to this host's own tailscale serve front door: the
+/// remote end is this host's tailnet address (the same as the local end) on 443.
+pub(crate) fn is_front_door(local: SocketAddr, remote: SocketAddr) -> bool {
+    remote.port() == 443 && remote.ip().to_canonical() == local.ip().to_canonical() && is_tailnet(remote.ip())
 }
 
 type Shared = Arc<dyn PeerResolver>;
@@ -278,13 +507,10 @@ fn resolver_slot() -> &'static RwLock<Shared> {
     SLOT.get_or_init(|| RwLock::new(Arc::new(OsResolver)))
 }
 
-/// Resolve on every request: an Origin is never memoised, because an owner
-/// verdict must rest on a fresh inventory (the OS resolver memoises only the
-/// socket's holders, re-checked per use, and the cached inventory confirms
-/// only workers).
-async fn resolve_cached(peer: SocketAddr) -> Origin {
+/// Resolve on every request: an Origin is never memoised.
+async fn resolve_cached(conn: Conn) -> Origin {
     let resolver = resolver_slot().read().map(|r| r.clone()).unwrap_or_else(|p| p.into_inner().clone());
-    tokio::task::spawn_blocking(move || resolver.resolve(peer))
+    tokio::task::spawn_blocking(move || resolver.resolve(conn))
         .await
         .unwrap_or_else(|e| Origin::Unattributed(format!("resolver task failed: {e}")))
 }
@@ -303,6 +529,7 @@ pub async fn attribute(mut req: Request, next: Next) -> Response {
         // In-process calls (the server acting for a lane) have no socket.
         return next.run(req).await;
     };
+    let conn = Conn { peer, server: req.extensions().get::<ServerLocal>().map(|s| s.0) };
     // The SERVER's own environment, never the request: a throwaway test server
     // launched from inside a worker pane would otherwise attribute its own
     // test client to that pane. Said once, at WARN, so it cannot pass unseen.
@@ -315,7 +542,7 @@ pub async fn attribute(mut req: Request, next: Next) -> Response {
         });
         return next.run(req).await;
     }
-    match resolve_cached(peer).await {
+    match resolve_cached(conn).await {
         Origin::Worker(worker) if !super::session_verbs::valid_session_name(&worker) => {
             // A pane in an `amux-*` session whose name is no valid worker name:
             // worker-originated, with no identity the server could act on.
@@ -420,19 +647,20 @@ pub(crate) mod test_support {
     pub(crate) struct ByPort(pub HashMap<u16, Origin>);
 
     impl PeerResolver for ByPort {
-        fn resolve(&self, peer: SocketAddr) -> Origin {
-            self.0.get(&peer.port()).cloned().unwrap_or(Origin::Outside)
+        fn resolve(&self, conn: Conn) -> Origin {
+            self.0.get(&conn.peer.port()).cloned().unwrap_or(Origin::Outside)
         }
     }
 }
 
-/// Platform lookups. Each answers "which local pids hold a TCP socket whose
-/// LOCAL end is `peer`" (the client end of a connection to this server) and
-/// "who is this pid's parent".
+/// Platform lookups. `scan` walks the process table once for a connection
+/// (client end + server end): the exact connection's holders, the processes
+/// whose sockets this user may not list, and the front-door connections.
 pub(crate) mod os {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     use std::net::SocketAddr;
 
+    #[derive(Debug)]
     pub(crate) enum LookupError {
         #[cfg_attr(any(target_os = "macos", target_os = "linux"), allow(dead_code))]
         Unsupported(&'static str),
@@ -440,12 +668,12 @@ pub(crate) mod os {
     }
 
     #[cfg(target_os = "macos")]
-    pub(super) use super::macos::{holds, ppid_of, socket_owners};
+    pub(super) use super::macos::{holds, ppid_of, root_tailscaled, scan, tty_of};
     #[cfg(target_os = "linux")]
-    pub(super) use super::linux::{holds, ppid_of, socket_owners};
+    pub(super) use super::linux::{holds, ppid_of, root_tailscaled, scan, tty_of};
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    pub(super) fn socket_owners(_peer: SocketAddr) -> Result<Vec<u32>, LookupError> {
+    pub(super) fn scan(_client: SocketAddr, _server: SocketAddr) -> Result<super::Scan, LookupError> {
         Err(LookupError::Unsupported("no socket-owner lookup on this platform"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -453,8 +681,16 @@ pub(crate) mod os {
         None
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    pub(super) fn holds(_pid: u32, _peer: SocketAddr) -> bool {
+    pub(super) fn tty_of(_pid: u32) -> Option<u64> {
+        None
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(super) fn holds(_pid: u32, _client: SocketAddr, _server: SocketAddr) -> bool {
         false
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(super) fn root_tailscaled() -> Result<Vec<u32>, String> {
+        Err("no process table lookup on this platform".into())
     }
 }
 
@@ -462,7 +698,7 @@ pub(crate) mod os {
 /// `struct socket_fdinfo` (sys/proc_info.h), which libc does not declare; the
 /// prefix up to `soi_proto` and `in_sockinfo` are declared here with C layout,
 /// and the union is over-allocated (the kernel requires buffersize >= its
-/// size). `macos_self_connection_resolves_to_this_process` proves the layout.
+/// size). `os_lookup_matches_the_exact_connection` proves the layout.
 #[cfg(target_os = "macos")]
 #[allow(dead_code)] // C layout fields the kernel fills but this lookup never reads
 mod macos {
@@ -473,6 +709,7 @@ mod macos {
     const SOCKINFO_IN: i32 = 1;
     const SOCKINFO_TCP: i32 = 2;
     const INI_IPV4: u8 = 0x1;
+    const NODEV: u32 = u32::MAX;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -573,6 +810,7 @@ mod macos {
     const _: () = assert!(std::mem::size_of::<VinfoStat>() == 136);
     const _: () = assert!(std::mem::offset_of!(SocketInfo, soi_kind) == 232);
     const _: () = assert!(std::mem::offset_of!(SocketInfo, soi_proto) == 240);
+    const _: () = assert!(std::mem::offset_of!(InSockinfo, insi_faddr) == 32);
     const _: () = assert!(std::mem::offset_of!(InSockinfo, insi_laddr) == 48);
 
     fn all_pids() -> Vec<i32> {
@@ -592,28 +830,40 @@ mod macos {
         buf
     }
 
-    fn socket_fds(pid: i32) -> Vec<i32> {
+    /// A pid's socket fds, or the errno when the kernel refuses to list them
+    /// (EPERM: another uid's process).
+    fn socket_fds(pid: i32) -> Result<Vec<i32>, i32> {
         // SAFETY: as above; the kernel writes whole proc_fdinfo records.
         let need = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
         if need <= 0 {
-            return vec![];
+            return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
         }
         let size = std::mem::size_of::<libc::proc_fdinfo>();
         let mut buf: Vec<libc::proc_fdinfo> = Vec::with_capacity(need as usize / size + 16);
         let cap = (buf.capacity() * size) as libc::c_int;
         let got = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, buf.as_mut_ptr().cast(), cap) };
         if got <= 0 {
-            return vec![];
+            return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
         }
         // SAFETY: `got` bytes of initialised records were written.
         unsafe { buf.set_len(got as usize / size) };
-        buf.iter()
+        Ok(buf.iter()
             .filter(|f| f.proc_fdtype as libc::c_int == libc::PROX_FDTYPE_SOCKET)
             .map(|f| f.proc_fd)
-            .collect()
+            .collect())
     }
 
-    fn local_end(pid: i32, fd: i32) -> Option<SocketAddr> {
+    fn addr(bytes: &[u8; 16], v4: bool, port: i32) -> SocketAddr {
+        let ip = if v4 {
+            IpAddr::V4(Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]))
+        } else {
+            IpAddr::V6(Ipv6Addr::from(*bytes)).to_canonical()
+        };
+        SocketAddr::new(ip, u16::from_be(port as u16))
+    }
+
+    /// (local end, remote end) of an inet socket fd.
+    fn endpoints(pid: i32, fd: i32) -> Option<(SocketAddr, SocketAddr)> {
         // SAFETY: zeroed POD; the kernel writes at most size_of bytes.
         let mut info: SocketFdInfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<SocketFdInfo>() as libc::c_int;
@@ -629,54 +879,88 @@ mod macos {
         }
         // SAFETY: both TCP and IN kinds begin the union with in_sockinfo.
         let ini = unsafe { info.psi.soi_proto.pri_in };
-        let port = u16::from_be(ini.insi_lport as u16);
-        let ip = if ini.insi_vflag & INI_IPV4 != 0 {
-            let a = &ini.insi_laddr;
-            IpAddr::V4(Ipv4Addr::new(a[12], a[13], a[14], a[15]))
-        } else {
-            IpAddr::V6(Ipv6Addr::from(ini.insi_laddr)).to_canonical()
-        };
-        Some(SocketAddr::new(ip, port))
+        let v4 = ini.insi_vflag & INI_IPV4 != 0;
+        Some((addr(&ini.insi_laddr, v4, ini.insi_lport), addr(&ini.insi_faddr, v4, ini.insi_fport)))
     }
 
-    pub(crate) fn socket_owners(peer: SocketAddr) -> Result<Vec<u32>, LookupError> {
+    pub(crate) fn scan(client: SocketAddr, server: SocketAddr) -> Result<super::Scan, LookupError> {
         let pids = all_pids();
         if pids.is_empty() {
             return Err(LookupError::Failed("proc_listallpids returned nothing".into()));
         }
-        let mut owners = vec![];
-        for pid in pids {
-            if pid <= 0 {
-                continue;
+        let mut out = super::Scan::default();
+        for pid in pids.into_iter().filter(|&p| p > 0) {
+            let fds = match socket_fds(pid) {
+                Ok(fds) => fds,
+                Err(libc::EPERM) => {
+                    out.uninspectable.push(pid as u32);
+                    continue;
+                }
+                Err(_) => continue, // exited, or no fds to list
+            };
+            let (mut holds, mut door) = (false, false);
+            for fd in fds {
+                if let Some((local, remote)) = endpoints(pid, fd) {
+                    holds |= local == client && remote == server;
+                    door |= super::is_front_door(local, remote);
+                }
             }
-            if socket_fds(pid).into_iter().any(|fd| local_end(pid, fd) == Some(peer)) {
-                owners.push(pid as u32);
+            if holds {
+                out.holders.push(pid as u32);
+            }
+            if door {
+                out.front_door.push(pid as u32);
             }
         }
-        Ok(owners)
+        Ok(out)
     }
 
-    /// Whether `pid` still holds a socket whose local end is `peer`.
-    pub(crate) fn holds(pid: u32, peer: SocketAddr) -> bool {
-        socket_fds(pid as i32).into_iter().any(|fd| local_end(pid as i32, fd) == Some(peer))
+    /// Whether `pid` still holds this exact connection (both ends).
+    pub(crate) fn holds(pid: u32, client: SocketAddr, server: SocketAddr) -> bool {
+        socket_fds(pid as i32)
+            .unwrap_or_default()
+            .into_iter()
+            .any(|fd| endpoints(pid as i32, fd) == Some((client, server)))
     }
 
-    pub(crate) fn ppid_of(pid: u32) -> Option<u32> {
+    fn bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
         // SAFETY: zeroed POD; the kernel writes exactly one proc_bsdinfo.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
         let got = unsafe {
             libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size)
         };
-        (got == size).then_some(info.pbi_ppid)
+        (got == size).then_some(info)
+    }
+
+    pub(crate) fn ppid_of(pid: u32) -> Option<u32> {
+        bsdinfo(pid).map(|i| i.pbi_ppid)
+    }
+
+    /// The controlling tty's device number, or None without one.
+    pub(crate) fn tty_of(pid: u32) -> Option<u64> {
+        bsdinfo(pid).map(|i| i.e_tdev).filter(|&d| d != NODEV && d != 0).map(u64::from)
+    }
+
+    pub(crate) fn root_tailscaled() -> Result<Vec<u32>, String> {
+        let (ok, out, err) = super::run_bounded(
+            std::process::Command::new("/bin/ps").args(["-A", "-o", "pid=,uid=,ucomm="]),
+            std::time::Duration::from_secs(2),
+        )?;
+        if !ok {
+            return Err(format!("ps failed: {}", err.trim()));
+        }
+        Ok(super::parse_root_tailscaled(&out))
     }
 }
 
-/// Linux: `/proc/net/tcp{,6}` gives the socket inode for a local endpoint;
-/// `/proc/<pid>/fd` links name the holders; `/proc/<pid>/stat` the parent.
+/// Linux: `/proc/net/tcp{,6}` gives each socket's endpoints and inode;
+/// `/proc/<pid>/fd` links name the holders; `/proc/<pid>/stat` the parent and
+/// controlling tty.
 #[cfg(target_os = "linux")]
 mod linux {
     use super::os::LookupError;
+    use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     /// `0100007F:1F90` (v4) or 32 hex digits (v6), each 32-bit word printed
@@ -699,53 +983,90 @@ mod linux {
         Some(SocketAddr::new(ip, port))
     }
 
-    fn inode_for(peer: SocketAddr) -> Result<Option<u64>, LookupError> {
+    /// Every socket row: (local, remote, inode).
+    fn sockets() -> Result<Vec<(SocketAddr, SocketAddr, u64)>, LookupError> {
+        let mut rows = vec![];
         let mut read_any = false;
         for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
             let Ok(text) = std::fs::read_to_string(table) else { continue };
             read_any = true;
             for line in text.lines().skip(1) {
                 let cols: Vec<&str> = line.split_whitespace().collect();
-                if cols.len() > 9 && parse_endpoint(cols[1]) == Some(peer) {
-                    if let Ok(inode) = cols[9].parse::<u64>() {
-                        if inode != 0 {
-                            return Ok(Some(inode));
-                        }
+                if cols.len() <= 9 {
+                    continue;
+                }
+                if let (Some(l), Some(r), Ok(inode)) = (parse_endpoint(cols[1]), parse_endpoint(cols[2]), cols[9].parse::<u64>()) {
+                    if inode != 0 {
+                        rows.push((l, r, inode));
                     }
                 }
             }
         }
-        if read_any { Ok(None) } else { Err(LookupError::Failed("/proc/net/tcp unreadable".into())) }
+        if read_any { Ok(rows) } else { Err(LookupError::Failed("/proc/net/tcp unreadable".into())) }
     }
 
-    pub(crate) fn socket_owners(peer: SocketAddr) -> Result<Vec<u32>, LookupError> {
-        let Some(inode) = inode_for(peer)? else { return Ok(vec![]) };
-        let want = format!("socket:[{inode}]");
-        let mut owners = vec![];
+    fn socket_inodes(pid: &str) -> Result<HashSet<u64>, std::io::ErrorKind> {
+        let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).map_err(|e| e.kind())?;
+        Ok(fds.flatten()
+            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+            .filter_map(|l| l.to_str()?.strip_prefix("socket:[")?.strip_suffix(']')?.parse().ok())
+            .collect())
+    }
+
+    pub(crate) fn scan(client: SocketAddr, server: SocketAddr) -> Result<super::Scan, LookupError> {
+        let rows = sockets()?;
+        let target: HashSet<u64> = rows.iter().filter(|(l, r, _)| *l == client && *r == server).map(|(_, _, i)| *i).collect();
+        let doors: HashSet<u64> = rows.iter().filter(|(l, r, _)| super::is_front_door(*l, *r)).map(|(_, _, i)| *i).collect();
+        let mut out = super::Scan::default();
         let procs = std::fs::read_dir("/proc").map_err(|e| LookupError::Failed(e.to_string()))?;
         for entry in procs.flatten() {
-            let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
-            let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else { continue };
-            if fds.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l.as_os_str() == want.as_str())) {
-                owners.push(pid);
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+            let Ok(pid) = name.parse::<u32>() else { continue };
+            match socket_inodes(&name) {
+                Ok(inodes) => {
+                    if !target.is_disjoint(&inodes) {
+                        out.holders.push(pid);
+                    }
+                    if !doors.is_disjoint(&inodes) {
+                        out.front_door.push(pid);
+                    }
+                }
+                Err(std::io::ErrorKind::PermissionDenied) => out.uninspectable.push(pid),
+                Err(_) => {}
             }
         }
-        Ok(owners)
+        Ok(out)
     }
 
-    /// Whether `pid` still holds the socket whose local end is `peer`.
-    pub(crate) fn holds(pid: u32, peer: SocketAddr) -> bool {
-        let Ok(Some(inode)) = inode_for(peer) else { return false };
-        let want = format!("socket:[{inode}]");
-        std::fs::read_dir(format!("/proc/{pid}/fd"))
-            .map(|fds| fds.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l.as_os_str() == want.as_str())))
-            .unwrap_or(false)
+    pub(crate) fn holds(pid: u32, client: SocketAddr, server: SocketAddr) -> bool {
+        let Ok(rows) = sockets() else { return false };
+        let target: HashSet<u64> = rows.iter().filter(|(l, r, _)| *l == client && *r == server).map(|(_, _, i)| *i).collect();
+        socket_inodes(&pid.to_string()).is_ok_and(|inodes| !target.is_disjoint(&inodes))
+    }
+
+    /// Fields after the `(comm)` of /proc/<pid>/stat: state, ppid, pgrp,
+    /// session, tty_nr, ...
+    fn stat_fields(pid: u32) -> Option<Vec<String>> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        Some(stat[stat.rfind(')')? + 1..].split_whitespace().map(str::to_string).collect())
     }
 
     pub(crate) fn ppid_of(pid: u32) -> Option<u32> {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let rest = &stat[stat.rfind(')')? + 1..];
-        rest.split_whitespace().nth(1)?.parse().ok()
+        stat_fields(pid)?.get(1)?.parse().ok()
+    }
+
+    pub(crate) fn tty_of(pid: u32) -> Option<u64> {
+        stat_fields(pid)?.get(4)?.parse::<u64>().ok().filter(|&t| t != 0)
+    }
+
+    pub(crate) fn root_tailscaled() -> Result<Vec<u32>, String> {
+        let procs = std::fs::read_dir("/proc").map_err(|e| e.to_string())?;
+        Ok(procs.flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "tailscaled"))
+            .filter(|pid| std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .is_ok_and(|s| s.lines().any(|l| l.starts_with("Uid:") && l.split_whitespace().nth(1) == Some("0"))))
+            .collect())
     }
 }
 
@@ -753,86 +1074,330 @@ mod linux {
 mod tests {
     use super::*;
 
-    fn panes() -> HashMap<u32, String> {
-        HashMap::from([(100, "amux-dev-a".to_string()), (200, "personal".to_string())])
-    }
-
+    // Process table for the pure tests:
+    //   101 -> 100 (amux-dev-a pane shell) -> 50 (tmux server) -> 1
+    //   201 -> 200 (the owner's own tmux pane "personal") -> 50 -> 1
+    //   301 -> 300 -> 1 (owner terminal);  401 -> unreadable parent
+    //   501 -> 1 (reparented to launchd) but its controlling tty is dev-a's pane tty
+    //   601 <-> 602 (a ppid cycle: the walk runs out of steps)
     fn chain(pid: u32) -> Option<u32> {
-        // 101 -> 100 (amux-dev-a pane) -> 50 (tmux server) -> 1
-        // 201 -> 200 (owner's own tmux pane) -> 50 -> 1
-        // 301 -> 300 -> 1 (owner terminal)
-        // 401 -> unreadable parent
         match pid {
             101 => Some(100),
             100 | 200 => Some(50),
-            50 => Some(1),
+            50 | 300 | 501 => Some(1),
             201 => Some(200),
             301 => Some(300),
-            300 => Some(1),
+            601 => Some(602),
+            602 => Some(601),
             _ => None,
+        }
+    }
+    const DEV_A_TTY: u64 = 0x1000_0007;
+    fn tty(pid: u32) -> Option<u64> {
+        (pid == 501).then_some(DEV_A_TTY)
+    }
+    fn panes() -> Panes {
+        Panes {
+            by_pid: HashMap::from([(100, "amux-dev-a".to_string()), (200, "personal".to_string())]),
+            by_tty: HashMap::from([(DEV_A_TTY, "amux-dev-a".to_string())]),
         }
     }
 
     #[test]
     fn a_descendant_of_an_amux_pane_is_that_worker_and_other_chains_are_not() {
         let p = panes();
-        assert_eq!(classify(&[101], &p, &chain), Origin::Worker("dev-a".into()));
-        assert_eq!(classify(&[100], &p, &chain), Origin::Worker("dev-a".into()), "the pane shell itself");
-        assert_eq!(classify(&[201], &p, &chain), Origin::Outside, "the owner's own tmux is not a worker");
-        assert_eq!(classify(&[301], &p, &chain), Origin::Outside);
-        // Shared socket: any holder inside a worker pane makes it that worker.
-        assert_eq!(classify(&[301, 101], &p, &chain), Origin::Worker("dev-a".into()));
+        assert_eq!(classify(&[101], &p, &chain, &tty), Origin::Worker("dev-a".into()));
+        assert_eq!(classify(&[100], &p, &chain, &tty), Origin::Worker("dev-a".into()), "the pane shell itself");
+        assert_eq!(classify(&[201], &p, &chain, &tty), Origin::Outside, "the owner's own tmux is not a worker");
+        assert_eq!(classify(&[301], &p, &chain, &tty), Origin::Outside);
+        assert_eq!(classify(&[301, 101], &p, &chain, &tty), Origin::Worker("dev-a".into()), "any worker holder");
+    }
+
+    /// Review N1: `amux send &` from a one-shot shell is reparented to launchd,
+    /// so its ancestry reads outside; its controlling tty still names the pane.
+    #[test]
+    fn a_worker_process_reparented_to_launchd_is_still_that_worker_by_its_tty() {
+        assert_eq!(chain(501), Some(1));
+        assert_eq!(classify(&[501], &panes(), &chain, &tty), Origin::Worker("dev-a".into()));
     }
 
     #[test]
     fn outside_must_be_proven_never_assumed() {
         let p = panes();
-        assert!(matches!(classify(&[], &p, &chain), Origin::Unattributed(_)), "no owner");
-        assert!(matches!(classify(&[401], &p, &chain), Origin::Unattributed(_)), "broken chain");
-        assert!(matches!(classify(&[301, 401], &p, &chain), Origin::Unattributed(_)), "one unproven holder");
+        assert!(matches!(classify(&[], &p, &chain, &tty), Origin::Unattributed(_)), "no owner");
+        assert!(matches!(classify(&[401], &p, &chain, &tty), Origin::Unattributed(_)), "broken chain");
+        assert!(matches!(classify(&[301, 401], &p, &chain, &tty), Origin::Unattributed(_)), "one unproven holder");
+        // Review N4: running out of steps is not proof of reaching the root.
+        assert!(matches!(classify(&[601], &p, &chain, &tty), Origin::Unattributed(_)), "a cycle");
+    }
+
+    fn rdev_ok(path: &str) -> Result<u64, String> {
+        Ok(path.trim_start_matches("/dev/ttys").parse::<u64>().map_err(|e| e.to_string())? + 0x1000_0000)
     }
 
     #[test]
-    fn tmux_pane_lines_parse() {
-        let m = parse_panes("123 amux-dev-a\n456 personal session\n\n").unwrap();
-        assert_eq!(m.get(&123).map(String::as_str), Some("amux-dev-a"));
-        assert_eq!(m.get(&456).map(String::as_str), Some("personal session"));
-        assert_eq!(m.len(), 2);
-        for bad in ["123 amux-dev-a\nbad\n", "x amux-dev-a\n", "123\n", "123 \n"] {
-            assert!(parse_panes(bad).is_err(), "an unreadable line could hide a worker pane: {bad:?}");
+    fn tmux_pane_lines_parse_and_any_unreadable_line_fails_the_inventory() {
+        let m = parse_panes("123 /dev/ttys007 amux-dev-a\n456 /dev/ttys009 personal session\n\n", &rdev_ok).unwrap();
+        assert_eq!(m.by_pid.get(&123).map(String::as_str), Some("amux-dev-a"));
+        assert_eq!(m.by_pid.get(&456).map(String::as_str), Some("personal session"));
+        assert_eq!(m.by_tty.get(&DEV_A_TTY).map(String::as_str), Some("amux-dev-a"));
+        for bad in ["123 /dev/ttys007 amux-dev-a\nbad\n", "x /dev/ttys1 amux-dev-a\n", "123\n", "123 /dev/ttys1\n", "123 tty amux-a\n"] {
+            assert!(parse_panes(bad, &rdev_ok).is_err(), "an unreadable line could hide a worker pane: {bad:?}");
+        }
+        let unstatable = |p: &str| -> Result<u64, String> { Err(format!("cannot stat {p}")) };
+        assert!(parse_panes("1 /dev/ttys1 amux-a\n", &unstatable).is_err(), "a pane tty that cannot be read fails closed");
+    }
+
+    #[test]
+    fn tmux_output_is_an_inventory_only_when_it_succeeded_or_no_server_exists() {
+        assert!(panes_from_output(false, "", "no server running on /tmp/tmux-501/default\n").unwrap().by_pid.is_empty());
+        assert!(panes_from_output(false, "", "error connecting to /tmp/tmux-501/default (No such file or directory)\n").unwrap().by_pid.is_empty(),
+            "no socket: tmux 3.6a's no-server message");
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        for denied in [
+            "error connecting to /tmp/tmux-501/default (Permission denied)",
+            "error connecting to /tmp/tmux-501/default (Connection refused)",
+            "error connecting to /tmp/tmux-501/default (No such file or directory) and more",
+            "lost server",
+            "",
+            &format!("tmux {nonce:x}: an error message no version of tmux has printed yet"),
+        ] {
+            assert!(panes_from_output(false, "", denied).is_err(), "a failed read proves nothing: {denied:?}");
         }
     }
 
-    /// The real OS lookup, not a paraphrase: a loopback connection made by
-    /// this test process resolves to this pid, and its ancestry walks to the
-    /// root without breaking (or finds a pane if the suite runs inside one).
+    #[test]
+    fn a_hung_command_is_cut_off_and_reported() {
+        let start = Instant::now();
+        let r = run_bounded(std::process::Command::new("/bin/sleep").arg("5"), Duration::from_millis(100));
+        assert!(r.is_err(), "{r:?}");
+        assert!(start.elapsed() < Duration::from_secs(2), "the deadline held");
+        assert_eq!(run_bounded(std::process::Command::new("/bin/echo").arg("hi"), Duration::from_secs(2)).unwrap().1.trim(), "hi");
+    }
+
+    #[test]
+    fn root_tailscaled_is_read_from_the_process_table_and_the_front_door_is_this_hosts_tailnet_443() {
+        assert_eq!(parse_root_tailscaled("  416     0 tailscaled\n  417   501 tailscaled\n  418     0 tailscale\n"), vec![416]);
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert!(is_front_door(a("100.85.233.44:50000"), a("100.85.233.44:443")));
+        assert!(is_front_door(a("[fd7a:115c:a1e0::b132:e92c]:50000"), a("[fd7a:115c:a1e0::b132:e92c]:443")));
+        assert!(!is_front_door(a("100.85.233.44:50000"), a("100.85.233.45:443")), "another tailnet host");
+        assert!(!is_front_door(a("100.85.233.44:50000"), a("100.85.233.44:8824")), "the server port itself");
+        assert!(!is_front_door(a("192.168.1.207:50000"), a("192.168.1.207:443")), "not tailnet");
+    }
+
+    /// Fake lookups for the shipped decision.
+    #[derive(Clone)]
+    struct Fake {
+        scan: Result<Scan, String>,
+        tailscaled: Result<Vec<u32>, String>,
+        cached: Result<Panes, String>,
+        fresh: Result<Panes, String>,
+    }
+
+    impl Fake {
+        fn holders(h: &[u32]) -> Self {
+            Fake {
+                scan: Ok(Scan { holders: h.to_vec(), ..Default::default() }),
+                tailscaled: Ok(vec![]),
+                cached: Ok(panes()),
+                fresh: Ok(panes()),
+            }
+        }
+        /// The deployed phone path: nobody visible holds the connection, root
+        /// tailscaled (pid 416) is running and its sockets are unlistable.
+        fn forwarded(front_door: &[u32]) -> Self {
+            Fake {
+                scan: Ok(Scan { holders: vec![], uninspectable: vec![416], front_door: front_door.to_vec() }),
+                tailscaled: Ok(vec![416]),
+                cached: Ok(panes()),
+                fresh: Ok(panes()),
+            }
+        }
+    }
+
+    impl Lookups for Fake {
+        fn scan(&self, _: SocketAddr, _: SocketAddr) -> Result<Scan, os::LookupError> {
+            self.scan.clone().map_err(os::LookupError::Failed)
+        }
+        fn root_tailscaled(&self) -> Result<Vec<u32>, String> {
+            self.tailscaled.clone()
+        }
+        fn panes(&self, fresh: bool) -> Result<Panes, String> {
+            if fresh { self.fresh.clone() } else { self.cached.clone() }
+        }
+        fn ppid_of(&self, pid: u32) -> Option<u32> {
+            chain(pid)
+        }
+        fn tty_of(&self, pid: u32) -> Option<u64> {
+            tty(pid)
+        }
+    }
+
+    fn lo(port: u16) -> Conn {
+        Conn { peer: SocketAddr::from(([127, 0, 0, 1], port)), server: Some(SocketAddr::from(([127, 0, 0, 1], 8824))) }
+    }
+
+    #[test]
+    fn the_decision_grants_outside_only_on_a_fresh_inventory() {
+        assert_eq!(decide(lo(1), &Fake::holders(&[301])), Origin::Outside);
+        assert_eq!(decide(lo(1), &Fake::holders(&[101])), Origin::Worker("dev-a".into()));
+        // Stale cached inventory without the pane; the fresh read finds it.
+        let stale = Fake { cached: Ok(Panes::default()), ..Fake::holders(&[101]) };
+        assert_eq!(decide(lo(1), &stale), Origin::Worker("dev-a".into()));
+        // The fresh read fails: identity unavailable, whatever the cache said.
+        let failed = Fake { cached: Ok(Panes::default()), fresh: Err("tmux gone".into()), ..Fake::holders(&[301]) };
+        assert!(matches!(decide(lo(1), &failed), Origin::IdentityUnavailable(_)));
+        // The server end unknown on a loopback connection: never owner.
+        assert!(matches!(decide(Conn { server: None, ..lo(1) }, &Fake::holders(&[301])), Origin::Unattributed(_)));
+        // A genuinely remote peer (no local holder, not loopback).
+        let remote = Conn { peer: "192.168.1.50:5000".parse().unwrap(), server: Some("192.168.1.207:8824".parse().unwrap()) };
+        assert_eq!(decide(remote, &Fake::holders(&[])), Origin::Remote);
+    }
+
+    /// Review B1 (6c98cf27), dev-lead's tests 1-3.
+    #[test]
+    fn the_owners_phone_through_tailscale_serve_is_remote_and_only_then() {
+        // (1) the forwarded owner phone path.
+        assert_eq!(decide(lo(53514), &Fake::forwarded(&[])), Origin::Remote);
+        // An owner process at the front door (this Mac's browser on the ts.net
+        // URL) leaves the forward provably free of workers.
+        assert_eq!(decide(lo(53514), &Fake::forwarded(&[301])), Origin::Remote);
+        // (2) a local worker connected to this host's front door: refused.
+        assert!(matches!(decide(lo(53514), &Fake::forwarded(&[101])), Origin::IdentityUnavailable(_)));
+        assert!(matches!(decide(lo(53514), &Fake::forwarded(&[501])), Origin::IdentityUnavailable(_)), "by tty too");
+        assert!(matches!(decide(lo(53514), &Fake::forwarded(&[401])), Origin::IdentityUnavailable(_)), "unprovable");
+        let blind = Fake { fresh: Err("tmux gone".into()), ..Fake::forwarded(&[301]) };
+        assert!(matches!(decide(lo(53514), &blind), Origin::IdentityUnavailable(_)), "front door unreadable");
+        // (3) tailscaled absent, not the uninspectable holder, or unidentifiable.
+        let absent = Fake { tailscaled: Ok(vec![]), ..Fake::forwarded(&[]) };
+        assert!(matches!(decide(lo(53514), &absent), Origin::Unattributed(_)));
+        let inspectable = Fake { scan: Ok(Scan { uninspectable: vec![], ..Default::default() }), ..Fake::forwarded(&[]) };
+        assert!(matches!(decide(lo(53514), &inspectable), Origin::Unattributed(_)), "a visible tailscaled holds nothing here");
+        let unknown = Fake { tailscaled: Err("ps failed".into()), ..Fake::forwarded(&[]) };
+        assert!(matches!(decide(lo(53514), &unknown), Origin::Unattributed(_)));
+    }
+
+    /// The real OS scan: holders are matched on BOTH ends of the connection.
+    /// The server listens on 0.0.0.0, so this process opens two connections
+    /// that share one client end (SO_REUSEADDR) to two server addresses, as
+    /// review B2's worker did; each server end names exactly its own
+    /// connection, and once the first closes it is no longer held although the
+    /// second still holds the same client end (dev-lead's test 4).
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn os_lookup_resolves_a_loopback_connection_to_this_process() {
+    fn os_lookup_matches_the_exact_connection_on_both_ends() {
+        use std::os::fd::FromRawFd;
+        let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let a = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let client_end = a.local_addr().unwrap();
+        let (_a_srv, _) = listener.accept().unwrap();
+        let server_a = SocketAddr::from(([127, 0, 0, 1], port));
+        let me = std::process::id();
+        let scan_a = os::scan(client_end, server_a).expect("scan on a supported platform");
+        assert_eq!(scan_a.holders, vec![me], "the exact connection, by this pid");
+        assert!(os::holds(me, client_end, server_a));
+        // A second server address on this host for the same client end.
+        let other_ip = local_non_loopback_ip();
+        let Some(other_ip) = other_ip else {
+            panic!("this test needs a non-loopback address on the host to reproduce a shared client end");
+        };
+        let server_b = SocketAddr::new(other_ip, port);
+        // SAFETY: a fresh socket, configured with plain setsockopt/bind/connect,
+        // then owned by a TcpStream that closes it.
+        let b = unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0);
+            let one: libc::c_int = 1;
+            let sz = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            assert_eq!(libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, (&one as *const libc::c_int).cast(), sz), 0);
+            let sin = |ip: std::net::Ipv4Addr, p: u16| libc::sockaddr_in {
+                #[cfg(target_os = "macos")]
+                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: p.to_be(),
+                sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(ip.octets()) },
+                sin_zero: [0; 8],
+            };
+            let std::net::IpAddr::V4(other4) = other_ip else { panic!("v4 expected") };
+            let local = sin(std::net::Ipv4Addr::LOCALHOST, client_end.port());
+            let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            assert_eq!(libc::bind(fd, (&local as *const libc::sockaddr_in).cast(), len), 0, "share the client end");
+            let remote = sin(other4, port);
+            assert_eq!(libc::connect(fd, (&remote as *const libc::sockaddr_in).cast(), len), 0, "connect to the other server address");
+            std::net::TcpStream::from_raw_fd(fd)
+        };
+        let (_b_srv, b_peer) = listener.accept().unwrap();
+        assert_eq!(b_peer, client_end, "the server sees the same client end for both connections");
+        assert!(os::holds(me, client_end, server_b));
+        assert_eq!(os::scan(client_end, server_b).unwrap().holders, vec![me]);
+        // Close A: its connection is no longer held, although B still holds the
+        // same client end. Local-end-only matching would still say "held".
+        drop(a);
+        drop(_a_srv);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!os::holds(me, client_end, server_a), "a closed connection is not inherited by another sharing its client end");
+        assert!(os::scan(client_end, server_a).unwrap().holders.is_empty());
+        assert!(os::holds(me, client_end, server_b));
+        drop(b);
+        // This process's ancestry walks to the root and its tty (if any) reads.
+        assert!(os::ppid_of(me).is_some(), "parent of this process must be readable");
+        let _ = os::tty_of(me);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn local_non_loopback_ip() -> Option<std::net::IpAddr> {
+        // A UDP "connect" sends nothing; it only picks the outbound address.
+        let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        s.connect("192.0.2.1:9").ok()?;
+        let ip = s.local_addr().ok()?.ip();
+        (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+    }
+
+    /// The memo only ever confirms a worker: an Outside verdict leaves nothing
+    /// remembered, so the next request is decided by a full scan again.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn an_owner_verdict_is_never_remembered() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (_server_side, peer) = listener.accept().unwrap();
-        assert_eq!(peer, client.local_addr().unwrap());
-        let owners = match os::socket_owners(peer) {
-            Ok(o) => o,
-            Err(_) => panic!("socket lookup failed on a supported platform"),
-        };
-        assert!(owners.contains(&std::process::id()), "owners {owners:?} must include {}", std::process::id());
-        let me = std::process::id();
-        assert!(os::ppid_of(me).is_some(), "parent of this process must be readable");
-        let origin = classify(&owners, &HashMap::new(), &os::ppid_of);
-        assert_eq!(origin, Origin::Outside, "with no panes, a readable chain is outside");
-        // An unrelated port nobody holds is not owned.
-        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        assert!(matches!(os::socket_owners(free), Ok(v) if v.is_empty()));
+        let (_srv, peer) = listener.accept().unwrap();
+        let conn = Conn { peer, server: Some(listener.local_addr().unwrap()) };
+        let origin = OsResolver.resolve(conn);
+        let remembered = holder_memo().lock().unwrap().contains_key(&conn);
+        assert_eq!(remembered, matches!(origin, Origin::Worker(_)), "memo written only for a worker ({origin:?})");
+        drop(client);
+    }
+
+    /// Live check, run by hand on a host serving amux (`--ignored`): every
+    /// loopback connection the running server holds right now, decided by the
+    /// shipped OS lookups. Through `tailscale serve` (the owner's phone) the
+    /// expected verdict is Remote; a local client's is Outside or Worker.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn live_server_connections_are_decided() {
+        let (_, out, _) = run_bounded(std::process::Command::new("/usr/sbin/lsof").args(["-nP", "-iTCP:8824", "-sTCP:ESTABLISHED"]), Duration::from_secs(5)).unwrap();
+        let server_side: Vec<(SocketAddr, SocketAddr)> = out.lines().skip(1)
+            .filter_map(|l| l.split_whitespace().nth(8))
+            .filter_map(|n| n.split_once("->"))
+            .filter_map(|(a, b)| Some((a.parse::<SocketAddr>().ok()?, b.parse::<SocketAddr>().ok()?)))
+            .filter(|(srv, _)| srv.port() == 8824)
+            .collect();
+        assert!(!server_side.is_empty(), "no live connections to decide");
+        for (server, peer) in server_side {
+            let origin = decide(Conn { peer, server: Some(server) }, &OsLookups);
+            let scan = os::scan(peer, server).ok();
+            println!("LIVE {peer} -> {server}: {origin:?} holders={:?}", scan.map(|s| s.holders));
+        }
     }
 
     // ---- the policy through the real send gate --------------------------
     //
     // A paused target holds a send in steering_queue after the group policy
     // runs, so these reach the shipped send_post without a tmux pane. Each
-    // request carries ConnectInfo like a served socket; the fake resolver
-    // answers by client port.
+    // request carries ConnectInfo (and the server end) like a served socket.
 
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
@@ -897,6 +1462,7 @@ mod tests {
         }
         let mut req = b.body(Body::from(json!({"text": "probe"}).to_string())).unwrap();
         req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], port))));
+        req.extensions_mut().insert(ServerLocal(SocketAddr::from(([127, 0, 0, 1], 8824))));
         let res = app.clone().oneshot(req).await.unwrap();
         let status = res.status();
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -929,7 +1495,6 @@ mod tests {
         let (st, v) = post(&app(state.clone()), CODEX_WORKER, &[]).await;
         assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "{v}");
         assert!(queued_senders(&state).is_empty(), "owner token from a worker pane is not owner input");
-        // Inside its own group it is stamped as itself, never as the owner.
         let (st, v) = post(&app(state.clone()), SAME_GROUP_CODEX, &[]).await;
         assert_eq!(st, StatusCode::OK, "{v}");
         assert_eq!(queued_senders(&state), vec!["peer".to_string()]);
@@ -948,7 +1513,6 @@ mod tests {
     async fn a_worker_cannot_borrow_another_workers_name() {
         let (state, dir, _r) = fixture();
         let _h = crate::api::settings::test_env::set_home(dir.path());
-        // caller (alpha) claims to be peer (beta) to reach a beta target.
         let (st, v) = post(&app(state.clone()), CLAUDE_WORKER, &[("x-amux-session", "peer"), ("x-amux-worker", "peer")]).await;
         assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "{v}");
         assert!(queued_senders(&state).is_empty());
@@ -965,163 +1529,48 @@ mod tests {
         assert!(queued_senders(&state).is_empty());
     }
 
-    /// Review B1: a failed tmux inventory is unproven evidence. A worker's
-    /// process whose pane cannot be listed must be refused, never let through
-    /// as the owner, while the same process with a working inventory is that
-    /// worker.
-    struct InventoryResolver(Result<HashMap<u32, String>, String>);
+    /// The shipped decision behind the middleware and send gate, with fake
+    /// lookups: what each OS answer becomes at the HTTP boundary.
+    struct DecideWith(Fake);
 
-    impl PeerResolver for InventoryResolver {
-        fn resolve(&self, peer: SocketAddr) -> Origin {
-            // pid 101's chain runs through pane 100 (amux-caller) when listed.
-            let chain = |pid: u32| match pid {
-                101 => Some(100),
-                100 => Some(50),
-                50 => Some(1),
-                _ => None,
-            };
-            decide(peer, Ok(vec![101]), || self.0.clone(), || self.0.clone(), &chain)
+    impl PeerResolver for DecideWith {
+        fn resolve(&self, conn: Conn) -> Origin {
+            decide(conn, &self.0)
         }
     }
 
     #[tokio::test]
-    async fn a_failed_pane_inventory_refuses_instead_of_promoting_a_worker_to_owner() {
+    async fn os_answers_reach_the_send_gate_fail_closed() {
         let (state, dir, guard) = fixture();
         let _h = crate::api::settings::test_env::set_home(dir.path());
         drop(guard);
-        let failed = test_support::set_resolver(Arc::new(InventoryResolver(Err("tmux exited 1".into()))));
-        let (st, v) = post(&app(state.clone()), OWNER, &[]).await;
-        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_unavailable")), "{v}");
-        assert!(v["why"].as_str().unwrap_or("").contains("tmux pane inventory failed"), "{v}");
-        assert!(queued_senders(&state).is_empty(), "nothing reaches the send gate as owner input");
-        drop(failed);
-        let _listed = test_support::set_resolver(Arc::new(InventoryResolver(Ok(HashMap::from([(100, "amux-caller".to_string())])))));
-        let (st, v) = post(&app(state.clone()), OWNER, &[]).await;
-        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "listed: it is caller: {v}");
-    }
-
-    /// Review round 2: the parser's verdict on real tmux diagnostics, carried
-    /// through the shipped middleware. Only "no server running" may read as an
-    /// empty inventory; a connection error must refuse.
-    #[tokio::test]
-    async fn tmux_connection_errors_refuse_through_the_middleware() {
-        let (state, dir, guard) = fixture();
-        let _h = crate::api::settings::test_env::set_home(dir.path());
-        drop(guard);
-        for stderr in [
-            "error connecting to /tmp/tmux-501/default (Permission denied)",
-            "error connecting to /tmp/tmux-501/default (Connection refused)",
-            "lost server",
-            "",
-        ] {
-            let inv = panes_from_output(false, "", stderr);
-            let r = test_support::set_resolver(Arc::new(InventoryResolver(inv)));
+        let worker_panes = Panes { by_pid: HashMap::from([(100, "amux-caller".to_string())]), by_tty: HashMap::new() };
+        let cases: Vec<(&str, Fake, &str)> = vec![
+            ("failed inventory", Fake { cached: Err("x".into()), fresh: Err("tmux exited 1".into()), ..Fake::holders(&[301]) }, "worker_identity_unavailable"),
+            ("unknown tmux error", Fake { fresh: panes_from_output(false, "", "tmux: something new"), ..Fake::holders(&[301]) }, "worker_identity_unavailable"),
+            ("stale cache, fresh finds the worker", Fake { cached: Ok(Panes::default()), fresh: Ok(worker_panes.clone()), ..Fake::holders(&[101]) }, "worker_group_boundary"),
+            ("worker at the front door", Fake { fresh: Ok(worker_panes.clone()), ..Fake::forwarded(&[101]) }, "worker_identity_unavailable"),
+            ("no forwarder", Fake { tailscaled: Ok(vec![]), ..Fake::forwarded(&[]) }, "worker_origin_unattributed"),
+        ];
+        for (label, fake, code) in cases {
+            let r = test_support::set_resolver(Arc::new(DecideWith(fake)));
             let (st, v) = post(&app(state.clone()), OWNER, &[]).await;
-            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_unavailable")), "{stderr:?}: {v}");
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(code)), "{label}: {v}");
             drop(r);
         }
-        assert!(queued_senders(&state).is_empty(), "no diagnostic lets a worker through as the owner");
-        // The one authoritative absence: no tmux server means no worker pane,
-        // so a readable chain with no pane is outside.
-        let r = test_support::set_resolver(Arc::new(InventoryResolver(panes_from_output(false, "", "no server running on /tmp/tmux-501/default"))));
+        assert!(queued_senders(&state).is_empty(), "no failure lets a request through as the owner");
+        // The owner's phone through tailscale serve sends as the owner.
+        let r = test_support::set_resolver(Arc::new(DecideWith(Fake::forwarded(&[]))));
         let (st, v) = post(&app(state.clone()), OWNER, &[]).await;
-        assert!(st != StatusCode::FORBIDDEN || v["code"] != json!("worker_origin_unattributed"), "no server: {v}");
+        assert_eq!(st, StatusCode::OK, "forwarded phone: {v}");
+        assert_eq!(queued_senders(&state), vec![String::new()]);
         drop(r);
-    }
-
-    /// The default, not a list: an error string nobody has seen before (here
-    /// randomised per run, so no allow-list can anticipate it) is refused as
-    /// identity unavailable, never read as an empty inventory.
-    #[tokio::test]
-    async fn any_unknown_tmux_error_is_refused_as_identity_unavailable() {
-        let (state, dir, guard) = fixture();
-        let _h = crate::api::settings::test_env::set_home(dir.path());
-        drop(guard);
-        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let unknown = format!("tmux {nonce:x}: an error message no version of tmux has printed yet");
-        let r = test_support::set_resolver(Arc::new(InventoryResolver(panes_from_output(false, "", &unknown))));
-        let (st, v) = post(&app(state.clone()), OWNER, &[]).await;
-        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_unavailable")), "{v}");
-        assert!(v["error"].as_str().unwrap_or("").starts_with("identity unavailable"), "{v}");
-        assert!(queued_senders(&state).is_empty());
-        drop(r);
-    }
-
-    #[test]
-    fn tmux_output_is_an_inventory_only_when_it_succeeded_or_no_server_runs() {
-        assert_eq!(panes_from_output(true, "7 amux-a\n", "").unwrap().get(&7).map(String::as_str), Some("amux-a"));
-        assert!(panes_from_output(false, "", "no server running on /tmp/tmux-501/default\n").unwrap().is_empty());
-        assert!(panes_from_output(false, "", "error connecting to /tmp/tmux-501/default (No such file or directory)\n").unwrap().is_empty(),
-            "no socket: tmux 3.6a's no-server message");
-        for denied in [
-            "error connecting to /tmp/tmux-501/default (Permission denied)",
-            "error connecting to /tmp/tmux-501/default (Connection refused)",
-            "error connecting to /tmp/tmux-501/default (No such file or directory) and more",
-        ] {
-            assert!(panes_from_output(false, "", denied).is_err(), "a failed connection proves nothing: {denied}");
-        }
-        assert!(panes_from_output(false, "", "lost server\n").is_err());
-        assert!(panes_from_output(false, "", "").is_err(), "a silent failure is an error, not an empty fleet");
-    }
-
-    /// Review round 3: a worker pane that starts after the cached inventory
-    /// was read is absent from it. Absence in a cached read must not grant the
-    /// owner; the verdict comes from a fresh read, which finds the pane.
-    struct StaleInventory;
-
-    impl PeerResolver for StaleInventory {
-        fn resolve(&self, peer: SocketAddr) -> Origin {
-            let chain = |pid: u32| match pid {
-                101 => Some(100),
-                100 => Some(50),
-                50 => Some(1),
-                _ => None,
-            };
-            decide(peer, Ok(vec![101]), || Ok(HashMap::new()), || Ok(HashMap::from([(100, "amux-caller".to_string())])), &chain)
-        }
-    }
-
-    #[tokio::test]
-    async fn a_stale_cached_inventory_never_grants_owner_to_a_new_worker() {
-        let (state, dir, guard) = fixture();
-        let _h = crate::api::settings::test_env::set_home(dir.path());
-        drop(guard);
-        let _r = test_support::set_resolver(Arc::new(StaleInventory));
-        for _ in 0..2 {
-            // Twice: no verdict is memoised between requests either.
-            let (st, v) = post(&app(state.clone()), OWNER, &[]).await;
-            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "it is caller: {v}");
-        }
-        assert!(queued_senders(&state).is_empty());
-        // And a fresh read that fails is identity unavailable even when the
-        // cached read (stale, empty) would have said outside.
-        let chain = |pid: u32| match pid { 101 => Some(1), _ => None };
-        let o = decide("127.0.0.1:1".parse().unwrap(), Ok(vec![101]), || Ok(HashMap::new()), || Err("tmux gone".into()), &chain);
-        assert!(matches!(o, Origin::IdentityUnavailable(_)), "{o:?}");
-    }
-
-    /// A remembered socket holder is reused only while it still holds that
-    /// exact socket; a closed connection's port is not inherited.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn a_remembered_socket_holder_is_rechecked() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (server_side, peer) = listener.accept().unwrap();
-        let me = std::process::id();
-        assert!(os::holds(me, peer), "this process holds its open client socket");
-        assert_eq!(socket_owners_checked(peer).ok(), Some(vec![me]));
-        drop(client);
-        drop(server_side);
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(!os::holds(me, peer), "a closed socket is no longer held");
-        assert!(matches!(socket_owners_checked(peer), Ok(v) if v.is_empty()), "the memo is not inherited");
     }
 
     /// The proof header is server-set only: a client cannot assert it.
     #[tokio::test]
     async fn a_client_supplied_process_proof_is_stripped() {
-        let (state, dir, _r) = fixture();
+        let (_state, dir, _r) = fixture();
         let _h = crate::api::settings::test_env::set_home(dir.path());
         async fn echo(headers: axum::http::HeaderMap) -> String {
             headers.get(PROCESS_WORKER_HEADER).and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
@@ -1132,7 +1581,6 @@ mod tests {
         let res = router.clone().oneshot(req).await.unwrap();
         let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"", "an owner request cannot claim process proof");
-        drop(state);
     }
 
     #[cfg(target_os = "linux")]
