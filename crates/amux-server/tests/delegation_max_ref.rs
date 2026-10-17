@@ -237,3 +237,24 @@ async fn a_pane_row_matching_an_amux_delivery_is_not_human_typed() {
     e.seed_pane_prompt(MAX_PANE, INSTRUCTION, t);
     refused_with(&e, Some(max_ref(MAX_PANE, t)), "max_ref_not_human_typed", "pane row echoing an amux delivery").await;
 }
+
+/// B2 at the HTTP layer: mrpopo mints a pane row in its OWN lane through its
+/// own /report (a UserPromptSubmit observation), then cites it. The row is
+/// real, and the citation is still refused as max_ref_own_lane.
+#[tokio::test]
+async fn a_pane_row_minted_through_the_actors_own_report_is_refused() {
+    let e = setup().await;
+    let now = now_s();
+    let dir = e.home().join("status-events").join(MRPOPO);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("current.json"), json!({"run_id": "review-run", "provider": "claude", "started": now - 100.0}).to_string()).unwrap();
+    let before = e.max_row_id();
+    let report = json!({"native_status": true, "event": "UserPromptSubmit", "run_id": "review-run", "provider": "claude",
+        "sequence": 1, "event_ts": now - 1.0, "turn_id": "t1", "prompt": INSTRUCTION});
+    let (st, v) = e.call(Who::Worker(MRPOPO), "POST", &format!("/api/sessions/{MRPOPO}/report"), Some(report)).await;
+    assert!(st.is_success(), "the self-report is accepted: {st} {v}");
+    let minted = e.rows_after(before);
+    assert!(minted.iter().any(|(s, o, t, x)| s == MRPOPO && o == "pane" && t == "user" && x == INSTRUCTION),
+        "the report minted a pane row in mrpopo's lane: {minted:?}");
+    refused_with(&e, Some(max_ref(MRPOPO, now - 1.0)), "max_ref_own_lane", "own-lane row minted through /report").await;
+}

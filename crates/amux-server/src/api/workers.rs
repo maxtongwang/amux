@@ -623,12 +623,22 @@ pub async fn create_worker(
     ) {
         return refusal;
     }
+    let requested_name: Option<String> = requested.map(str::to_string);
     let summary = json!({"name": requested, "cwd": body.cwd, "provider": body.provider, "model": body.model});
     let action = crate::api::delegation::Action::CreateWorker { tags: lead_tags.clone(), settings: vec![], owner_only: None };
     let st = state.0.clone();
     let out = create_worker_inner(state, Json(body)).await;
     crate::api::sessions_legacy::invalidate_sessions_cache();
     if out.status().is_success() {
+        // A store create has no tag field: the lead's team tag is written to
+        // the worker's session env, where every group reader looks.
+        if let (Some(team), Some(name)) = (lead_tags.first(), requested_name.as_deref()) {
+            let path = crate::api::session_verbs::env_path(name);
+            if let Err(e) = crate::api::session_verbs::EnvFile::merge_plain(&path, &[("CC_TAGS".to_string(), Some(team.clone()))]) {
+                tracing::warn!(worker = %name, team = %team, error = %e, verdict = "lead_create_tag_unwritten", measured = true, n_considered = 1,
+                    "a lead's store-created worker could not be given its team tag");
+            }
+        }
         crate::api::delegation::record_allowed(&st, &headers, &crate::api::delegation::Target::NewWorker, &action, Value::Null, summary);
     }
     out
@@ -2518,11 +2528,16 @@ pub async fn keys_worker(
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
     // Keys into a pane: a worker's own pane only (ai-config #160).
-    if let Err(r) = crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Worker(name.clone()),
+    let grant = match crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Worker(name.clone()),
         &crate::api::delegation::Action::SetConfig { keys: vec!["keys".into()] }, Some(&body)) {
-        return r;
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    let resp = crate::api::session_verbs::keys_verb(&name, &body).await;
+    if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(&state, json!({"name": name}), json!({"keys": body.get("keys")}));
     }
-    crate::api::session_verbs::keys_verb(&name, &body).await
+    resp
 }
 
 /// `POST /api/workers/{id}/duplicate` — copy a worker's env file and register

@@ -315,10 +315,13 @@ fn maxref_row(name: &str) -> Option<Terms> {
 pub(crate) fn key_class(key: &str) -> KeyClass {
     // Group and global layers: secrets and held keys keep their class; no
     // other row exists for them.
+    // Group and global layers: secrets, held keys and mrpopo's explicit rows
+    // keep their class (a row's phrase applies on every layer); a worker's
+    // own or a lead's settings are not settable there by anyone but the owner.
     for layer in ["group:", "global:"] {
         if let Some(inner) = key.strip_prefix(layer) {
             return match key_class(inner) {
-                c @ (KeyClass::Secret | KeyClass::Held) => c,
+                c @ (KeyClass::Secret | KeyClass::Held | KeyClass::MaxRef(_)) => c,
                 _ => KeyClass::OwnerOnly,
             };
         }
@@ -479,10 +482,10 @@ fn owned(t: Terms) -> Vec<String> {
     t.iter().map(|p| p.to_string()).collect()
 }
 
-/// mrpopo's rows. Every owner-only setting that is neither a secret nor in
-/// [`HELD_FOR_MAX`] is delegable with ONE max_ref row naming the target and
-/// the setting: a listed row's phrases ([`MAXREF_ROWS`]), else the setting's
-/// own name (an env key or field). Membership names every changed group.
+/// mrpopo's rows: ONLY the explicit ones ([`MAXREF_ROWS`] plus the action
+/// rows below), each needing ONE max_ref row naming the target and the row's
+/// setting. An owner-only key with no explicit row is refused for mrpopo on
+/// every layer (review of c86867e5, B1). Membership names every changed group.
 fn decide_mrpopo(action: &Action, t: &TargetFacts) -> Decision {
     let with = |terms: Vec<Vec<String>>| Decision::AllowWithMaxRef { terms };
     if t.is_actor && held_items("mrpopo:").any(|h| h == "own-config") {
@@ -494,7 +497,9 @@ fn decide_mrpopo(action: &Action, t: &TargetFacts) -> Decision {
             for k in keys {
                 let group = match key_class(k) {
                     KeyClass::MaxRef(tm) => owned(tm),
-                    KeyClass::OwnerOnly => vec![k.rsplit(':').next().unwrap_or(k).to_string()],
+                    KeyClass::OwnerOnly => {
+                        return deny("delegation_not_allowed", format!("'{k}' has no delegation row; it stays the owner's"))
+                    }
                     KeyClass::SelfOk | KeyClass::LeadOk => {
                         return deny("delegation_not_allowed", format!("'{k}' is the worker's own setting or a lead's; mrpopo has no row for it"))
                     }
@@ -1022,8 +1027,14 @@ mod tests {
         assert_eq!(code(decide(&m, &Action::CreateGroup { group: "ops2".into() }, &OTHER)), "max_ref:create group+ops2");
         // Other teams' membership: each changed group must be named.
         assert_eq!(code(decide(&m, &tags(&["dev"], &["dev", "ops"]), &OTHER)), "max_ref:ops");
-        // Owner-only classes with no listed row: the setting names itself.
-        assert_eq!(code(decide(&m, &cfg(&["env:CC_SOMETHING_OWNER_ONLY"]), &OTHER)), "max_ref:CC_SOMETHING_OWNER_ONLY");
+        // An owner-only key with no explicit row stays the owner's, on every layer.
+        for k in ["env:CC_SOMETHING_OWNER_ONLY", "group:env:CC_SOMETHING_OWNER_ONLY", "global:env:CC_SOMETHING_OWNER_ONLY", "global:env:CC_MODEL"] {
+            assert_eq!(code(decide(&m, &cfg(&[k]), &OTHER)), "delegation_not_allowed", "{k}");
+        }
+        // An explicit row keeps its phrase on the group and global layers.
+        for k in ["group:env:AMUX_EMAIL_EXTERNAL_ALLOW", "global:env:AMUX_EMAIL_EXTERNAL_ALLOW"] {
+            assert_eq!(code(decide(&m, &cfg(&[k]), &OTHER)), "max_ref:external email", "{k}");
+        }
         for (k, first) in [("worktree_verify", "verify command"), ("env:CC_VERIFY", "verify command"), ("env:CC_DEPLOY_CHECK", "deploy check"),
             ("env:CC_WORKTREE_AUTO_MERGE", "auto-merge"), ("env:AMUX_YOLO_AUTO_YES", "auto-yes"), ("env:CC_PROJECT_LEAD", "project lead"),
             ("env:CC_RECEIVE_DENY", "receive deny")] {

@@ -423,7 +423,9 @@ pub async fn apply(
 
     // Delegated changes are logged (ai-config #160): the instance apply's
     // grant, and each worker declaration a worker applied.
-    if let Some(g) = grant.as_ref() {
+    // A 207 with errors is not a clean change: the instance apply is logged
+    // only when every item applied (worker declarations log per changed item).
+    if let Some(g) = grant.as_ref().filter(|_| errors.is_empty()) {
         g.commit(&state, Value::Null, json!({"changed": changed}));
     }
     for (name, g) in planned {

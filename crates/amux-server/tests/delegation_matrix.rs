@@ -86,13 +86,14 @@ async fn a_lead_never_creates_an_untagged_worker() {
     for (i, tags) in [json!([]), serde_json::Value::Null, json!("")].into_iter().enumerate() {
         let name = format!("review-untagged-{i}");
         let (st, v) = e.call(Who::Worker(DEV_LEAD), "POST", "/api/sessions", Some(create_body(&e.dir, &name, tags.clone()))).await;
-        if st.is_success() {
-            assert_eq!(e.tags(&name), e.set(&["dev"]), "tags={tags}: created without the team tag: {v}");
-        } else {
-            assert_refused(st, &v, &format!("tags={tags}"));
-            assert!(!e.env_path(&name).exists());
-        }
+        // Settled: an untagged lead create gets the lead's team tag, stored.
+        assert_allowed(st, &v, &format!("untagged lead create tags={tags}"));
+        assert_eq!(e.tags(&name), e.set(&["dev"]), "tags={tags}: the team tag must be stored: {v}");
     }
+    // The store create route stores it too.
+    let (st, v) = e.call(Who::Worker(DEV_LEAD), "POST", "/api/workers", Some(json!({"name": "review-untagged-store", "cwd": "/tmp"}))).await;
+    assert_allowed(st, &v, "untagged lead store create");
+    assert_eq!(e.tags("review-untagged-store"), e.set(&["dev"]), "store create must store the team tag: {v}");
 }
 
 #[tokio::test]

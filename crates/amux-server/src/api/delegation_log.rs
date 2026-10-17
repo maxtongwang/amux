@@ -25,9 +25,6 @@
 //!   already logged as a WARN with its verdict code at the refusal site; this
 //!   file records only what changed, so its line count is the change count.
 
-// `record` is called by api::delegation (piece a). Remove this allow when that
-// lands; until then only the route and the tests reach the writer.
-
 use crate::api::AppState;
 use crate::config::amux_home;
 use axum::extract::{Query, State};

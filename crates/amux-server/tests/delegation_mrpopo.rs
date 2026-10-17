@@ -282,3 +282,33 @@ async fn leads_and_self_never_get_mrpopos_classes() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// mrpopo at the group and global layers: an explicit row keeps its phrase
+/// there; an owner-only key with no row is refused even with a max_ref.
+#[tokio::test]
+async fn mrpopo_at_the_group_and_global_layers() {
+    let t = now_s() - 60.0;
+    // Group layer, explicit row (external email), naming the group and the setting.
+    let e = setup().await;
+    e.seed_pane_prompt(MAX_PANE, "allow external email for the dev group", t);
+    let body = with_ref(scope_body("group", "dev", "env", json!({"AMUX_EMAIL_EXTERNAL_ALLOW": "1"})), max_ref(MAX_PANE, t), "Max asked");
+    let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(body)).await;
+    assert_allowed(st, &v, "mrpopo group-layer external email with a specific max_ref");
+    // Global layer, explicit row: no target to name, the setting is enough.
+    let e = setup().await;
+    e.seed_pane_prompt(MAX_PANE, "allow external email for everyone", t);
+    let body = with_ref(scope_body("global", "", "env", json!({"AMUX_EMAIL_EXTERNAL_ALLOW": "1"})), max_ref(MAX_PANE, t), "Max asked");
+    let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(body)).await;
+    assert_allowed(st, &v, "mrpopo global-layer external email with a specific max_ref");
+    // No explicit row: refused on both layers even when Max named the key.
+    for level in ["group", "global"] {
+        let e = setup().await;
+        e.seed_pane_prompt(MAX_PANE, "set CC_SOMETHING_OWNER_ONLY for the dev group", t);
+        let name = if level == "group" { "dev" } else { "" };
+        let body = with_ref(scope_body(level, name, "env", json!({"CC_SOMETHING_OWNER_ONLY": "1"})), max_ref(MAX_PANE, t), "Max asked");
+        let before = e.snapshot();
+        let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(body)).await;
+        assert_code(st, &v, "delegation_not_allowed", &format!("{level}-layer key with no row"));
+        assert_eq!(before, e.snapshot(), "{level}: nothing written");
+    }
+}

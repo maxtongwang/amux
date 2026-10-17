@@ -55,7 +55,7 @@ pub const LOG_REL: &str = "audit/delegated-changes.jsonl";
 pub const ATTRIBUTION_COLUMN: &str = "process_origin";
 
 /// Every max_ref refusal code the spec defines.
-pub const MAX_REF_CODES: [&str; 8] = [
+pub const MAX_REF_CODES: [&str; 9] = [
     "max_ref_missing",
     "max_ref_no_such_row",
     "max_ref_not_human_typed",
@@ -64,6 +64,7 @@ pub const MAX_REF_CODES: [&str; 8] = [
     "max_ref_outside_window",
     "max_ref_does_not_name_target",
     "max_ref_does_not_name_setting",
+    "max_ref_own_lane",
 ];
 
 /// Who a request speaks for.
