@@ -266,6 +266,9 @@ async fn apply(
     if let Some(refusal) = worker_apply_refusal(&headers, &spec, dry) {
         return refusal;
     }
+    // Who is applying: a worker (process-attributed headers) or the owner. A
+    // worker's messages and creation prompts are ITS input, never the owner's.
+    let origin = super::session_verbs::request_worker_origin(&headers);
     let home = crate::config::amux_home();
     let sessions_dir = home.join("sessions");
 
@@ -618,8 +621,9 @@ async fn apply(
     // if its session is not up yet (provisioned separately) it queues and lands
     // when the worker starts. Only newly-created workers are here (see the loop).
     for (name, prompt) in &worker_prompts {
+        let text = crate::api::session_verbs::origin_stamped(&origin, name, prompt).unwrap_or_else(|| prompt.clone());
         let _ =
-            crate::api::session_verbs::steer_enqueue(&state, name, prompt, "env-apply-prompt", "")
+            crate::api::session_verbs::steer_enqueue(&state, name, &text, "env-apply-prompt", "")
                 .await;
     }
 
@@ -819,23 +823,64 @@ async fn apply(
                 )
             })
             .collect();
+        let caller = origin.clone();
+        let refused = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let refused_w = refused.clone();
         let res = state
             .store
             .write_async(move |conn| {
                 let now = chrono::Utc::now();
                 let mut events = vec![];
                 for (to, from, text) in &msgs {
+                    // A worker applying an env sends as itself. Naming the owner or
+                    // another worker as `from` is refused, never silently honoured.
+                    let caller_actor = if caller.is_empty() {
+                        None
+                    } else {
+                        let named_self = from.is_empty() || from == &caller;
+                        let me = crate::db::queries::get_worker(conn, &caller)?;
+                        match (named_self, me) {
+                            (true, Some(w)) => Some((
+                                amux_core::events::Actor::Worker { id: amux_core::ids::WorkerId::parse(&w.id).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))? },
+                                w.display_name,
+                            )),
+                            (false, _) => {
+                                if let Ok(mut r) = refused_w.lock() {
+                                    r.push(json!({"kind": "message", "to": to, "code": "env_message_sender_refused",
+                                        "error": format!("{caller} applied this env, so its messages are from {caller}; it cannot send as '{from}'")}));
+                                }
+                                continue;
+                            }
+                            (true, None) => {
+                                if let Ok(mut r) = refused_w.lock() {
+                                    r.push(json!({"kind": "message", "to": to, "code": "worker_identity_refused",
+                                        "error": "the applying worker has no registered identity, so its messages cannot be attributed"}));
+                                }
+                                continue;
+                            }
+                        }
+                    };
                     // Unknown worker name -> skip (a message to nobody is a no-op).
                     let target = match super::messages::resolve_recipient(conn, to)? {
                         Some(t) => t,
                         None => continue,
                     };
-                    // Sender: a worker name/id -> that worker; else the owner (an
-                    // env is applied by the owner, so an empty from is honestly them).
+                    if let Some((_, caller_name)) = &caller_actor {
+                        if let Some(refusal) = super::messages::worker_send_refusal(conn, caller_name, &target)? {
+                            if let Ok(mut r) = refused_w.lock() {
+                                r.push(json!({"kind": "message", "to": to, "code": refusal.code, "error": refusal.reason}));
+                            }
+                            continue;
+                        }
+                    }
+                    // Sender: the applying worker; else (owner applying) a worker
+                    // name/id -> that worker, or the owner.
                     let is_owner = from.is_empty()
                         || from.eq_ignore_ascii_case("human")
                         || from.eq_ignore_ascii_case("owner");
-                    let from_actor = if is_owner {
+                    let from_actor = if let Some((actor, _)) = &caller_actor {
+                        actor.clone()
+                    } else if is_owner {
                         amux_core::events::Actor::Human {
                             name: if from.is_empty() {
                                 "owner".into()
@@ -885,6 +930,12 @@ async fn apply(
         if let Err(e) = res {
             errors.push(json!({"kind": "message", "error": e.to_string()}));
         }
+        let refused_now: Vec<Value> = refused.lock().map(|r| r.clone()).unwrap_or_default();
+        for refusal in &refused_now {
+            tracing::warn!(origin = %origin, refusal = %refusal, verdict = "env_message_refused", measured = true,
+                n_considered = 1, "an env apply message from a worker was refused");
+        }
+        errors.extend(refused_now);
     }
 
     Json(json!({
