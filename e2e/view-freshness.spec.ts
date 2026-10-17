@@ -74,8 +74,20 @@ test('selected terminal text explains the pause and clears after selection is re
   await expect(status).toContainText('Updated', { timeout: 15000 });
 });
 
-test('transport contact cannot hide stale fleet data and a fresh snapshot clears the banner', async ({ page }) => {
+test('a quiet fleet is revalidated, not shown as stale', async ({ page }) => {
   test.setTimeout(70000);
+  const state = await setup(page);
+  // No invalidates arrive, so nothing refetches the list on its own. After
+  // 30s the watchdog revalidates; an answered revalidation is current data.
+  const reads = state.sessionReads;
+  await expect.poll(() => state.sessionReads, { timeout: 45000 }).toBeGreaterThan(reads);
+  await page.waitForTimeout(20000);
+  await expect(page.locator('.cards')).not.toHaveClass(/workers-stale/);
+  await expect(page.locator('.cards')).not.toContainText('Stale since');
+});
+
+test('transport contact cannot hide stale fleet data and a fresh snapshot clears the banner', async ({ page }) => {
+  test.setTimeout(90000);
   const state = await setup(page);
   state.hangSessions = true;
   // Model continuing SSE pings without sessions payloads. Keep the transport
@@ -84,7 +96,8 @@ test('transport contact cannot hide stale fleet data and a fresh snapshot clears
     setInterval(() => (globalThis as any).eval('_lastDataTime = Date.now()'), 1000);
   });
   const fleet = page.locator('.cards.workers-stale');
-  await expect(fleet).toContainText('Stale since', { timeout: 45000 });
+  // 30s of no data, then a revalidation that never answers for 15s more.
+  await expect(fleet).toContainText('Stale since', { timeout: 65000 });
   const reads = state.sessionReads;
   await page.evaluate(() => (globalThis as any).eval('_checkViewFreshness(Date.now())'));
   expect(state.sessionReads).toBe(reads);

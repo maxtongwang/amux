@@ -687,6 +687,7 @@ let _sessionLoadError = null; // Last failed worker read; a response is not nece
 let _initialLoad = true;   // true until first data arrives from server
 let _sessionsLastAppliedAt = null; // Sessions snapshots only; transport pings are not data.
 let _sessionsStale = false;
+let _sessionsRevalidateAt = null; // A quiet-fleet revalidation is in flight since this time.
 let _lastDataTime = null;  // timestamp of last successful data
 // AC-275: when NO data has ever arrived, _lastDataTime stays null and every
 // staleness check below is falsy — so a client that never receives its first
@@ -931,11 +932,21 @@ function _checkViewFreshness(now) {
     }
   }
   // Embedded terminals intentionally do not subscribe to fleet updates.
-  if (!window._peekEmbed && !_sessionsStale && now - (_sessionsLastAppliedAt || _pageLoadTime) > 30000) {
+  // The list is refetched only on an SSE invalidate, so a quiet fleet sends
+  // no data for long stretches. Quiet is not stale: after 30s, revalidate
+  // (a 304 when nothing changed); only a list that stays unconfirmed 15s
+  // past that revalidation is shown as stale.
+  if (window._peekEmbed || _sessionsStale) return;
+  const sessionsAge = now - (_sessionsLastAppliedAt || _pageLoadTime);
+  if (sessionsAge <= 30000) {
+    _sessionsRevalidateAt = null;
+  } else if (!_sessionsRevalidateAt) {
+    _sessionsRevalidateAt = now;
+    fetchSessions();
+  } else if (now - _sessionsRevalidateAt > 15000) {
     _sessionsStale = true;
-    _interactionDiagnostic({ verdict: 'sessions-stale', measured: true, n_considered: 1,
-      age_ms: now - (_sessionsLastAppliedAt || _pageLoadTime) });
-    fetchSessions(); // Coalesced, once per stale episode; success resets the latch.
+    _interactionDiagnostic({ verdict: 'sessions-stale', measured: true, n_considered: 1, age_ms: sessionsAge });
+    fetchSessions(); // Once per stale episode; success resets the latch.
     render();
   }
 }
@@ -5473,6 +5484,7 @@ function _sessionReadRecovered() {
   const changed = !!_sessionLoadError || _sessionsStale;
   _sessionsLastAppliedAt = Date.now();
   _sessionsStale = false;
+  _sessionsRevalidateAt = null;
   _sessionLoadError = null;
   _sessionRetryAttempt = 0;
   clearTimeout(_sessionRetryTimer);
