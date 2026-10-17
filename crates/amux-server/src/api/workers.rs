@@ -1445,7 +1445,7 @@ async fn stop_worker_inner(state: &AppState, key: String) -> Response {
             Some(StepOutcome::NotFound)
         );
         if is_not_found && crate::api::session_verbs::lane_env_exists(&key) {
-            return match crate::api::session_verbs::stop_for_pause(&state, &key).await {
+            return match crate::api::session_verbs::stop_for_pause(state, &key).await {
                 Ok(()) => (
                     StatusCode::OK,
                     Json(json!({ "applied": true, "state": "stopped", "worker_id": key })),
@@ -1614,6 +1614,7 @@ pub async fn resume_worker(
 /// [`lifecycle_gate`] for a store key; the owner skips the lookup. Returns
 /// the grant and the RESOLVED name, which the verb then acts on (N14). The
 /// inner stop/start calls run with no worker headers: authorized here.
+#[allow(clippy::result_large_err)] // the refusal IS the handler's response; it is returned as-is
 async fn lifecycle_gate_key(state: &AppState, headers: &axum::http::HeaderMap, key: &str, verb: &str)
     -> Result<(Option<crate::api::delegation::Grant>, String), Response> {
     if crate::api::session_verbs::worker_origin(headers).is_empty() {
@@ -2456,6 +2457,7 @@ pub async fn reset_worker(State(state): State<AppState>, Path(key): Path<String>
 
 /// Lifecycle verbs on another worker go through the delegation table
 /// (ai-config #160): self, or a lead for a non-lead worker in its team.
+#[allow(clippy::result_large_err)] // the refusal IS the handler's response; it is returned as-is
 fn lifecycle_gate(state: &AppState, headers: &axum::http::HeaderMap, name: &str, verb: &str) -> Result<Option<crate::api::delegation::Grant>, Response> {
     let action = crate::api::delegation::Action::Lifecycle { verb: verb.to_string() };
     crate::api::delegation::authorize(state, headers, &crate::api::delegation::Target::Worker(name.to_string()), &action, None)

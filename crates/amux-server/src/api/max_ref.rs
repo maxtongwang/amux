@@ -69,11 +69,7 @@ pub(crate) struct MaxRefEvidence {
 /// Outside is NOT owner proof here: a worker reaches it through `launchctl
 /// submit`. Until dev-lead rules, only Remote (another host's forwarder)
 /// proves the owner for an own-lane citation; Outside counts like a pane row.
-pub(crate) fn max_ref_session_allowed(actor: &str, ev: &MaxRefEvidence) -> bool {
-    row_allowed_for(actor, &ev.session, ev.source, ev.remote)
-}
-
-fn row_allowed_for(actor: &str, session: &str, source: HumanSource, remote: bool) -> bool {
+pub(crate) fn max_ref_session_allowed(actor: &str, session: &str, source: HumanSource, remote: bool) -> bool {
     if actor.is_empty() {
         return true;
     }
@@ -274,6 +270,7 @@ pub(crate) fn names_phrase(text: &str, phrase: &str) -> bool {
 /// `now`, naming at least one of `targets` (non-empty required here). The
 /// nearest qualifying row wins. Prefer [`verify_max_ref_terms`] for a change
 /// that has a setting: this form authorizes on the target name alone.
+#[cfg(test)]
 pub(crate) fn verify_max_ref(state: &AppState, r: Option<&MaxRef>, targets: &[&str], now: f64) -> Result<MaxRefEvidence, MaxRefRefusal> {
     if targets.iter().all(|t| t.trim().is_empty()) {
         return logged(r, Err(MaxRefRefusal::DoesNotNameTarget));
@@ -286,6 +283,7 @@ pub(crate) fn verify_max_ref(state: &AppState, r: Option<&MaxRef>, targets: &[&s
 /// see [`names_phrase`]); matches are never combined across rows. An empty
 /// `targets` is a fleet-level change with no target requirement. An empty
 /// `terms` is a caller bug and is refused as [`MaxRefRefusal::DoesNotNameSetting`].
+#[cfg(test)]
 pub(crate) fn verify_max_ref_terms(state: &AppState, r: Option<&MaxRef>, targets: &[&str], terms: &[&str], now: f64) -> Result<MaxRefEvidence, MaxRefRefusal> {
     verify_max_ref_groups(state, r, "", targets, &[terms], now)
 }
@@ -339,7 +337,7 @@ fn verify(state: &AppState, r: Option<&MaxRef>, actor: &str, targets: &[&str], g
     if typed.is_empty() {
         return Err(MaxRefRefusal::NotHumanTyped);
     }
-    typed.retain(|row| row_allowed_for(actor, &row.session, row.source.unwrap_or(HumanSource::Pane), row.remote));
+    typed.retain(|row| max_ref_session_allowed(actor, &row.session, row.source.unwrap_or(HumanSource::Pane), row.remote));
     if typed.is_empty() {
         return Err(MaxRefRefusal::OwnLane);
     }
@@ -664,12 +662,11 @@ mod tests {
 
     #[test]
     fn max_ref_own_lane_pane_row_refused_owner_send_and_other_lane_accepted() {
-        let ev = |session: &str, source, remote| MaxRefEvidence { row_id: 1, session: session.into(), ts: NOW, excerpt: String::new(), source, remote };
-        assert!(!max_ref_session_allowed("test-actor", &ev("test-actor", HumanSource::Pane, false)), "own-lane pane row");
-        assert!(!max_ref_session_allowed("test-actor@chat", &ev("test-actor", HumanSource::Pane, false)), "own lane via its Chat tab");
-        assert!(!max_ref_session_allowed("test-actor", &ev("test-actor", HumanSource::OwnerSend, false)), "own-lane Outside send: launchctl reaches Outside");
-        assert!(max_ref_session_allowed("test-actor", &ev("test-actor", HumanSource::OwnerSend, true)), "own-lane Remote owner send");
-        assert!(max_ref_session_allowed("test-actor", &ev("test-other", HumanSource::Pane, false)), "other-lane pane row");
+        assert!(!max_ref_session_allowed("test-actor", "test-actor", HumanSource::Pane, false), "own-lane pane row");
+        assert!(!max_ref_session_allowed("test-actor@chat", "test-actor", HumanSource::Pane, false), "own lane via its Chat tab");
+        assert!(!max_ref_session_allowed("test-actor", "test-actor", HumanSource::OwnerSend, false), "own-lane Outside send: launchctl reaches Outside");
+        assert!(max_ref_session_allowed("test-actor", "test-actor", HumanSource::OwnerSend, true), "own-lane Remote owner send");
+        assert!(max_ref_session_allowed("test-actor", "test-other", HumanSource::Pane, false), "other-lane pane row");
     }
 
 

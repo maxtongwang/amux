@@ -725,6 +725,7 @@ fn request_meta(body: Option<&Value>) -> Result<(Option<super::max_ref::MaxRef>,
 /// THE gate for a mutating request. `Ok(None)`: the owner, nothing to log.
 /// `Ok(Some(grant))`: allowed through the table; call [`Grant::commit`] after
 /// the change lands. `Err(response)`: refused in the #8 shape.
+#[allow(clippy::result_large_err)] // the refusal IS the handler's response; it is returned as-is
 pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, target: &Target, action: &Action, body: Option<&Value>) -> Result<Option<Grant>, Response> {
     let (origin, class, decision) = decide_for(headers, target, action);
     if class == Class::Owner {
