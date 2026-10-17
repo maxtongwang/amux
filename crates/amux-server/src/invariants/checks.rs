@@ -3046,6 +3046,110 @@ pub fn argv_key_is_env_shaped(key: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// Parsed evidence only: never retain argv or Claude's private config in results.
+pub struct ClaudeRemoteControl {
+    pub worker: String,
+    pub pid: Option<u32>,
+    pub argv_has_flag: bool,
+    pub bridge_entry: bool,
+}
+
+pub fn claude_remote_control_on(
+    workers: &[ClaudeRemoteControl],
+    unavailable: Option<&str>,
+) -> Vec<InvariantResult> {
+    const ID: &str = "claude.remote_control_on";
+    let count = workers.len();
+    if workers.is_empty() {
+        return vec![match unavailable {
+            Some(why) => InvariantResult::unknown(ID, why),
+            None => InvariantResult::pass(ID),
+        }
+        .evidence(json!({"measured": unavailable.is_none(), "n_considered": count}))];
+    }
+    workers
+        .iter()
+        .map(|w| {
+            let why = unavailable.or_else(|| {
+                w.pid
+                    .is_none()
+                    .then_some("Claude process could not be identified")
+            });
+            let result = if let Some(why) = why {
+                InvariantResult::unknown(ID, why)
+            } else if w.argv_has_flag || w.bridge_entry {
+                InvariantResult::pass(ID)
+            } else {
+                InvariantResult::fail(
+                    ID,
+                    "running Claude worker has Remote Control",
+                    "Claude process has neither --remote-control nor a matching bridge PID",
+                )
+            };
+            result.entity(&w.worker).evidence(json!({
+                "worker": w.worker, "pid": w.pid,
+                "argv_has_flag": w.argv_has_flag, "bridge_entry": w.bridge_entry,
+                "measured": why.is_none(), "n_considered": count,
+            }))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod remote_control_tests {
+    use super::*;
+    #[test]
+    fn invariant_negative_control_remote_control() {
+        let workers: Vec<_> = [(true, false), (false, true), (false, false)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (flag, bridge))| ClaudeRemoteControl {
+                worker: format!("worker-{i}"),
+                pid: Some(i as u32 + 1),
+                argv_has_flag: flag,
+                bridge_entry: bridge,
+            })
+            .collect();
+        let results = claude_remote_control_on(&workers, None);
+        assert_eq!(
+            results.iter().map(|r| r.status).collect::<Vec<_>>(),
+            vec![
+                super::super::Status::Pass,
+                super::super::Status::Pass,
+                super::super::Status::Fail
+            ]
+        );
+        assert_eq!(
+            results[2].evidence,
+            json!({
+                "worker": "worker-2", "pid": 3, "argv_has_flag": false,
+                "bridge_entry": false, "measured": true, "n_considered": 3
+            })
+        );
+        for why in ["ps unreadable", "Claude config unreadable"] {
+            let unknown = claude_remote_control_on(&workers, Some(why));
+            assert!(unknown
+                .iter()
+                .all(|r| r.status == super::super::Status::Unknown));
+            assert_eq!(unknown[0].evidence["measured"], false);
+            assert_eq!(unknown[0].evidence["n_considered"], 3);
+        }
+        let empty = claude_remote_control_on(&[], None);
+        assert_eq!(empty[0].evidence["n_considered"], 0);
+        assert_eq!(empty[0].evidence["measured"], true);
+        let missing = [ClaudeRemoteControl {
+            worker: "missing".into(),
+            pid: None,
+            argv_has_flag: false,
+            bridge_entry: false,
+        }];
+        assert_eq!(
+            claude_remote_control_on(&missing, None)[0].status,
+            super::super::Status::Unknown
+        );
+    }
+}
+
 /// AMUX-4946: is any live process carrying a credential in its argv?
 ///
 /// Process arguments are world-readable, and a tmux SERVER keeps the argv of

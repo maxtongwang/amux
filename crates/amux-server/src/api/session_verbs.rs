@@ -3270,11 +3270,16 @@ pub(crate) fn iter_jsonl_tail(path: &Path, max_bytes: u64) -> Vec<Value> {
 /// existing transcript. Line 0 keeps the original name for the life of the
 /// file, which is why the reader half ([`transcript_display_name`]) must take
 /// the LAST record and not the first — either half alone is inert.
-fn claude_session_flag(name: &str, conv_id: &str, resumable: bool) -> String {
+fn claude_session_flag(name: &str, conv_id: &str, resumable: bool, isolated: bool) -> String {
+    let identity = crate::provider::claude::interactive_identity_args(name, isolated)
+        .iter()
+        .map(|arg| sh_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
     if resumable && !conv_id.is_empty() {
-        format!("--resume {conv_id} --name {}", sh_quote(name))
+        format!("--resume {conv_id} {identity}")
     } else {
-        format!("--name {}", sh_quote(name))
+        identity
     }
 }
 
@@ -15647,7 +15652,12 @@ pub(crate) async fn start_session(
                 resumable = true;
             }
         }
-        session_flag = claude_session_flag(name, &conv_id, resumable);
+        session_flag = claude_session_flag(
+            name,
+            &conv_id,
+            resumable,
+            env_flag_on(cfg.get("CC_ISOLATED")),
+        );
     }
     let defaults = EnvFile::load(&home().join("defaults.env"));
     let default_flags = defaults.get_or("CC_DEFAULT_FLAGS", "").to_string();
@@ -16618,7 +16628,8 @@ pub(crate) async fn start_session(
             sleep_ms(100).await;
             send_key(name, "C-u").await;
             sleep_ms(100).await;
-            let fresh_flag = format!("--name {}", sh_quote(name));
+            let fresh_flag =
+                claude_session_flag(name, "", false, env_flag_on(cfg.get("CC_ISOLATED")));
             let cmd_fresh = provider_command_in_workspace(
                 &work_dir,
                 &format!(
@@ -42430,7 +42441,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
     fn resume_carries_the_session_name() {
         // The defect: resume produced ONLY `--resume <id>`, so a renamed
         // session's harness kept its birth name forever.
-        let f = claude_session_flag("amux", "1dd2cd21-c4a7-46b9-9b97-51fccbe721a2", true);
+        let f = claude_session_flag("amux", "1dd2cd21-c4a7-46b9-9b97-51fccbe721a2", true, false);
         assert!(
             f.contains("--resume 1dd2cd21-c4a7-46b9-9b97-51fccbe721a2"),
             "{f}"
@@ -42439,17 +42450,19 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             f.contains("--name amux"),
             "resume dropped the session name: {f}"
         );
-        // Fresh start is unchanged: --name only, never a bare/empty --resume.
-        let fresh = claude_session_flag("amux", "", false);
-        assert_eq!(fresh, "--name amux");
+        assert!(f.contains("--remote-control amux"));
+        // Fresh starts retain identity, never a bare/empty --resume.
+        let fresh = claude_session_flag("amux", "", false, false);
+        assert_eq!(fresh, "--name amux --remote-control amux");
         // A stale conv id (file gone) must not smuggle --resume in.
-        let stale = claude_session_flag("amux", "1dd2cd21-c4a7-46b9-9b97-51fccbe721a2", false);
+        let stale =
+            claude_session_flag("amux", "1dd2cd21-c4a7-46b9-9b97-51fccbe721a2", false, false);
         assert_eq!(
-            stale, "--name amux",
+            stale, "--name amux --remote-control amux",
             "unresumable id must fall back to fresh: {stale}"
         );
         // Names are quoted, not interpolated raw.
-        assert!(claude_session_flag("a b", "x", false).contains("--name 'a b'"));
+        assert!(claude_session_flag("a b", "x", false, false).contains("--name 'a b'"));
 
         // ...and it SURVIVES the splice. Testing the flag string alone would
         // not catch build_claude_cmd's dedupe eating it, which is the same
@@ -42460,7 +42473,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             &EnvFile::default(),
             "--model claude-fable-5 --dangerously-skip-permissions",
             "",
-            &claude_session_flag("amux", "1dd2cd21-c4a7-46b9-9b97-51fccbe721a2", true),
+            &claude_session_flag("amux", "1dd2cd21-c4a7-46b9-9b97-51fccbe721a2", true, false),
             "",
         );
         assert!(
@@ -42477,6 +42490,21 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             1,
             "duplicated --resume: {cmd}"
         );
+    }
+
+    #[test]
+    fn fresh_retry_keeps_remote_control_and_isolation() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        for isolated in [false, true] {
+            let mut cfg = EnvFile::default();
+            cfg.set("CC_ISOLATED", if isolated { "1" } else { "0" });
+            let fresh = claude_session_flag("a b", "", false, isolated);
+            let cmd = build_claude_cmd(&cfg, "", "", &fresh, "");
+            assert!(cmd.contains("--name 'a b'"));
+            assert_eq!(cmd.contains("--remote-control 'a b'"), !isolated);
+            assert!(!cmd.contains("--resume"));
+        }
     }
 
     #[test]
