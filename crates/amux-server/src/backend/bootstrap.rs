@@ -270,6 +270,19 @@ impl Bootstrap {
             };
 
             let mut command = adapter.build_command(PromptMode::Interactive);
+            if matches!(row.provider.as_str(), "claude" | "claude-code") {
+                let name = if row.display_name.trim().is_empty() {
+                    &row.id
+                } else {
+                    &row.display_name
+                };
+                let isolated = crate::api::session_verbs::env_flag_on(
+                    row.environment.get("CC_ISOLATED").map(String::as_str),
+                );
+                command.extend(crate::provider::claude::interactive_identity_args(
+                    name, isolated,
+                ));
+            }
             if row
                 .permissions
                 .iter()
@@ -646,7 +659,16 @@ mod tests {
         // cwd and env.
         let spawns = backend.spawns.lock().unwrap();
         assert_eq!(spawns.len(), 1);
-        assert_eq!(spawns[0].command, vec!["claude"]);
+        assert_eq!(
+            spawns[0].command,
+            vec![
+                "claude".to_string(),
+                "--name".into(),
+                format!("w-{id}"),
+                "--remote-control".into(),
+                format!("w-{id}")
+            ]
+        );
         assert_eq!(spawns[0].cwd, "/tmp/bootstrap-test-cwd");
         assert_eq!(spawns[0].env.get("FOO").map(String::as_str), Some("bar"));
         // Display name rides along for backend metadata (herdr workspace
@@ -703,7 +725,14 @@ mod tests {
         let spawns = backend.spawns.lock().unwrap();
         assert_eq!(
             spawns[0].command,
-            vec!["claude", "--dangerously-skip-permissions"]
+            vec![
+                "claude".to_string(),
+                "--name".into(),
+                format!("w-{id}"),
+                "--remote-control".into(),
+                format!("w-{id}"),
+                "--dangerously-skip-permissions".into()
+            ]
         );
     }
 
