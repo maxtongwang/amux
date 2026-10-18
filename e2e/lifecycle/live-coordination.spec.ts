@@ -1,5 +1,6 @@
+// live-coordination.spec coverage — use shared browser defaults and route diagnostics.
 import { lifecycleProvider, expectLifecycleWorker } from './provider';
-import { test, expect, Page } from '@playwright/test';
+import { test, expect, Page } from '../fixtures';
 import { expectDelivered, boot, auth, checkpoint } from './evidence';
 
 async function send(page: Page, name: string, text: string) {

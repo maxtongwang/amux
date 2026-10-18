@@ -4,7 +4,7 @@
 // asserts a worker created through the modern API becomes VISIBLE in the
 // real UI — the strangler-fig's load-bearing promise: the old dashboard
 // keeps working while the new server takes over underneath.
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 test('worker created via API appears in the dashboard session list', async ({ page, request }) => {
   await page.goto('/');

@@ -1,4 +1,5 @@
-import { test, expect, Page } from '@playwright/test';
+// worker-card-counts.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect, Page } from './fixtures';
 
 // Ethan, 2026-08-11: "on the sched row in the card view of worker list page
 // homepage put # of board items (total)".

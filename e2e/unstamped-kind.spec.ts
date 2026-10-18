@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// unstamped-kind.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from './fixtures';
 
 // AMUX-2670. A raw-tmux fallback send is reconciled into the trail by the CLI
 // as type `raw-tmux-fallback`. It must NOT render as an ordinary human message:

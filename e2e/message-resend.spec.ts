@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// message-resend.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from './fixtures';
 
 // AMUX-2318. The card's scope is implemented on both surfaces; what it says is
 // NOT re-verified is the live-DOM check, which was run against the PYTHON build

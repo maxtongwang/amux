@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// board-search-slim.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from './fixtures';
 
 // AMUX-2840 step 2. Free-text board search reads desc and log, which slim=1
 // does not ship. Rather than switching engines to /api/search — measured to

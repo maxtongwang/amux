@@ -1,7 +1,7 @@
 // Phase 0 golden scenarios (RR-0025), updated for the REAL extracted
 // dashboard (Phase 8): server boots, the actual SPA loads and parses, health
 // is truthful, auth rejects bad tokens, mobile renders without overflow.
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 test('health returns 200 with build hash and revision', async ({ request }) => {
   const res = await request.get('/health');

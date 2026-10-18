@@ -35,7 +35,8 @@
 //    older than 18s, checked every 5s → _forceSseReconnect → fresh initial
 //    push + refetch), so the phase-2 budget reflects its cadence, not
 //    network latency.
-import { test, expect, Page, APIRequestContext } from '@playwright/test';
+import { test, expect, Page } from './fixtures';
+import { APIRequestContext } from '@playwright/test';
 
 // ---- helpers ---------------------------------------------------------------
 

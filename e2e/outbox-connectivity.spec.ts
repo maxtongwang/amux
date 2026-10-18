@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// outbox-connectivity.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from './fixtures';
 
 // AMUX-2585. While offline the outbox hands every mutation a synthetic 202 that
 // never touched the network. It is `ok`, so apiCall used to reset

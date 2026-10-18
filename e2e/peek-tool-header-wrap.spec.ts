@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// peek-tool-header-wrap.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from './fixtures';
 
 // Ethan, 2026-09-27, with a screenshot of a Bash call in peek: "fix the
 // formatting of how u show peek shit". The tool name read "B / a / s / h", one

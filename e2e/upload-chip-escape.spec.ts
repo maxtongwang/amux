@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// upload-chip-escape.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from './fixtures';
 
 // AF-235 — the escape hatch for a stuck attachment.
 //

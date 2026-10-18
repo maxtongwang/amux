@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// live-semantic-intake.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from '../fixtures';
 import {boot,auth,checkpoint} from './evidence';
 test('LC-SEMANTIC-INTAKE: real model appends paraphrases, updates refinements, and preserves distinct outcomes',async({page,request},info)=>{
   test.setTimeout(360_000);expect(process.env.AMUX_LIFECYCLE_LAB_ACK).toBe('dedicated-test-instance');

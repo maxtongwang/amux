@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// suggestion-control-verdict.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from './fixtures';
 
 // ATE-75 — a no-op suggestion probe must not turn into a silent Enter.
 //

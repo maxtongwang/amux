@@ -1,5 +1,6 @@
+// live-journey.spec coverage — use shared browser defaults and route diagnostics.
 import { lifecycleProvider, expectLifecycleWorker, selectLifecycleProvider, createLifecycleWorker } from './provider';
-import { test, expect } from '@playwright/test';
+import { test, expect } from '../fixtures';
 import { boot, auth, checkpoint } from './evidence';
 
 // Requires a dedicated lab with real provider auth and the normal board driver.
