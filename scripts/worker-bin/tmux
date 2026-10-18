@@ -4,8 +4,8 @@
 # WORKER PANE PATHs only; the amux server never has this directory on its PATH.
 # Commands that run arguments are scanned as one text after only new-session/new-window
 # -n/-s values are omitted, so harmless quoted text may be refused. A kill word or -K
-# passes only for shell-running text without a tmux word, or when every tmux word
-# immediately selects a different -S socket or non-default -L name.
+# passes only for shell-running text without a tmux word; a nested tmux is refused even
+# when it names a private socket. The global -c shell text is scanned the same way.
 # The real tmux is resolved by absolute path. Exit 1 on refusal; 127 if it is missing.
 
 set -u
@@ -41,7 +41,7 @@ ARGV=("$@")
 sock_S=""; have_S=0
 sock_L=""; have_L=0
 have_K=0
-shell_cmd=0
+shell_cmd=0; shell_text=""
 i=0
 n=$#
 while [ "$i" -lt "$n" ]; do
@@ -67,7 +67,7 @@ while [ "$i" -lt "$n" ]; do
         case "$c" in
           S) sock_S="$val"; have_S=1 ;;
           L) sock_L="$val"; have_L=1 ;;
-          c) shell_cmd=1 ;;
+          c) shell_cmd=1; shell_text="$val" ;;
         esac
         j=$len
         ;;
@@ -79,11 +79,6 @@ while [ "$i" -lt "$n" ]; do
 done
 cmd_start=$i
 
-# -c runs a shell command (login-shell use), not a tmux command; any tmux it
-# runs resolves through this guard again.
-if [ "$shell_cmd" -eq 1 ]; then
-  exec "$REAL" "$@"
-fi
 
 # --- is the target the live server? --------------------------------------------
 uid="$(id -u 2>/dev/null || echo 0)"
@@ -213,6 +208,15 @@ scan_running_arguments() {
   [ "$kind" = shell ] && [ "$has_tmux" -eq 0 ] && return
   refuse "$danger (inside running command)"
 }
+
+# -c runs shell text (login-shell use), not a tmux command. A nested absolute-path tmux
+# would not pass through this guard again, so the text gets the conservative scan.
+if [ "$shell_cmd" -eq 1 ]; then
+  kind=shell
+  running_args=("$shell_text")
+  scan_running_arguments
+  exec "$REAL" "$@"
+fi
 
 # --- command chain -----------------------------------------------------------------
 # Commands separate on an argument ";" (shell \;) or one ending in an unescaped ";".

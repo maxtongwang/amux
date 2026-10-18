@@ -151,6 +151,18 @@ class WorkerTmuxGuardTests(unittest.TestCase):
                     'tmux kill-session -t x;true', 'x=$(tmux kill-server)', 'echo `tmux kill-pane`', 'tmux kill-server 2>&1'):
             self.assert_refused('run-shell', cmd)
 
+    def test_global_dash_c_shell_text_is_scanned(self):
+        # Review round 6: -c used to exec before any inspection, so an absolute-path tmux
+        # inside it never passed through this guard again.
+        real = '/opt/homebrew/bin/tmux'
+        self.assert_refused('-S', str(self.live_sock), '-c', f'{real} -S {self.live_sock} kill-server')
+        self.assert_refused('-c', f'{real} kill-server')
+        self.assert_refused('-c', 'tmux kill-session -t x')
+        self.assert_refused('-uc', 'tmux -K list-sessions')
+        self.assert_refused('-c', '/tmp/p/tmux -S /tmp/p/sock kill-server')
+        self.assert_passed('-c', 'rg kill-server scripts')
+        self.assert_passed('-c', 'echo ok')
+
     def test_nested_command_kinds(self):
         self.assert_refused('run-shell', 'tmux kill-server')
         self.assert_refused('run-shell', 'x; /opt/homebrew/bin/tmux kill-server>/dev/null')
