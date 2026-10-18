@@ -21,10 +21,10 @@ NEW=$(commit 'echo new launcher')
 run "$NEW"
 expect test ! -e "$DEST"                       # never installs a copy that was not there
 echo 'echo old launcher' > "$DEST"
-INODE=$(stat -f %i "$DEST" 2>/dev/null || stat -c %i "$DEST")
+INODE=$(stat -c %i "$DEST" 2>/dev/null || stat -f %i "$DEST")
 run "$NEW"
 expect grep -qx 'echo new launcher' "$DEST"
-expect test "$(stat -f %i "$DEST" 2>/dev/null || stat -c %i "$DEST")" != "$INODE"
+expect test "$(stat -c %i "$DEST" 2>/dev/null || stat -f %i "$DEST")" != "$INODE"
 expect grep -q "verdict=authority_launcher_synced" "$LOG"
 BAD=$(commit 'if then fi (')
 run "$BAD"

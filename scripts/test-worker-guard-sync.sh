@@ -17,8 +17,9 @@ git init -q "$REPO"; mkdir -p "$REPO/scripts/worker-bin"
 commit() { printf '%s\n' "$1" > "$REPO/scripts/worker-bin/tmux"
   git -C "$REPO" add -A; git -C "$REPO" -c user.name=t -c user.email=t@e commit -qm x; git -C "$REPO" rev-parse HEAD; }
 run() { REPO="$REPO" LOG="$LOG" AMUX_WORKER_BIN_DIR="$DIR" bash -c "source '$TMP/fn.sh'; sync_worker_bin_guard $1"; }
-inode() { stat -f %i "$1" 2>/dev/null || stat -c %i "$1"; }
-mode() { stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"; }
+# GNU stat first: on Linux `stat -f` means filesystem status and succeeds with the wrong output.
+inode() { stat -c %i "$1" 2>/dev/null || stat -f %i "$1"; }
+mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 
 V1=$(commit 'echo guard v1')
 run "$V1"                                        # absent: the bug this fixes
