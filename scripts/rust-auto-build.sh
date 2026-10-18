@@ -128,6 +128,37 @@ sync_authority_launcher() {
   fi
 }
 
+# THE WORKER TMUX GUARD SHIPS THROUGH THE SAME GATE (DMIW-11). The server puts
+# <amux home>/worker-bin first on every worker pane's PATH, but only install.sh
+# wrote worker-bin/tmux, so #21 went live on 2026-10-18 with no guard installed
+# and a guard change would never deploy. Install the elected bytes when absent,
+# replace them by rename when they differ (a running guard keeps its inode),
+# leave a symlinked copy alone, and refuse bytes that do not parse.
+sync_worker_bin_guard() {
+  local sha="$1" dir dest tmp action
+  [ "${AMUX_WORKER_BIN_SYNC:-1}" = "0" ] && return 0
+  dir="${AMUX_WORKER_BIN_DIR:-${AMUX_HOME:-$HOME/.amux}/worker-bin}"
+  dest="$dir/tmux"
+  if [ -L "$dest" ]; then
+    echo "== $(date '+%F %T') WORKER GUARD SYNC SKIPPED sha=$sha dest=$dest verdict=worker_guard_symlink_left" >> "$LOG"
+    return 0
+  fi
+  mkdir -p "$dir" 2>/dev/null || return 0
+  tmp="$(mktemp "$dir/.tmux.XXXXXX")" || return 0
+  if ! git -C "$REPO" show "${sha}:scripts/worker-bin/tmux" > "$tmp" 2>/dev/null || ! bash -n "$tmp" 2>/dev/null; then
+    echo "== $(date '+%F %T') WORKER GUARD SYNC SKIPPED sha=$sha verdict=worker_guard_invalid (git show or bash -n failed)" >> "$LOG"
+    rm -f "$tmp"; return 0
+  fi
+  if [ -f "$dest" ] && cmp -s "$tmp" "$dest"; then rm -f "$tmp"; return 0; fi
+  action=updated; [ -e "$dest" ] || action=installed
+  if chmod 0755 "$tmp" && mv -f "$tmp" "$dest"; then
+    echo "== $(date '+%F %T') WORKER GUARD $action sha=$sha dest=$dest verdict=worker_guard_synced" >> "$LOG"
+  else
+    rm -f "$tmp"
+    echo "== $(date '+%F %T') WORKER GUARD SYNC FAILED sha=$sha dest=$dest verdict=worker_guard_sync_failed" >> "$LOG"
+  fi
+}
+
 # Existing worker helpers also ship on authorized ticks without a Rust rebuild.
 # Replace only existing regular files: no settings changes or isolated-worker
 # hook enrollment. Read exact elected bytes, validate and verify the rename.
@@ -310,6 +341,7 @@ if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" != "1" ] \
   fi
   sync_bash_cli "$built_sha"
   sync_authority_launcher "$built_sha"
+  sync_worker_bin_guard "$built_sha"
   sync_observed_edits_hooks "$built_sha"
   # ADOPTION COOLDOWN: batch rapid commits from multiple lanes into fewer
   # rebuilds. Each self-adoption kills all SSE connections (6-12s of

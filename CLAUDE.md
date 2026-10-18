@@ -88,7 +88,8 @@ Verify a hook by what it WROTE, not by the settings file.
 
 **Worker tmux guard.** Worker panes get `~/.amux/worker-bin` first on PATH
 (`worker_tmux_guard_rc` in `api/session_verbs.rs`; installed from
-`scripts/worker-bin/tmux` by `install.sh`). For commands that run arguments, the
+`scripts/worker-bin/tmux` by `install.sh`, and refreshed from the activated commit on
+every authorized builder tick by `sync_worker_bin_guard` in `scripts/rust-auto-build.sh`). For commands that run arguments, the
 guard joins all arguments except the value after `-n`/`-s` on `new-session` or
 `new-window`, then refuses any kill word or `-K` unless shell-running text has
 no `tmux` word. A nested tmux naming a private socket is still refused (nested
