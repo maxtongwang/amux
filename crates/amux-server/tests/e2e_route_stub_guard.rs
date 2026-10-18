@@ -69,6 +69,17 @@ fn a_spec_that_stubs_a_request_routes_through_the_fixture_that_notices_a_dead_st
     let mut context_route: Vec<String> = Vec::new();
     let mut guarded = 0usize;
 
+    // A module that extends the fixture (e2e/operands.ts: `base` is the
+    // fixture's `test`) carries the same dead-stub wrapper, so a spec importing
+    // `test` from it is guarded too. Accepted only while that module itself
+    // still imports from './fixtures', so the exception cannot outlive the
+    // property it relies on.
+    let derived_fixture = |module: &str| {
+        std::fs::read_to_string(workspace_root().join("e2e").join(format!("{module}.ts")))
+            .is_ok_and(|m| m.contains("from './fixtures'"))
+    };
+    let operands_extends_fixture = derived_fixture("operands");
+
     for p in &specs {
         let Ok(src) = std::fs::read_to_string(p) else {
             continue;
@@ -82,7 +93,9 @@ fn a_spec_that_stubs_a_request_routes_through_the_fixture_that_notices_a_dead_st
         if uses_ctx {
             context_route.push(name.clone());
         }
-        if src.contains("from './fixtures'") {
+        if src.contains("from './fixtures'")
+            || (operands_extends_fixture && src.contains("from './operands'"))
+        {
             guarded += 1;
         } else {
             offenders.push(name);
