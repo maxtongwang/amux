@@ -5,7 +5,10 @@ import json
 from pathlib import Path
 import shlex
 
-from hook_labels import reconcile
+import sys as _sys
+# The shared labeller lives beside this file; importlib loaders (tests) and runs from any cwd must find it.
+_sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent))
+from hook_labels import reconcile  # noqa: E402
 
 COMMON = ('SessionStart', 'SessionEnd', 'UserPromptSubmit', 'PreToolUse',
           'PermissionRequest', 'PostToolUse', 'PreCompact', 'PostCompact', 'Stop')

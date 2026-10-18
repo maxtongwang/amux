@@ -24,7 +24,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from hook_labels import reconcile
+import sys as _sys
+# The shared labeller lives beside this file; importlib loaders (tests) and runs from any cwd must find it.
+_sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent))
+from hook_labels import reconcile  # noqa: E402
 
 
 REPORT_MARKERS = ("hook-report.sh", "amux-report.sh")
