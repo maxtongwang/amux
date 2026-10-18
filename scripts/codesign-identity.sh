@@ -10,18 +10,7 @@ if [ "${1:-}" = --help ]; then usage; exit 0; fi
 if [ "${1:-}" = --owner-provision ] && [ "$#" -eq 1 ]; then
   cat <<'OWNER'
 Owner step: an agent opens a Terminal window running scripts/codesign-identity-setup.sh
-(it asks only for the Mac password and verifies the result). Equivalent commands:
-bash <<'PROVISION'
-set -euo pipefail
-umask 077
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
-read -r -s -p 'Login keychain password: ' keychain_password < /dev/tty; printf '\n'
-openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout "$work/key.pem" -out "$work/cert.pem" -subj '/CN=amux local code signing/O=amux local build' -addext 'basicConstraints=critical,CA:false' -addext 'keyUsage=critical,digitalSignature' -addext 'extendedKeyUsage=critical,codeSigning'
-openssl pkcs12 -export -inkey "$work/key.pem" -in "$work/cert.pem" -out "$work/identity.p12" -passout "pass:$keychain_password" -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
-security import "$work/identity.p12" -k "$HOME/Library/Keychains/login.keychain-db" -P "$keychain_password" -T /usr/bin/codesign
-security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$HOME/Library/Keychains/login.keychain-db"
-PROVISION
+(it asks only for the Mac password, repairs partial setup on rerun, and verifies the result).
 OWNER
   exit 3
 fi

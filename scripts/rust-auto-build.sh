@@ -614,7 +614,7 @@ fi
     fi
     local guard_cmd=(python3 "$REPO/scripts/cargo-target-guard.py" clear --target "$root" --path "$candidate")
     [ "${AMUX_RS_DISK_CLEAR_DRYRUN:-}" != 1 ] || guard_cmd+=(--dry-run)
-    if result=$("${guard_cmd[@]}"); then
+    if result=$(${guard_cmd[@]+"${guard_cmd[@]}"}); then
       echo "== cargo_reclaim_result path=$candidate $result"
     else
       echo "== WARN cargo_reclaim_deferred DEFERRED path=$candidate $result; retry after builds finish."
@@ -637,7 +637,7 @@ fi
     else
       reclaim_cmd=(python3 "$REPO/scripts/cargo-target-guard.py" reclaim --target "$HOME/.amux/rust-build-target"
                    --max-gb "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-32}" --to-gb "${AMUX_CARGO_RECLAIM_TO_GB:-25}")
-      if result=$("${reclaim_cmd[@]}"); then
+      if result=$(${reclaim_cmd[@]+"${reclaim_cmd[@]}"}); then
         echo "== Clearing done: cargo_reclaim_result $result"
       else
         echo "== WARN cargo_reclaim_deferred DEFERRED target=$HOME/.amux/rust-build-target $result; retry after builds finish."
@@ -656,7 +656,7 @@ fi
       [ -d "$cand" ] && sweep_cmd+=(--target "$cand")
     done
     if [ "${#sweep_cmd[@]}" -gt 3 ]; then
-      if result=$("${sweep_cmd[@]}"); then
+      if result=$(${sweep_cmd[@]+"${sweep_cmd[@]}"}); then
         echo "== cargo_sweep_result $result"
         date +%F > "$SWEEP_STAMP"
       else

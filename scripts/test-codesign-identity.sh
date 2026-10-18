@@ -42,6 +42,13 @@ if [ "${1:-}" = --check-plan ]; then
   [ "$status" -eq 2 ] && [[ "$error" == *'Refusing --keychain: symlink'* ]] || {
     echo 'FAIL: provisioner accepted a symlinked keychain' >&2; exit 1;
   }
+  : > "$guard_dir/plain-file"
+  status=0
+  no_keychain_plan=$(DRY_RUN=1 /bin/bash "$(dirname "$0")/codesign-server.sh" "$guard_dir/plain-file" 2>&1) || status=$?
+  [ "$status" -eq 0 ] && [[ "$no_keychain_plan" == *'PLAN: codesign --force'* ]] &&
+    [[ "$no_keychain_plan" == *'PLAN: security find-certificate'* ]] || {
+    echo 'FAIL: /bin/bash no-keychain signing plan failed' >&2; printf '%s\n' "$no_keychain_plan" >&2; exit 1;
+  }
   rm -rf "$guard_dir"
   trap - EXIT
   echo 'PASS: signing plan contains expected commands and no forbidden operation'

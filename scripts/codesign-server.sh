@@ -25,17 +25,17 @@ identity_list_args=()
 if [ -n "$keychain" ]; then identity_list_args=("$keychain"); fi
 if [ "${DRY_RUN:-0}" = 1 ]; then
   if [ "$verify_only" = 0 ]; then
-    plan_command codesign --force --sign "$IDENTITY" --identifier "$IDENTIFIER" --options runtime --timestamp=none "${keychain_args[@]}" "$bin"
+    plan_command codesign --force --sign "$IDENTITY" --identifier "$IDENTIFIER" --options runtime --timestamp=none ${keychain_args[@]+"${keychain_args[@]}"} "$bin"
   fi
   plan_command codesign --verify --strict "$bin"
   plan_command codesign -dvvv "$bin"
   plan_command codesign -d -r- "$bin"
-  plan_command security find-certificate -c "$IDENTITY" -Z "${identity_list_args[@]}"
+  plan_command security find-certificate -c "$IDENTITY" -Z ${identity_list_args[@]+"${identity_list_args[@]}"}
   exit 0
 fi
 if [ "$verify_only" = 0 ]; then
   run_sensitive codesign --force --sign "$IDENTITY" --identifier "$IDENTIFIER" \
-      --options runtime --timestamp=none "${keychain_args[@]}" "$bin" || {
+      --options runtime --timestamp=none ${keychain_args[@]+"${keychain_args[@]}"} "$bin" || {
     code=$?; [ "$code" -eq 75 ] && exit 75
     echo 'codesign signing failed' >&2; exit 1
   }
@@ -55,7 +55,7 @@ printf '%s\n' "$details" | grep -Fx "Authority=$IDENTITY" >/dev/null || {
 printf '%s\n' "$requirement" | grep -F "identifier \"$IDENTIFIER\"" >/dev/null || {
   echo 'codesign designated requirement identifier mismatch' >&2; exit 1;
 }
-identity_hash=$(run_sensitive security find-certificate -c "$IDENTITY" -Z "${identity_list_args[@]}" \
+identity_hash=$(run_sensitive security find-certificate -c "$IDENTITY" -Z ${identity_list_args[@]+"${identity_list_args[@]}"} \
   | awk '/^SHA-1 hash:/ {print $3; exit}')
 [ -n "$identity_hash" ] && printf '%s\n' "$requirement" | grep -Fi "$identity_hash" >/dev/null || {
   echo 'codesign designated requirement certificate mismatch' >&2; exit 1;

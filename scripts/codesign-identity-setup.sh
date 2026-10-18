@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # One-time owner setup of the stable amux signing identity, so macOS keeps amux-server-rs's
 # permissions across every deploy. Run in a Terminal window: the only input is the Mac password.
-# Idempotent: an existing identity is kept and only verified.
+# Idempotent: an existing identity has its key access repaired and is verified.
 #
 # Usage: scripts/codesign-identity-setup.sh            (the owner, in a Terminal window)
 #        DRY_RUN=1 scripts/codesign-identity-setup.sh  (print the commands, run nothing)
 # Tests only: AMUX_CODESIGN_TEST_DIR=<mktemp dir> AMUX_CODESIGN_TEST_PASSWORD=<pw> with the
 #        disposable keychain <dir>/k.keychain-db (enforced by codesign-keychain-guard.sh).
-# Exit: 0 ready, 1 failed (nothing half-done is left trusted), 2 bad usage or not interactive.
+# Exit: 0 ready, 1 failed, 2 bad usage or not interactive.
 set -euo pipefail
 umask 077
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -36,26 +36,56 @@ say "Setting up the amux signing identity. This happens once; after it, macOS ke
 # codesign signs with an untrusted identity; -v would list only trusted ones.
 have_identity() { security find-identity -p codesigning "$keychain" 2>/dev/null | grep -qF "\"$identity\""; }
 
+apply_partition_list() {
+  local attempt password_to_try
+  for attempt in 1 2 3; do
+    if [ -n "${AMUX_CODESIGN_TEST_DIR:-}" ]; then
+      password_to_try=$password
+      if [ "$attempt" -eq 1 ] && [ "${AMUX_CODESIGN_TEST_WRONG_FIRST:-0}" = 1 ]; then
+        password_to_try="wrong-$password"
+      fi
+    elif [ "${DRY_RUN:-0}" = 1 ]; then
+      password_to_try='<password>'
+    else
+      password_to_try=''
+      while [ -z "$password_to_try" ]; do
+        read -r -s -p 'Type your Mac login keychain password and press Return: ' password_to_try < /dev/tty
+        printf '\n'
+        [ -n "$password_to_try" ] || say 'The password cannot be empty. Try again.'
+      done
+    fi
+    if [ "${DRY_RUN:-0}" = 1 ]; then
+      plan_command security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k '<password>' "$keychain"
+      return 0
+    fi
+    if security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password_to_try" "$keychain" >/dev/null 2>&1; then
+      return 0
+    fi
+    say "That password did not match the keychain. Try again ($attempt of 3)."
+  done
+  say 'Could not set signing key access after 3 tries. Run this setup again to repair the existing identity.'
+  return 1
+}
+
 if [ "${DRY_RUN:-0}" != 1 ] && have_identity; then
-  say "Step 1 of 3: the identity already exists. Nothing to create."
+  say "Step 1 of 3: the identity already exists. Repairing signing key access."
 else
   say "Step 1 of 3: creating the identity."
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
-  if [ -z "$password" ] && [ "${DRY_RUN:-0}" != 1 ]; then
-    read -r -s -p 'Type your Mac password (the one you log in with) and press Return: ' password < /dev/tty
-    printf '\n'
-  fi
-  pw="${password:-<password>}"
+  p12_password='<random-password>'
+  if [ "${DRY_RUN:-0}" != 1 ]; then p12_password=$(openssl rand -hex 24); fi
   run openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout "$work/key.pem" -out "$work/cert.pem" \
     -subj "/CN=$identity/O=amux local build" -addext basicConstraints=critical,CA:false \
     -addext keyUsage=critical,digitalSignature -addext extendedKeyUsage=critical,codeSigning
   run openssl pkcs12 -export -inkey "$work/key.pem" -in "$work/cert.pem" -out "$work/identity.p12" \
-    -passout "pass:$pw" -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
-  run security import "$work/identity.p12" -k "$keychain" -P "$pw" -T /usr/bin/codesign
-  # Lets codesign use the key without asking again on every build.
-  run security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$keychain" >/dev/null
+    -passout "pass:$p12_password" -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
+  run security import "$work/identity.p12" -k "$keychain" -P "$p12_password" -T /usr/bin/codesign
 fi
+
+# This is the first operation that checks the typed login keychain password.
+# Reapply it on reruns so a failed first setup is repairable.
+apply_partition_list
 
 say "Step 2 of 3: checking that it signs."
 probe_dir=$(mktemp -d)

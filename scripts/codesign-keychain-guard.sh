@@ -43,13 +43,13 @@ codesign_ci_add_test_keychain() {
     [ -n "$line" ] && CODESIGN_CI_KEYCHAINS+=("$line")
   done <<< "$listing"
   CODESIGN_CI_SEARCH_CHANGED=1
-  run_sensitive security list-keychains -d user -s "${CODESIGN_CI_KEYCHAINS[@]}" "$1"
+  run_sensitive security list-keychains -d user -s ${CODESIGN_CI_KEYCHAINS[@]+"${CODESIGN_CI_KEYCHAINS[@]}"} "$1"
   echo 'CI: disposable signing keychain added to user search list'
 }
 
 codesign_ci_restore_keychains() {
   [ "${CODESIGN_CI_SEARCH_CHANGED:-0}" = 1 ] || return 0
-  run_sensitive security list-keychains -d user -s "${CODESIGN_CI_KEYCHAINS[@]}" || return $?
+  run_sensitive security list-keychains -d user -s ${CODESIGN_CI_KEYCHAINS[@]+"${CODESIGN_CI_KEYCHAINS[@]}"} || return $?
   CODESIGN_CI_SEARCH_CHANGED=0
   echo 'CI: original user keychain search list restored'
 }
