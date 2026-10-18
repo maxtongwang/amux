@@ -102,7 +102,11 @@ pub(crate) async fn retire<F: Fleet>(
         if fleet.is_running(name).await {return Err("lead provider did not stop; preserved".into());}
         if source==expired {return Ok(Outcome::Deferred);}
         if std::fs::read(&active).ok().as_deref()!=Some(env_bytes.as_slice()) {return Ok(Outcome::Deferred);}
-        std::fs::rename(&active,&expired).map_err(|e|e.to_string())?;
+        {
+            let _env = crate::api::session_verbs::env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+            let _file = crate::api::session_verbs::incarnation_file_lock(&active).map_err(|e| e.to_string())?;
+            std::fs::rename(&active,&expired).map_err(|e|e.to_string())?;
+        }
         crate::api::session_verbs::dispose_verified_worker_terminal(name).await;
         crate::api::rename_identity::release(home, name);
         crate::api::sessions_legacy::invalidate_sessions_cache();
@@ -186,6 +190,9 @@ pub(crate) async fn retire<F: Fleet>(
         let retired_head = receipt["head"].as_str().unwrap_or("").to_string();
         let retired_main = receipt["merged"].as_str().unwrap_or("").to_string();
         let finalized = state.store.write_async(move |conn| {
+            let _env = crate::api::session_verbs::env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+            let _file = crate::api::session_verbs::incarnation_file_lock(&active)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
             if !active.exists()
                 || verified_board(conn,&worker)?.as_ref() != Some(&expected_board)
                 || std::fs::read(&active).ok().as_deref() != Some(old_env.as_slice()) {
@@ -336,6 +343,9 @@ pub(crate) async fn retire<F: Fleet>(
     // input writes. New work arriving during Git cleanup wins; restore the clean
     // checkout below instead of orphaning its board on an expired worker.
     let finalized = state.store.write_async(move |conn| {
+        let _env = crate::api::session_verbs::env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _file = crate::api::session_verbs::incarnation_file_lock(&active_for_finalize)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         if (src != active_for_finalize && active_for_finalize.exists())
             || verified_board(conn,&worker)?.as_ref() != Some(&expected_board)
             || std::fs::read(&src).ok().as_deref() != Some(old_env.as_slice()) {

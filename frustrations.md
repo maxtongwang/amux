@@ -6141,3 +6141,19 @@ FIX: Bind launch and run token paths to CC_INCARNATION; rename moves no token
   material. Eager bounded migration re-keys live legacy launch hashes and warns
   with a dropped count for unowned legacy material. Deletion and retirement
   revoke incarnation material; failed run revocation logs worker_run_token_revoke_failed.
+
+## Concurrent first mints replace worker identity
+AREA: identity
+SEVERITY: degrades
+STATUS: fixed
+DATE: 2026-10-18
+SESSION: PR-3-round-7
+CARD: maxtongwang/amux#3
+SYMPTOM: First launch and schedule mints read an absent incarnation concurrently,
+  persist different IDs, and invalidate issued credentials. Assignment failures
+  became None and the scheduler still launched a shell without its requested token.
+COST: Round-6 Codex blocker; all three new Rust assertions fail on df127b7f.
+FIX: Serialize read/assign/persist with env writers and lifecycle file operations;
+  a shared flock covers CLI registration too. Assign eagerly on env creation,
+  duplication and registration. Mint errors log worker_token_mint_failed or
+  worker_run_token_mint_failed at WARN and prevent launch/spawn.

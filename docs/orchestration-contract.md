@@ -93,6 +93,13 @@ resolves the current worker name through its env file. Rename preserves these
 paths, so a run guard revokes the exact file it created. Deletion and retirement
 remove that incarnation's launch hash and run directory.
 
+Worker env creation, duplication and CLI registration assign the incarnation
+before launch. Env rewrites preserve it under the same env mutex and
+`sessions/.incarnation.lock` flock used by the legacy first-mint fallback;
+concurrent mints therefore return the same persisted identity. A requested
+credential failure emits a WARN (`worker_token_mint_failed` or
+`worker_run_token_mint_failed`) and fails the launch or schedule before spawn.
+
 At startup, `rename_identity::ensure_migrated` eagerly re-keys legacy name-based
 launch hashes for live workers. The bounded migration revokes unowned legacy
 hashes and legacy run directories, logs `worker_tokens_migrated` and a WARN

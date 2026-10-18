@@ -482,7 +482,7 @@ fn env_write_error(path: &std::path::Path, e: &std::io::Error) -> String {
     format!("could not write session env at {}: {e}", path.display())
 }
 
-fn env_write_lock() -> &'static std::sync::Mutex<()> {
+pub(crate) fn env_write_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
@@ -514,6 +514,49 @@ pub(crate) fn unique_tmp_path(path: &Path) -> std::path::PathBuf {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+/// Cross-process companion to env_write_lock. The Bash registrar uses the
+/// same flock, so its env replacement cannot race the server's first mint.
+pub(crate) fn incarnation_file_lock(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    let Some(sessions) = path.parent().filter(|p| p.file_name().is_some_and(|n| n == "sessions")) else {
+        return Ok(None);
+    };
+    if path.extension().is_none_or(|e| e != "env") { return Ok(None); }
+    std::fs::create_dir_all(sessions)?;
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+        .open(sessions.join(".incarnation.lock"))?;
+    // SAFETY: file owns a valid fd, and stays open until the critical section ends.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Some(file))
+}
+
+// All callers hold env_write_lock: first assignment and every env rewrite
+// share one boundary, so a stale snapshot cannot erase or replace an identity.
+fn worker_incarnation_for_write(path: &Path) -> std::io::Result<Option<String>> {
+    let Some(sessions) = path.parent().filter(|p| p.file_name().is_some_and(|n| n == "sessions")) else {
+        return Ok(None);
+    };
+    if path.extension().is_none_or(|e| e != "env") { return Ok(None); }
+    let home = sessions.parent().ok_or_else(|| std::io::Error::other("sessions has no home"))?;
+    let name = path.file_stem().and_then(|n| n.to_str()).ok_or_else(|| std::io::Error::other("invalid worker env path"))?;
+    match super::rename_identity::incarnation(home, name) {
+        Some(id) => Ok(Some(id)),
+        None => super::rename_identity::new_incarnation().map(Some),
+    }
+}
+
+fn worker_text_with_incarnation(path: &Path, text: &str) -> std::io::Result<String> {
+    let Some(id) = worker_incarnation_for_write(path)? else { return Ok(text.to_string()); };
+    let mut text: String = text.split_inclusive('\n').filter(|line| {
+        EnvFile::parse_line(line).is_none_or(|(key, _)| key != super::rename_identity::INCARNATION_KEY)
+    }).collect();
+    if !text.is_empty() && !text.ends_with('\n') { text.push('\n'); }
+    text.push_str(&EnvFile::assignment(super::rename_identity::INCARNATION_KEY, &id)?);
+    Ok(text)
 }
 
 impl EnvFile {
@@ -648,13 +691,11 @@ impl EnvFile {
     }
 
     pub(crate) fn load(path: &Path) -> Self {
+        std::fs::read_to_string(path).map(|text| Self::from_text(&text)).unwrap_or_default()
+    }
+
+    pub(crate) fn from_text(text: &str) -> Self {
         let mut pairs: Vec<(String, String)> = Vec::new();
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Self {
-                pairs,
-                dirty: Vec::new(),
-            };
-        };
         for (k, v) in text.lines().filter_map(Self::parse_line) {
             match pairs.iter_mut().find(|(pk, _)| *pk == k) {
                 Some((_, pv)) => *pv = v,
@@ -693,6 +734,7 @@ impl EnvFile {
     /// Python `_write_env` (py:4252): `# updated:` header + K="V", atomic 0600.
     pub(crate) fn write(&self, path: &Path) -> std::io::Result<()> {
         let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _file = incarnation_file_lock(path)?;
         let mut latest = if self.dirty.is_empty() {
             self.clone()
         } else {
@@ -703,6 +745,9 @@ impl EnvFile {
                 Some(value) => latest.set(key, value),
                 None => latest.remove(key),
             }
+        }
+        if let Some(id) = worker_incarnation_for_write(path)? {
+            latest.set(super::rename_identity::INCARNATION_KEY, &id);
         }
         latest.write_unlocked(path)
     }
@@ -736,7 +781,7 @@ impl EnvFile {
         }
     }
 
-    fn write_unlocked(&self, path: &Path) -> std::io::Result<()> {
+    pub(crate) fn write_unlocked(&self, path: &Path) -> std::io::Result<()> {
         use std::io::Write as _;
         let mut out = format!(
             "# updated: {}\n",
@@ -764,6 +809,8 @@ impl EnvFile {
 
     pub(crate) fn replace_text(path: &Path, text: &str) -> std::io::Result<()> {
         let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _file = incarnation_file_lock(path)?;
+        let text = worker_text_with_incarnation(path, text)?;
         use std::io::Write as _;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -818,6 +865,7 @@ impl EnvFile {
             }
         }
         let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _file = incarnation_file_lock(path)?;
         // Read with the worker-file parser: it un-escapes the double-quoted
         // values Self::write produces, which crate::config::parse_env_file
         // does not, so a round trip here cannot grow backslashes.
@@ -837,6 +885,7 @@ impl EnvFile {
             .iter()
             .map(|(key, value)| format!("{key}={}\n", Self::plain_quote(value)))
             .collect();
+        let text = worker_text_with_incarnation(path, &text)?;
         use std::io::Write as _;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -16402,8 +16451,10 @@ pub(crate) async fn start_session(
     // channel (set-environment, imported by name), so it never reaches argv or
     // a typed line, and a lane the rule left gets it unset as a stale key.
     if !isolated {
-        if let Some(token) = super::worker_identity::mint(&home(), name) {
-            vault_values.push((super::worker_identity::TOKEN_ENV.to_string(), token));
+        match super::worker_identity::mint(&home(), name) {
+            Ok(Some(token)) => vault_values.push((super::worker_identity::TOKEN_ENV.to_string(), token)),
+            Ok(None) => {},
+            Err(error) => return (false, format!("worker token mint failed; launch not started: {error}")),
         }
     }
     let vault_keys: Vec<String> = vault_values.iter().map(|(k, _)| k.clone()).collect();
@@ -18074,16 +18125,14 @@ pub(crate) async fn dispose_verified_worker_terminal(name: &str) {
     kill_tmux_session(name).await;
 }
 
-/// A duplicated env file is a different worker: strip the source's
-/// incarnation so the copy can never carry the source's rename aliases. On
-/// failure the copy is removed (the caller answers 500, nothing half-made).
-fn copied_env_is_a_new_incarnation(copy: &Path) -> bool {
-    match super::rename_identity::strip_incarnation(copy) {
+/// Publish a duplicate with its own identity in one locked atomic write.
+/// Failed publication leaves no env, and must never remove a concurrent winner.
+fn copied_env_is_a_new_incarnation(source: &Path, copy: &Path) -> bool {
+    match super::rename_identity::copy_incarnation(source, copy) {
         Ok(()) => true,
         Err(e) => {
-            tracing::warn!(path = %copy.display(), error = %e, verdict = "duplicate_incarnation_strip_failed",
-                measured = true, n_considered = 1, "a duplicated worker's env kept its source's incarnation; removed");
-            let _ = std::fs::remove_file(copy);
+            tracing::warn!(path = %copy.display(), error = %e, verdict = "duplicate_incarnation_assignment_failed",
+                measured = true, n_considered = 1, "could not publish a duplicated worker with its own identity");
             false
         }
     }
@@ -30570,7 +30619,7 @@ pub(crate) fn duplicate_verb(state: &AppState, name: &str, headers: &HeaderMap, 
             json!({"error": format!("session '{new_name}' already exists")}),
         );
     }
-    if std::fs::copy(env_path(name), &new_file).is_err() || !copied_env_is_a_new_incarnation(&new_file) {
+    if !copied_env_is_a_new_incarnation(&env_path(name), &new_file) {
         return jresp(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({"error": "copy failed"}),
@@ -30689,7 +30738,7 @@ async fn clone_post(state: &AppState, name: &str, body: &Value) -> Response {
             json!({"error": format!("session '{new_name}' already exists")}),
         );
     }
-    if std::fs::copy(env_path(name), &new_file).is_err() || !copied_env_is_a_new_incarnation(&new_file) {
+    if !copied_env_is_a_new_incarnation(&env_path(name), &new_file) {
         return jresp(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({"error": "copy failed"}),
@@ -30977,7 +31026,17 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
     // leftover hash is what a later worker taking this name would be checked
     // against, and leftover records would keep this worker's aliases alive.
     release_name_state(name);
-    let _ = std::fs::remove_file(env_path(name));
+    {
+        let _env = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+        match incarnation_file_lock(&env_path(name)) {
+            Ok(_file) => { let _ = std::fs::remove_file(env_path(name)); },
+            Err(error) => {
+                tracing::warn!(session = name, %error, verdict = "worker_delete_identity_lock_failed",
+                    measured = true, n_considered = 1, "worker env deletion could not acquire identity lock");
+                return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": error.to_string()}));
+            }
+        }
+    }
     let _ = std::fs::remove_file(mem_file(name));
     let _ = std::fs::remove_file(meta_path(name));
     let _ = std::fs::remove_file(log_path(name));
@@ -32389,6 +32448,8 @@ fn sanitize_session_name(raw: &str) -> String {
 /// Move old→new if old exists and new doesn't; report the state either way.
 /// An fs error is a hard failure (the caller returns 500 naming the steps).
 fn move_if(old: &Path, new: &Path, label: &str, steps: &mut Vec<String>) -> Result<(), String> {
+    let _env = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _file = incarnation_file_lock(old).map_err(|e| e.to_string())?;
     if old.exists() && !new.exists() {
         std::fs::rename(old, new).map_err(|e| format!("{label}: rename failed: {e}"))?;
         steps.push(format!("{label}: moved"));
@@ -32406,6 +32467,8 @@ fn move_if(old: &Path, new: &Path, label: &str, steps: &mut Vec<String>) -> Resu
 /// name from it. Rewritten atomically by [`replace_file_keeping_mode`]; every
 /// other line, and every line ending (LF or CRLF), is kept byte for byte.
 fn rewrite_cc_name(env: &Path, new_name: &str, steps: &mut Vec<String>) -> Result<(), String> {
+    let _env = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _file = incarnation_file_lock(env).map_err(|e| e.to_string())?;
     let text = match std::fs::read_to_string(env) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -46013,8 +46076,8 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         let _home = crate::api::settings::test_env::set_home(home.path());
         let (state, _dir) = state();
         rename_fixture_env("r6-old", "CC_AUTO_START=0\nAMUX_CONTRACT_DONE=1\n");
-        mint(home.path(), "r6-old").unwrap();
-        let run = mint_run(home.path(), "r6-old").unwrap();
+        mint(home.path(), "r6-old").unwrap().unwrap();
+        let run = mint_run(home.path(), "r6-old").unwrap().unwrap();
         let value = run.value.clone();
         assert_eq!(check(home.path(), "r6-old", Some(&value)), Check::Valid);
         let response = rename_session(&state, "r6-old", "r6-new").await;
@@ -46033,12 +46096,12 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         let _home = crate::api::settings::test_env::set_home(home.path());
         let (state, _dir) = state();
         rename_fixture_env("r6-new", "CC_AUTO_START=0\nAMUX_CONTRACT_DONE=1\n");
-        let stale = mint(home.path(), "r6-new").unwrap();
-        let stale_run = mint_run(home.path(), "r6-new").unwrap();
+        let stale = mint(home.path(), "r6-new").unwrap().unwrap();
+        let stale_run = mint_run(home.path(), "r6-new").unwrap().unwrap();
         // Retain an unrelated previous holder's credentials as crash debris.
         std::fs::remove_file(env_path("r6-new")).unwrap();
         rename_fixture_env("r6-old", "CC_AUTO_START=0\nAMUX_CONTRACT_DONE=1\n");
-        let own = mint_run(home.path(), "r6-old").unwrap();
+        let own = mint_run(home.path(), "r6-old").unwrap().unwrap();
         crate::api::rename_identity::ensure_incarnation(home.path(), "r6-old").unwrap();
         // Interrupt immediately after the env move, before any later rename step.
         std::fs::rename(env_path("r6-old"), env_path("r6-new")).unwrap();
@@ -46108,7 +46171,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             "CC_NAME=\"review-c\"\nCC_TAGS=dev\nCC_AUTO_START=0\nAMUX_CONTRACT_DONE=1\nCC_TEST_FAKE_PANE=1\n",
         );
         rename_fixture_env("review-peer", "CC_TAGS=dev\nCC_AUTO_START=0\nCC_TEST_FAKE_PANE=1\n");
-        let token = crate::api::worker_identity::mint(home.path(), "review-c").expect("rule 10 is on");
+        let token = crate::api::worker_identity::mint(home.path(), "review-c").unwrap().expect("rule 10 is on");
         let tokens = home.path().join("worker-tokens");
         // A deleted worker's leftovers at the target name, and a live run token.
         std::fs::write(tokens.join("review-d.sha256"), "stale-digest").unwrap();

@@ -1887,9 +1887,10 @@ impl LiveDeliverer {
                     }
                     // Its own worker token for the life of the run (rule 10),
                     // removed when `_run_token` drops after the child exits.
-                    let _run_token = (!owner.is_empty())
-                        .then(|| crate::api::worker_identity::mint_run(&crate::config::amux_home(), &owner))
-                        .flatten();
+                    let _run_token = if owner.is_empty() { None } else {
+                        crate::api::worker_identity::mint_run(&crate::config::amux_home(), &owner)
+                            .map_err(|error| format!("worker run token mint failed; run not started: {error}"))?
+                    };
                     match &_run_token {
                         Some(t) => { command.env(crate::api::worker_identity::TOKEN_ENV, &t.value); }
                         None => { command.env_remove(crate::api::worker_identity::TOKEN_ENV); }
@@ -3826,6 +3827,34 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn round7_mint_failure_is_warned_and_schedule_never_starts_tokenless() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/w.env"), "AMUX_CONTRACT_DONE=1\n").unwrap();
+        let _g = crate::api::settings::test_env::set_home(home.path());
+        crate::api::rename_identity::ensure_incarnation(home.path(), "w").unwrap();
+        std::fs::write(home.path().join("worker-tokens"), "blocks token directory").unwrap();
+        let log = std::sync::Arc::new(std::fs::File::create(home.path().join("warnings.log")).unwrap());
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_max_level(tracing::Level::WARN).with_writer(log).finish();
+        let _scope = tracing::subscriber::set_default(subscriber);
+        let (store, _dir) = store();
+        let state = crate::api::AppState {
+            store, started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let marker = home.path().join("started");
+        let mut sched = make_row("SCHED-R7", "w", None, "");
+        sched.raw.insert("kind".into(), Value::from("shell"));
+        sched.raw.insert("command".into(), Value::from(format!("touch '{}'", marker.display())));
+        let out = LiveDeliverer::new(state).deliver(&sched, "test").await;
+        assert!(!marker.exists(), "credential failure must prevent shell spawn");
+        assert!(matches!(out, RunOutcome::Failed { .. }), "{out:?}");
+        let logs = std::fs::read_to_string(home.path().join("warnings.log")).unwrap();
+        assert!(logs.contains("WARN") && logs.contains("worker_run_token_mint_failed"), "{logs}");
     }
 
     /// gtm-engine, 2026-10-07 (SCHED-173): a rule-10 lane's shell schedule

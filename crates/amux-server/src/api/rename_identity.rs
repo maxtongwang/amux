@@ -26,10 +26,9 @@
 //!
 //! - A worker's incarnation is a random id in its env file
 //!   ([`INCARNATION_KEY`]). It moves with the env file on rename, is assigned
-//!   on the worker's first rename if it has none, and is stripped from a
-//!   duplicated env file ([`strip_incarnation`]), so two workers never share
-//!   one. A worker created under a reused name has a new env file and so a
-//!   different (or no) incarnation.
+//!   at creation, with a serialized fallback for legacy workers. Duplication
+//!   ([`copy_incarnation`]) assigns a fresh id before publishing the copy.
+//!   A worker created under a reused name has a different incarnation.
 //! - Every record carries the renamed worker's incarnation (`inc`).
 //! - Resolution: a live name is never redirected. Otherwise the newest record
 //!   whose `old` is the claimed name names an incarnation; its newest record
@@ -96,7 +95,7 @@ pub(crate) fn incarnation(home: &Path, name: &str) -> Option<String> {
     incarnation_in(&env_file(home, name))
 }
 
-fn new_incarnation() -> std::io::Result<String> {
+pub(crate) fn new_incarnation() -> std::io::Result<String> {
     use std::io::Read;
     let mut b = [0u8; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
@@ -104,7 +103,8 @@ fn new_incarnation() -> std::io::Result<String> {
 }
 
 /// The worker's incarnation, assigning one (written to its env file) if it
-/// has none. A worker is one incarnation for the life of its env file.
+/// has none. Legacy fallback only: creation assigns eagerly. The complete
+/// read/assign/persist operation shares the env writers' lock.
 pub(crate) fn ensure_incarnation(home: &Path, name: &str) -> std::io::Result<String> {
     ensure_migrated(home)?;
     assign_incarnation(home, name)
@@ -112,7 +112,9 @@ pub(crate) fn ensure_incarnation(home: &Path, name: &str) -> std::io::Result<Str
 
 // Migration already holds WRITE_LOCK; do not recurse through its public boundary.
 fn assign_incarnation(home: &Path, name: &str) -> std::io::Result<String> {
+    let _env = super::session_verbs::env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
     let path = env_file(home, name);
+    let _file = super::session_verbs::incarnation_file_lock(&path)?;
     if !path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -135,8 +137,8 @@ fn assign_incarnation(home: &Path, name: &str) -> std::io::Result<String> {
         .append(true)
         .open(&path)?
         .write_all(format!("{lead}{INCARNATION_KEY}=\"{id}\"\n").as_bytes())?;
-    // A concurrent whole-file env rewrite can lose the append; say so rather
-    // than hand out an id no env file carries.
+    // Confirm persistence before issuing any credential. Assignment and env
+    // rewrites hold the same process mutex and cross-process file lock.
     if incarnation_in(&path).as_deref() != Some(id.as_str()) {
         return Err(std::io::Error::other(format!(
             "the incarnation for '{name}' did not persist"
@@ -152,15 +154,18 @@ fn assign_incarnation(home: &Path, name: &str) -> std::io::Result<String> {
     Ok(id)
 }
 
-/// Remove the incarnation from a freshly duplicated env file: the copy is a
-/// different worker and must never carry the source's aliases.
-pub(crate) fn strip_incarnation(path: &Path) -> std::io::Result<()> {
-    let mut cfg = super::session_verbs::EnvFile::load(path);
-    if cfg.get(INCARNATION_KEY).is_none() {
-        return Ok(());
+/// Copy and reset under one lock: a mint must never see the source identity
+/// briefly published at the duplicate's path.
+pub(crate) fn copy_incarnation(source: &Path, copy: &Path) -> std::io::Result<()> {
+    let _env = super::session_verbs::env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _file = super::session_verbs::incarnation_file_lock(copy)?;
+    if copy.exists() {
+        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "duplicate worker already exists"));
     }
-    cfg.remove(INCARNATION_KEY);
-    cfg.write(path)
+    let text = std::fs::read_to_string(source)?;
+    let mut cfg = super::session_verbs::EnvFile::from_text(&text);
+    cfg.set(INCARNATION_KEY, &new_incarnation()?);
+    cfg.write_unlocked(copy)
 }
 
 /// One line of the record file: a rename (`new` and, once migrated, `inc`),
@@ -779,9 +784,9 @@ pub(crate) mod tests {
     fn a_duplicate_does_not_carry_the_incarnation() {
         let d = home_with(&["a"]);
         rename(d.path(), "a", "b");
-        std::fs::copy(env_file(d.path(), "b"), env_file(d.path(), "dup")).unwrap();
-        strip_incarnation(&env_file(d.path(), "dup")).unwrap();
-        assert_eq!(incarnation(d.path(), "dup"), None);
+        copy_incarnation(&env_file(d.path(), "b"), &env_file(d.path(), "dup")).unwrap();
+        assert!(incarnation(d.path(), "dup").is_some());
+        assert_ne!(incarnation(d.path(), "dup"), incarnation(d.path(), "b"));
         assert!(incarnation(d.path(), "b").is_some());
     }
 
