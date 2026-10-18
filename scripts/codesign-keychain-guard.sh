@@ -57,16 +57,17 @@ ensure_signing_search_list() {
   read_user_search_list "$listed" || {
     echo 'WARN verdict=codesign_search_list_parse_failed' >&2; return 1;
   }
-  for entry in "${USER_SEARCH_LIST[@]}"; do
+  # bash 3.2 + set -u: an empty list must expand to nothing, not abort (Codex B1 on a986cc9).
+  for entry in ${USER_SEARCH_LIST[@]+"${USER_SEARCH_LIST[@]}"}; do
     if [ "$entry" = "$keychain" ]; then
       echo 'INFO verdict=codesign_search_list_present' >&2
       return 0
     fi
   done
   if [ "${DRY_RUN:-0}" = 1 ]; then
-    plan_command security list-keychains -d user -s "${USER_SEARCH_LIST[@]}" "$keychain"
+    plan_command security list-keychains -d user -s ${USER_SEARCH_LIST[@]+"${USER_SEARCH_LIST[@]}"} "$keychain"
   else
-    security list-keychains -d user -s "${USER_SEARCH_LIST[@]}" "$keychain" || {
+    security list-keychains -d user -s ${USER_SEARCH_LIST[@]+"${USER_SEARCH_LIST[@]}"} "$keychain" || {
       echo 'WARN verdict=codesign_search_list_append_failed' >&2; return 1;
     }
   fi

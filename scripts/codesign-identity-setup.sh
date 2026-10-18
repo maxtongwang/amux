@@ -7,7 +7,11 @@ here="$(cd "$(dirname "$0")" && pwd)"
 source "$here/codesign-keychain-guard.sh"
 identity='amux local code signing'
 work=''
-cleanup() { [ -z "$work" ] || rm -rf "$work"; }
+probe_dir=''
+cleanup() {
+  [ -z "$work" ] || rm -rf "$work"
+  [ -z "$probe_dir" ] || rm -rf "$probe_dir"
+}
 trap cleanup EXIT
 run() { if [ "${DRY_RUN:-0}" = 1 ]; then plan_command "$@"; else "$@"; fi; }
 [ "$(uname -s)" = Darwin ] || { echo 'macOS only' >&2; exit 2; }
@@ -95,7 +99,6 @@ else
   [ -n "$identity_hash" ] || { echo 'WARN verdict=codesign_identity_hash_missing' >&2; exit 1; }
   codesign --force --sign "$identity_hash" --identifier com.amux.codesign-probe --keychain "$keychain" "$probe_dir/probe"
   shown=$(codesign -dvv "$probe_dir/probe" 2>&1)
-  rm -rf "$probe_dir"
   grep -qF "Authority=$identity" <<< "$shown" || { echo 'WARN verdict=codesign_probe_failed' >&2; exit 1; }
   echo "PASS: probe Authority=$identity"
 fi

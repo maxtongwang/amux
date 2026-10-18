@@ -56,6 +56,14 @@ for line in os.environ["PLAN_TEXT"].splitlines():
     [[ "$no_keychain_plan" == *'PLAN: security find-certificate'* ]] || {
     echo 'FAIL: /bin/bash no-keychain signing plan failed' >&2; printf '%s\n' "$no_keychain_plan" >&2; exit 1;
   }
+  # An empty user search list (bash 3.2 + set -u) must still append and sign (Codex B1 on a986cc9).
+  status=0
+  empty_list_plan=$(DRY_RUN=1 AMUX_CODESIGN_PLAN_SEARCH_LIST=' ' /bin/bash "$(dirname "$0")/codesign-server.sh" "$guard_dir/plain-file" 2>&1) || status=$?
+  [ "$status" -eq 0 ] && [[ "$empty_list_plan" == *'PLAN: security list-keychains -d user -s '*'amux-signing.keychain-db'* ]] &&
+    [[ "$empty_list_plan" == *'PLAN: codesign --force'* ]] && [[ "$empty_list_plan" != *'unbound variable'* ]] || {
+    echo 'FAIL: /bin/bash signing plan with an empty search list failed' >&2; printf '%s\n' "$empty_list_plan" >&2; exit 1;
+  }
+  echo 'PASS: empty user search list appends the dedicated keychain and signs'
   rm -rf "$guard_dir"
   trap - EXIT
   echo 'PASS: signing plan contains expected commands and no forbidden operation'
