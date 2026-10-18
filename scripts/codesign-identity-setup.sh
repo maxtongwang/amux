@@ -14,6 +14,13 @@ here="$(cd "$(dirname "$0")" && pwd)"
 source "$here/codesign-keychain-guard.sh"
 
 identity='amux local code signing'
+work=''
+probe_dir=''
+cleanup() {
+  [ -z "$work" ] || rm -rf "$work"
+  [ -z "$probe_dir" ] || rm -rf "$probe_dir"
+}
+trap cleanup EXIT
 say() { printf '\n%s\n' "$*"; }
 run() { if [ "${DRY_RUN:-0}" = 1 ]; then plan_command "$@"; else "$@"; fi; }
 
@@ -37,7 +44,7 @@ say "Setting up the amux signing identity. This happens once; after it, macOS ke
 have_identity() { security find-identity -p codesigning "$keychain" 2>/dev/null | grep -qF "\"$identity\""; }
 
 apply_partition_list() {
-  local attempt password_to_try
+  local attempt password_to_try partition_error partition_status
   for attempt in 1 2 3; do
     if [ -n "${AMUX_CODESIGN_TEST_DIR:-}" ]; then
       password_to_try=$password
@@ -55,13 +62,20 @@ apply_partition_list() {
       done
     fi
     if [ "${DRY_RUN:-0}" = 1 ]; then
-      plan_command security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k '<password>' "$keychain"
+      plan_command security set-key-partition-list -S apple-tool:,apple:,codesign: -s -t private -l "$identity" -k '<password>' "$keychain"
       return 0
     fi
-    if security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password_to_try" "$keychain" >/dev/null 2>&1; then
+    if partition_error=$(security set-key-partition-list -S apple-tool:,apple:,codesign: -s -t private -l "$identity" -k "$password_to_try" "$keychain" 2>&1 >/dev/null); then
       return 0
+    else
+      partition_status=$?
     fi
-    say "That password did not match the keychain. Try again ($attempt of 3)."
+    if [[ "$partition_error" == *passphrase*not\ correct* ]] || [[ "$partition_error" == *password*not\ correct* ]]; then
+      say "That password did not match the keychain. Try again ($attempt of 3)."
+      continue
+    fi
+    printf 'Could not set signing key access (security exit %s): %s\n' "$partition_status" "$partition_error" >&2
+    return 1
   done
   say 'Could not set signing key access after 3 tries. Run this setup again to repair the existing identity.'
   return 1
@@ -72,13 +86,12 @@ if [ "${DRY_RUN:-0}" != 1 ] && have_identity; then
 else
   say "Step 1 of 3: creating the identity."
   work=$(mktemp -d)
-  trap 'rm -rf "$work"' EXIT
   p12_password='<random-password>'
   if [ "${DRY_RUN:-0}" != 1 ]; then p12_password=$(openssl rand -hex 24); fi
   run openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout "$work/key.pem" -out "$work/cert.pem" \
     -subj "/CN=$identity/O=amux local build" -addext basicConstraints=critical,CA:false \
     -addext keyUsage=critical,digitalSignature -addext extendedKeyUsage=critical,codeSigning
-  run openssl pkcs12 -export -inkey "$work/key.pem" -in "$work/cert.pem" -out "$work/identity.p12" \
+  run openssl pkcs12 -export -name "$identity" -inkey "$work/key.pem" -in "$work/cert.pem" -out "$work/identity.p12" \
     -passout "pass:$p12_password" -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
   run security import "$work/identity.p12" -k "$keychain" -P "$p12_password" -T /usr/bin/codesign
 fi
@@ -94,7 +107,6 @@ run codesign --force --sign "$identity" --identifier com.amux.codesign-probe --k
 if [ "${DRY_RUN:-0}" != 1 ]; then
   shown=$(codesign -dvv "$probe_dir/probe" 2>&1 || true)
   if ! have_identity || ! grep -qF "Authority=$identity" <<<"$shown"; then
-    rm -rf "$probe_dir"
     say "Setup did not finish: the identity could not sign. Nothing was changed outside your keychain; tell the agent and it will look.
 Details for the agent:
 $(security find-identity -p codesigning "$keychain" 2>&1 | head -5)
@@ -102,7 +114,6 @@ $(grep -E 'Authority|Signature|Identifier' <<<"$shown")"
     exit 1
   fi
 fi
-rm -rf "$probe_dir"
 say "OK: the identity is present and signs."
 
 say "Step 3 of 3: one switch in System Settings.

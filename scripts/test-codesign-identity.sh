@@ -19,6 +19,7 @@ if [ "${1:-}" = --check-plan ]; then
   [[ "${plan##*$'\n'}" == 'PLAN: security delete-keychain '* ]] || {
     echo 'FAIL: signing plan is missing a required phase or cleanup' >&2; exit 1;
   }
+  check_identity_plan "$plan" || exit 1
   forbidden='add-'"trusted"'|trust-'"settings"'|login.'"keychain"'|/Library/Keychains/'"System"'|default-'"keychain"'|list-'"keychains"'|login-'"keychain"'|osa'"script"'|tcc'"util"'|open -a'
   if printf '%s\n' "$plan" | grep -Eiq "$forbidden"; then
     echo 'FAIL: signing plan contains a forbidden operation' >&2; exit 1

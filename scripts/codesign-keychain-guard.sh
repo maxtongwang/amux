@@ -17,6 +17,33 @@ require_test_keychain() {
 
 plan_command() { printf 'PLAN:'; printf ' %q' "$@"; printf '\n'; }
 
+check_identity_plan() {
+  local plan=$1 line found_partition=0 found_export=0
+  while IFS= read -r line; do
+    case "$line" in
+      'PLAN: security set-key-partition-list '*)
+        found_partition=1
+        if [[ "$line" != *' -t private '* ]] ||
+           [[ "$line" != *' -l amux\ local\ code\ signing '* ]]; then
+          echo 'FAIL: partition-list plan must select the amux private key' >&2
+          return 1
+        fi
+        ;;
+      'PLAN: openssl pkcs12 -export '*)
+        found_export=1
+        if [[ "$line" != *' -name amux\ local\ code\ signing '* ]]; then
+          echo 'FAIL: PKCS#12 export plan must label the amux key' >&2
+          return 1
+        fi
+        ;;
+    esac
+  done <<< "$plan"
+  [ "$found_partition" -eq 1 ] && [ "$found_export" -eq 1 ] || {
+    echo 'FAIL: identity plan is missing export or partition-list step' >&2
+    return 1
+  }
+}
+
 run_sensitive() {
   local status=0
   perl -e 'alarm 30; exec @ARGV or die "exec failed: $!\n"' "$@" || status=$?

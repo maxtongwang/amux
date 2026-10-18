@@ -23,9 +23,9 @@ password=${AMUX_CODESIGN_TEST_PASSWORD:-}
 [ -n "$password" ] || { echo 'Disposable keychain password required' >&2; exit 2; }
 if [ "${DRY_RUN:-0}" = 1 ]; then
   plan_command openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout "$work/key.pem" -out "$work/cert.pem" -subj "/CN=$identity/O=amux local build" -addext basicConstraints=critical,CA:false -addext keyUsage=critical,digitalSignature -addext extendedKeyUsage=critical,codeSigning
-  plan_command openssl pkcs12 -export -inkey "$work/key.pem" -in "$work/cert.pem" -out "$work/identity.p12" -passout 'pass:<random-password>' -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
+  plan_command openssl pkcs12 -export -name "$identity" -inkey "$work/key.pem" -in "$work/cert.pem" -out "$work/identity.p12" -passout 'pass:<random-password>' -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
   plan_command security import "$work/identity.p12" -k "$keychain" -P '<random-password>' -T /usr/bin/codesign
-  plan_command security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k '<random-password>' "$keychain"
+  plan_command security set-key-partition-list -S apple-tool:,apple:,codesign: -s -t private -l "$identity" -k '<random-password>' "$keychain"
   exit 0
 fi
 run_sensitive openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
@@ -33,9 +33,9 @@ run_sensitive openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
   -addext 'basicConstraints=critical,CA:false' -addext 'keyUsage=critical,digitalSignature' \
   -addext 'extendedKeyUsage=critical,codeSigning' >/dev/null 2>&1
 chmod 600 "$work/key.pem"
-run_sensitive openssl pkcs12 -export -inkey "$work/key.pem" -in "$work/cert.pem" \
+run_sensitive openssl pkcs12 -export -name "$identity" -inkey "$work/key.pem" -in "$work/cert.pem" \
   -out "$work/identity.p12" -passout "pass:$password" \
   -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 >/dev/null 2>&1
 run_sensitive security import "$work/identity.p12" -k "$keychain" -P "$password" -T /usr/bin/codesign >/dev/null
-run_sensitive security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+run_sensitive security set-key-partition-list -S apple-tool:,apple:,codesign: -s -t private -l "$identity" -k "$password" "$keychain" >/dev/null
 echo 'Disposable signing identity provisioned'

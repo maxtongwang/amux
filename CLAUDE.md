@@ -244,7 +244,8 @@ activation. The one-time owner step is ONE script,
 `scripts/codesign-identity-setup.sh`: at a time Max chooses, an agent opens a
 Terminal window running it. It asks only for his Mac password, creates the
 identity in the login keychain (no trust settings are written), verifies a
-test signature, is safe to rerun, and ends by printing the Full Disk Access
+test signature, scopes key access to that identity, is safe to rerun, and ends
+by printing the Full Disk Access
 switch to flip for `amux-server-rs`. No agent runs it unattended (it refuses
 without a terminal). Builders and tests only use disposable keychains
 (`scripts/test-codesign-identity-setup.sh`); the builder never provisions an

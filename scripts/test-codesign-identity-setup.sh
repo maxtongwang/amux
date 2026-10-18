@@ -23,10 +23,46 @@ forbidden='add-'"trusted"'|trust-'"settings"'|login.'"keychain"'|/Library/Keycha
 if printf '%s\n' "$plan" | grep -Eiq "$forbidden"; then echo 'FAIL: setup plan contains a forbidden operation'; printf '%s\n' "$plan"; exit 1; fi
 printf '%s\n' "$plan" | grep -q 'PLAN: security import' || { echo 'FAIL: plan has no import step'; exit 1; }
 printf '%s\n' "$plan" | grep -q 'PLAN: security set-key-partition-list' || { echo 'FAIL: plan has no partition-list step'; exit 1; }
+check_identity_plan "$plan" || exit 1
 echo 'PASS: setup plan touches only the disposable keychain'
+require_test_keychain "$keychain" || exit 2
 security create-keychain -p "$password" "$keychain"
 security unlock-keychain -p "$password" "$keychain"
 codesign_ci_add_test_keychain "$keychain"
+
+# The second signing key must retain its distinct access policy through failed setup and reruns.
+unrelated='unrelated CI signing key'
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -keyout "$work/unrelated.key" \
+  -out "$work/unrelated.crt" -subj "/CN=$unrelated" >/dev/null 2>&1
+openssl pkcs12 -export -name "$unrelated" -inkey "$work/unrelated.key" \
+  -in "$work/unrelated.crt" -out "$work/unrelated.p12" -passout "pass:$password" \
+  -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
+security import "$work/unrelated.p12" -k "$keychain" -P "$password" -T /usr/bin/codesign >/dev/null
+security set-key-partition-list -S apple-tool:,apple: -s -t private -l "$unrelated" -k "$password" "$keychain" >/dev/null
+security dump-keychain -a "$keychain" > "$work/before.dump"
+partition_for_label() {
+  python3 - "$1" "$2" <<'PY'
+import pathlib
+import sys
+
+label, path = sys.argv[1:]
+blocks = pathlib.Path(path).read_text().split('keychain: ')
+matches = [''.join(line for line in block.splitlines(keepends=True)
+                   if 'partition_id:' in line)
+           for block in blocks if f'"labl"<blob>="{label}"' in block
+           and 'partition_id:' in block]
+if len(matches) != 1:
+    sys.exit(f'expected one partition list for {label}, found {len(matches)}')
+sys.stdout.write(matches[0])
+PY
+}
+unrelated_before=$(partition_for_label "$unrelated" "$work/before.dump")
+[[ "$unrelated_before" == *'apple-tool:'* ]] &&
+  [[ "$unrelated_before" == *'apple:'* ]] &&
+  [[ "$unrelated_before" != *'codesign:'* ]] || {
+    echo "FAIL: unrelated key did not start with a distinct partition list: $unrelated_before" >&2
+    exit 1
+  }
 status=0
 out1=$(AMUX_CODESIGN_TEST_PASSWORD="wrong-$password" perl -e 'alarm 60; exec @ARGV' /bin/bash "$repo/scripts/codesign-identity-setup.sh" 2>&1) || status=$?
 [ "$status" -eq 1 ] && grep -q 'creating the identity' <<<"$out1" && grep -q 'after 3 tries' <<<"$out1" \
@@ -41,3 +77,15 @@ grep -q 'already exists' <<<"$out2" && grep -q 'OK: the identity is present and 
   && echo 'PASS: a further run reapplies key access and verifies' || { echo 'FAIL: second run output'; printf '%s\n' "$out2"; exit 1; }
 n=$(security find-identity -p codesigning "$keychain" | grep -c '"amux local code signing"')
 [ "$n" -eq 1 ] && echo 'PASS: exactly one identity after three runs' || { echo "FAIL: $n identities"; exit 1; }
+security dump-keychain -a "$keychain" > "$work/after.dump"
+unrelated_after=$(partition_for_label "$unrelated" "$work/after.dump")
+[ "$unrelated_before" = "$unrelated_after" ] || {
+  echo 'FAIL: unrelated signing key partition list changed' >&2; exit 1;
+}
+amux_partition=$(partition_for_label 'amux local code signing' "$work/after.dump")
+[[ "$amux_partition" == *'apple-tool:'* ]] &&
+  [[ "$amux_partition" == *'apple:'* ]] &&
+  [[ "$amux_partition" == *'codesign:'* ]] || {
+  echo "FAIL: amux signing key lacks expected partition list: $amux_partition" >&2; exit 1;
+}
+echo 'PASS: unrelated key partition list is unchanged; amux key has signing access'
