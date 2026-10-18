@@ -16290,6 +16290,11 @@ pub(crate) async fn start_session(
                 "the server's PATH lacks /usr/sbin (launchd plist); the worker shell appends /usr/sbin and /sbin");
         }
     }
+    // LAST PATH change of the pane's setup, so the worker-bin tmux guard is
+    // first on the pane's PATH and nothing sourced above can reorder it. The
+    // server's own PATH never gets this dir (see worker_tmux_guard_rc).
+    let tmux_guard_rc = worker_tmux_guard_rc(name);
+    shell_rc.push_str(&tmux_guard_rc);
     if !isolated {
         tracing::info!(session=name, endpoint, home=%home().display(), measured=true,
             n_considered=harness_env.len(), verdict="worker_harness_routing",
@@ -16575,6 +16580,10 @@ pub(crate) async fn start_session(
                 ),
                 false
             );
+        }
+        // Same worker-bin tmux guard a fresh shell gets, after every PATH change.
+        if !tmux_guard_rc.is_empty() {
+            shell_step!(&tmux_guard_rc, false);
         }
     } else {
         // Fresh tmux session hosting the user's login shell (py:24647).
@@ -21925,6 +21934,47 @@ pub(crate) fn mark_schedule_run_delivered(
 /// `sysctl` failed in a lane and Mixpeek's host gate read "go" on a host at
 /// load 26 (gs12-compute, 2026-10-04).
 pub(crate) const WORKER_SYSTEM_PATH_RC: &str = "for __d in /usr/sbin /sbin; do case \":$PATH:\" in *\":$__d:\"*) ;; *) PATH=\"$PATH:$__d\" ;; esac; done; unset __d; export PATH; ";
+
+/// Worker-only command guards: `scripts/worker-bin/`, installed by install.sh to
+/// `<amux home>/worker-bin` (today only `tmux`, which refuses kill-server,
+/// kill-session and kill-pane on the live amux tmux server). It goes on a WORKER
+/// PANE's PATH and nowhere else: the server's own `Command::new("tmux")` calls
+/// resolve through the server's PATH (the launchd plist's LAUNCHD_PATH), which
+/// must never contain this dir, or the server's own kills would be refused.
+pub(crate) fn worker_bin_dir() -> PathBuf {
+    home().join("worker-bin")
+}
+
+/// Shell line that puts `dir` first on PATH. Idempotent (a shell that already
+/// starts with it is unchanged) and adds no empty entry when PATH is empty.
+pub(crate) fn worker_bin_path_rc(dir: &Path) -> String {
+    let q = sh_quote(&dir.to_string_lossy());
+    format!("case \"$PATH\" in {q}|{q}:*) ;; *) PATH={q}\"${{PATH:+:$PATH}}\" ;; esac; export PATH; ")
+}
+
+/// The pane-launch line for the worker tmux guard, or empty (logged) when the
+/// guard is not installed. Also reports a server whose own PATH carries the
+/// worker-bin dir, because then the server's tmux calls hit the guard.
+pub(crate) fn worker_tmux_guard_rc(name: &str) -> String {
+    let dir = worker_bin_dir();
+    let server_path = std::env::var("PATH").unwrap_or_default();
+    if server_path_has_dir(&server_path, &dir) {
+        tracing::error!(session = name, dir = %dir.display(), measured = true, n_considered = 1,
+            verdict = "server_path_contains_worker_bin",
+            "the amux server's own PATH contains the worker-bin dir; its tmux calls would resolve to the worker guard. Fix the launchd plist PATH (install.sh LAUNCHD_PATH)");
+    }
+    if !dir.join("tmux").is_file() {
+        tracing::warn!(session = name, dir = %dir.display(), measured = true, n_considered = 1,
+            verdict = "worker_tmux_guard_absent",
+            "worker-bin/tmux is not installed; this pane runs tmux unguarded (run install.sh)");
+        return String::new();
+    }
+    worker_bin_path_rc(&dir)
+}
+
+fn server_path_has_dir(path: &str, dir: &Path) -> bool {
+    path.split(':').any(|d| !d.is_empty() && Path::new(d) == dir)
+}
 
 /// Stamp the history row of the queue item just delivered. The row linked to
 /// `queue_id` is the send's own record, so its stamp is authoritative and also
@@ -53615,6 +53665,109 @@ mod spawn_argv_secret_tests {
     /// Same idiom as `the_at_boundary_scheduler_path_no_longer_borrows_the_owners_origin`
     /// above: read the shipped source, code lines only, so the function's own
     /// prose cannot satisfy it.
+    /// The worker-bin line puts the guard dir FIRST on a pane's PATH, so a bare
+    /// `tmux` in the pane resolves to the guard, while the same lookup with the
+    /// server's PATH (no line applied) resolves to the real binary. Both tmux
+    /// files here are inert fakes that are only resolved, never executed.
+    #[test]
+    fn a_worker_pane_resolves_tmux_through_worker_bin_and_the_server_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let guard_dir = tmp.path().join("amux home").join("worker-bin");
+        let real_dir = tmp.path().join("real-bin");
+        for d in [&guard_dir, &real_dir] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("tmux"), "#!/bin/sh\nexit 99\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(d.join("tmux"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let rc = crate::api::session_verbs::worker_bin_path_rc(&guard_dir);
+        let g = guard_dir.to_string_lossy().to_string();
+        let r = real_dir.to_string_lossy().to_string();
+        let sh = |prelude: &str, path: &str, tail: &str| -> String {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("{prelude} {tail}"))
+                .env_clear()
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let base = format!("{r}:/usr/bin:/bin");
+        // Pane: guard first, and a bare `tmux` resolves to it.
+        assert_eq!(sh(&rc, &base, "printf %s \"$PATH\""), format!("{g}:{base}"));
+        assert_eq!(sh(&rc, &base, "command -v tmux").trim(), guard_dir.join("tmux").to_string_lossy());
+        // Idempotent on a restarted (surviving) shell.
+        assert_eq!(sh(&format!("{rc}{rc}"), &base, "printf %s \"$PATH\""), format!("{g}:{base}"));
+        // An empty PATH gains no empty (= cwd) entry.
+        assert_eq!(sh(&rc, "", "printf %s \"$PATH\""), g);
+        // Server: same lookup without the pane line resolves to the real binary.
+        assert_eq!(sh(":;", &base, "command -v tmux").trim(), real_dir.join("tmux").to_string_lossy());
+        assert!(crate::api::session_verbs::server_path_has_dir(&format!("/x:{g}"), &guard_dir));
+        assert!(!crate::api::session_verbs::server_path_has_dir(&base, &guard_dir));
+    }
+
+    /// The worker-bin dir is added ONLY to the pane launch env: both pane
+    /// setup paths (fresh shell_rc, surviving shell) apply it after every other
+    /// PATH change; no server code outside the pane launch names the dir or
+    /// rewrites the server's own PATH; the backend's tmux is the bare name
+    /// resolved from the server env; and install.sh's launchd PATH lacks it.
+    #[test]
+    fn the_worker_bin_dir_reaches_only_the_pane_launch_env() {
+        fn code(src: &str) -> String {
+            src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+        }
+        let sv = code(include_str!("session_verbs.rs"));
+        let start = sv.find("pub(crate) async fn start_session(").expect("start_session is gone");
+        let body = &sv[start..];
+        let fresh = body.find("shell_rc.push_str(&tmux_guard_rc);").expect("fresh pane shell lost the tmux guard");
+        for earlier in [
+            "shell_rc.push_str(WORKER_SYSTEM_PATH_RC);",
+            "shell_rc.push_str(&docker_vm_exports(name));",
+            "shell_rc.push_str(&workspace_isolation_exports(name));",
+        ] {
+            let at = body.find(earlier).unwrap_or_else(|| panic!("{earlier} is gone"));
+            assert!(at < fresh, "{earlier} runs after the tmux guard and could reorder PATH");
+        }
+        let surviving = body.find("shell_step!(&tmux_guard_rc, false);").expect("surviving pane shell lost the tmux guard");
+        let scope = body.find("shell_step!(&surviving_shell_scope_rc(name), false);").expect("surviving scope step is gone");
+        assert!(scope < surviving, "the surviving shell applies scope PATH changes after the tmux guard");
+        // Only the pane-launch helper resolves the dir.
+        let uses = sv.matches(concat!("worker_bin", "_dir()")).count();
+        assert_eq!(uses, 2, "the worker-bin dir helper should be defined once and called once (worker_tmux_guard_rc), found {uses}");
+        // No other server source names the dir or rewrites the process PATH.
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![src_root];
+        let mut scanned = 0;
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                scanned += 1;
+                let c = code(&std::fs::read_to_string(&p).unwrap());
+                assert!(!c.contains("set_var(\"PATH\""), "{} rewrites the server's own PATH", p.display());
+                if !p.ends_with("api/session_verbs.rs") {
+                    assert!(!c.contains("worker-bin") && !c.contains("worker_bin"),
+                        "{} names the worker-bin dir outside the pane launch", p.display());
+                }
+            }
+        }
+        assert!(scanned > 50, "scanned only {scanned} source files");
+        let tmux = code(include_str!("../backend/tmux.rs"));
+        assert!(tmux.contains("Self { bin: \"tmux\".into() }"), "the tmux backend no longer resolves a bare tmux from the server env");
+        let install = &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.sh")).expect("install.sh is readable");
+        let launchd = install.lines().find(|l| l.starts_with("LAUNCHD_PATH=")).expect("install.sh LAUNCHD_PATH is gone");
+        assert!(!launchd.contains("worker-bin"), "the server's launchd PATH contains worker-bin: {launchd}");
+        assert!(install.contains("\"scripts/worker-bin/tmux\""), "install.sh no longer installs the worker tmux guard");
+    }
+
     /// A worker shell gets /usr/sbin and /sbin on PATH when the server's PATH
     /// lacks them, without duplicating them when it has them.
     #[test]

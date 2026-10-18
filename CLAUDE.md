@@ -86,6 +86,23 @@ owes two things: the fix, and a log signal so the next instance self-announces
 Tool-event hooks need a `matcher` (regex). `"*"` is invalid; use `".*"`.
 Verify a hook by what it WROTE, not by the settings file.
 
+**Worker tmux guard.** Worker panes get `~/.amux/worker-bin` first on PATH
+(`worker_tmux_guard_rc` in `api/session_verbs.rs`; installed from
+`scripts/worker-bin/tmux` by `install.sh`). For commands that run arguments, the
+guard joins all arguments except the value after `-n`/`-s` on `new-session` or
+`new-window`, then refuses any kill word or `-K` unless shell-running text has
+no `tmux` word. A nested tmux naming a private socket is still refused (nested
+socket options can be overridden or sit in an unexecuted branch); a kill passes
+only when tmux itself is called directly with `-S` or a non-default `-L`.
+Quoted harmless text can be refused because the guard splits on whitespace,
+quotes, and shell/tmux separators rather than parsing nested commands.
+It exits 1 and logs `verdict=tmux_guard_refused` to `~/.amux/logs/tmux-guard.log`.
+Everything else execs the real tmux (`AMUX_REAL_TMUX`, else Homebrew/system).
+The server's own PATH never contains worker-bin. For a throwaway tmux, use a
+private socket and let it end on its own:
+`d=$(mktemp -d); env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$d" tmux -S "$d/sock" new-session -d 'sleep 3'`.
+Tests use a fake real tmux via `AMUX_REAL_TMUX` (`scripts/test-worker-tmux-guard.py`).
+
 ## Workflow
 
 - **No auto-pull.** Shared checkout; the freshness hook reports staleness, the human decides.
