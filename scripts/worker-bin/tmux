@@ -143,8 +143,12 @@ tmux guard: refused '$why' on the LIVE amux tmux server (verdict=tmux_guard_refu
 Killing it ends every worker pane in the fleet. For a throwaway tmux, use a private
 socket in a fresh environment, and let it end on its own:
   d=\$(mktemp -d); env -u TMUX -u TMUX_PANE TMUX_TMPDIR="\$d" tmux -S "\$d/sock" new-session -d 'sleep 3'
-A kill on that explicit -S socket passes through:
+A kill on that explicit -S (or a non-default -L) socket passes through:
   env -u TMUX -u TMUX_PANE tmux -S <your mktemp>/sock kill-server
+Tests that drive tmux: run them under amux-isolated, which gives them their own tmux server.
+This guard refuses conservatively: text that only mentions a kill can be refused too. If that
+blocked real work, name an explicit private socket as above; every refusal is logged to
+~/.amux/logs/tmux-guard.log.
 EOF
   exit 1
 }

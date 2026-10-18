@@ -215,6 +215,12 @@ class WorkerTmuxGuardTests(unittest.TestCase):
         self.assert_passed()
         self.assertEqual(self.log_lines(), [])
 
+    def test_the_refusal_names_the_ways_through(self):
+        r = self.run_guard('kill-server')
+        self.assertEqual(r.returncode, 1)
+        for phrase in ('tmux -S <your mktemp>/sock kill-server', 'amux-isolated', 'tmux-guard.log', 'conservatively'):
+            self.assertIn(phrase, r.stderr, phrase)
+
     def test_data_arguments_mentioning_a_kill_pass_through(self):
         # Messages, buffers, typed text and names are data tmux never runs.
         self.assert_passed('display-message', '-p', 'Never run kill-server')
