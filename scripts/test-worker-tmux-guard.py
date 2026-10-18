@@ -151,6 +151,33 @@ class WorkerTmuxGuardTests(unittest.TestCase):
                     'tmux kill-session -t x;true', 'x=$(tmux kill-server)', 'echo `tmux kill-pane`', 'tmux kill-server 2>&1'):
             self.assert_refused('run-shell', cmd)
 
+    def test_nested_command_kinds(self):
+        self.assert_refused('run-shell', 'tmux kill-server')
+        self.assert_refused('run-shell', 'x; /opt/homebrew/bin/tmux kill-server>/dev/null')
+        self.assert_refused('new-window', 'tmux kill-session -t x')
+        self.assert_refused('bind-key', 'X', 'kill-server')
+        self.assert_refused('if-shell', 'true', 'kill-server')
+        self.assert_refused('run-shell', 'tmux -uK list-sessions')
+        self.assert_refused('run-shell', f'tmux -S {self.live_sock} kill-server')
+        self.assert_refused('run-shell', 'echo "$(tmux kill-server)"')
+        self.assert_refused('run-shell', 'x && tmux kill-pane')
+        self.assert_refused('run-shell', r'tmux list-sessions \; kill-server')
+        self.assert_refused('bind-key', 'X', 'display-message ok; kill-server')
+        self.assert_refused('if-shell', 'true', 'display-message ok', 'kill-server')
+        for command in ('new-session', 'respawn-pane', 'respawn-window', 'pipe-pane', 'display-popup'):
+            with self.subTest(command=command):
+                self.assert_refused(command, 'tmux kill-server')
+        for command in ('confirm-before', 'command-prompt', 'display-menu', 'set-hook'):
+            with self.subTest(command=command):
+                self.assert_refused(command, 'kill-server')
+
+        self.assert_passed('new-window', '-d', 'rg kill-server scripts')
+        self.assert_passed('run-shell', 'env -u TMUX -u TMUX_PANE tmux -L review-private kill-server')
+        self.assert_passed('run-shell', 'tmux -S /tmp/p/sock kill-server')
+        self.assert_passed('run-shell', 'echo "x; tmux kill-server"')
+        self.assert_passed('run-shell', 'grep kill-server scripts')
+        self.assert_passed('bind-key', 'X', 'display-message "x; kill-server"')
+
     # --- pass-throughs ---------------------------------------------------------------
     def test_kill_on_other_socket_passes_with_exact_argv(self):
         self.assert_passed('-S', '/tmp/other/sock', 'kill-server')
