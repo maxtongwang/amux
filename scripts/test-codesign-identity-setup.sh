@@ -47,6 +47,7 @@ out=$(perl -e 'alarm 90; exec @ARGV' bash "$repo/scripts/codesign-identity-setup
 grep -q 'PASS: dedicated signing identity signs' <<< "$out" || { printf '%s\n' "$out"; exit 1; }
 grep -q 'verdict=codesign_search_list_appended' <<< "$out"
 grep -q 'PASS: probe Authority=amux local code signing' <<< "$out"
+echo 'PASS: probe Authority=amux local code signing'
 echo 'PASS: setup created and signed from the disposable dedicated keychain'
 snapshot after_first
 read_user_search_list "$(cat "$work/before.search")"

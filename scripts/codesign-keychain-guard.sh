@@ -86,7 +86,7 @@ try:
     for cmd in commands:
         if cmd[:2] in (["security", "default-keychain"], ["security", "add-trusted-cert"], ["security", "trust-settings"]):
             raise ValueError("forbidden keychain mutation")
-        if cmd[:2] == ["security", "delete-keychain"] and cmd[-1] != os.environ["SEARCH_LIST_KEYCHAIN"]:
+        if cmd[:2] == ["security", "delete-keychain"] and (cmd[-1] != os.environ["SEARCH_LIST_KEYCHAIN"] or "amux-codesign-ci-" not in cmd[-1]):
             raise ValueError("delete-keychain outside the disposable keychain")
         if cmd[:1] == ["security"] and cmd[:2] != ["security", "list-keychains"] and any("login.keychain" in arg for arg in cmd[2:]):
             raise ValueError("login keychain mutation")

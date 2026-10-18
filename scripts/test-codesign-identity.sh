@@ -123,7 +123,7 @@ if [ "$status" -eq 75 ]; then echo 'SKIP: temporary keychain creation timed out'
 run_sensitive security unlock-keychain -p "$password" "$keychain" || status=$?
 if [ "$status" -eq 75 ]; then echo 'SKIP: temporary keychain unlock timed out'; exit 0; fi
 [ "$status" -eq 0 ] || exit "$status"
-echo 'PASS: disposable keychain is used only by explicit path'
+echo 'PASS: disposable keychain creation is guarded'
 
 bash "$repo/scripts/codesign-identity.sh" --keychain "$keychain" || status=$?
 if [ "$status" -eq 75 ]; then echo 'SKIP: identity provisioning timed out'; exit 0; fi
