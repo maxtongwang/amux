@@ -91,10 +91,11 @@ Verify a hook by what it WROTE, not by the settings file.
 `scripts/worker-bin/tmux` by `install.sh`). For commands that run arguments, the
 guard joins all arguments except the value after `-n`/`-s` on `new-session` or
 `new-window`, then refuses any kill word or `-K` unless shell-running text has
-no `tmux` word or every `tmux` word immediately selects a different `-S` socket
-or non-default `-L` name. Quoted harmless text can be refused because the guard
-splits on whitespace, quotes, and shell/tmux separators rather than parsing
-nested commands.
+no `tmux` word. A nested tmux naming a private socket is still refused (nested
+socket options can be overridden or sit in an unexecuted branch); a kill passes
+only when tmux itself is called directly with `-S` or a non-default `-L`.
+Quoted harmless text can be refused because the guard splits on whitespace,
+quotes, and shell/tmux separators rather than parsing nested commands.
 It exits 1 and logs `verdict=tmux_guard_refused` to `~/.amux/logs/tmux-guard.log`.
 Everything else execs the real tmux (`AMUX_REAL_TMUX`, else Homebrew/system).
 The server's own PATH never contains worker-bin. For a throwaway tmux, use a
