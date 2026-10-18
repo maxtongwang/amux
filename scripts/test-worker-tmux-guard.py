@@ -172,8 +172,10 @@ class WorkerTmuxGuardTests(unittest.TestCase):
                 self.assert_refused(command, 'kill-server')
 
         self.assert_passed('new-window', '-d', 'rg kill-server scripts')
-        self.assert_passed('run-shell', 'env -u TMUX -u TMUX_PANE tmux -L review-private kill-server')
-        self.assert_passed('run-shell', 'tmux -S /tmp/p/sock kill-server')
+        # Nested private sockets are NOT exempted (review round 5); call tmux directly with -S/-L.
+        self.assert_refused('run-shell', 'env -u TMUX -u TMUX_PANE tmux -L review-private kill-server')
+        self.assert_refused('run-shell', 'tmux -S /tmp/p/sock kill-server')
+        self.assert_passed('-S', '/tmp/p/sock', 'kill-server')
         # Quotes do not exempt harmless text in commands that run arguments.
         self.assert_refused('run-shell', 'echo "x; tmux kill-server"')
         self.assert_passed('run-shell', 'grep kill-server scripts')
@@ -197,7 +199,12 @@ class WorkerTmuxGuardTests(unittest.TestCase):
         self.assert_refused('run-shell', 'tmux -L review-private kill-server; tmux kill-pane')
         self.assert_refused('run-shell', f'tmux -S {self.live_sock} kill-server')
         self.assert_refused('run-shell', 'tmux -L default kill-server')
-        self.assert_passed('run-shell', 'tmux -L review-private kill-server; tmux -S /tmp/p/sock kill-pane')
+        self.assert_refused('run-shell', 'tmux -L review-private kill-server; tmux -S /tmp/p/sock kill-pane')
+        # Round-5 repros: a private socket elsewhere in the text, or a later -S/-L, never exempts.
+        self.assert_refused('if-shell', 'true', 'kill-server', 'run-shell "tmux -L review-private list-sessions"')
+        self.assert_refused('bind-key', 'X', 'display-message "tmux -L review-private"; kill-server')
+        self.assert_refused('run-shell', f'/opt/homebrew/bin/tmux -L review-private -S {self.live_sock} kill-server')
+        self.assert_refused('run-shell', 'tmux -L review-private -L default kill-server')
 
     # --- pass-throughs ---------------------------------------------------------------
     def test_kill_on_other_socket_passes_with_exact_argv(self):

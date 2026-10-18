@@ -143,7 +143,8 @@ tmux guard: refused '$why' on the LIVE amux tmux server (verdict=tmux_guard_refu
 Killing it ends every worker pane in the fleet. For a throwaway tmux, use a private
 socket in a fresh environment, and let it end on its own:
   d=\$(mktemp -d); env -u TMUX -u TMUX_PANE TMUX_TMPDIR="\$d" tmux -S "\$d/sock" new-session -d 'sleep 3'
-A kill on that explicit -S (or a non-default -L) socket passes through:
+A kill on that explicit -S (or a non-default -L) socket passes through when tmux is
+called directly (not nested inside run-shell, if-shell, bind-key or a new window):
   env -u TMUX -u TMUX_PANE tmux -S <your mktemp>/sock kill-server
 Tests that drive tmux: run them under amux-isolated, which gives them their own tmux server.
 This guard refuses conservatively: text that only mentions a kill can be refused too. If that
@@ -193,32 +194,23 @@ tokenize_command_text() {
 }
 
 scan_running_arguments() {
-  local text="${running_args[*]}" w next value j has_tmux=0 safe_tmux=1 danger=""
+  # Conservative by design (dev-lead, review convergence): a kill word or -K anywhere in the
+  # text of a command that runs its arguments refuses. The one exemption is shell text that
+  # names no tmux at all (`rg kill-server scripts`). A nested tmux naming a private socket is
+  # NOT exempted: socket options inside nested text can be overridden or sit in an unexecuted
+  # branch; run that tmux directly with -S/-L instead, which the top-level check passes.
+  local text="${running_args[*]}" w j has_tmux=0 danger=""
   local -a tokens=()
   tokenize_command_text "$text"
   for ((j=0; j<${#tokens[@]}; j++)); do
     w="${tokens[$j]}"
-    if [[ "$w" = *tmux ]]; then
-      has_tmux=1
-      next="${tokens[$((j + 1))]:-}"
-      value="${tokens[$((j + 2))]:-}"
-      if [ "$next" = -S ] && [ -n "$value" ]; then
-        same_path "$value" "$live_sock" && safe_tmux=0
-        same_path "$value" "$default_real" && safe_tmux=0
-        same_path "$value" "$default_env" && safe_tmux=0
-      elif [ "$next" = -L ] && [ -n "$value" ] && [ "$value" != default ]; then
-        same_path "${TMUX_TMPDIR:-/tmp}/tmux-$uid/$value" "$live_sock" && safe_tmux=0
-      else
-        safe_tmux=0
-      fi
-    fi
+    [[ "$w" = *tmux ]] && has_tmux=1
     if is_protected_word "$w" || [ "$w" = -K ] || [[ "$w" = -[A-Za-z]*K* ]]; then
       danger="$w"
     fi
   done
   [ -n "$danger" ] || return
   [ "$kind" = shell ] && [ "$has_tmux" -eq 0 ] && return
-  [ "$has_tmux" -eq 1 ] && [ "$safe_tmux" -eq 1 ] && return
   refuse "$danger (inside running command)"
 }
 
