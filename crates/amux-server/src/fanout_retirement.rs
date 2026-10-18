@@ -75,6 +75,7 @@ pub(crate) async fn retire<F: Fleet>(
     home: &Path,
     name: &str,
 ) -> Result<Outcome, String> {
+    crate::api::rename_identity::ensure_migrated(home).map_err(|e| e.to_string())?;
     let active = home.join("sessions").join(format!("{name}.env"));
     let expired = active.with_extension("env.reaped");
     let source = if active.exists() {
@@ -635,6 +636,15 @@ mod tests {
     #[tokio::test]
     async fn verified_published_board_stops_idle_provider_removes_worktree_and_expires_with_history(
     ) {
+        // Round 5: real retirement before the first legacy alias read.
+        let legacy = Fixture::new().await;
+        std::fs::write(legacy.home.join("renames.jsonl"),
+            format!("{}\n", serde_json::json!({"old":"test-ret-legacy", "new":legacy.name}))).unwrap();
+        assert_eq!(legacy.retire(&TestFleet::default()).await.unwrap(), Outcome::Expired);
+        std::fs::write(legacy.env(), "CC_TAGS=other\n").unwrap();
+        assert_eq!(crate::api::board::callback_target(&legacy.home, "test-ret-legacy".into()),
+            "test-ret-legacy", "legacy aliases must be settled before retirement moves the env file");
+
         let f = Fixture::new().await;
         let fleet = TestFleet::default();
         git(&f.w.repo, &["worktree", "lock", &f.w.path])

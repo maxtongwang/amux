@@ -43,7 +43,8 @@
 //!   `a`, now `b`) and touches no incarnation's records. The accepted cost:
 //!   the original worker's process, if it still claims that name, is no
 //!   longer resolved; it was told its new name and relaunches under it.
-//! - Legacy records without `inc` are migrated on first read: given the
+//! - Legacy records without `inc` are migrated at startup and before any identity
+//!   read or mutation: given the
 //!   current live holder's incarnation when the old chain reaches one
 //!   unambiguously, dropped otherwise (`rename_records_migrated`, and a WARN
 //!   with the dropped count).
@@ -84,7 +85,10 @@ fn worker_exists(home: &Path, name: &str) -> bool {
 /// The incarnation recorded in an env file, if any.
 fn incarnation_in(path: &Path) -> Option<String> {
     let cfg = super::session_verbs::EnvFile::load(path);
-    cfg.get(INCARNATION_KEY).map(str::trim).filter(|v| !v.is_empty()).map(String::from)
+    cfg.get(INCARNATION_KEY)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(String::from)
 }
 
 /// A live worker's incarnation, if it has one.
@@ -102,9 +106,18 @@ fn new_incarnation() -> std::io::Result<String> {
 /// The worker's incarnation, assigning one (written to its env file) if it
 /// has none. A worker is one incarnation for the life of its env file.
 pub(crate) fn ensure_incarnation(home: &Path, name: &str) -> std::io::Result<String> {
+    ensure_migrated(home)?;
+    assign_incarnation(home, name)
+}
+
+// Migration already holds WRITE_LOCK; do not recurse through its public boundary.
+fn assign_incarnation(home: &Path, name: &str) -> std::io::Result<String> {
     let path = env_file(home, name);
     if !path.exists() {
-        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no worker '{name}'")));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no worker '{name}'"),
+        ));
     }
     if let Some(id) = incarnation_in(&path) {
         return Ok(id);
@@ -113,7 +126,11 @@ pub(crate) fn ensure_incarnation(home: &Path, name: &str) -> std::io::Result<Str
     // APPENDED, so every other byte of the env file (its comments, order and
     // line endings) stays as it was, and the file keeps its mode (0600).
     let current = std::fs::read(&path)?;
-    let lead = if current.is_empty() || current.ends_with(b"\n") { "" } else { "\n" };
+    let lead = if current.is_empty() || current.ends_with(b"\n") {
+        ""
+    } else {
+        "\n"
+    };
     std::fs::OpenOptions::new()
         .append(true)
         .open(&path)?
@@ -121,10 +138,17 @@ pub(crate) fn ensure_incarnation(home: &Path, name: &str) -> std::io::Result<Str
     // A concurrent whole-file env rewrite can lose the append; say so rather
     // than hand out an id no env file carries.
     if incarnation_in(&path).as_deref() != Some(id.as_str()) {
-        return Err(std::io::Error::other(format!("the incarnation for '{name}' did not persist")));
+        return Err(std::io::Error::other(format!(
+            "the incarnation for '{name}' did not persist"
+        )));
     }
-    tracing::info!(session = name, verdict = "worker_incarnation_assigned", measured = true, n_considered = 1,
-        "a worker was given its incarnation id");
+    tracing::info!(
+        session = name,
+        verdict = "worker_incarnation_assigned",
+        measured = true,
+        n_considered = 1,
+        "a worker was given its incarnation id"
+    );
     Ok(id)
 }
 
@@ -171,6 +195,7 @@ fn parse(line: &str) -> Option<Rec> {
 /// Append one rename record for incarnation `inc`. Called after a rename has
 /// fully succeeded.
 pub(crate) fn record(home: &Path, old: &str, new: &str, inc: &str) -> std::io::Result<()> {
+    ensure_migrated(home)?;
     if old == new
         || inc.is_empty()
         || !super::session_verbs::valid_session_name(old)
@@ -209,6 +234,9 @@ fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
 /// worker's aliases, including a live intermediate holder's, are unaffected.
 /// Returns (records dropped, marker written).
 pub(crate) fn release_incarnation(home: &Path, name: &str, inc: Option<&str>) -> std::io::Result<(usize, bool)> {
+    ensure_migrated(home)?;
+    let migrated_inc = incarnation(home, name);
+    let inc = inc.or(migrated_inc.as_deref());
     let _w = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = record_path(home);
     let text = match std::fs::read_to_string(&path) {
@@ -226,12 +254,20 @@ pub(crate) fn release_incarnation(home: &Path, name: &str, inc: Option<&str>) ->
         })
         .collect();
     // Only the newest line about `name` decides whether it still redirects.
-    let redirects = kept.lines().rev().filter_map(parse).find(|r| r.old == name).is_some_and(|r| !r.released);
+    let redirects = kept
+        .lines()
+        .rev()
+        .filter_map(parse)
+        .find(|r| r.old == name)
+        .is_some_and(|r| !r.released);
     if redirects {
         if !kept.is_empty() && !kept.ends_with('\n') {
             kept.push('\n');
         }
-        kept.push_str(&format!("{}\n", json!({"old": name, "released": true, "at": chrono::Utc::now().timestamp()})));
+        kept.push_str(&format!(
+            "{}\n",
+            json!({"old": name, "released": true, "at": chrono::Utc::now().timestamp()})
+        ));
     }
     if dropped > 0 || redirects {
         write_atomic(&path, &kept)?;
@@ -245,91 +281,147 @@ pub(crate) fn release_incarnation(home: &Path, name: &str, inc: Option<&str>) ->
 /// failure leaves records that the incarnation check still keeps away from
 /// any later holder of the name.
 pub(crate) fn release(home: &Path, name: &str) {
+    if ensure_migrated(home).is_err() {
+        return;
+    }
     let active = env_file(home, name);
     let inc = incarnation_in(&active).or_else(|| incarnation_in(&active.with_extension("env.reaped")));
     match release_incarnation(home, name, inc.as_deref()) {
         Ok((0, false)) => {}
-        Ok((n, marked)) => tracing::info!(name, dropped = n, marked, verdict = "rename_records_released",
-            measured = true, n_considered = n,
-            "a worker released its name; its incarnation's rename records were dropped"),
-        Err(e) => tracing::warn!(name, error = %e, verdict = "rename_records_release_failed", measured = true,
-            n_considered = 1, "a worker released its name but its rename records could not be updated"),
+        Ok((n, marked)) => tracing::info!(
+            name,
+            dropped = n,
+            marked,
+            verdict = "rename_records_released",
+            measured = true,
+            n_considered = n,
+            "a worker released its name; its incarnation's rename records were dropped"
+        ),
+        Err(e) => {
+            tracing::warn!(name, error = %e, verdict = "rename_records_release_failed", measured = true,
+            n_considered = 1, "a worker released its name but its rename records could not be updated")
+        }
     }
 }
 
-/// The holder a legacy record (no `inc`) reached under the old name-chain
-/// rule: newest record per old name, followed to the first live worker. None
-/// for a dead end or a cycle (ambiguous).
-fn legacy_holder(home: &Path, newest: &HashMap<String, String>, start: &str) -> Option<String> {
-    let mut seen = HashSet::from([start.to_string()]);
-    let mut cur = newest.get(start)?.clone();
+/// Follow mixed history to a live holder. Release markers, cycles and a
+/// current record whose incarnation is no longer live are hard boundaries.
+fn legacy_holder(home: &Path, newest: &HashMap<String, Rec>, records: &[Rec], start: &str) -> Option<String> {
+    let mut seen = HashSet::new();
+    let mut cur = start.to_string();
     loop {
+        if !super::session_verbs::valid_session_name(&cur) || !seen.insert(cur.clone()) {
+            return None;
+        }
+        let rec = newest.get(&cur)?;
+        if rec.released {
+            return None;
+        }
+        if let Some(inc) = rec.inc.as_deref() {
+            let holder = records
+                .iter()
+                .rev()
+                .find(|r| r.inc.as_deref() == Some(inc))?
+                .new
+                .as_deref()?;
+            return (super::session_verbs::valid_session_name(holder)
+                && incarnation(home, holder).as_deref() == Some(inc))
+            .then(|| holder.to_string());
+        }
+        cur = rec.new.clone()?;
+        if !super::session_verbs::valid_session_name(&cur) {
+            return None;
+        }
         if worker_exists(home, &cur) {
             return Some(cur);
         }
-        if !seen.insert(cur.clone()) {
-            return None;
-        }
-        cur = newest.get(&cur)?.clone();
     }
 }
 
-/// Rewrite legacy records (no `inc`) once: each gets its live holder's
-/// incarnation, or is dropped. Caller holds no lock; this takes it.
-fn migrate_legacy(home: &Path) {
-    let _w = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let path = record_path(home);
-    let Ok(text) = std::fs::read_to_string(&path) else { return };
-    let legacy: Vec<Rec> = text.lines().filter_map(parse).filter(Rec::legacy).collect();
-    if legacy.is_empty() {
-        return;
-    }
-    let newest: HashMap<String, String> =
-        legacy.iter().filter_map(|r| Some((r.old.clone(), r.new.clone()?))).collect();
-    let (mut migrated, mut dropped) = (0usize, 0usize);
-    let mut out = String::with_capacity(text.len());
-    for line in text.split_inclusive('\n') {
-        let Some(rec) = parse(line) else {
-            out.push_str(line);
-            continue;
+/// Settle legacy ownership once, before any lifecycle mutation. The version
+/// marker is published last: interruption leaves an idempotently retryable
+/// rewrite, never a marker claiming unfinished migration succeeded.
+pub(crate) fn ensure_migrated(home: &Path) -> std::io::Result<()> {
+    let result = (|| {
+        let _w = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let marker = home.join("renames.version");
+        match std::fs::read_to_string(&marker) {
+            Ok(v) if v == "1\n" => return Ok(()),
+            Ok(_) => return Err(std::io::Error::other("unsupported rename records version")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        std::fs::create_dir_all(home)?;
+        let path = record_path(home);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e),
         };
-        if !rec.legacy() {
-            out.push_str(line);
-            continue;
-        }
-        let inc = legacy_holder(home, &newest, &rec.old).and_then(|h| ensure_incarnation(home, &h).ok());
-        match inc {
-            Some(inc) => {
-                let mut v: Value = serde_json::from_str(line.trim_end()).unwrap_or_else(|_| json!({}));
-                v["inc"] = json!(inc);
-                out.push_str(&format!("{v}\n"));
-                migrated += 1;
+        let records: Vec<Rec> = text.lines().filter_map(parse).collect();
+        let legacy: Vec<&Rec> = records.iter().filter(|r| r.legacy()).collect();
+        let newest: HashMap<String, Rec> = records.iter().map(|r| (r.old.clone(), r.clone())).collect();
+        let (mut migrated, mut dropped) = (0usize, 0usize);
+        let mut out = String::with_capacity(text.len());
+        for line in text.split_inclusive('\n') {
+            let Some(rec) = parse(line) else {
+                out.push_str(line);
+                continue;
+            };
+            if !rec.legacy() {
+                out.push_str(line);
+                continue;
             }
-            None => dropped += 1,
+            let inc = match legacy_holder(home, &newest, &records, &rec.old) {
+                Some(holder) => Some(assign_incarnation(home, &holder)?),
+                None => None,
+            };
+            match inc {
+                Some(inc) => {
+                    let mut v: Value = serde_json::from_str(line.trim_end()).unwrap_or_else(|_| json!({}));
+                    v["inc"] = json!(inc);
+                    out.push_str(&format!("{v}\n"));
+                    migrated += 1;
+                }
+                None => dropped += 1,
+            }
         }
-    }
-    if let Err(e) = write_atomic(&path, &out) {
+        if !legacy.is_empty() {
+            write_atomic(&path, &out)?;
+            tracing::info!(
+                migrated,
+                dropped,
+                verdict = "rename_records_migrated",
+                measured = true,
+                n_considered = legacy.len(),
+                "legacy rename records were bound to their live holder's incarnation"
+            );
+            if dropped > 0 {
+                tracing::warn!(
+                    dropped,
+                    verdict = "rename_records_legacy_dropped",
+                    measured = true,
+                    n_considered = legacy.len(),
+                    "legacy rename records reached no live holder unambiguously and were dropped"
+                );
+            }
+        }
+        write_atomic(&marker, "1\n")
+    })();
+    if let Err(ref e) = result {
         tracing::warn!(error = %e, verdict = "rename_records_migration_failed", measured = true,
-            n_considered = legacy.len(), "legacy rename records could not be migrated; they are ignored");
-        return;
+            n_considered = 1, "rename identity operation blocked until legacy migration succeeds");
     }
-    tracing::info!(migrated, dropped, verdict = "rename_records_migrated", measured = true,
-        n_considered = legacy.len(), "legacy rename records were bound to their live holder's incarnation");
-    if dropped > 0 {
-        tracing::warn!(dropped, verdict = "rename_records_legacy_dropped", measured = true,
-            n_considered = legacy.len(),
-            "legacy rename records reached no live holder unambiguously and were dropped");
-    }
+    result
 }
 
 fn load(home: &Path) -> Vec<Rec> {
-    let read = || std::fs::read_to_string(record_path(home)).unwrap_or_default();
-    let mut text = read();
-    if text.lines().filter_map(parse).any(|r| r.legacy()) {
-        migrate_legacy(home);
-        text = read();
-    }
-    text.lines().filter_map(parse).filter(|r| !r.legacy()).collect()
+    std::fs::read_to_string(record_path(home))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(parse)
+        .filter(|r| !r.legacy())
+        .collect()
 }
 
 /// The name the worker once called `name` holds now, or None when `name` is
@@ -337,13 +429,19 @@ fn load(home: &Path) -> Vec<Rec> {
 /// (a worker now under its last name is a different incarnation). The live
 /// check runs first, so the common case reads no record.
 pub(crate) fn current_name(home: &Path, name: &str) -> Option<String> {
+    ensure_migrated(home).ok()?;
     if !super::session_verbs::valid_session_name(name) || worker_exists(home, name) {
         return None;
     }
     let records = load(home);
     // The newest line about the claimed name: a release marker ends it.
     let inc = records.iter().rev().find(|r| r.old == name)?.inc.clone()?;
-    let now = records.iter().rev().find(|r| r.inc.as_deref() == Some(inc.as_str()))?.new.clone()?;
+    let now = records
+        .iter()
+        .rev()
+        .find(|r| r.inc.as_deref() == Some(inc.as_str()))?
+        .new
+        .clone()?;
     if now == name || !worker_exists(home, &now) {
         return None;
     }
@@ -413,6 +511,103 @@ pub(crate) mod tests {
         std::fs::rename(env_file(home, old), env_file(home, new)).unwrap();
         record(home, old, new, &inc).unwrap();
         inc
+    }
+
+    async fn assert_consumers(home: &Path, expected: &str) {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+        let _home = crate::api::settings::test_env::set_home(home);
+        let app = Router::new()
+            .route(
+                "/who",
+                get(|h: axum::http::HeaderMap| async move {
+                    format!(
+                        "{}:{}",
+                        h["x-amux-worker"].to_str().unwrap(),
+                        h["x-amux-session"].to_str().unwrap()
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(resolve_headers));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/who")
+                    .header("x-amux-worker", "review-a")
+                    .header("x-amux-session", "review-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let header = String::from_utf8(body.to_vec()).unwrap();
+        let callback = crate::api::board::callback_target(home, "review-a".into());
+        assert_eq!(
+            (header, callback),
+            (format!("{expected}:{expected}"), expected.to_string())
+        );
+    }
+
+    fn legacy_fixture() -> tempfile::TempDir {
+        let d = home_with(&["review-b"]);
+        std::fs::write(record_path(d.path()), "{\"old\":\"review-a\",\"new\":\"review-b\"}\n").unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn release_before_first_legacy_read_does_not_rebind() {
+        let d = legacy_fixture();
+        release(d.path(), "review-b");
+        std::fs::remove_file(env_file(d.path(), "review-b")).unwrap();
+        live_worker(d.path(), "review-b");
+        assert_consumers(d.path(), "review-a").await;
+    }
+
+    #[tokio::test]
+    async fn rename_before_first_legacy_read_keeps_alias() {
+        let d = legacy_fixture();
+        // The real rename entry point must migrate BEFORE moving the env.
+        // ensure_incarnation is also an identity mutation boundary.
+        rename(d.path(), "review-b", "review-c");
+        assert_consumers(d.path(), "review-c").await;
+    }
+
+    #[tokio::test]
+    async fn retirement_before_first_legacy_read_does_not_rebind() {
+        let d = legacy_fixture();
+        // Retirement releases the .env.reaped copy after expiry.
+        std::fs::rename(
+            env_file(d.path(), "review-b"),
+            env_file(d.path(), "review-b").with_extension("env.reaped"),
+        )
+        .unwrap();
+        release(d.path(), "review-b");
+        live_worker(d.path(), "review-b");
+        assert_consumers(d.path(), "review-a").await;
+    }
+
+    #[test]
+    fn legacy_migration_is_idempotent() {
+        let d = legacy_fixture();
+        // A prior partial upgrade already wrote a current edge after a legacy
+        // one. Migration must follow both formats to the same live incarnation.
+        std::fs::rename(env_file(d.path(), "review-b"), env_file(d.path(), "review-c")).unwrap();
+        std::fs::write(env_file(d.path(), "review-c"), "CC_INCARNATION=mixed-inc\n").unwrap();
+        std::fs::OpenOptions::new().append(true).open(record_path(d.path())).unwrap()
+            .write_all(b"{\"old\":\"review-b\",\"new\":\"review-c\",\"inc\":\"mixed-inc\"}\n").unwrap();
+        ensure_migrated(d.path()).unwrap();
+        assert_eq!(current_name(d.path(), "review-a").as_deref(), Some("review-c"));
+        assert_eq!(current_name(d.path(), "review-b").as_deref(), Some("review-c"));
+        let once = std::fs::read(record_path(d.path())).unwrap();
+        let env = std::fs::read(env_file(d.path(), "review-c")).unwrap();
+        let marker = d.path().join("renames.version");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap_or_default(), "1\n");
+        let version_time = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        ensure_migrated(d.path()).unwrap();
+        assert_eq!(std::fs::metadata(&marker).unwrap().modified().unwrap(), version_time);
+        assert_eq!(std::fs::read(record_path(d.path())).unwrap(), once);
+        assert_eq!(std::fs::read(env_file(d.path(), "review-c")).unwrap(), env);
     }
 
     #[test]

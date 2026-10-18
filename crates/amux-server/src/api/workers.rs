@@ -3157,6 +3157,10 @@ mod tests {
             (&me, "PUT", "/api/config/apply", json!({"workers": [{"name": "review-dev-lead", "flags": "--x"}]}), 403),
             (&lead, "POST", "/api/sessions", create, 400),
         ];
+        // This in-process router bypasses async_main: perform its startup
+        // migration before asserting refused requests cannot change files.
+        crate::api::rename_identity::ensure_migrated(home.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(home.path().join("renames.version")).unwrap(), "1\n");
         let before = snapshot(home.path());
         for (headers, m, path, body, want) in &cases {
             let (st, _, v) = send_with(&app, m, path, Some(body.clone()), headers).await;

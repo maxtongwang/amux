@@ -30841,6 +30841,9 @@ fn find_latest_session_id(work_dir: &str) -> String {
 }
 
 async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Response {
+    if let Err(error) = super::rename_identity::ensure_migrated(&home()) {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": error.to_string()}));
+    }
     if !session_destructive_allowed(state, headers) {
         return jresp(
             StatusCode::FORBIDDEN,
@@ -32625,6 +32628,9 @@ async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response
         }));
     }
     let _serialize = RENAME_LOCK.lock().await;
+    if let Err(error) = super::rename_identity::ensure_migrated(&home()) {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": error.to_string()}));
+    }
     let old_env = env_path(name);
     let new_env = env_path(&new_name);
     let resuming = !old_env.exists() && new_env.exists();
