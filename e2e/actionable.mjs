@@ -1,4 +1,4 @@
-// Browser-free half of the e2e actionability contract (helpers.ts waitForActionable) — pure so node:test can pin it.
+// The e2e actionability contract behind helpers.ts waitForActionable/clickWhenActionable — browser-free so node:test can pin it.
 // Hosted e2e failure investigation, "Proposed bounded fix" item 2: one deadline, measured stability, a named failure.
 
 export const ACTIONABLE_DEFAULT_BUDGET_MS = 15_000;
@@ -167,4 +167,145 @@ export function buildNotActionable(f) {
   ].join('\n');
   const line = JSON.stringify({ verdict: ACTIONABLE_VERDICT, measured: true, n_considered: 1, ...details });
   return { error: new ActionableTimeout(message, details), line };
+}
+
+// ── The preflight loop and the single click ────────────────────────────────
+// They live here, over a Playwright-shaped locator, so node:test can drive
+// them with fake locators (actionable.test.mjs). helpers.ts supplies `env`:
+// the browser-only failure context (cover probe, screenshot, project/shard).
+
+/** Browser-side: sample the target's box on `frames` consecutive animation frames. Serialized into the page. */
+export function sampleFrames(el, frames) {
+  return new Promise((resolve) => {
+    const rects = [];
+    const take = () => {
+      const r = el.getBoundingClientRect();
+      rects.push({ x: r.x, y: r.y, width: r.width, height: r.height });
+      if (rects.length >= frames) resolve({ rects, viewport: { width: innerWidth, height: innerHeight } });
+      else requestAnimationFrame(take);
+    };
+    requestAnimationFrame(take);
+  });
+}
+
+const nextFrame = (target, deadline) =>
+  raceDeadline(target.page().evaluate(() => new Promise((r) => requestAnimationFrame(() => r(null)))), deadline, 'frame pacing');
+
+const firstLine = e => String(e?.message ?? e).split('\n')[0];
+
+async function notActionable(target, label, deadline, phase, reason, lastError, env) {
+  const elapsedMs = deadline.elapsed();
+  const context = env?.failureContext ? await env.failureContext(target, label) : { coverWhy: 'no failure probe supplied' };
+  const { error, line } = buildNotActionable({
+    ...context,
+    elapsedMs,
+    budgetMs: deadline.budgetMs,
+    selector: String(target),
+    label,
+    phase,
+    reason,
+    callLog: extractCallLog(lastError?.message),
+  });
+  (env?.log ?? console.log)(line);
+  return error;
+}
+
+/**
+ * The waitForActionable contract (documented on the helpers.ts export), over
+ * any Playwright-shaped locator. Every step is given at most the remaining
+ * budget, so the one deadline bounds the whole preflight.
+ */
+export async function waitForActionableWith(target, options, env) {
+  const opts = normalizeActionableOptions(options);
+  const deadline = createDeadline(opts.budgetMs);
+  let phase = 'resolve';
+  let reason = 'no attempt completed';
+  let lastError = null;
+  // The last FINISHED attempt's verdict. A budget that runs out early in a fresh
+  // attempt must not overwrite it, or a covered target would report "resolve".
+  let outcome = null;
+  const finish = () => { outcome = { phase, reason }; };
+  while (!deadline.expired() && !target.page().isClosed()) {
+    try {
+      phase = 'resolve';
+      const n = await raceDeadline(target.count(), deadline, 'resolve');
+      if (n !== 1) {
+        reason = `${n} elements match; exactly one attached element is required`;
+        finish();
+        await nextFrame(target, deadline);
+        continue;
+      }
+      phase = 'visible';
+      if (!(await raceDeadline(target.isVisible(), deadline, 'visible'))) {
+        reason = 'attached but not visible';
+        finish();
+        await nextFrame(target, deadline);
+        continue;
+      }
+      phase = 'enabled';
+      if (!(await target.isEnabled({ timeout: deadline.timeout(2_000) }))) {
+        reason = 'visible but disabled';
+        finish();
+        await nextFrame(target, deadline);
+        continue;
+      }
+      if (opts.scroll) {
+        phase = 'scroll';
+        await target.scrollIntoViewIfNeeded({ timeout: deadline.timeout(3_000) });
+      }
+      phase = 'stable';
+      const sample = await raceDeadline(
+        target.evaluate(sampleFrames, opts.stableFrames, { timeout: deadline.timeout() }), deadline, 'stability sampling');
+      const rect = sample.rects[sample.rects.length - 1];
+      if (!stableRun(sample.rects)) {
+        reason = `bounding box still moving across ${opts.stableFrames} animation frames`;
+        finish();
+        continue; // the sampling itself waited those frames
+      }
+      phase = 'viewport';
+      if (!centreInViewport(rect, sample.viewport)) {
+        reason = opts.scroll
+          ? 'at rest with its centre outside the viewport after scrolling'
+          : 'centre outside the viewport and scrolling is disabled for this check';
+        finish();
+        await nextFrame(target, deadline);
+        continue;
+      }
+      phase = 'hit-test';
+      reason = 'trial click did not pass (another element receives the pointer events, or the target changed)';
+      await target.click({ trial: true, timeout: deadline.timeout() });
+      return { deadline, rect };
+    } catch (e) {
+      if (e instanceof DeadlineExceeded) {
+        if (!outcome) reason = `budget ended during ${phase}`;
+        break;
+      }
+      lastError = e; // keep Playwright's own error: its message carries the call log
+      if (phase !== 'hit-test') reason = `${phase} step threw: ${firstLine(e)}`;
+      finish();
+      // The trial click was given the whole remaining budget, so its timeout IS
+      // the deadline; stop here and keep its call log ("... intercepts pointer events").
+      if (phase === 'hit-test' && e?.name === 'TimeoutError') break;
+      await nextFrame(target, deadline).catch(() => {}); // pace a fast-failing step; expiry ends the loop
+    }
+  }
+  const final = outcome ?? { phase, reason };
+  if (target.page().isClosed()) final.reason = `page closed during ${phase}; ${final.reason}`;
+  throw await notActionable(target, opts.label, deadline, final.phase, final.reason, lastError, env);
+}
+
+/**
+ * waitForActionableWith, then exactly ONE real click with the remaining budget.
+ * The click is never retried: it may already have been delivered, and a second
+ * delivery of a business action is a different bug. Assert its effect after.
+ */
+export async function clickWhenActionableWith(target, options, env) {
+  const label = normalizeActionableOptions(options).label;
+  const { deadline } = await waitForActionableWith(target, options, env);
+  try {
+    await target.click({ timeout: deadline.timeout() });
+  } catch (e) {
+    throw await notActionable(target, label, deadline, 'click',
+      'the single real click failed after a passing preflight (re-render or new cover in between)', e, env);
+  }
 }

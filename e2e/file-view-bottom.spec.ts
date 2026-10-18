@@ -1,3 +1,4 @@
+// File view bottom edge: every viewer's last line is reachable at every size, late responses cannot replace the current file.
 import {test, expect, Page, allowUnusedRoute} from './fixtures';
 import {cleanup} from './teardown';
 import {mkdtemp, writeFile, rm, copyFile, readFile} from 'node:fs/promises';
@@ -374,10 +375,22 @@ test('late directory and file responses cannot replace the worker current file',
     ] as const){
       let release!:()=>void, arrived!:()=>void, completed!:()=>void;
       const held=new Promise<void>(r=>release=r), seen=new Promise<void>(r=>arrived=r), done=new Promise<void>(r=>completed=r);
-      await page.route(matcher,async route=>{
-        const response=await route.fetch();arrived();await held;
-        await route.fulfill({response});completed();
+      // EVERY request this route matched is owned by this test, not just the
+      // first: the view can issue a second matching /api/ls, and its handler
+      // was still inside route.fetch() when the old unroute returned, so it
+      // threw "Test ended" into the NEXT test (F10: stack at this test, failure
+      // reported at the next). Each handler is tracked, its error kept here, and
+      // all of them are drained before this iteration ends.
+      const handlers:Promise<void>[]=[], handlerErrors:string[]=[];
+      await page.route(matcher,route=>{
+        const handled=(async()=>{
+          const response=await route.fetch();arrived();await held;
+          await route.fulfill({response});completed();
+        })().catch(e=>{handlerErrors.push(String(e?.message??e).split('\n')[0]);});
+        handlers.push(handled);
+        return handled;
       });
+      const drain=async()=>{await page.unroute(matcher);await Promise.all(handlers);};
       try{
         await start();await seen;
         await page.evaluate(p=>(window as any)._psfViewFile(p),currentFile);
@@ -387,7 +400,10 @@ test('late directory and file responses cannot replace the worker current file',
         await expect(page.locator('#psf-body')).toContainText(end);
         await expect(page.locator('#psf-body')).not.toContainText('OLD_FILE_MUST_NOT_REPLACE_CURRENT');
         await finalLine(page,'#psf-body .file-overlay-body');
-      }finally{release();await cleanup('unroute held response', () => page.unroute(matcher));}
+        // Drained inside the test body, so a handler failure fails THIS test.
+        await drain();
+        expect(handlerErrors,`held ${String(matcher)} handlers (${handlers.length}) all completed`).toEqual([]);
+      }finally{release();await cleanup('drain held route handlers', drain);}
     }
   }finally { await cleanup('remove temp folder', () => rm(dir,{recursive:true,force:true})); }
 });

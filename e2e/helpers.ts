@@ -3,14 +3,9 @@
 import { test, BrowserContext, Locator } from '@playwright/test';
 import {
   ActionableTimeout,
-  DeadlineExceeded,
-  buildNotActionable,
-  centreInViewport,
+  clickWhenActionableWith,
   createDeadline,
-  extractCallLog,
-  normalizeActionableOptions,
-  raceDeadline,
-  stableRun,
+  waitForActionableWith,
 } from './actionable.mjs';
 
 export { ActionableTimeout };
@@ -36,20 +31,7 @@ export interface Actionable {
   rect: Rect;
 }
 
-// Browser-side probes. Self-contained: Playwright serializes them into the page.
-function sampleFrames(el: Element, frames: number) {
-  return new Promise<{ rects: Rect[]; viewport: Viewport }>((resolve) => {
-    const rects: Rect[] = [];
-    const take = () => {
-      const r = el.getBoundingClientRect();
-      rects.push({ x: r.x, y: r.y, width: r.width, height: r.height });
-      if (rects.length >= frames) resolve({ rects, viewport: { width: innerWidth, height: innerHeight } });
-      else requestAnimationFrame(take);
-    };
-    requestAnimationFrame(take);
-  });
-}
-
+// Browser-side probe for the failure report. Self-contained: Playwright serializes it into the page.
 function probeCover(el: Element) {
   const r = el.getBoundingClientRect();
   const rect = { x: r.x, y: r.y, width: r.width, height: r.height };
@@ -68,9 +50,6 @@ function probeCover(el: Element) {
   }
   return { rect, viewport, cover: { chain, truncated: !top(n) }, why: null };
 }
-
-const nextFrame = (target: Locator, deadline: Deadline) =>
-  raceDeadline(target.page().evaluate(() => new Promise((r) => requestAnimationFrame(() => r(null)))), deadline, 'frame pacing');
 
 /**
  * Wait until `target` can really take a click, under ONE total deadline.
@@ -91,84 +70,12 @@ const nextFrame = (target: Locator, deadline: Deadline) =>
  * element, rect, viewport, project/shard/worker, elapsed/budget, a screenshot
  * attachment and Playwright's call log, and prints one measured
  * `e2e_not_actionable` verdict line for the CI log sweep.
+ *
+ * The loop itself is actionable.mjs waitForActionableWith, so node:test pins
+ * it with fake locators; this file adds only the browser failure context.
  */
 export async function waitForActionable(target: Locator, options?: ActionableOptions): Promise<Actionable> {
-  const opts = normalizeActionableOptions(options);
-  const deadline = createDeadline(opts.budgetMs);
-  let phase = 'resolve';
-  let reason = 'no attempt completed';
-  let lastError: unknown = null;
-  // The last FINISHED attempt's verdict. A budget that runs out early in a fresh
-  // attempt must not overwrite it, or a covered target would report "resolve".
-  let outcome: { phase: string; reason: string } | null = null;
-  const finish = () => { outcome = { phase, reason }; };
-  while (!deadline.expired() && !target.page().isClosed()) {
-    try {
-      phase = 'resolve';
-      const n = await raceDeadline(target.count(), deadline, 'resolve');
-      if (n !== 1) {
-        reason = `${n} elements match; exactly one attached element is required`;
-        finish();
-        await nextFrame(target, deadline);
-        continue;
-      }
-      phase = 'visible';
-      if (!(await raceDeadline(target.isVisible(), deadline, 'visible'))) {
-        reason = 'attached but not visible';
-        finish();
-        await nextFrame(target, deadline);
-        continue;
-      }
-      phase = 'enabled';
-      if (!(await target.isEnabled({ timeout: deadline.timeout(2_000) }))) {
-        reason = 'visible but disabled';
-        finish();
-        await nextFrame(target, deadline);
-        continue;
-      }
-      if (opts.scroll) {
-        phase = 'scroll';
-        await target.scrollIntoViewIfNeeded({ timeout: deadline.timeout(3_000) });
-      }
-      phase = 'stable';
-      const sample = await raceDeadline(
-        target.evaluate(sampleFrames, opts.stableFrames, { timeout: deadline.timeout() }), deadline, 'stability sampling');
-      const rect = sample.rects[sample.rects.length - 1];
-      if (!stableRun(sample.rects)) {
-        reason = `bounding box still moving across ${opts.stableFrames} animation frames`;
-        finish();
-        continue; // the sampling itself waited those frames
-      }
-      phase = 'viewport';
-      if (!centreInViewport(rect, sample.viewport)) {
-        reason = opts.scroll
-          ? 'at rest with its centre outside the viewport after scrolling'
-          : 'centre outside the viewport and scrolling is disabled for this check';
-        finish();
-        await nextFrame(target, deadline);
-        continue;
-      }
-      phase = 'hit-test';
-      reason = 'trial click did not pass (another element receives the pointer events, or the target changed)';
-      await target.click({ trial: true, timeout: deadline.timeout() });
-      return { deadline, rect };
-    } catch (e) {
-      if (e instanceof DeadlineExceeded) {
-        if (!outcome) reason = `budget ended during ${phase}`;
-        break;
-      }
-      lastError = e; // keep Playwright's own error: its message carries the call log
-      if (phase !== 'hit-test') reason = `${phase} step threw: ${firstLine(e)}`;
-      finish();
-      // The trial click was given the whole remaining budget, so its timeout IS
-      // the deadline; stop here and keep its call log ("... intercepts pointer events").
-      if (phase === 'hit-test' && (e as Error)?.name === 'TimeoutError') break;
-      await nextFrame(target, deadline).catch(() => {}); // pace a fast-failing step; expiry ends the loop
-    }
-  }
-  const final: { phase: string; reason: string } = outcome ?? { phase, reason };
-  if (target.page().isClosed()) final.reason = `page closed during ${phase}; ${final.reason}`;
-  throw await notActionable(target, opts.label, deadline, final.phase, final.reason, lastError);
+  return waitForActionableWith(target, options, BROWSER_ENV);
 }
 
 /**
@@ -177,24 +84,15 @@ export async function waitForActionable(target: Locator, options?: ActionableOpt
  * delivery of a business action is a different bug. Assert its effect after.
  */
 export async function clickWhenActionable(target: Locator, options?: ActionableOptions): Promise<void> {
-  const label = normalizeActionableOptions(options).label;
-  const { deadline } = await waitForActionable(target, options);
-  try {
-    await target.click({ timeout: deadline.timeout() });
-  } catch (e) {
-    throw await notActionable(target, label, deadline, 'click',
-      'the single real click failed after a passing preflight (re-render or new cover in between)', e);
-  }
+  await clickWhenActionableWith(target, options, BROWSER_ENV);
 }
 
 function firstLine(e: unknown): string {
   return String((e as Error)?.message ?? e).split('\n')[0];
 }
 
-async function notActionable(
-  target: Locator, label: string | null, deadline: Deadline, phase: string, reason: string, lastError: unknown,
-): Promise<ActionableTimeout> {
-  const elapsedMs = deadline.elapsed();
+/** What a failure report needs that only a live browser and the test runner can supply. */
+async function failureContext(target: Locator, label: string | null) {
   const page = target.page();
   let info: ReturnType<typeof test.info> | null = null;
   try { info = test.info(); } catch { info = null; }
@@ -226,26 +124,19 @@ async function notActionable(
       screenshot = `failed: ${firstLine(e)}`;
     }
   }
-  const { error, line } = buildNotActionable({
+  return {
     project: info?.project.name ?? null,
     shard: process.env.AMUX_E2E_SHARD || (shardCfg ? `${shardCfg.current}/${shardCfg.total}` : null),
     worker: info ? info.workerIndex : null,
-    elapsedMs,
-    budgetMs: deadline.budgetMs,
-    selector: String(target),
-    label,
-    phase,
-    reason,
     rect,
     viewport,
     cover,
     coverWhy,
     screenshot,
-    callLog: extractCallLog((lastError as Error)?.message),
-  });
-  console.log(line);
-  return error;
+  };
 }
+
+const BROWSER_ENV = { failureContext };
 
 /**
  * Click something inside a scroll-snap container (the board kanban) reliably.

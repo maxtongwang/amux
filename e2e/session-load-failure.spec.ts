@@ -1,4 +1,6 @@
+// Session-list read failures: access errors, transient overloads and their autonomous recovery.
 import { test, expect, Page } from './fixtures';
+import { cleanup } from './teardown';
 
 async function anonymousShell(page: Page, cached = false) {
   await page.addInitScript(({ cached }) => {
@@ -91,23 +93,39 @@ test('a transient worker-list overload heals without making the user click Retry
       close() {}
     }});
   });
+  // The recovery answer is HELD until the notice has been seen. Answered at
+  // once, the 1s backoff retry could clear the notice just as the assertion
+  // began on a loaded runner (F14: retry fulfilled 5ms after it started).
   let attempts = 0;
+  let releaseRecovery!: () => void;
+  const recoveryHeld = new Promise<void>(r => { releaseRecovery = r; });
+  const handlers: Promise<void>[] = [];
   await page.route(/\/api\/sessions(?:\?.*)?$/, route => {
     attempts++;
     if (attempts === 1) {
       return route.fulfill({status:503, contentType:'application/json',
         body:'{"error":"temporarily unavailable"}'});
     }
-    return route.fulfill({status:200, contentType:'application/json', body:'[]'});
+    const answered = recoveryHeld.then(() => route.fulfill({status:200, contentType:'application/json', body:'[]'}));
+    handlers.push(answered);
+    return answered;
   });
-  await page.goto('/#view=workers');
-  await expect(page.locator('#session-read-notice')).toBeEmpty();
-  await page.locator('#conn-status').first().click();
-  const notice = page.locator('#conn-modal-read-notice');
-  await expect(notice).toContainText('Worker updates are unavailable');
-  await expect.poll(() => attempts).toBe(2);
-  await expect(notice).toBeEmpty();
-  await expect(page.locator('#conn-status').first()).toHaveText(/Live|Polling/);
+  try {
+    await page.goto('/#view=workers');
+    await expect(page.locator('#session-read-notice')).toBeEmpty();
+    await page.locator('#conn-status').first().click();
+    const notice = page.locator('#conn-modal-read-notice');
+    await expect(notice).toContainText('Worker updates are unavailable');
+    // The backoff timer, not a click, issued the retry: it is already waiting.
+    await expect.poll(() => attempts).toBe(2);
+    await expect(notice).toContainText('Worker updates are unavailable');
+    releaseRecovery();
+    await expect(notice).toBeEmpty();
+    await expect(page.locator('#conn-status').first()).toHaveText(/Live|Polling/);
+  } finally {
+    releaseRecovery();
+    await cleanup('drain held sessions answers', () => Promise.all(handlers));
+  }
 });
 
 test('an authorization failure does not start the transient-error retry loop', async ({page}) => {

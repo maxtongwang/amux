@@ -420,14 +420,29 @@ test('Converse (OpenAI Realtime): ask_worker goes to the chat companion, usage a
     await rt({ type: 'response.done', response: { id: 'r2', output: [], usage: {
       input_token_details: { audio_tokens: 120, text_tokens: 800, cached_tokens: 0 }, output_token_details: { audio_tokens: 300, text_tokens: 40 } } } });
     await expect(page.locator('#vx-live')).toContainText('tests are green');
+    // "Start" only means the call is no longer active; _vxEnd paints it before
+    // its serialized FINAL save lands (F15 read usage 0 in that gap). The
+    // receipt is the final save's own response: this conversation's POST with
+    // ended_at set, answered OK.
+    const finalSave = page.waitForResponse(r => {
+      if (r.request().method() !== 'POST' || new URL(r.url()).pathname !== conv) return false;
+      const body = r.request().postDataJSON();
+      return body?.engine === 'openai' && !!body.ended_at;
+    }, { timeout: 15_000 });
     await page.locator('#vx-call').click();
     await expect(page.locator('#vx-call-lbl')).toHaveText('Start');
+    const saved = await finalSave;
+    expect(saved.ok(), `final save answered ${saved.status()}`).toBe(true);
+    const finalBody = saved.request().postDataJSON();
     expect(chat.state.terminal, 'the worker terminal send path was never called').toBe(0);
 
     const listed = await (await request.get(conv, { headers: auth })).json();
     const rec = listed.conversations.find((c: any) => c.engine === 'openai');
     expect(rec, 'the Realtime conversation is logged').toBeTruthy();
+    expect(rec.id, 'the listed record is the one whose final save landed').toBe(finalBody.id);
     const full = await (await request.get(`${conv}/${rec.id}`, { headers: auth })).json();
+    expect(full.ended_at, 'the stored record is the final save').toBeTruthy();
+    expect(full.rev, 'the stored revision is the final save\'s revision').toBe(finalBody.rev);
     expect(full.usage.input_audio_tokens).toBe(120);
     expect(full.usage.output_audio_tokens).toBe(300);
     expect(full.usage.audio_in_ms).toBeGreaterThan(0);

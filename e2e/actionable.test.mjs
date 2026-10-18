@@ -1,4 +1,4 @@
-// Unit contract for e2e/actionable.mjs, the browser-free half of waitForActionable — refs report "Proposed bounded fix" item 2.
+// Unit contract for e2e/actionable.mjs, the browser-free waitForActionable/clickWhenActionable — refs report "Proposed bounded fix" item 2.
 // Runs in spa-gates (`node --test e2e/*.test.mjs`); the browser half is e2e/actionable-helper.spec.ts.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -9,6 +9,7 @@ import {
   DeadlineExceeded,
   buildNotActionable,
   centreInViewport,
+  clickWhenActionableWith,
   createDeadline,
   extractCallLog,
   formatElementPath,
@@ -16,6 +17,7 @@ import {
   raceDeadline,
   rectsStable,
   stableRun,
+  waitForActionableWith,
 } from './actionable.mjs';
 
 const R = (x, y, width = 40, height = 20) => ({ x, y, width, height });
@@ -189,22 +191,103 @@ test('failure: an unmeasured cover says so instead of reading as "not covered"',
   assert.match(clear.error.message, /not covered/);
 });
 
-// What the predicate reads: helpers.ts with // and /* */ comments removed, so prose about
-// these words cannot satisfy or trip it. It fails if a forced click, a sleep, or a
-// non-delegating clickSnapped is written in code.
-test('helpers.ts: no forced click, no sleep, and clickSnapped delegates to the shared contract', () => {
-  const src = fs.readFileSync(new URL('./helpers.ts', import.meta.url), 'utf8');
+// What the predicate reads: helpers.ts and actionable.mjs with // and /* */ comments removed,
+// so prose about these words cannot satisfy or trip it. It fails if a forced click, a sleep,
+// a click in helpers.ts, or a non-delegating clickSnapped/clickWhenActionable is written in code.
+const codeOf = name => {
+  const src = fs.readFileSync(new URL(name, import.meta.url), 'utf8');
   const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`])\/\/.*$/gm, '$1');
-  assert.ok(code.length > 200, 'comment stripping left the code');
+  assert.ok(code.length > 200, `comment stripping left the code of ${name}`);
+  return code;
+};
+test('helpers.ts: no forced click, no sleep, and every click helper delegates to the shared contract', () => {
+  const code = codeOf('./helpers.ts');
   assert.doesNotMatch(code, /\bforce\s*:/);
   assert.doesNotMatch(code, /waitForTimeout\s*\(/);
   assert.doesNotMatch(code, /\bsetTimeout\s*\(/);
+  assert.doesNotMatch(code, /\.click\(/, 'helpers.ts issues no click of its own; actionable.mjs owns the one real click');
   const body = /export async function clickSnapped\([^)]*\)[^{]*\{([\s\S]*?)\n\}/.exec(code);
   assert.ok(body, 'clickSnapped is defined');
   assert.match(body[1], /clickWhenActionable\(/);
-  assert.doesNotMatch(body[1], /\.click\(/, 'clickSnapped performs no click of its own');
-  // The real click is issued once: exactly one non-trial .click( call in the file.
+  const cwa = /export async function clickWhenActionable\([^)]*\)[^{]*\{([\s\S]*?)\n\}/.exec(code);
+  assert.ok(cwa, 'clickWhenActionable is defined');
+  assert.match(cwa[1], /clickWhenActionableWith\(/);
+});
+test('actionable.mjs: no forced click or sleep; one real click and one trial click in code', () => {
+  const code = codeOf('./actionable.mjs');
+  assert.doesNotMatch(code, /\bforce\s*:/);
+  assert.doesNotMatch(code, /waitForTimeout\s*\(/);
   const clicks = code.match(/\.click\(\{[^}]*\}\)/g) || [];
   assert.equal(clicks.filter(c => !/trial:\s*true/.test(c)).length, 1, clicks.join(' | '));
   assert.equal(clicks.filter(c => /trial:\s*true/.test(c)).length, 1, 'one trial (hit-test) click');
 });
+
+// ── The loop itself, driven by fake locators (PR-2 review follow-ups) ────────
+// A fake is Playwright-shaped: each method resolves like the real one, and any
+// step handed a `timeout` that hangs honours it the way Playwright does, by
+// waiting that long and throwing a TimeoutError. So a step given more than the
+// remaining budget visibly overruns the budget.
+const REST = R(20, 20);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const timeoutError = ms => Object.assign(new Error(`Timeout ${ms}ms exceeded.`), { name: 'TimeoutError' });
+
+function fakeLocator(over = {}) {
+  const calls = { trial: 0, real: 0, steps: [] };
+  const page = { isClosed: () => false, evaluate: async () => null };
+  const record = (step, opts) => calls.steps.push({ step, at: Date.now(), timeout: opts?.timeout });
+  const loc = {
+    calls,
+    page: () => page,
+    toString: () => "locator('#fake')",
+    count: async () => 1,
+    isVisible: async () => true,
+    async isEnabled(opts) { record('enabled', opts); return over.isEnabled ? over.isEnabled(opts) : true; },
+    async scrollIntoViewIfNeeded(opts) { record('scroll', opts); if (over.scroll) await over.scroll(opts); },
+    async evaluate(_fn, _arg, opts) { record('stable', opts); return { rects: [REST, REST, REST], viewport: { width: 400, height: 800 } }; },
+    async click(opts) {
+      record(opts?.trial ? 'trial' : 'click', opts);
+      if (opts?.trial) { calls.trial++; return; }
+      calls.real++;
+      if (over.click) await over.click(opts);
+    },
+  };
+  return loc;
+}
+const quiet = { failureContext: async () => ({ coverWhy: 'fake locator' }), log: () => {} };
+
+test('clickWhenActionable: a failing real click is performed exactly once, never retried', async () => {
+  const loc = fakeLocator({ click: async () => { throw new Error('Element is not attached to the DOM'); } });
+  await assert.rejects(clickWhenActionableWith(loc, { budgetMs: 2_000 }, quiet),
+    e => e instanceof ActionableTimeout && e.phase === 'click');
+  assert.equal(loc.calls.real, 1, `real clicks issued: ${loc.calls.real}`);
+  assert.equal(loc.calls.trial, 1, 'the preflight passed once and was not re-run after the click failed');
+  // And the success path clicks once too.
+  const ok = fakeLocator();
+  await clickWhenActionableWith(ok, { budgetMs: 2_000 }, quiet);
+  assert.equal(ok.calls.real, 1);
+});
+
+// Budget small enough that an uncapped 2s/3s step cap is a visible overrun.
+const BUDGET = 150;
+const MARGIN = 100;
+for (const [phase, over] of [
+  ['enabled', { isEnabled: async opts => { await sleep(opts.timeout); throw timeoutError(opts.timeout); } }],
+  ['scroll', { scroll: async opts => { await sleep(opts.timeout); throw timeoutError(opts.timeout); } }],
+]) {
+  test(`deadline: a hung ${phase} step gets only the remaining budget, and elapsed_ms stays within it`, async () => {
+    const loc = fakeLocator(over);
+    const t0 = Date.now();
+    let err;
+    await assert.rejects(waitForActionableWith(loc, { budgetMs: BUDGET }, quiet), e => { err = e; return e instanceof ActionableTimeout; });
+    assert.equal(err.phase, phase);
+    assert.ok(err.details.elapsed_ms <= BUDGET + MARGIN, `elapsed_ms ${err.details.elapsed_ms} > ${BUDGET}+${MARGIN}`);
+    assert.equal(err.details.budget_ms, BUDGET);
+    const given = loc.calls.steps.filter(s => s.timeout !== undefined);
+    assert.ok(given.some(s => s.step === phase), `the ${phase} step was reached and handed a timeout`);
+    for (const s of given) {
+      const remaining = BUDGET - (s.at - t0);
+      assert.ok(s.timeout <= remaining + 5, `${s.step} was given ${s.timeout}ms with ~${remaining}ms of budget left`);
+      assert.ok(s.timeout >= 1, `${s.step} timeout ${s.timeout} (0 means wait forever)`);
+    }
+  });
+}
