@@ -1,4 +1,4 @@
-import { test, expect, Page } from './fixtures';
+import { test, expect, Page, peekFilterProbe } from './operands';
 
 async function sourceFilter(page: Page, kind: string) {
   await page.getByRole('button', {name:'Filter messages', exact:true}).click();
@@ -551,7 +551,12 @@ async function filterSpecimen(page: Page) {
   });
 }
 
-test('filter button combines source and content with Find, then resets both without losing the query', async ({page}) => {
+test('filter button combines source and content with Find, then resets both without losing the query', async ({page, operands}) => {
+  // F11 operands: the filter's inputs per prompt, and any refresh that replaced the injected rows or board.
+  operands({label:'peek-filter', paths:['/api/history','/api/board','/api/sessions','/api/client-debug'], jsonPaths:['/api/client-debug'],
+    globals:['peekSession','_peekMsgRowsFor','_peekMsgRows','_peekKindHintsFor','_peekKindHints','_peekMsgNavKind','_peekMsgNavContent','peekSearchQuery'],
+    dom:['#peek-msg-count','#peek-filter-summary','[name="peek-filter-source"]:checked','[name="peek-filter-content"]:checked'],
+    probe:peekFilterProbe('AMUX-4242')});
   await filterSpecimen(page);
   await page.getByRole('button', {name:'Filter messages', exact:true}).click();
   const panel=page.getByRole('dialog', {name:'Filter worker messages'});
