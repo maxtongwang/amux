@@ -10,7 +10,14 @@ require_test_keychain() {
     *) echo 'Refusing --keychain: use mktemp under TMPDIR or /tmp' >&2; return 2 ;;
   esac
   [ ! -L "$1" ] || { echo 'Refusing --keychain: symlink' >&2; return 2; }
-  [ "$1" = "$AMUX_CODESIGN_TEST_DIR/k.keychain-db" ] || {
+  expected=${AMUX_CODESIGN_TEST_KEYCHAIN:-$AMUX_CODESIGN_TEST_DIR/k.keychain-db}
+  if [ -n "${AMUX_CODESIGN_TEST_KEYCHAIN:-}" ]; then
+    case "$expected" in
+      "$HOME"/Library/Keychains/amux-codesign-ci-*.keychain-db) ;;
+      *) echo 'Refusing --keychain: test keychain must be disposable under Library/Keychains' >&2; return 2 ;;
+    esac
+  fi
+  [ "$1" = "$expected" ] || {
     echo 'Refusing --keychain: path must be the disposable test keychain' >&2; return 2;
   }
 }

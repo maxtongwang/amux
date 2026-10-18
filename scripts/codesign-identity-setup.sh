@@ -12,7 +12,7 @@ trap cleanup EXIT
 run() { if [ "${DRY_RUN:-0}" = 1 ]; then plan_command "$@"; else "$@"; fi; }
 [ "$(uname -s)" = Darwin ] || { echo 'macOS only' >&2; exit 2; }
 if [ -n "${AMUX_CODESIGN_TEST_DIR:-}" ]; then
-  keychain="$AMUX_CODESIGN_TEST_DIR/k.keychain-db"
+  keychain="${AMUX_CODESIGN_TEST_KEYCHAIN:-$AMUX_CODESIGN_TEST_DIR/k.keychain-db}"
   require_test_keychain "$keychain" || exit 2
   password_file="$AMUX_CODESIGN_TEST_DIR/keychain-password"
 else

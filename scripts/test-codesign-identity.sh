@@ -64,7 +64,8 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 tmp_root=${TMPDIR:-/tmp}
 work=$(mktemp -d "${tmp_root%/}/amux-codesign.XXXXXXXX")
 export AMUX_CODESIGN_TEST_DIR=$work
-keychain="$work/k.keychain-db"
+keychain="$HOME/Library/Keychains/amux-codesign-ci-$(basename "$work").keychain-db"
+export AMUX_CODESIGN_TEST_KEYCHAIN="$keychain"
 password=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
 export AMUX_CODESIGN_TEST_PASSWORD=$password
 cleanup() {

@@ -6,10 +6,14 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 work=$(mktemp -d "${TMPDIR:-/tmp}/amux-codesign.XXXXXX")
 work=$(cd "$work" && pwd -P)
 export AMUX_CODESIGN_TEST_DIR="$work"
-keychain="$work/k.keychain-db"
+keychain="$HOME/Library/Keychains/amux-codesign-ci-$(basename "$work").keychain-db"
+export AMUX_CODESIGN_TEST_KEYCHAIN="$keychain"
 source "$repo/scripts/codesign-keychain-guard.sh"
 require_test_keychain "$keychain" || exit 2
-cleanup() { rm -rf "$work"; }
+cleanup() {
+  security delete-keychain "$keychain" >/dev/null 2>&1 || true
+  rm -rf "$work"
+}
 trap cleanup EXIT
 snapshot() {
   security list-keychains -d user > "$work/$1.search"
