@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Provision only disposable signing keys; print the owner's separate login step.
+# Provision only disposable signing keys for the hosted signing test.
 set -euo pipefail
 umask 077
 source "$(dirname "$0")/codesign-keychain-guard.sh"
@@ -9,8 +9,8 @@ usage() { echo "usage: $0 --owner-provision | --keychain PATH"; }
 if [ "${1:-}" = --help ]; then usage; exit 0; fi
 if [ "${1:-}" = --owner-provision ] && [ "$#" -eq 1 ]; then
   cat <<'OWNER'
-Owner step: an agent opens a Terminal window running scripts/codesign-identity-setup.sh
-(it asks only for the Mac password, repairs partial setup on rerun, and verifies the result).
+Owner step: an agent runs scripts/codesign-identity-setup.sh
+(it creates a dedicated keychain without prompting and verifies the result).
 OWNER
   exit 3
 fi
@@ -25,7 +25,8 @@ if [ "${DRY_RUN:-0}" = 1 ]; then
   plan_command openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout "$work/key.pem" -out "$work/cert.pem" -subj "/CN=$identity/O=amux local build" -addext basicConstraints=critical,CA:false -addext keyUsage=critical,digitalSignature -addext extendedKeyUsage=critical,codeSigning
   plan_command openssl pkcs12 -export -name "$identity" -inkey "$work/key.pem" -in "$work/cert.pem" -out "$work/identity.p12" -passout 'pass:<random-password>' -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
   plan_command security import "$work/identity.p12" -k "$keychain" -P '<random-password>' -T /usr/bin/codesign
-  plan_command security set-key-partition-list -S apple-tool:,apple:,codesign: -s -t private -l "$identity" -k '<random-password>' "$keychain"
+  plan_command security find-identity -p codesigning "$keychain"
+  plan_command security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k '<random-password>' "$keychain"
   exit 0
 fi
 run_sensitive openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
@@ -37,5 +38,10 @@ run_sensitive openssl pkcs12 -export -name "$identity" -inkey "$work/key.pem" -i
   -out "$work/identity.p12" -passout "pass:$password" \
   -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 >/dev/null 2>&1
 run_sensitive security import "$work/identity.p12" -k "$keychain" -P "$password" -T /usr/bin/codesign >/dev/null
-run_sensitive security set-key-partition-list -S apple-tool:,apple:,codesign: -s -t private -l "$identity" -k "$password" "$keychain" >/dev/null
+identities=$(run_sensitive security find-identity -p codesigning "$keychain")
+count=$(printf '%s\n' "$identities" | awk '/^[[:space:]]*[0-9]+\)/ {n++} END {print n+0}')
+[ "$count" -eq 1 ] && grep -qF "\"$identity\"" <<< "$identities" || {
+  echo "WARN verdict=codesign_keychain_contaminated identities=$count" >&2; exit 1;
+}
+run_sensitive security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
 echo 'Disposable signing identity provisioned'

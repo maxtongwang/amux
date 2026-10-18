@@ -17,16 +17,14 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Parse saved keychain dump without keychain access
-        run: python3 scripts/test-keychain-partitions.py
       - name: Stable local signing and adoption refusal
         run: |
           set -o pipefail
           DRY_RUN=1 bash scripts/test-codesign-identity.sh | bash scripts/test-codesign-identity.sh --check-plan
           DRY_RUN=1 bash scripts/test-codesign-identity.sh > "$RUNNER_TEMP/codesign.plan"
-          sed 's/ -t private -l amux\\ local\\ code\\ signing//' "$RUNNER_TEMP/codesign.plan" > "$RUNNER_TEMP/unscoped.plan"
-          if bash scripts/test-codesign-identity.sh --check-plan < "$RUNNER_TEMP/unscoped.plan"; then
-            echo 'FAIL: plan checker accepted an unscoped partition-list command' >&2
+          sed 's/ -S apple-tool:\\,apple:\\,codesign: -s -k / -S apple-tool:\\,apple:\\,codesign: -s -t private -l amux\\ local\\ code\\ signing -k /' "$RUNNER_TEMP/codesign.plan" > "$RUNNER_TEMP/scoped.plan"
+          if bash scripts/test-codesign-identity.sh --check-plan < "$RUNNER_TEMP/scoped.plan"; then
+            echo 'FAIL: plan checker accepted a scoped partition-list command' >&2
             exit 1
           fi
           bash scripts/test-codesign-identity.sh

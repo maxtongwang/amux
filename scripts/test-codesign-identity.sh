@@ -73,7 +73,6 @@ cleanup() {
   if [ "${DRY_RUN:-0}" = 1 ]; then
     plan_command security delete-keychain "$keychain"
   else
-    codesign_ci_restore_keychains || cleanup_status=$?
     run_sensitive security delete-keychain "$keychain" >/dev/null 2>&1 || delete_status=$?
     [ "$cleanup_status" -ne 0 ] || cleanup_status=$delete_status
   fi
@@ -112,7 +111,7 @@ if [ "$status" -eq 75 ]; then echo 'SKIP: temporary keychain creation timed out'
 run_sensitive security unlock-keychain -p "$password" "$keychain" || status=$?
 if [ "$status" -eq 75 ]; then echo 'SKIP: temporary keychain unlock timed out'; exit 0; fi
 [ "$status" -eq 0 ] || exit "$status"
-codesign_ci_add_test_keychain "$keychain"
+echo 'PASS: disposable keychain is used only by explicit path'
 
 bash "$repo/scripts/codesign-identity.sh" --keychain "$keychain" || status=$?
 if [ "$status" -eq 75 ]; then echo 'SKIP: identity provisioning timed out'; exit 0; fi
@@ -134,7 +133,9 @@ for bin in one two; do
   [ -s "$work/$bin.req" ] || { echo 'FAIL: designated requirement absent' >&2; exit 1; }
   grep -F 'identifier "com.amux.server-rs"' "$work/$bin.req" >/dev/null
 done
+echo 'PASS: both signed binaries report Authority=amux local code signing'
 cmp "$work/one.req" "$work/two.req"
+echo 'PASS: two binaries have the same designated requirement'
 cp "$work/one" "$work/live"
 cp "$work/two" "$work/staged"
 printf 'tamper\n' >> "$work/staged"

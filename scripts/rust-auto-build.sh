@@ -871,12 +871,17 @@ fi
     # activate an image that loses the grant held by the previous image.
     if [ "$(uname -s)" = "Darwin" ]; then
       CS_ID='amux local code signing'
-      probe_status=0
-      certificates=$(security find-certificate -c "$CS_ID" -Z 2>&1) || probe_status=$?
-      if [ "$probe_status" -ne 0 ] && [ "$probe_status" -ne 44 ]; then
-        reason=${certificates//$'\n'/ }
-        echo "== WARN verdict=codesign_refused sha=$built_sha reason=identity_probe_failed:${reason:0:500} — keeping the live binary"
-        exit 1
+      CS_KEYCHAIN="$HOME/Library/Keychains/amux-signing.keychain-db"
+      probe_status=44
+      certificates=''
+      if [ -e "$CS_KEYCHAIN" ]; then
+        probe_status=0
+        certificates=$(security find-certificate -c "$CS_ID" -Z "$CS_KEYCHAIN" 2>&1) || probe_status=$?
+        if [ "$probe_status" -ne 0 ] && [ "$probe_status" -ne 44 ]; then
+          reason=${certificates//$'\n'/ }
+          echo "== WARN verdict=codesign_refused sha=$built_sha reason=identity_probe_failed:${reason:0:500} — keeping the live binary"
+          exit 1
+        fi
       fi
       if [ "$probe_status" -eq 0 ] && printf '%s\n' "$certificates" | grep -Fq 'SHA-1 hash:'; then
         if sign_result=$(bash "$REPO/scripts/codesign-server.sh" "$INSTALL_TMP" 2>&1); then

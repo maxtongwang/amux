@@ -7,7 +7,7 @@ IDENTITY='amux local code signing'
 IDENTIFIER='com.amux.server-rs'
 
 usage() { echo "usage: $0 [--keychain PATH] [--verify-only] staged-binary"; }
-keychain=''
+keychain="$HOME/Library/Keychains/amux-signing.keychain-db"
 verify_only=0
 if [ "${1:-}" = --help ]; then usage; exit 0; fi
 if [ "${1:-}" = --keychain ]; then
@@ -19,12 +19,11 @@ if [ "${1:-}" = --verify-only ]; then verify_only=1; shift; fi
 [ "$#" -eq 1 ] && [ -f "$1" ] || { usage >&2; exit 2; }
 bin=$1
 if [ "$(uname -s)" != Darwin ]; then echo 'SKIP: macOS only'; exit 0; fi
-keychain_args=()
-if [ -n "$keychain" ]; then keychain_args=(--keychain "$keychain"); fi
-identity_list_args=()
-if [ -n "$keychain" ]; then identity_list_args=("$keychain"); fi
+keychain_args=(--keychain "$keychain")
+identity_list_args=("$keychain")
 if [ "${DRY_RUN:-0}" = 1 ]; then
   if [ "$verify_only" = 0 ]; then
+    plan_command security unlock-keychain -p '<password>' "$keychain"
     plan_command codesign --force --sign "$IDENTITY" --identifier "$IDENTIFIER" --options runtime --timestamp=none ${keychain_args[@]+"${keychain_args[@]}"} "$bin"
   fi
   plan_command codesign --verify --strict "$bin"
@@ -34,6 +33,18 @@ if [ "${DRY_RUN:-0}" = 1 ]; then
   exit 0
 fi
 if [ "$verify_only" = 0 ]; then
+  if [ -n "${AMUX_CODESIGN_TEST_DIR:-}" ]; then
+    password=${AMUX_CODESIGN_TEST_PASSWORD:?test password required}
+  else
+    password_file="$HOME/.amux/codesign/keychain-password"
+    [ -f "$password_file" ] && [ ! -L "$password_file" ] && [ "$(stat -f %Lp "$password_file")" = 600 ] || {
+      echo 'WARN verdict=codesign_password_missing' >&2; exit 1;
+    }
+    password=$(cat "$password_file")
+  fi
+  run_sensitive security unlock-keychain -p "$password" "$keychain" >/dev/null || {
+    echo 'WARN verdict=codesign_unlock_failed' >&2; exit 1;
+  }
   run_sensitive codesign --force --sign "$IDENTITY" --identifier "$IDENTIFIER" \
       --options runtime --timestamp=none ${keychain_args[@]+"${keychain_args[@]}"} "$bin" || {
     code=$?; [ "$code" -eq 75 ] && exit 75

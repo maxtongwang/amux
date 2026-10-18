@@ -239,26 +239,19 @@ ScheduleWakeup, or one delay sized to the job. (AF-396)
 ### Stable macOS Signing
 
 The macOS auto-builder signs each staged `amux-server-rs` with the local
-`amux local code signing` certificate and identifier `com.amux.server-rs` before
-activation. The one-time owner step is ONE script,
-`scripts/codesign-identity-setup.sh`: at a time Max chooses, an agent opens a
-Terminal window running it. It asks only for his Mac password, creates the
-identity in the login keychain (no trust settings are written), verifies a
-test signature, scopes key access to that identity, is safe to rerun, and ends
-by printing the Full Disk Access
-switch to flip for `amux-server-rs`. No agent runs it unattended (it refuses
-without a terminal). Builders and tests only use disposable keychains
-(`scripts/test-codesign-identity-setup.sh`); the builder never provisions an
-identity itself.
+`amux local code signing` certificate and identifier `com.amux.server-rs`.
+`scripts/codesign-identity-setup.sh` creates or repairs a dedicated keychain at
+`~/Library/Keychains/amux-signing.keychain-db` without prompting. Its random
+password is stored at `~/.amux/codesign/keychain-password` (mode 0600). The
+keychain is accessed only by explicit path and never added to the search list.
+After setup, Max enables Full Disk Access for `amux-server-rs` once.
 
-Until the identity exists, the builder emits
-`verdict=codesign_identity_missing` once per build and continues adopting the
-ad-hoc binary. After it exists, any signing or verification failure emits
-`verdict=codesign_refused` and preserves the installed image. The
-`server.stable_codesign_identity` invariant reports the installed image's
-certificate and identifier; it is unmeasured off macOS. A temporary-keychain
-smoke test is `bash scripts/test-codesign-identity.sh`; its plan check runs
-before any keychain command.
+Until the identity exists, the builder emits `verdict=codesign_identity_missing`
+and adopts an ad-hoc binary. Once it exists, unlock/sign/verification failures
+emit `verdict=codesign_refused` and preserve the installed image. The
+`server.stable_codesign_identity` invariant checks the installed image's
+certificate and identifier; it is unmeasured off macOS. Hosted CI uses only
+throwaway keychains for signing checks; local verification is dry-run only.
 
 **Before `git push origin main`:**
 ```bash
