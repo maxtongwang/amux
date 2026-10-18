@@ -467,6 +467,7 @@ PY2
 # whole life of the feature while nothing emitted it.
 /usr/bin/python3 - <<'PY2'
 import importlib.util,sys
+sys.path.insert(0, "scripts/hooks")
 spec=importlib.util.spec_from_file_location("inst","scripts/hooks/install-claude-status-hooks.py")
 m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 c=m.canonical("/tmp/hook-report.sh")
@@ -489,6 +490,7 @@ PY2
 import importlib.util, json, subprocess, sys, tempfile
 from pathlib import Path
 
+sys.path.insert(0, "scripts/hooks")
 spec = importlib.util.spec_from_file_location("inst", "scripts/hooks/install-claude-status-hooks.py")
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 
@@ -588,6 +590,69 @@ assert not any("ask-guard.py" in c for _, _, c in rows)
 assert ("PreToolUse", "Edit|Write", "~/.codex/scripts/worktree-guard.sh") in rows
 assert ("Stop", None, "python3 /x/.amux/native-status.py codex") in rows
 print("ok   codex: six native report events, Bash read router, no Notification or ask guard, unrelated hooks kept, idempotent")
+PY
+
+# Codex trust is keyed to group and handler position. Labels belong on the
+# handlers; existing labels and neighboring handlers must survive unchanged.
+CODEX_HOME="$TMP/codex-labelled" /usr/bin/python3 - <<'PY'
+import json, os, subprocess, sys
+from pathlib import Path
+
+home = Path(os.environ["CODEX_HOME"])
+home.mkdir()
+path = home / "hooks.json"
+path.write_text(json.dumps({"hooks": {
+    "Stop": [{"hooks": [
+        {"type": "command", "command": "echo before", "statusMessage": "other"},
+        {"type": "command", "command": 'bash "$HOME/.amux/hook-report.sh" idle stop-hook', "statusMessage": "my report label"},
+        {"type": "command", "command": "echo after"},
+    ]}],
+    "PreToolUse": [{"matcher": "Bash", "hooks": [
+        {"type": "command", "command": "echo neighbor"},
+        {"type": "command", "command": 'python3 "$HOME/.amux/hooks/large-read-guard.py"'},
+    ]}],
+}}))
+installer = [sys.executable, "scripts/hooks/install-claude-status-hooks.py", "--provider", "codex"]
+def run(args):
+    result = subprocess.run(args, env={**os.environ, "CODEX_HOME": str(home)}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+original = path.read_bytes()
+assert "7 hooks would change" in run(installer + ["--dry-run"])
+assert path.read_bytes() == original, "dry run wrote hooks.json"
+run(installer)
+hooks = json.loads(path.read_text())["hooks"]
+stop = hooks["Stop"][0]["hooks"]
+assert [h["command"] for h in stop[:3]] == ["echo before", 'bash "$HOME/.amux/hook-report.sh" idle stop-hook', "echo after"]
+assert stop[1]["statusMessage"] == "my report label"
+router = hooks["PreToolUse"][0]["hooks"]
+assert router[0]["command"] == "echo neighbor" and router[1]["statusMessage"] == "amux read router"
+reports = [h for groups in hooks.values() for g in groups for h in g["hooks"] if "hook-report.sh" in h["command"]]
+assert len(reports) == 6
+assert all(h["statusMessage"] in ("my report label", "amux status report") for h in reports)
+installed = path.read_bytes()
+assert "0 hooks would change" in run(installer + ["--dry-run"])
+run(installer)
+assert path.read_bytes() == installed, "repeat install changed hooks.json"
+
+with_native = json.loads(path.read_text())
+with_native["hooks"]["Stop"][0]["hooks"].append({"type": "command", "command": "python3 /tmp/native-status.py codex",
+                                                    "statusMessage": "my native label"})
+path.write_text(json.dumps(with_native))
+installed = path.read_bytes()
+native = [sys.executable, "scripts/hooks/install-native-status-hooks.py", "--provider", "codex",
+          "--settings", str(path), "--script", "/tmp/native-status.py"]
+assert "10 hooks would change" in run(native + ["--dry-run"])
+assert path.read_bytes() == installed
+run(native)
+native_hooks = [h for groups in json.loads(path.read_text())["hooks"].values() for g in groups for h in g["hooks"] if "native-status.py" in h["command"]]
+assert len(native_hooks) == 10
+assert sorted(h["statusMessage"] for h in native_hooks) == ["amux native status"] * 9 + ["my native label"]
+installed = path.read_bytes()
+assert "0 hooks would change" in run(native + ["--dry-run"])
+run(native)
+assert path.read_bytes() == installed
+print("ok   codex: labels, positions, user labels, dry-run counts, and both installers are idempotent")
 PY
 if /usr/bin/python3 scripts/hooks/install-claude-status-hooks.py --provider codex --settings "$TMP/codex-ask.json" \
   --hook-path '$HOME/.amux/hook-report.sh' --ask-guard-path '$HOME/.amux/hooks/ask-guard.py' 2>"$TMP/codex-ask.err"; then

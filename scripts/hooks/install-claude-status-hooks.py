@@ -24,6 +24,11 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import sys as _sys
+# The shared labeller lives beside this file; importlib loaders (tests) and runs from any cwd must find it.
+_sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent))
+from hook_labels import reconcile  # noqa: E402
+
 
 REPORT_MARKERS = ("hook-report.sh", "amux-report.sh")
 READ_GUARD_MARKERS = ("large-read-guard.py",)
@@ -94,7 +99,7 @@ def canonical_codex(hook_path: str) -> dict[str, dict[str, Any]]:
     (hook-report skips source=compact, which Codex reports through PostCompact instead)."""
     quoted = '"' + hook_path.replace('"', '\\"') + '"'
     base = f"bash {quoted}"
-    return {
+    events = {
         "SessionStart": group(f"{base} subagent-reset session-start-hook"),
         "UserPromptSubmit": group(f"{base} active prompt-hook"),
         "PostToolUse": group(f"{base} active tool-hook", ".*"),
@@ -102,13 +107,18 @@ def canonical_codex(hook_path: str) -> dict[str, dict[str, Any]]:
         "SubagentStart": group(f"{base} subagent-start subagent-start-hook"),
         "SubagentStop": group(f"{base} subagent-stop subagent-stop-hook"),
     }
+    for event_group in events.values():
+        event_group["hooks"][0]["statusMessage"] = "amux status report"
+    return events
 
 
 def canonical_read_guard(hook_path: str, provider: str = "claude") -> list[dict[str, Any]]:
     quoted = '"' + hook_path.replace('"', '\\"') + '"'
     command = f"python3 {quoted}"
     if provider == "codex":
-        return [group(command, "Bash")]  # Codex reads files through its shell tool
+        router = group(command, "Bash")  # Codex reads files through its shell tool
+        router["hooks"][0]["statusMessage"] = "amux read router"
+        return [router]
     return [group(command, "Read"), group(command, "Bash")]
 
 
@@ -165,6 +175,7 @@ def merge(
     read_guard_path: str = "$HOME/.amux/hooks/large-read-guard.py",
     ask_guard_path: str | None = None,
     provider: str = "claude",
+    changes: list[int] | None = None,
 ) -> dict[str, Any]:
     if provider not in ("claude", "codex"):
         raise ValueError(f"unknown provider {provider!r}")
@@ -173,6 +184,14 @@ def merge(
     raw_hooks = data.setdefault("hooks", {})
     if not isinstance(raw_hooks, dict):
         raise ValueError("settings 'hooks' must be an object")
+
+    if provider == "codex":
+        report_groups = {event: [event_group] for event, event_group in canonical_codex(hook_path).items()}
+        count = reconcile(raw_hooks, report_groups, lambda command: is_amux_report(command))
+        count += reconcile(raw_hooks, {"PreToolUse": canonical_read_guard(read_guard_path, provider)}, is_amux_read_guard)
+        if changes is not None:
+            changes.append(count)
+        return data
 
     # Remove only managed amux commands. A group can contain unrelated commands
     # beside one old hook; keep the group and every unrelated hook intact.
@@ -267,7 +286,10 @@ def main() -> int:
         action="store_true",
         help="wire canonical events even when the installed handler cannot answer them",
     )
+    parser.add_argument("--dry-run", action="store_true", help="count changed managed hooks without writing settings")
     args = parser.parse_args()
+    if args.dry_run and args.provider != "codex":
+        parser.error("--dry-run currently requires --provider codex")
     if args.settings is None:
         # Resolved after --provider: a Codex run defaulting to Claude's settings would replace Claude's
         # managed report hooks with the Codex set and drop its Notification producer (PR #6 review).
@@ -302,11 +324,17 @@ def main() -> int:
             raise SystemExit(f"refusing to overwrite non-object settings in {args.settings}")
     else:
         data = {}
+    before = json.loads(json.dumps(data))
+    changes: list[int] = []
     try:
-        merged = merge(data, args.hook_path, args.read_guard_path, args.ask_guard_path, args.provider)
+        merged = merge(data, args.hook_path, args.read_guard_path, args.ask_guard_path, args.provider, changes)
     except ValueError as exc:
         raise SystemExit(f"refusing to rewrite {args.settings}: {exc}")
-    write_atomic(args.settings, merged)
+    if args.dry_run:
+        print(f"{sum(changes)} hooks would change in {args.settings}")
+        return 0
+    if merged != before:
+        write_atomic(args.settings, merged)
     print(f"wired amux {args.provider} status and read-routing hooks in {args.settings}")
     return 0
 
