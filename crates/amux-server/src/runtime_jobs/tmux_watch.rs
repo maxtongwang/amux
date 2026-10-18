@@ -155,7 +155,8 @@ pub(crate) async fn read_census(socket: Option<&Path>) -> Census {
     cmd.args(["list-sessions", "-F", "#{session_name}"])
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
-        .stdin(std::process::Stdio::null());
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
     let out = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output()).await;
     match out {
         Ok(Ok(o)) => parse_census(o.status.success(), &String::from_utf8_lossy(&o.stdout), &String::from_utf8_lossy(&o.stderr)),
