@@ -1,0 +1,2 @@
+{"event":"started","id":"t1","retry":0}
+{"event":"finished","id":"t1","retry":0,"status":"passed","expected":"passed","outcome":"expected","duration_ms":1000,"errors":[]}

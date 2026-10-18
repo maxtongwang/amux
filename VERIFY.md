@@ -121,6 +121,38 @@ Pass: the spec name and `N passed`. If e2e infra is genuinely unavailable, say
 so in the evidence and why — that is a legitimate `verified` note, not a failure
 to hide.
 
+### e2e worker control (hosted)
+
+Whether CI should run fewer Playwright workers per shard is measured, not
+assumed. rust.yml takes a `workflow_dispatch` input `e2e_workers` (1-4; push
+and pull_request runs keep 2). Retries are not an input: the config fixes
+`retries: 0`. Each shard writes its setting into its evidence as `control.json`.
+
+```bash
+git fetch origin
+scripts/e2e-worker-control.sh dispatch <sha> 20      # 20 runs at workers=1 and 20 at workers=2, interleaved
+scripts/e2e-worker-control.sh report e2e-control-<sha12>.tsv
+```
+
+`dispatch` pushes `e2e-control/<sha12>` at the SHA (a dispatch needs a branch,
+not a bare SHA; the branch triggers nothing by itself) and records each run id.
+`<sha>` must contain the `e2e_workers` input, and the default branch must
+declare `workflow_dispatch`. Every dispatch is a full rust.yml run, cargo jobs
+included. `report` downloads each run's `e2e-evidence-*` artifacts and prints,
+per setting, complete/partial/unmeasured runs, shard execution and job wall
+times against the 20 min execution and 30 min job budgets, and each case that
+failed or did not finish as pass/fail/unfinished/unmeasured. A run with no
+artifact counts as unmeasured, never as a pass; mixed SHAs or a setting that
+contradicts its dispatch exit 1.
+
+Change the default to workers=1 only if, at one SHA and full population,
+workers=1 removes failures that reproduce at workers=2 (for example
+draw-realtime's p95 budget) and every workers=1 shard fits both budgets with no
+unmeasured runs. If workers=1 does not fit, keep 2 and rebalance or add shards
+from measured wall time (`scripts/e2e-durations.mjs`); never drop tests to fit.
+Failures that persist at workers=1 are not load; look at isolation instead.
+Twenty clean runs support a change; they do not prove zero flake.
+
 ## Vault secrets (`api/vault_secrets.rs`)
 
 ```bash
