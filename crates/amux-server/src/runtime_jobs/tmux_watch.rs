@@ -509,9 +509,18 @@ async fn drive_pending(state: &AppState, home: &Path, st: &mut WatchState, kept:
     }
     save_state(home, st);
     let todo = st.pending.clone();
+    // A bounded fixture pause makes a process crash between completed starts reproducible.
+    // The production default is zero; config parsing is shared with other server knobs.
+    let step_delay_ms = crate::config::env_i64("AMUX_TMUX_WATCH_RESTORE_STEP_DELAY_MS", 0).clamp(0, 10_000) as u64;
     let r = restore_fleet(home, &todo, |name| {
         let s = state.clone();
-        async move { start(&s, &name).await }
+        async move {
+            let result = start(&s, &name).await;
+            if step_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(step_delay_ms)).await;
+            }
+            result
+        }
     })
     .await;
     let done = settle_pending(st, &r, now);

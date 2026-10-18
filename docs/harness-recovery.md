@@ -4,6 +4,10 @@ Recovery is part of every durable harness operation. The server being alive,
 retaining a database row, and recovering unfinished work are separate claims.
 A crash test must kill a real process without a shutdown flush, restart the
 same binary against the same state, and exercise the recovered operation.
+The tmux watch process specimen sets `AMUX_TMUX_WATCH_RESTORE_STEP_DELAY_MS`
+(0 by default, capped at 10000) to hold a completed worker start before the
+next one. This creates a repeatable SIGKILL window without changing normal
+restore timing.
 
 ## State and side effects
 
