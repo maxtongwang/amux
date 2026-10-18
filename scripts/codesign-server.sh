@@ -24,7 +24,7 @@ identity_list_args=("$keychain")
 if [ "${DRY_RUN:-0}" = 1 ]; then
   if [ "$verify_only" = 0 ]; then
     plan_command security unlock-keychain -p '<password>' "$keychain"
-    plan_command codesign --force --sign "$IDENTITY" --identifier "$IDENTIFIER" --options runtime --timestamp=none ${keychain_args[@]+"${keychain_args[@]}"} "$bin"
+    plan_command codesign --force --sign '<identity-hash>' --identifier "$IDENTIFIER" --options runtime --timestamp=none ${keychain_args[@]+"${keychain_args[@]}"} "$bin"
   fi
   plan_command codesign --verify --strict "$bin"
   plan_command codesign -dvvv "$bin"
@@ -45,7 +45,12 @@ if [ "$verify_only" = 0 ]; then
   run_sensitive security unlock-keychain -p "$password" "$keychain" >/dev/null || {
     echo 'WARN verdict=codesign_unlock_failed' >&2; exit 1;
   }
-  run_sensitive codesign --force --sign "$IDENTITY" --identifier "$IDENTIFIER" \
+  identities=$(run_sensitive security find-identity -p codesigning "$keychain") || {
+    echo 'WARN verdict=codesign_identity_probe_failed' >&2; exit 1;
+  }
+  identity_hash=$(printf '%s\n' "$identities" | awk -v label="\"$IDENTITY\"" 'index($0,label) {print $2; exit}')
+  [ -n "$identity_hash" ] || { echo 'WARN verdict=codesign_identity_hash_missing' >&2; exit 1; }
+  run_sensitive codesign --force --sign "$identity_hash" --identifier "$IDENTIFIER" \
       --options runtime --timestamp=none ${keychain_args[@]+"${keychain_args[@]}"} "$bin" || {
     code=$?; [ "$code" -eq 75 ] && exit 75
     echo 'codesign signing failed' >&2; exit 1

@@ -86,11 +86,13 @@ else
 fi
 run security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain"
 if [ "${DRY_RUN:-0}" = 1 ]; then
-  plan_command codesign --force --sign "$identity" --identifier com.amux.codesign-probe --keychain "$keychain" '<probe>'
+  plan_command codesign --force --sign '<identity-hash>' --identifier com.amux.codesign-probe --keychain "$keychain" '<probe>'
 else
   probe_dir=$(mktemp -d)
   cp /usr/bin/true "$probe_dir/probe"
-  codesign --force --sign "$identity" --identifier com.amux.codesign-probe --keychain "$keychain" "$probe_dir/probe"
+  identity_hash=$(printf '%s\n' "$identities" | awk -v label="\"$identity\"" 'index($0,label) {print $2; exit}')
+  [ -n "$identity_hash" ] || { echo 'WARN verdict=codesign_identity_hash_missing' >&2; exit 1; }
+  codesign --force --sign "$identity_hash" --identifier com.amux.codesign-probe --keychain "$keychain" "$probe_dir/probe"
   shown=$(codesign -dvv "$probe_dir/probe" 2>&1)
   rm -rf "$probe_dir"
   grep -qF "Authority=$identity" <<< "$shown" || { echo 'WARN verdict=codesign_probe_failed' >&2; exit 1; }
