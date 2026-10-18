@@ -59,11 +59,14 @@ function probeCover(el: Element) {
   if (hit === el || el.contains(hit)) return { rect, viewport, cover: null, why: null };
   const chain: CoverNode[] = [];
   let n: Element | null = hit;
-  while (n && n !== document.documentElement && chain.length < 8) {
-    chain.unshift({ tag: n.tagName.toLowerCase(), id: n.id || '', classes: Array.from(n.classList) });
-    n = n.parentElement;
+  // The path stops below <body> (every element is under it, so it says
+  // nothing), unless <body> itself is what covers the target.
+  const top = (x: Element | null) => !x || x === document.documentElement || (x === document.body && chain.length > 0);
+  while (!top(n) && chain.length < 8) {
+    chain.unshift({ tag: n!.tagName.toLowerCase(), id: n!.id || '', classes: Array.from(n!.classList) });
+    n = n!.parentElement;
   }
-  return { rect, viewport, cover: { chain, truncated: !!n && n !== document.documentElement }, why: null };
+  return { rect, viewport, cover: { chain, truncated: !top(n) }, why: null };
 }
 
 const nextFrame = (target: Locator, deadline: Deadline) =>
