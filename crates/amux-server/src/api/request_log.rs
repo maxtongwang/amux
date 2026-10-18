@@ -2114,6 +2114,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["POST"],
     },
     RouteEntry {
+        path: "/api/fleet/restore",
+        methods: &["POST"],
+    },
+    RouteEntry {
         path: "/api/usage",
         methods: &["GET"],
     },
