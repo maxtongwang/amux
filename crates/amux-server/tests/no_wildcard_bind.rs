@@ -261,7 +261,10 @@ fn no_wildcard_bind_outside_the_production_listener() {
             bad.push(format!("{}:{line}: wildcard {call}", file.display()));
         }
     }
-    assert_eq!(allowed, 1, "production listener allow-list is stale");
+    // 0 once the listener takes its address from config (AMUX_BIND, PR #30):
+    // its wildcard default then lives outside any bind call. Never more than
+    // the one production listener.
+    assert!(allowed <= 1, "more than one production listener matched the allow-list: {allowed}");
     assert!(
         bad.is_empty(),
         "wildcard binds can raise the macOS firewall dialog:\n{}",
