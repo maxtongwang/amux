@@ -690,6 +690,19 @@ async fn create_worker_inner(
         group,
     };
 
+    // Registering an existing env-backed worker assigns its identity now.
+    // Store-only display names need not be filenames; those workers receive
+    // an incarnation when their env is materialized by the shared writer.
+    if crate::api::session_verbs::valid_session_name(&config.display_name) {
+        if let Err(error) = crate::api::rename_identity::ensure_incarnation(&crate::config::amux_home(), &config.display_name) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(session = %config.display_name, %error, verdict = "worker_registration_incarnation_failed",
+                    measured = true, n_considered = 1, "worker registration could not assign identity");
+                return internal(error);
+            }
+        }
+    }
+
     // RR-0034 create contract: server-minted ULID id, version 0, Stopped.
     let id = WorkerId::from_ulid(ulid::Ulid::new());
     let now = chrono::Utc::now().to_rfc3339();
@@ -2851,7 +2864,7 @@ mod tests {
         // over a socket without that token is refused before the create rule;
         // with the token the exact self-registration proceeds.
         std::fs::write(home.path().join("sessions/review-dev-b.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\nAMUX_CONTRACT_DONE=1\n").unwrap();
-        let token = crate::api::worker_identity::mint(home.path(), "review-dev-b").expect("rule 10 mints for review-dev-b");
+        let token = crate::api::worker_identity::mint(home.path(), "review-dev-b").unwrap().expect("rule 10 mints for review-dev-b");
         let over_socket = |tok: Option<&str>| {
             let mut b = Request::builder().method("POST").uri("/api/workers")
                 .header(header::CONTENT_TYPE, "application/json").header("X-Amux-Session", "review-dev-b");
@@ -2899,7 +2912,7 @@ mod tests {
         let _guard = isolated(home.path());
         membership_fleet(home.path());
         std::fs::write(home.path().join("sessions/review-dev-b.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\nAMUX_CONTRACT_DONE=1\n").unwrap();
-        let token = crate::api::worker_identity::mint(home.path(), "review-dev-b").expect("rule 10 mints");
+        let token = crate::api::worker_identity::mint(home.path(), "review-dev-b").unwrap().expect("rule 10 mints");
         let (app, _db) = app();
         let dir = home.path().join("work");
         std::fs::create_dir_all(&dir).unwrap();
@@ -3157,6 +3170,10 @@ mod tests {
             (&me, "PUT", "/api/config/apply", json!({"workers": [{"name": "review-dev-lead", "flags": "--x"}]}), 403),
             (&lead, "POST", "/api/sessions", create, 400),
         ];
+        // This in-process router bypasses async_main: perform its startup
+        // migration before asserting refused requests cannot change files.
+        crate::api::rename_identity::ensure_migrated(home.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(home.path().join("renames.version")).unwrap(), "1\n");
         let before = snapshot(home.path());
         for (headers, m, path, body, want) in &cases {
             let (st, _, v) = send_with(&app, m, path, Some(body.clone()), headers).await;
@@ -3181,7 +3198,7 @@ mod tests {
         membership_fleet(home.path());
         std::fs::write(home.path().join("sessions/review-dev-lead.env"),
             "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads,dev\"\nAMUX_CONTRACT_DONE=1\n").unwrap();
-        crate::api::worker_identity::mint(home.path(), "review-dev-lead").expect("rule 10 mints");
+        crate::api::worker_identity::mint(home.path(), "review-dev-lead").unwrap().expect("rule 10 mints");
         let (app, _db) = app();
         let dir = home.path().join("work");
         std::fs::create_dir_all(&dir).unwrap();

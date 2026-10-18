@@ -4408,40 +4408,20 @@ fn sanitize_session_name(raw: &str) -> String {
         .collect()
 }
 
-/// `# updated:` header + K="V" lines, 0600, atomic rename — byte-compatible
-/// with `EnvFile::write` in session_verbs (which is private to that module;
-/// duplicating ~15 lines here is cheaper than widening a file another lane is
-/// actively editing).
-fn write_env_file(path: &std::path::Path, pairs: &[(&str, String)]) -> std::io::Result<()> {
-    use std::io::Write as _;
+/// Serialize legacy create/update through the locked worker-env writer.
+/// Even a stale caller must preserve the incarnation already on disk.
+pub(super) fn write_env_file(path: &std::path::Path, pairs: &[(&str, String)]) -> std::io::Result<()> {
     let mut out = format!(
         "# updated: {}\n",
         chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f")
     );
-    // The one env serializer (escapes quotes, refuses newlines/NUL): a raw
-    // `{k}="{v}"` let a value write extra lines (review B2).
     for (k, v) in pairs {
         out.push_str(&crate::api::session_verbs::EnvFile::assignment(k, v)?);
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    // ONE implementation, shared with session_verbs::EnvFile::write (AF-104).
-    // The pid-only temp name lived in BOTH copies, so the same race had to be
-    // found twice; the header above still explains why the ~15 lines around it
-    // were duplicated, and this is the line where that duplication cost money.
-    let tmp = crate::api::session_verbs::unique_tmp_path(path);
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        f.write_all(out.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
+    crate::api::session_verbs::EnvFile::replace_text(path, &out)
+        .inspect_err(|error| tracing::warn!(%error, path = %path.display(),
+            verdict = "worker_env_create_failed", measured = true, n_considered = 1,
+            "legacy worker env could not persist its identity-preserving update"))
 }
 
 /// Provider-shaped model -> env wiring for a newly created worker. Pure and

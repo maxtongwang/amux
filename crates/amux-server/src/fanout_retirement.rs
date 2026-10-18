@@ -75,6 +75,7 @@ pub(crate) async fn retire<F: Fleet>(
     home: &Path,
     name: &str,
 ) -> Result<Outcome, String> {
+    crate::api::rename_identity::ensure_migrated(home).map_err(|e| e.to_string())?;
     let active = home.join("sessions").join(format!("{name}.env"));
     let expired = active.with_extension("env.reaped");
     let source = if active.exists() {
@@ -101,8 +102,13 @@ pub(crate) async fn retire<F: Fleet>(
         if fleet.is_running(name).await {return Err("lead provider did not stop; preserved".into());}
         if source==expired {return Ok(Outcome::Deferred);}
         if std::fs::read(&active).ok().as_deref()!=Some(env_bytes.as_slice()) {return Ok(Outcome::Deferred);}
-        std::fs::rename(&active,&expired).map_err(|e|e.to_string())?;
+        {
+            let _env = crate::api::session_verbs::env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+            let _file = crate::api::session_verbs::incarnation_file_lock(&active).map_err(|e| e.to_string())?;
+            std::fs::rename(&active,&expired).map_err(|e|e.to_string())?;
+        }
         crate::api::session_verbs::dispose_verified_worker_terminal(name).await;
+        crate::api::rename_identity::release(home, name);
         crate::api::sessions_legacy::invalidate_sessions_cache();
         tracing::info!(project,session=name,worktree_removed=removed,verdict="project.lead_expired",measured=true,n_considered=1,"approved project lead expired; transcript and evidence retained");
         return Ok(Outcome::Expired);
@@ -184,6 +190,9 @@ pub(crate) async fn retire<F: Fleet>(
         let retired_head = receipt["head"].as_str().unwrap_or("").to_string();
         let retired_main = receipt["merged"].as_str().unwrap_or("").to_string();
         let finalized = state.store.write_async(move |conn| {
+            let _env = crate::api::session_verbs::env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+            let _file = crate::api::session_verbs::incarnation_file_lock(&active)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
             if !active.exists()
                 || verified_board(conn,&worker)?.as_ref() != Some(&expected_board)
                 || std::fs::read(&active).ok().as_deref() != Some(old_env.as_slice()) {
@@ -197,6 +206,7 @@ pub(crate) async fn retire<F: Fleet>(
         return match finalized {
             Ok(outcome) if outcome.applied => {
                 crate::api::session_verbs::dispose_verified_worker_terminal(name).await;
+                crate::api::rename_identity::release(home, name);
                 crate::api::sessions_legacy::invalidate_sessions_cache();
                 tracing::info!(session=name,verdict="project_executor_decommissioned",measured=true,worktree_removed,mode=checkout_mode,
                     "fully verified project executor expired after confirming integration and review");
@@ -333,6 +343,9 @@ pub(crate) async fn retire<F: Fleet>(
     // input writes. New work arriving during Git cleanup wins; restore the clean
     // checkout below instead of orphaning its board on an expired worker.
     let finalized = state.store.write_async(move |conn| {
+        let _env = crate::api::session_verbs::env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _file = crate::api::session_verbs::incarnation_file_lock(&active_for_finalize)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         if (src != active_for_finalize && active_for_finalize.exists())
             || verified_board(conn,&worker)?.as_ref() != Some(&expected_board)
             || std::fs::read(&src).ok().as_deref() != Some(old_env.as_slice()) {
@@ -346,6 +359,7 @@ pub(crate) async fn retire<F: Fleet>(
     match finalized {
         Ok(outcome) if outcome.applied => {
             crate::api::session_verbs::dispose_verified_worker_terminal(name).await;
+            crate::api::rename_identity::release(home, name);
             crate::api::sessions_legacy::invalidate_sessions_cache();
             tracing::info!(session=name,verdict="fanout_decommissioned",measured=true,worktree_removed=true,
                 "fully verified worker expired after confirming remote main and removing its worktree");
@@ -632,6 +646,15 @@ mod tests {
     #[tokio::test]
     async fn verified_published_board_stops_idle_provider_removes_worktree_and_expires_with_history(
     ) {
+        // Round 5: real retirement before the first legacy alias read.
+        let legacy = Fixture::new().await;
+        std::fs::write(legacy.home.join("renames.jsonl"),
+            format!("{}\n", serde_json::json!({"old":"test-ret-legacy", "new":legacy.name}))).unwrap();
+        assert_eq!(legacy.retire(&TestFleet::default()).await.unwrap(), Outcome::Expired);
+        std::fs::write(legacy.env(), "CC_TAGS=other\n").unwrap();
+        assert_eq!(crate::api::board::callback_target(&legacy.home, "test-ret-legacy".into()),
+            "test-ret-legacy", "legacy aliases must be settled before retirement moves the env file");
+
         let f = Fixture::new().await;
         let fleet = TestFleet::default();
         git(&f.w.repo, &["worktree", "lock", &f.w.path])
@@ -643,7 +666,35 @@ mod tests {
             r#"{"generation":1,"input_hash":"test","report":{"head":"ignored"}}"#,
         )
         .unwrap();
+        // This worker was renamed here from test-ret-src (review of 3f5ab3df, B1).
+        let inc = crate::api::rename_identity::ensure_incarnation(&f.home, &f.name).unwrap();
+        crate::api::rename_identity::record(&f.home, "test-ret-src", &f.name, &inc).unwrap();
+        assert_eq!(
+            crate::api::board::callback_target(&f.home, "test-ret-src".into()),
+            f.name,
+            "control: the alias resolves while the worker holds the name"
+        );
+        let hash = crate::api::worker_identity::hash_path(&f.home, &inc);
+        let runs = crate::api::worker_identity::runs_dir(&f.home, &inc);
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(&hash, "launch-hash").unwrap();
+        std::fs::write(runs.join("run.sha256"), "run-hash").unwrap();
         assert_eq!(f.retire(&fleet).await.unwrap(), Outcome::Expired);
+        assert!(!hash.exists(), "retirement revokes the incarnation launch hash");
+        assert!(!runs.exists(), "retirement revokes the incarnation run tokens");
+        assert_eq!(
+            crate::api::rename_identity::tests::records_of(&f.home, &inc),
+            0,
+            "expiry drops exactly the retired worker's incarnation's records"
+        );
+        // An unrelated worker takes the expired name: the alias must not follow.
+        std::fs::write(f.env(), "CC_TAGS=other\n").unwrap();
+        assert_eq!(
+            crate::api::board::callback_target(&f.home, "test-ret-src".into()),
+            "test-ret-src",
+            "an expired worker's aliases must not attach to the next holder of its name"
+        );
+        std::fs::remove_file(f.env()).unwrap();
         assert_eq!(fleet.stops.load(Ordering::SeqCst), 1);
         assert!(!Path::new(&f.w.path).exists());
         assert!(!crate::api::session_verbs::worktree_is_registered(&f.w.repo, &f.w.path).await);

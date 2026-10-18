@@ -5,7 +5,7 @@
 //! `contract::rule_on(home, lane, "10")` holds:
 //!
 //! - **Identity.** Each launch mints a random token. The server keeps only its
-//!   sha256 (`~/.amux/worker-tokens/<lane>.sha256`, 0600); the value reaches the
+//!   sha256 (`~/.amux/worker-tokens/<incarnation>.sha256`, 0600); the value reaches the
 //!   lane as `AMUX_WORKER_TOKEN` through the vault channel (tmux
 //!   set-environment, then imported by name), never argv or a typed line. The
 //!   CLI and hooks send it as `X-Amux-Worker-Token`. A mutating request over a
@@ -33,8 +33,23 @@ pub const TOKEN_ENV: &str = "AMUX_WORKER_TOKEN";
 pub const TOKEN_HEADER: &str = "x-amux-worker-token";
 pub const RULE: &str = "10";
 
-fn hash_path(home: &Path, lane: &str) -> PathBuf {
-    home.join("worker-tokens").join(format!("{lane}.sha256"))
+pub(crate) fn hash_path(home: &Path, incarnation: &str) -> PathBuf {
+    home.join("worker-tokens").join(format!("{incarnation}.sha256"))
+}
+
+/// Revoke one incarnation, independent of its current or former names.
+pub(crate) fn release(home: &Path, incarnation: &str) {
+    let hash = hash_path(home, incarnation);
+    let runs = runs_dir(home, incarnation);
+    for (path, result) in [(&hash, std::fs::remove_file(&hash)), (&runs, std::fs::remove_dir_all(&runs))] {
+        match result {
+            Ok(()) => tracing::info!(verdict = "worker_token_released", measured = true, n_considered = 1,
+                "released incarnation token material"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => tracing::warn!(path = %path.display(), error = %e, verdict = "worker_token_release_failed",
+                measured = true, n_considered = 1, "could not remove released incarnation token material"),
+        }
+    }
 }
 
 fn digest(token: &str) -> String {
@@ -42,49 +57,51 @@ fn digest(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
-fn random_token() -> Option<String> {
+fn random_token() -> std::io::Result<String> {
     use std::io::Read;
     let mut b = [0u8; 32];
-    std::fs::File::open("/dev/urandom").ok()?.read_exact(&mut b).ok()?;
-    Some(hex::encode(b))
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    Ok(hex::encode(b))
 }
 
-/// Mint a fresh token for a launch of `lane`, or None when rule 10 does not
-/// apply (a stale hash is then removed, so the lane is not held to a token it
-/// no longer receives). The caller delivers the value; it is never logged.
-pub fn mint(home: &Path, lane: &str) -> Option<String> {
-    let path = hash_path(home, lane);
-    if !super::session_verbs::valid_session_name(lane) || !super::contract::rule_on(home, lane, RULE) {
-        let _ = std::fs::remove_file(&path);
-        return None;
-    }
-    let Some(token) = random_token() else {
-        tracing::warn!(lane, measured = false, n_considered = 1, verdict = "worker_token_unminted",
-            why_unmeasured = "no /dev/urandom", "rule 10: could not mint a worker token; the lane launches unminted");
-        return None;
-    };
-    let _ = std::fs::create_dir_all(path.parent().unwrap_or(home));
-    let tmp = path.with_extension("tmp");
-    let wrote = std::fs::write(&tmp, digest(&token)).and_then(|_| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+/// None means rule 10 is disabled. A requested credential failure is an error;
+/// callers must stop before launching, and the WARN never contains the token.
+pub fn mint(home: &Path, lane: &str) -> std::io::Result<Option<String>> {
+    let result = (|| {
+        if !valid_identity(lane) { return Err(std::io::Error::other("invalid worker identity")); }
+        if !super::contract::rule_on(home, lane, RULE) {
+            if let Some(inc) = super::rename_identity::incarnation(home, lane) {
+                let _ = std::fs::remove_file(hash_path(home, &inc));
+            }
+            return Ok(None);
         }
-        std::fs::rename(&tmp, &path)
-    });
-    if let Err(e) = wrote {
-        tracing::warn!(lane, error = %e, measured = true, n_considered = 1, verdict = "worker_token_unminted",
-            "rule 10: could not store the worker token hash; the lane launches unminted");
-        return None;
-    }
-    tracing::info!(lane, measured = true, n_considered = 1, verdict = "worker_token_minted",
-        "rule 10: minted a worker token for this launch");
-    if let Some(flags) = bypass_flag(home, lane) {
-        tracing::warn!(lane, flag = flags, measured = true, n_considered = 1, verdict = "bypass_without_sandbox",
-            "rule 10: the lane runs a permission-bypass flag without an OS sandbox (report-only in phase 1)");
-    }
-    Some(token)
+        let incarnation = super::rename_identity::ensure_incarnation(home, lane)?;
+        let path = hash_path(home, &incarnation);
+        let token = random_token()?;
+        std::fs::create_dir_all(path.parent().unwrap_or(home))?;
+        let tmp = super::session_verbs::unique_tmp_path(&path);
+        let wrote = std::fs::write(&tmp, digest(&token)).and_then(|_| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            }
+            std::fs::rename(&tmp, &path)
+        });
+        if wrote.is_err() { let _ = std::fs::remove_file(&tmp); }
+        wrote?;
+        tracing::info!(lane, measured = true, n_considered = 1, verdict = "worker_token_minted",
+            "rule 10: minted a worker token for this launch");
+        if let Some(flags) = bypass_flag(home, lane) {
+            tracing::warn!(lane, flag = flags, measured = true, n_considered = 1, verdict = "bypass_without_sandbox",
+                "rule 10: the lane runs a permission-bypass flag without an OS sandbox (report-only in phase 1)");
+        }
+        Ok(Some(token))
+    })();
+    result.inspect_err(|error| {
+        tracing::warn!(lane, %error, measured = true, n_considered = 1, verdict = "worker_token_mint_failed",
+            "worker credential could not be minted; launch not started");
+    })
 }
 
 // A SCHEDULED SHELL RUN SPEAKS AS ITS LANE (gtm-engine, 2026-10-07: SCHED-173,
@@ -97,8 +114,8 @@ pub fn mint(home: &Path, lane: &str) -> Option<String> {
 // with the server is ignored and removed after RUN_TOKEN_MAX_AGE_S.
 const RUN_TOKEN_MAX_AGE_S: u64 = 6 * 3600;
 
-fn runs_dir(home: &Path, lane: &str) -> PathBuf {
-    home.join("worker-tokens").join(format!("{lane}.runs"))
+pub(crate) fn runs_dir(home: &Path, incarnation: &str) -> PathBuf {
+    home.join("worker-tokens").join(format!("{incarnation}.runs"))
 }
 
 /// A token for one scheduler-launched run of `lane`. The value goes into the
@@ -110,32 +127,44 @@ pub struct RunToken {
 
 impl Drop for RunToken {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Err(error) = std::fs::remove_file(&self.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(error = %error, verdict = "worker_run_token_revoke_failed",
+                    measured = true, n_considered = 1, "completed scheduled run could not revoke its token");
+            }
+        }
     }
 }
 
-pub fn mint_run(home: &Path, lane: &str) -> Option<RunToken> {
-    if !super::session_verbs::valid_session_name(lane) || !super::contract::rule_on(home, lane, RULE) {
-        return None;
-    }
-    let token = random_token()?;
-    let dir = runs_dir(home, lane);
-    std::fs::create_dir_all(&dir).ok()?;
-    let d = digest(&token);
-    let path = dir.join(format!("{}.sha256", &d[..16]));
-    std::fs::write(&path, &d).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    tracing::info!(lane, measured = true, n_considered = 1, verdict = "worker_run_token_minted",
-        "rule 10: minted a token for one scheduled run of this lane");
-    Some(RunToken { path, value: token })
+pub fn mint_run(home: &Path, lane: &str) -> std::io::Result<Option<RunToken>> {
+    let result = (|| {
+        if !valid_identity(lane) { return Err(std::io::Error::other("invalid worker identity")); }
+        if !super::contract::rule_on(home, lane, RULE) { return Ok(None); }
+        let token = random_token()?;
+        let incarnation = super::rename_identity::ensure_incarnation(home, lane)?;
+        let dir = runs_dir(home, &incarnation);
+        std::fs::create_dir_all(&dir)?;
+        let d = digest(&token);
+        let path = dir.join(format!("{}.sha256", &d[..16]));
+        let guard = RunToken { path, value: token };
+        std::fs::write(&guard.path, &d)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&guard.path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        tracing::info!(lane, measured = true, n_considered = 1, verdict = "worker_run_token_minted",
+            "rule 10: minted a token for one scheduled run of this lane");
+        Ok(Some(guard))
+    })();
+    result.inspect_err(|error| {
+        tracing::warn!(lane, %error, measured = true, n_considered = 1, verdict = "worker_run_token_mint_failed",
+            "scheduled run credential could not be minted; run not started");
+    })
 }
 
-fn run_token_valid(home: &Path, lane: &str, presented: &str) -> bool {
-    let Ok(entries) = std::fs::read_dir(runs_dir(home, lane)) else { return false };
+fn run_token_valid(home: &Path, incarnation: &str, presented: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(runs_dir(home, incarnation)) else { return false };
     let want = digest(presented);
     let mut ok = false;
     for e in entries.flatten() {
@@ -168,12 +197,19 @@ pub fn check(home: &Path, lane: &str, presented: Option<&str>) -> Check {
     if !super::contract::rule_on(home, lane, RULE) {
         return Check::Unenforced;
     }
+    if !valid_identity(lane) { return Check::Invalid; }
+    // Direct credential checks share the bounded retry boundary too; callers
+    // need not pass through the HTTP rename resolver to recover after repair.
+    if super::rename_identity::ensure_migrated(home).is_err() { return Check::Invalid; }
+    let Some(incarnation) = super::rename_identity::incarnation(home, lane) else {
+        return if presented.is_some() { Check::Invalid } else { Check::Unminted };
+    };
     let presented = presented.map(str::trim).filter(|t| !t.is_empty());
-    if presented.is_some_and(|t| run_token_valid(home, lane, t)) {
+    if presented.is_some_and(|t| run_token_valid(home, &incarnation, t)) {
         return Check::Valid;
     }
-    let Ok(want) = std::fs::read_to_string(hash_path(home, lane)) else {
-        return Check::Unminted;
+    let Ok(want) = std::fs::read_to_string(hash_path(home, &incarnation)) else {
+        return if presented.is_some() { Check::Invalid } else { Check::Unminted };
     };
     match presented {
         Some(t) if super::auth::constant_time_eq(digest(t).as_bytes(), want.trim().as_bytes()) => Check::Valid,
@@ -393,7 +429,7 @@ pub fn report(home: &Path, lanes: &[String]) -> Value {
         }
         rows.push(json!({
             "lane": lane,
-            "token_minted": hash_path(home, lane).is_file(),
+            "token_minted": super::rename_identity::incarnation(home, lane).is_some_and(|inc| hash_path(home, &inc).is_file()),
             "credential_keys": keys.into_iter().collect::<Vec<_>>(),
             "bypass_flag": bypass_flag(home, lane),
             "sandboxed": false,
@@ -419,16 +455,67 @@ mod tests {
     }
 
     #[test]
+    fn round7_concurrent_first_launch_and_schedules_keep_all_tokens_valid() {
+        for _ in 0..100 {
+            let d = home_with("AMUX_CONTRACT_DONE=1\n");
+            let barrier = std::sync::Barrier::new(4);
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    let path = d.path().join("sessions/w.env");
+                    let mut stale = super::super::session_verbs::EnvFile::load(&path);
+                    barrier.wait();
+                    stale.set("CC_DESC", "concurrent save");
+                    stale.write(&path).unwrap();
+                });
+                let launch = scope.spawn(|| { barrier.wait(); mint(d.path(), "w").unwrap().expect("launch token") });
+                let run1 = scope.spawn(|| { barrier.wait(); mint_run(d.path(), "w").unwrap().expect("first schedule token") });
+                let run2 = scope.spawn(|| { barrier.wait(); mint_run(d.path(), "w").unwrap().expect("second schedule token") });
+                writer.join().unwrap();
+                let launch = launch.join().unwrap();
+                let run1 = run1.join().unwrap();
+                let run2 = run2.join().unwrap();
+                for token in [&launch, &run1.value, &run2.value] {
+                    assert_eq!(check(d.path(), "w", Some(token)), Check::Valid);
+                }
+                let text = std::fs::read_to_string(d.path().join("sessions/w.env")).unwrap();
+                assert_eq!(text.lines().filter(|l| l.starts_with("CC_INCARNATION=")).count(), 1);
+            });
+        }
+    }
+
+    #[test]
+    fn round7_worker_env_creation_assigns_and_rewrites_preserve_incarnation() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("sessions/new.env");
+        let mut cfg = super::super::session_verbs::EnvFile::default();
+        cfg.set("CC_NAME", "new");
+        cfg.write(&path).unwrap();
+        let id = super::super::rename_identity::incarnation(d.path(), "new").expect("creation assigns eagerly");
+        cfg.set("CC_DESC", "stale writer");
+        cfg.write(&path).unwrap();
+        super::super::session_verbs::EnvFile::replace_text(&path, "CC_DESC=raw replacement\nCC_INCARNATION=forged\n").unwrap();
+        super::super::session_verbs::EnvFile::merge_plain(&path, &[("CC_INCARNATION".into(), None)]).unwrap();
+        assert_eq!(super::super::rename_identity::incarnation(d.path(), "new"), Some(id.clone()));
+        let copy = d.path().join("sessions/copy.env");
+        super::super::rename_identity::copy_incarnation(&path, &copy).unwrap();
+        let copied = super::super::rename_identity::incarnation(d.path(), "copy").expect("duplicate assigns eagerly");
+        assert_ne!(id, copied);
+        let error = super::super::rename_identity::copy_incarnation(&path, &copy).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(super::super::rename_identity::incarnation(d.path(), "copy"), Some(copied));
+    }
+
+    #[test]
     fn a_minted_token_is_the_only_identity_for_a_rule_10_lane() {
         let d = home_with("AMUX_CONTRACT_DONE=1\n");
         let h = d.path();
         assert_eq!(check(h, "w", None), Check::Unminted, "before a launch the header is trusted");
-        let t = mint(h, "w").expect("rule 10 on: a token is minted");
-        assert!(!std::fs::read_to_string(hash_path(h, "w")).unwrap().contains(&t), "only the hash is stored");
+        let t = mint(h, "w").unwrap().expect("rule 10 on: a token is minted");
+        assert!(!std::fs::read_to_string(hash_path(h, &super::super::rename_identity::incarnation(h, "w").unwrap())).unwrap().contains(&t), "only the hash is stored");
         assert_eq!(check(h, "w", Some(&t)), Check::Valid);
         assert_eq!(check(h, "w", None), Check::Invalid, "a bare header is refused");
         assert_eq!(check(h, "w", Some("forged")), Check::Invalid);
-        let t2 = mint(h, "w").unwrap();
+        let t2 = mint(h, "w").unwrap().unwrap();
         assert_eq!(check(h, "w", Some(&t)), Check::Invalid, "a relaunch retires the old token");
         assert_eq!(check(h, "w", Some(&t2)), Check::Valid);
     }
@@ -439,8 +526,8 @@ mod tests {
     fn a_scheduled_runs_token_is_valid_beside_the_lanes_until_the_run_ends() {
         let d = home_with("AMUX_CONTRACT_DONE=1\n");
         let h = d.path();
-        let lane = mint(h, "w").unwrap();
-        let run = mint_run(h, "w").expect("rule 10 on: a run token is minted");
+        let lane = mint(h, "w").unwrap().unwrap();
+        let run = mint_run(h, "w").unwrap().expect("rule 10 on: a run token is minted");
         assert_eq!(check(h, "w", Some(&run.value)), Check::Valid, "the run speaks as the lane");
         assert_eq!(check(h, "w", Some(&lane)), Check::Valid, "the lane's own token still works");
         assert_eq!(check(h, "x", Some(&run.value)), Check::Unenforced, "another lane (rule off) is not affected");
@@ -454,10 +541,13 @@ mod tests {
     fn rule_10_off_mints_nothing_and_clears_a_stale_hash() {
         let d = home_with("AMUX_CONTRACT_DONE=1\n");
         let h = d.path();
-        mint(h, "w").unwrap();
-        std::fs::write(h.join("sessions/w.env"), "AMUX_CONTRACT_DONE=1\nAMUX_CONTRACT_RULES_OFF=\"6,7,10\"\n").unwrap();
-        assert_eq!(mint(h, "w"), None);
-        assert!(!hash_path(h, "w").exists(), "the lane is not held to a token it no longer receives");
+        mint(h, "w").unwrap().unwrap();
+        let path = h.join("sessions/w.env");
+        let mut env = super::super::session_verbs::EnvFile::load(&path);
+        env.set("AMUX_CONTRACT_RULES_OFF", "6,7,10");
+        env.write(&path).unwrap();
+        assert_eq!(mint(h, "w").unwrap(), None);
+        assert!(!hash_path(h, &super::super::rename_identity::incarnation(h, "w").unwrap()).exists(), "the lane is not held to a token it no longer receives");
         assert_eq!(check(h, "w", None), Check::Unenforced);
     }
 
@@ -480,7 +570,7 @@ mod tests {
         use tower::ServiceExt;
         let d = home_with("AMUX_CONTRACT_DONE=1\n");
         let _g = crate::api::settings::test_env::set_home(d.path());
-        let token = mint(d.path(), "w").unwrap();
+        let token = mint(d.path(), "w").unwrap().unwrap();
         let app = axum::Router::new()
             .route("/x", axum::routing::post(|| async { "ok" }).get(|| async { "ok" }))
             .layer(axum::middleware::from_fn(enforce));

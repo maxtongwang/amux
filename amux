@@ -828,42 +828,61 @@ cmd_register() {
   esac
 
   local file="$CC_SESSIONS/$name.env"
-  # MERGE, do not truncate (AMUX-3117). Re-registering an existing worker used to
-  # `cat >` the file down to CC_NAME/CC_DIR/CC_FLAGS, SILENTLY WIPING every other
-  # CC_* key it does not manage — CC_DESC and CC_TAGS were lost this way, and
-  # re-register is the only path to set flags (the PATCH-flags gap, AMUX-3115), so
-  # the destructive path was on the happy path (gtm-engine, 2026-08-14). Preserve
-  # every existing CC_* assignment except the three this verb owns, verbatim (no
-  # re-parse, so quoting/JSON values survive intact).
-  local preserved=""
-  if [[ -f "$file" ]]; then
-    preserved=$(grep -E '^CC_[A-Za-z0-9_]+=' "$file" 2>/dev/null \
-                | grep -vE '^(CC_NAME|CC_DIR|CC_FLAGS)=' || true)
-    # A flag given now replaces the stored value rather than duplicating it.
-    [[ -n "$wt" ]] && preserved=$(printf '%s\n' "$preserved" | grep -vE '^CC_WORKTREE=' || true)
-    [[ -n "$wt_profile" ]] && preserved=$(printf '%s\n' "$preserved" | grep -vE '^CC_WORKTREE_PROFILE=' || true)
+  # One lock shared with the server's incarnation/env writers. Reload inside
+  # it, assign at creation, then atomically replace; re-register keeps identity.
+  if ! python3 - "$file" "$name" "$resolved_dir" "$CC_FLAGS_STR" "$wt" "$wt_profile" <<'PYREGISTER'
+import fcntl, os, re, secrets, sys, tempfile
+from pathlib import Path
+path, name, directory, flags, wt, profile = sys.argv[1:]
+p = Path(path)
+p.parent.mkdir(parents=True, exist_ok=True)
+def quote(value):
+    if any(c in value for c in "\n\r\0"):
+        raise ValueError("worker env values cannot contain newline, carriage return or NUL")
+    return '"' + re.sub(r'([\\"$`])', r'\\\1', value) + '"'
+with (p.parent / ".incarnation.lock").open("a+") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    text = p.read_text() if p.exists() else ""
+    updates = {"CC_NAME": name, "CC_DIR": directory, "CC_FLAGS": flags}
+    if wt: updates["CC_WORKTREE"] = "1"
+    if profile: updates["CC_WORKTREE_PROFILE"] = profile
+    # Match EnvFile's last-assignment-wins parsing and ASCII validation.
+    ids = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("CC_INCARNATION="): continue
+        value = line.split("=", 1)[1].strip()
+        if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
+            value = value[1:-1]
+        ids.append(value.strip())
+    valid_id = bool(ids and re.fullmatch(r"[A-Za-z0-9_.-]+", ids[-1]) and ids[-1] not in (".", ".."))
+    incarnation = ids[-1] if valid_id else secrets.token_hex(16)
+    updates["CC_INCARNATION"] = incarnation
+    if not text:
+        for key in ("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "CC_AUTO_PICKUP", "CC_AUTO_CONTINUE", "CC_STANDING_ORDERS", "AMUX_COMMAND_LIFECYCLE", "AMUX_BOARD_FORCE_ADHERENCE"):
+            updates[key] = "0"
+    kept = [line for line in text.splitlines() if line.split("=", 1)[0].strip() not in updates]
+    out = "\n".join(kept) + "\n" + "".join(key + "=" + quote(value) + "\n" for key, value in updates.items())
+    fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".register-")
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(out)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, p)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+    if not valid_id:
+        print("verdict=worker_incarnation_assigned worker=" + name, file=sys.stderr)
+PYREGISTER
+  then
+    echo "verdict=worker_registration_failed worker=$name" >&2
+    die "could not persist worker registration"
   fi
-  {
-    echo "# amux session: $name"
-    echo "# registered: $(date -Iseconds)"
-    echo "CC_NAME=\"$name\""
-    echo "CC_DIR=\"$resolved_dir\""
-    echo "CC_FLAGS=\"${CC_FLAGS_STR}\""
-    # A brand-new worker starts with the Board-tab automation off (Ethan,
-    # 2026-10-08); a re-register keeps whatever the worker already had.
-    if [[ -z "$preserved" ]]; then
-      for kv in AMUX_DISPATCH_BACKLOG_WHEN_IDLE=0 CC_AUTO_PICKUP=0 CC_AUTO_CONTINUE=0 CC_STANDING_ORDERS=0 AMUX_COMMAND_LIFECYCLE=0 AMUX_BOARD_FORCE_ADHERENCE=0; do
-        echo "${kv%%=*}=\"${kv#*=}\""
-      done
-    fi
-    [[ -n "$wt" ]] && echo "CC_WORKTREE=\"1\""
-    [[ -n "$wt_profile" ]] && echo "CC_WORKTREE_PROFILE=\"$wt_profile\""
-    [[ -n "$preserved" ]] && printf '%s\n' "$preserved"
-  } > "$file"
 
   echo "${GREEN}registered${RESET} ${BOLD}$name${RESET} → $resolved_dir"
-  [[ -n "$preserved" ]] && echo "  ${DIM}preserved: $(printf '%s\n' "$preserved" | sed -E 's/=.*//' | paste -sd, -)${RESET}"
   [[ -n "$CC_FLAGS_STR" ]] && echo "  flags: $CC_FLAGS_STR"
+  return 0
 }
 
 # amux worktree <name> [show|profiles|widen <profile-or-folder>...|profile <p>]
@@ -1604,23 +1623,8 @@ cmd_exec() {
   require_worker_name exec "$name" "amux exec <name> [--model opus] [--yolo] [--dir /path] [claude flags...]"
   shift
 
-  parse_claude_flags "$@"
-
-  local resolved_dir="${CC_DIR:-$(pwd)}"
-  case "$resolved_dir" in
-    /*) ;;
-    *) die "CC_DIR must be absolute, got: $resolved_dir" ;;
-  esac
-
-  # Register if not exists, or update
-  local file="$CC_SESSIONS/$name.env"
-  cat > "$file" <<EOF
-# amux session: $name
-# registered: $(date -Iseconds)
-CC_NAME="$name"
-CC_DIR="$resolved_dir"
-CC_FLAGS="${CC_FLAGS_STR}"
-EOF
+  # Use the locked registrar and keep the same parsed flags/extra args.
+  cmd_register "$name" "$@"
 
   # Start
   cmd_start "$name" "${CC_EXTRA_ARGS[@]+"${CC_EXTRA_ARGS[@]}"}"

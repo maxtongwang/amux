@@ -47,6 +47,21 @@ has "$F" "CC_DIR=\"$TMP\""                 "CC_DIR updated"
 check "CC_DESC appears exactly once" "1" "$(grep -c '^CC_DESC=' "$F")"
 check "CC_FLAGS appears exactly once" "1" "$(grep -c '^CC_FLAGS=' "$F")"
 
+# Round 7: registration assigns once, including two concurrent first registers.
+for trial in $(seq 1 100); do
+  name="fresh-$trial"
+  CC_HOME="$TMP" "$AMUX_BIN" register "$name" --model opus --dir "$TMP" >/dev/null 2>&1 &
+  first=$!
+  CC_HOME="$TMP" "$AMUX_BIN" register "$name" --model opus --dir "$TMP" >/dev/null 2>&1 &
+  second=$!
+  wait "$first"; wait "$second"
+  f="$SESS/$name.env"
+  check "one incarnation on concurrent register $trial" "1" "$(grep -c '^CC_INCARNATION=' "$f" || true)"
+  before=$(grep '^CC_INCARNATION=' "$f" || true)
+  CC_HOME="$TMP" "$AMUX_BIN" register "$name" --model opus --dir "$TMP" >/dev/null 2>&1
+  check "register preserves incarnation $trial" "$before" "$(grep '^CC_INCARNATION=' "$f" || true)"
+done
+
 rm -rf "$TMP"
 echo "register merge: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

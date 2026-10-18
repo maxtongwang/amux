@@ -84,3 +84,24 @@ reports each measure that applies, with its baseline from 2026-10-05.
 
 Progress and evidence for each rule live on its card on `amux-helper`'s board,
 tagged `contract`. This file changes only when a rule changes.
+
+### Worker token storage
+
+Rule-10 launch hashes live at `worker-tokens/<CC_INCARNATION>.sha256`;
+scheduled-run hashes live in `worker-tokens/<CC_INCARNATION>.runs/`. Validation
+resolves the current worker name through its env file. Rename preserves these
+paths, so a run guard revokes the exact file it created. Deletion and retirement
+remove that incarnation's launch hash and run directory.
+
+Worker env creation, duplication and CLI registration assign the incarnation
+before launch. Env rewrites preserve it under the same env mutex and
+`sessions/.incarnation.lock` flock used by the legacy first-mint fallback;
+concurrent mints therefore return the same persisted identity. A requested
+credential failure emits a WARN (`worker_token_mint_failed` or
+`worker_run_token_mint_failed`) and fails the launch or schedule before spawn.
+
+At startup, `rename_identity::ensure_migrated` eagerly re-keys legacy name-based
+launch hashes for live workers. The bounded migration revokes unowned legacy
+hashes and legacy run directories, logs `worker_tokens_migrated` and a WARN
+`worker_tokens_legacy_dropped` with the dropped count, and writes its version
+marker last. Legacy run paths cannot move while their guards may still exist.

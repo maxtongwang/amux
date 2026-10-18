@@ -266,3 +266,42 @@ A registered checkout interrupted before acknowledgement resets in place on rest
 positive remote ancestry adopts a saved push before any reset or replay. Ordinary
 failed creation removes its own locked candidate. Stale cleanup is restricted to
 registered candidates in the same repository, preserving unrelated directories.
+
+## Worker identity upgrade
+
+Worker env rewrites preserve `CC_INCARNATION` under the shared env mutex and
+`sessions/.incarnation.lock`. This includes env apply, legacy create, API/CLI
+registration, raw replacement and scope merges. Duplication creates a fresh ID;
+rename moves the existing ID. Duplicate live IDs emit
+`worker_incarnation_duplicate` with both worker files.
+
+At upgrade, `renames.jsonl` maps old token names to live workers. Launch hashes
+and in-flight `<name>.runs/` hashes migrate to incarnation keys without changing
+run-token mtimes or the six-hour expiry. Publication links before unlinking, so
+a crash can be retried without replacing an already published credential.
+
+Per-file migration failures emit WARN `identity_migration_file_skipped` with the
+path and leave the failed file in place while startup continues. An unrecognized
+version marker triggers a new pass. Only marker I/O is fatal, with its path and
+`identity_migration_marker_io_fatal`. Completion markers are withheld while any
+entry or input scan remains unfinished. `worker-tokens.pending` and
+`renames.pending` list the remaining paths; successful retries clear their entries.
+WARN `identity_migration_pending` reports the migration, pending count, considered
+count, and retry interval. Each pass emits `identity_migration_attempt`.
+
+Startup retries unfinished work immediately. Identity operations retry at most
+once per 60 seconds per home, using an in-process monotonic clock; they still read
+successfully migrated credentials and rename records during the wait. No retry
+timer, manual marker edit, or process restart is required after filesystem repair.
+Completed markers bypass directory scans. Failed files and malformed journal lines
+remain on disk for diagnosis; a retry recomputes the pending list from source.
+
+Verification (temporary homes, including permission repair, malformed token targets,
+rename read/write recovery, partial run directories, and the retry window):
+
+```bash
+amux-isolated scripts/safe-cargo.sh test -p amux-server --lib round8_ -- --skip process_identity
+amux-isolated scripts/safe-cargo.sh test -p amux-server --lib round9_ -- --skip process_identity
+```
+
+Never run the migration against a real home during verification.

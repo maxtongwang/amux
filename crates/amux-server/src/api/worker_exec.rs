@@ -21,7 +21,7 @@
 //! the terminal pipeline (it would show a tmux `not running` with no dispatch
 //! line beside it).
 
-use super::session_verbs::{parse_env, SendOrigin};
+use super::session_verbs::{parse_env, EnvFile, SendOrigin};
 use super::AppState;
 use amux_core::worker_type::{WorkerTypeId, REGISTRY};
 use axum::response::{IntoResponse, Response};
@@ -117,7 +117,17 @@ pub(crate) fn worker_type_of(name: &str) -> WorkerTypeId {
 }
 
 pub(crate) fn adapter_for_session(name: &str) -> &'static dyn ExecutionAdapter {
-    adapter_for(&worker_type_of(name))
+    adapter_for_env(&parse_env(name))
+}
+
+/// [`adapter_for_session`] over an env the caller already loaded, so the send
+/// layer and every lifecycle gate pick the adapter by one rule.
+pub(crate) fn adapter_for_env(cfg: &EnvFile) -> &'static dyn ExecutionAdapter {
+    #[cfg(test)]
+    if cfg.get(fake_pane::ENV_KEY) == Some("1") {
+        return &fake_pane::FAKE;
+    }
+    adapter_for(&worker_type_of_env(cfg.get("CC_WORKER_TYPE")))
 }
 
 /// Count a handled dispatch (see module doc).
@@ -151,4 +161,61 @@ async fn list_types() -> Response {
         "types": REGISTRY,
     }))
     .into_response()
+}
+
+/// A test-only worker whose "pane" is an in-memory log: it reads as running
+/// and records every delivery with its origin, so a test can assert what amux
+/// typed into a worker through the real send layer without a tmux server.
+/// Selected per worker by `CC_TEST_FAKE_PANE=1` in its env file, so it follows
+/// the worker through a rename and touches no other test's workers.
+#[cfg(test)]
+pub(crate) mod fake_pane {
+    use super::*;
+    use std::sync::Mutex;
+
+    pub(crate) const ENV_KEY: &str = "CC_TEST_FAKE_PANE";
+    pub(crate) struct FakePane;
+    pub(crate) static FAKE: FakePane = FakePane;
+    static TYPED: Mutex<Vec<(String, String, &'static str)>> = Mutex::new(Vec::new());
+
+    /// Every `(text, origin)` delivered to `name` so far.
+    pub(crate) fn typed(name: &str) -> Vec<(String, &'static str)> {
+        TYPED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(n, _, _)| n == name)
+            .map(|(_, t, o)| (t.clone(), *o))
+            .collect()
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionAdapter for FakePane {
+        fn worker_type(&self) -> &'static str {
+            "test-fake-pane"
+        }
+        async fn start(&self, _: &AppState, _: &str) -> Dispatch<(bool, String)> {
+            Dispatch::Handled((true, "fake pane".into()))
+        }
+        async fn stop(&self, _: &str) -> Dispatch<(bool, String)> {
+            Dispatch::Handled((true, "fake pane".into()))
+        }
+        async fn deliver(&self, _: &AppState, name: &str, text: &str, origin: SendOrigin) -> Dispatch<(bool, String)> {
+            let origin = match origin {
+                SendOrigin::Owner => "owner",
+                SendOrigin::Automation => "amux",
+            };
+            TYPED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((name.to_string(), text.to_string(), origin));
+            Dispatch::Handled((true, "sent".into()))
+        }
+        fn running(&self, _: &str) -> Dispatch<bool> {
+            Dispatch::Handled(true)
+        }
+        async fn peek(&self, _: &AppState, name: &str, _: i64) -> Dispatch<Value> {
+            Dispatch::Handled(json!({"name": name, "output": ""}))
+        }
+    }
 }
