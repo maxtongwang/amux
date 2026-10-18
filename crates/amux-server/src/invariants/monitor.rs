@@ -174,6 +174,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     let mut out = Vec::new();
     let mut tm = SectionTimer::new();
 
+    // -- 0. does the live server use the stable macOS signing identity?
     out.push(checks::server_codesign_identity(live_server_codesign()));
     tm.mark(&out, "0. server code signing");
 

@@ -8,7 +8,14 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/amux-codesign.XXXXXX")
 work=$(cd "$work" && pwd -P)
 keychain="$work/k.keychain-db"
 password=$(openssl rand -hex 16)
-cleanup() { security delete-keychain "$keychain" >/dev/null 2>&1 || true; rm -rf "$work"; }
+source "$repo/scripts/codesign-keychain-guard.sh"
+cleanup() {
+  local status=0
+  codesign_ci_restore_keychains || status=$?
+  security delete-keychain "$keychain" >/dev/null 2>&1 || status=$?
+  rm -rf "$work"
+  return "$status"
+}
 trap cleanup EXIT
 export AMUX_CODESIGN_TEST_DIR="$work" AMUX_CODESIGN_TEST_PASSWORD="$password"
 plan=$(DRY_RUN=1 bash "$repo/scripts/codesign-identity-setup.sh" 2>&1)
@@ -18,6 +25,7 @@ printf '%s\n' "$plan" | grep -q 'PLAN: security import' || { echo 'FAIL: plan ha
 echo 'PASS: setup plan touches only the disposable keychain'
 security create-keychain -p "$password" "$keychain"
 security unlock-keychain -p "$password" "$keychain"
+codesign_ci_add_test_keychain "$keychain"
 out1=$(perl -e 'alarm 60; exec @ARGV' bash "$repo/scripts/codesign-identity-setup.sh" 2>&1) || { echo "FAIL: first run"; printf '%s\n' "$out1"; exit 1; }
 grep -q 'creating the identity' <<<"$out1" && grep -q 'OK: the identity is present and signs' <<<"$out1" && grep -q 'Full Disk Access' <<<"$out1" \
   && echo 'PASS: first run creates the identity, verifies a signature and prints the Full Disk Access step' \

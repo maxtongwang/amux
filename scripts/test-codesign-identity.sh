@@ -61,10 +61,13 @@ password=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
 export AMUX_CODESIGN_TEST_PASSWORD=$password
 cleanup() {
   local cleanup_status=0
+  local delete_status=0
   if [ "${DRY_RUN:-0}" = 1 ]; then
     plan_command security delete-keychain "$keychain"
   else
-    run_sensitive security delete-keychain "$keychain" >/dev/null 2>&1 || cleanup_status=$?
+    codesign_ci_restore_keychains || cleanup_status=$?
+    run_sensitive security delete-keychain "$keychain" >/dev/null 2>&1 || delete_status=$?
+    [ "$cleanup_status" -ne 0 ] || cleanup_status=$delete_status
   fi
   rm -rf "$work"
   if [ "$cleanup_status" -eq 75 ]; then
@@ -101,6 +104,7 @@ if [ "$status" -eq 75 ]; then echo 'SKIP: temporary keychain creation timed out'
 run_sensitive security unlock-keychain -p "$password" "$keychain" || status=$?
 if [ "$status" -eq 75 ]; then echo 'SKIP: temporary keychain unlock timed out'; exit 0; fi
 [ "$status" -eq 0 ] || exit "$status"
+codesign_ci_add_test_keychain "$keychain"
 
 bash "$repo/scripts/codesign-identity.sh" --keychain "$keychain" || status=$?
 if [ "$status" -eq 75 ]; then echo 'SKIP: identity provisioning timed out'; exit 0; fi

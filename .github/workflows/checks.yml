@@ -21,9 +21,9 @@ jobs:
         run: |
           set -o pipefail
           DRY_RUN=1 bash scripts/test-codesign-identity.sh | bash scripts/test-codesign-identity.sh --check-plan
+          bash scripts/test-codesign-identity.sh
       - name: One-time owner setup script, against a disposable keychain
         run: bash scripts/test-codesign-identity-setup.sh
-          bash scripts/test-codesign-identity.sh
   checks:
     runs-on: ubuntu-latest
     timeout-minutes: 10
