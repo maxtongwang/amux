@@ -243,7 +243,9 @@ The macOS auto-builder signs each staged `amux-server-rs` with the local
 `scripts/codesign-identity-setup.sh` creates or repairs a dedicated keychain at
 `~/Library/Keychains/amux-signing.keychain-db` without prompting. Its random
 password is stored at `~/.amux/codesign/keychain-password` (mode 0600). The
-keychain is accessed only by explicit path and never added to the search list.
+keychain is appended last to the user search list, without changing existing
+entries or the default keychain. macOS only resolves `codesign --keychain` identities
+from keychains already on that search list; setup and signing repair a missing entry.
 After setup, Max enables Full Disk Access for `amux-server-rs` once.
 
 Until the identity exists, the builder emits `verdict=codesign_identity_missing`

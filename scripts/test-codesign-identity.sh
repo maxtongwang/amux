@@ -20,10 +20,16 @@ if [ "${1:-}" = --check-plan ]; then
     echo 'FAIL: signing plan is missing a required phase or cleanup' >&2; exit 1;
   }
   check_identity_plan "$plan" || exit 1
-  forbidden='add-'"trusted"'|trust-'"settings"'|login.'"keychain"'|/Library/Keychains/'"System"'|default-'"keychain"'|list-'"keychains"'|login-'"keychain"'|osa'"script"'|tcc'"util"'|open -a'
+  forbidden='add-'"trusted"'|trust-'"settings"'|/Library/Keychains/'"System"'|default-'"keychain"'|login-'"keychain"'|osa'"script"'|tcc'"util"'|open -a'
   if printf '%s\n' "$plan" | grep -Eiq "$forbidden"; then
     echo 'FAIL: signing plan contains a forbidden operation' >&2; exit 1
   fi
+  plan_keychain=$(PLAN_TEXT="$plan" python3 -c 'import os, shlex
+for line in os.environ["PLAN_TEXT"].splitlines():
+    if line.startswith("PLAN: security create-keychain "):
+        print(shlex.split(line[6:])[-1]); break')
+  [ -n "$plan_keychain" ] || { echo 'FAIL: plan has no dedicated keychain' >&2; exit 1; }
+  check_search_list_plan "$plan" '"/Users/runner/Library/Keychains/login.keychain-db"' "$plan_keychain"
   status=0
   error=$(bash "$(dirname "$0")/codesign-identity.sh" --keychain /var/tmp/invalid.keychain-db 2>&1) || status=$?
   [ "$status" -eq 2 ] && [[ "$error" == *'Refusing --keychain'* ]] || {
@@ -74,6 +80,10 @@ cleanup() {
   if [ "${DRY_RUN:-0}" = 1 ]; then
     plan_command security delete-keychain "$keychain"
   else
+    if [ -f "$work/original.search" ]; then
+      read_user_search_list "$(cat "$work/original.search")" &&
+        run_sensitive security list-keychains -d user -s "${USER_SEARCH_LIST[@]}" >/dev/null || cleanup_status=$?
+    fi
     run_sensitive security delete-keychain "$keychain" >/dev/null 2>&1 || delete_status=$?
     [ "$cleanup_status" -ne 0 ] || cleanup_status=$delete_status
   fi
@@ -106,6 +116,7 @@ if [ "${DRY_RUN:-0}" = 1 ]; then
 fi
 
 status=0
+security list-keychains -d user > "$work/original.search"
 run_sensitive security create-keychain -p "$password" "$keychain" || status=$?
 if [ "$status" -eq 75 ]; then echo 'SKIP: temporary keychain creation timed out'; exit 0; fi
 [ "$status" -eq 0 ] || exit "$status"

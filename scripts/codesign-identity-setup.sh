@@ -49,6 +49,7 @@ else
 fi
 run security set-keychain-settings "$keychain"
 run security unlock-keychain -p "$password" "$keychain"
+ensure_signing_search_list "$keychain"
 if [ "${DRY_RUN:-0}" = 1 ]; then
   plan_command security find-identity -p codesigning "$keychain"
   need_import=1
@@ -96,6 +97,7 @@ else
   shown=$(codesign -dvv "$probe_dir/probe" 2>&1)
   rm -rf "$probe_dir"
   grep -qF "Authority=$identity" <<< "$shown" || { echo 'WARN verdict=codesign_probe_failed' >&2; exit 1; }
+  echo "PASS: probe Authority=$identity"
 fi
 echo 'PASS: dedicated signing identity signs; setup is repairable on rerun'
 echo 'Full Disk Access: Open System Settings > Privacy & Security > Full Disk Access and enable amux-server-rs (~/.local/bin/amux-server-rs).'

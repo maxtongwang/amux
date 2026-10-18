@@ -23,6 +23,7 @@ keychain_args=(--keychain "$keychain")
 identity_list_args=("$keychain")
 if [ "${DRY_RUN:-0}" = 1 ]; then
   if [ "$verify_only" = 0 ]; then
+    ensure_signing_search_list "$keychain"
     plan_command security unlock-keychain -p '<password>' "$keychain"
     plan_command codesign --force --sign '<identity-hash>' --identifier "$IDENTIFIER" --options runtime --timestamp=none ${keychain_args[@]+"${keychain_args[@]}"} "$bin"
   fi
@@ -33,6 +34,9 @@ if [ "${DRY_RUN:-0}" = 1 ]; then
   exit 0
 fi
 if [ "$verify_only" = 0 ]; then
+  ensure_signing_search_list "$keychain" || {
+    echo 'WARN verdict=codesign_search_list_repair_failed' >&2; exit 1;
+  }
   if [ -n "${AMUX_CODESIGN_TEST_DIR:-}" ]; then
     password=${AMUX_CODESIGN_TEST_PASSWORD:?test password required}
   else
