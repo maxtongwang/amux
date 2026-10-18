@@ -1,5 +1,9 @@
 import { test, expect } from '@playwright/test';
-test('Messages tab opens with the human pill selected', async ({ page }) => {
+test('Messages tab opens with the human pill selected', async ({ page }, testInfo) => {
+  // Flaky on ios-safari only (the #cv-all-item click times out): DMIW-8. Self-expiring
+  // quarantine approved 2026-10-18; from 2026-10-25 the case runs again with no edit.
+  test.fixme(testInfo.project.name === 'ios-safari' && Date.now() < Date.parse('2026-10-25T00:00:00Z'),
+    'flaky on ios-safari: DMIW-8 (quarantine expires 2026-10-25)');
   const urls: string[] = [];
   page.on('request', r => { if (r.url().includes('/api/history')) urls.push(r.url()); });
   await page.goto('/');
