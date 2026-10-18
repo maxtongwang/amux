@@ -37,7 +37,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 -keyout "$work/unrelated.key" 
 openssl pkcs12 -export -name "$unrelated" -inkey "$work/unrelated.key" \
   -in "$work/unrelated.crt" -out "$work/unrelated.p12" -passout "pass:$password" \
   -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
-security import "$work/unrelated.p12" -k "$keychain" -P "$password" -T /usr/bin/codesign >/dev/null
+security import "$work/unrelated.p12" -k "$keychain" -P "$password" >/dev/null
 security set-key-partition-list -S apple-tool:,apple: -s -t private -l "$unrelated" -k "$password" "$keychain" >/dev/null
 security dump-keychain -a "$keychain" > "$work/before.dump"
 partition_for_label() {

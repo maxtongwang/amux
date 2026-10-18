@@ -1,6 +1,6 @@
 keychain: "/tmp/disposable.keychain-db"
-version: 512
-class: "keys"
+version: 256
+class: 0x00000010
 attributes:
     0x00000001 <blob>="unrelated CI signing key"
     "labl"<blob>="unrelated CI signing key"
@@ -15,8 +15,8 @@ access: 3 entries
         authorizations (1): change_acl
         description: unrelated CI signing key
 keychain: "/tmp/disposable.keychain-db"
-version: 512
-class: "keys"
+version: 256
+class: 0x00000010
 attributes:
     "Label"<blob>=0x616d7578206c6f63616c20636f6465207369676e696e67
 access: 2 entries
