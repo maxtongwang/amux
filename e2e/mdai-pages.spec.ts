@@ -15,7 +15,7 @@ import { mkdtemp, readFile, rm, writeFile, mkdir, access } from 'node:fs/promise
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Page } from '@playwright/test';
-import { test, expect } from './fixtures';
+import { test, expect } from './operands';
 import { cleanup } from './teardown';
 
 type Mode = { delayMs: number; fail?: string };
@@ -74,8 +74,12 @@ async function editInstruction(page: Page) {
 }
 const fileText = (p: string) => readFile(p, 'utf8');
 
-test('MDAI: create and configure a node entirely in the UI, every field round-trips, runs are single-flight, honest and recoverable', async ({ page, request }, info) => {
+test('MDAI: create and configure a node entirely in the UI, every field round-trips, runs are single-flight, honest and recoverable', async ({ page, request, operands }, info) => {
   test.setTimeout(300_000);
+  // F01 operands: the doc each settings save sent and the server answered, and the form state it came from.
+  const ops = operands({ label: 'mdai-settings-save', paths: ['/api/files/mdai', '/api/client-debug'], jsonPaths: ['/api/files/mdai/doc', '/api/client-debug'],
+    globals: ['_mdaiTab', '_mdaiCur.abs', '_mdaiCur.mtime', '_mdaiCur.doc', '_mdaiPendingDoc', '_mdaiFormErr', '_mdaiDraft', '_mdaiBodyDraft', '_mdaiRunning'],
+    dom: ['#mdai-set-title', '#mdai-set-model', '#mdai-set-model-custom', '#mdai-set-timeout', '#mdai-set-refresh', '#mdai-body .mdai-field-err'] });
   const narrow = page.viewportSize()!.width <= 600;
   const api = await fakeMessagesApi();
   const dir = await mkdtemp(join(tmpdir(), 'amux-mdai-pages-'));
@@ -167,6 +171,7 @@ test('MDAI: create and configure a node entirely in the UI, every field round-tr
     // ---- Edit: settings, sources, the API call and the instruction ---------------
     await tab(page, 'settings');
     await page.locator('#mdai-set-title').fill('Resume here');
+    ops.mark('settings title filled');
     await page.locator('#mdai-set-model').selectOption('haiku');
     await page.locator('#mdai-set-timeout').fill('5');
     await page.locator('#mdai-set-save').click();
@@ -302,6 +307,7 @@ test('MDAI: create and configure a node entirely in the UI, every field round-tr
     await expect(page.locator('#mdai-list')).toContainText('No MDAI nodes yet');
     await expect(access(join(dir, 'team', 'Resume.mdai'))).rejects.toThrow();
   } finally {
+    await cleanup('capture F01 operands', () => ops.capture('finally')); // before the prefs and folder below are restored
     await cleanup('restore MDAI prefs', () => Promise.all([pref('mdai_root', prior[0]), pref('mdai_api_base', prior[1])]));
     await cleanup('stop the stand-in Messages API', () => api.close());
     await cleanup('remove temp folder', () => rm(dir, { recursive: true, force: true }));
