@@ -149,11 +149,13 @@ EOF
   exit 1
 }
 
-if ! target_is_live; then
-  exec "$REAL" "$@"
-fi
+# A private outer target (-S/-L) exempts only the top-level kill words and -K. Nested
+# shell or tmux text, and the global -c text, can name any socket, so the outer option
+# does not constrain them: they are scanned whatever the outer target (review round 7).
+live=0
+target_is_live && live=1
 
-[ "$have_K" -eq 1 ] && refuse "-K"
+[ "$have_K" -eq 1 ] && [ "$live" -eq 1 ] && refuse "-K"
 
 command_kind() {
   local w="$1" name
@@ -220,7 +222,7 @@ fi
 
 # --- command chain -----------------------------------------------------------------
 # Commands separate on an argument ";" (shell \;) or one ending in an unescaped ";".
-# The first word of each command is its name and is always checked.
+# The first word of each command is its name; a kill name refuses on the live target.
 expect_name=1
 kind=""
 skip_value=0
@@ -245,7 +247,7 @@ while [ "$i" -lt "$n" ]; do
   esac
   if [ "$expect_name" -eq 1 ]; then
     first="${a%%[[:space:]]*}"
-    is_protected_word "$first" && refuse "$first"
+    is_protected_word "$first" && [ "$live" -eq 1 ] && refuse "$first"
     kind=""
     skip_value=0
     names=0

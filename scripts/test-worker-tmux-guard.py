@@ -160,6 +160,17 @@ class WorkerTmuxGuardTests(unittest.TestCase):
         self.assert_refused('-c', 'tmux kill-session -t x')
         self.assert_refused('-uc', 'tmux -K list-sessions')
         self.assert_refused('-c', '/tmp/p/tmux -S /tmp/p/sock kill-server')
+        # Review round 7: an outer private -S/-L must not exempt the -c text.
+        nested = f'{real} -S {self.live_sock} kill-server'
+        self.assert_refused('-L', 'review-private', '-c', nested)
+        self.assert_refused('-S', '/tmp/p/private.sock', '-c', nested)
+        self.assert_refused('-Lreview-private', '-c', 'tmux kill-server')
+        self.assert_passed('-S', '/tmp/p/private.sock', '-c', 'echo ok')
+        # The same holds for nested running text under a private outer target.
+        self.assert_refused('-S', '/tmp/p/private.sock', 'run-shell', nested)
+        self.assert_refused('-L', 'review-private', 'new-window', '-d', nested)
+        self.assert_refused('-S', '/tmp/p/private.sock', 'bind-key', 'X', 'kill-server')
+        self.assert_passed('-S', '/tmp/p/private.sock', 'run-shell', 'echo ok')
         self.assert_passed('-c', 'rg kill-server scripts')
         self.assert_passed('-c', 'echo ok')
 
