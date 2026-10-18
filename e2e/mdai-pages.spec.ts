@@ -18,11 +18,18 @@ import type { Page } from '@playwright/test';
 import { test, expect } from './fixtures';
 import { cleanup } from './teardown';
 
-type Mode = { delayMs: number; fail?: string };
+// `hold`, when set, keeps this spec's node answers waiting until released: a
+// run stays in flight for exactly as long as the test needs it to, however
+// slow the runner. A wall-clock delay was not that: a 4s answer finished while
+// a loaded iOS runner was still reloading (F04/F06), and no longer wait could
+// bring the finished run's banner back.
+type Mode = { delayMs: number; fail?: string; hold?: Promise<void> };
 
 async function fakeMessagesApi() {
   const mode: Mode = { delayMs: 0 };
   const prompts: string[] = [];
+  let heldNow = 0;
+  let releaseHeld: (() => void) | null = null;
   const server: Server = createServer(async (req: IncomingMessage, res) => {
     let body = '';
     for await (const chunk of req) body += chunk;
@@ -32,7 +39,12 @@ async function fakeMessagesApi() {
     // running alongside this one (skill example inference on a skill save)
     // reach this stand-in too. Count only this spec's node: every node prompt
     // carries its instruction. Others get an answer and are not counted.
-    if (String(prompt).includes('"Where I Left Off" dashboard')) prompts.push(prompt);
+    const node = String(prompt).includes('"Where I Left Off" dashboard');
+    if (node) prompts.push(prompt);
+    if (node && mode.hold) {
+      heldNow++;
+      try { await mode.hold; } finally { heldNow--; }
+    }
     const { delayMs, fail } = mode;
     setTimeout(() => {
       if (res.destroyed) return;
@@ -48,7 +60,18 @@ async function fakeMessagesApi() {
   });
   await new Promise<void>(r => server.listen(0, '127.0.0.1', () => r()));
   const port = (server.address() as { port: number }).port;
-  return { url: `http://127.0.0.1:${port}`, mode, prompts, close: () => new Promise<void>(r => { server.closeAllConnections(); server.close(() => r()); }) };
+  // Hold this spec's node answers until the returned release() runs.
+  const hold = () => {
+    let open!: () => void;
+    mode.hold = new Promise<void>(r => { open = r; });
+    releaseHeld = () => { mode.hold = undefined; releaseHeld = null; open(); };
+    return releaseHeld;
+  };
+  return {
+    url: `http://127.0.0.1:${port}`, mode, prompts, hold, held: () => heldNow,
+    // A held answer is released before the server goes, so no handler outlives the spec.
+    close: () => new Promise<void>(r => { releaseHeld?.(); server.closeAllConnections(); server.close(() => r()); }),
+  };
 }
 
 const PROMPT = '# Amux Workstream Reconstruction & Resumption\n\nAnalyze my complete Amux message history and reconstruct all the workstreams.\n\n## Final instruction\n\nStart with a **"Where I Left Off" dashboard**.\n';
@@ -251,15 +274,25 @@ test('MDAI: create and configure a node entirely in the UI, every field round-tr
     await page.screenshot({ path: info.outputPath('mdai-preview.png') });
 
     // ---- Reload mid-run: the run is found again, then finishes ------------------
-    api.mode.delayMs = 4000;
-    await editInstruction(page);
-    await page.locator('#mdai-run-btn').click();
-    await expect(page.locator('#mdai-runbanner.mdai-runbanner')).toBeVisible();
-    await page.reload();
-    await page.evaluate(() => (window as any).switchView('mdai'));
-    await openNodeFromList(page);
-    await expect(page.locator('#mdai-runbanner.mdai-runbanner')).toBeVisible();
+    // The model answer is HELD until the reopened page has shown the run, so
+    // "found again" is asserted while the run is provably still in flight.
+    api.mode.delayMs = 0;
+    const releaseRun = api.hold();
+    try {
+      await editInstruction(page);
+      await page.locator('#mdai-run-btn').click();
+      await expect(page.locator('#mdai-runbanner.mdai-runbanner')).toBeVisible();
+      await expect.poll(() => api.held(), { message: 'the run reached the model and is held there' }).toBe(1);
+      await page.reload();
+      await page.evaluate(() => (window as any).switchView('mdai'));
+      await openNodeFromList(page);
+      await expect(page.locator('#mdai-runbanner.mdai-runbanner')).toBeVisible();
+      expect(api.held(), 'the banner was asserted while the run was still held').toBe(1);
+    } finally {
+      releaseRun();
+    }
     await expect(page.locator('#mdai-runbanner.mdai-runbanner')).toHaveCount(0, { timeout: 20_000 });
+    expect(api.held()).toBe(0);
     await tab(page, 'runs');
     await expect(page.locator('#mdai-body .mdai-run:not(.mdai-run-h)').first()).toContainText('Completed');
 
