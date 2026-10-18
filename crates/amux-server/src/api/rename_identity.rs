@@ -222,7 +222,9 @@ pub(crate) fn record(home: &Path, old: &str, new: &str, inc: &str) -> std::io::R
 }
 
 fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!("jsonl.{}.tmp", std::process::id()));
+    // Keep the full destination name: journal, version and pending files must
+    // not share a temporary path when one publication is damaged.
+    let tmp = path.with_file_name(format!("{}.{}.tmp", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id()));
     std::fs::write(&tmp, text)
         .and_then(|_| std::fs::rename(&tmp, path))
         .inspect_err(|_| {
@@ -347,7 +349,7 @@ fn legacy_holder(home: &Path, newest: &HashMap<String, Rec>, records: &[Rec], st
 }
 
 /// Per-file damage must not keep the fleet offline. Preserve the offending
-/// path and log it; marker I/O is the only fatal migration boundary.
+/// path and log it; unfinished entries stay eligible for a later retry.
 fn migration_skipped(path: &Path, error: &std::io::Error) {
     tracing::warn!(path = %path.display(), %error, verdict = "identity_migration_file_skipped",
         measured = true, n_considered = 1, "identity migration skipped a file; left in place");
@@ -368,6 +370,31 @@ fn marker_complete(path: &Path) -> std::io::Result<bool> {
 
 fn marker_error(path: &Path, error: std::io::Error) -> std::io::Error {
     std::io::Error::new(error.kind(), format!("fatal identity migration marker I/O at {}: {error}", path.display()))
+}
+
+/// Pending files contain paths only, never credential material. Completion is
+/// published only after the whole pass succeeds; a crash can safely replay it.
+fn finish_migration(home: &Path, stem: &str, pending: &[String], considered: usize) -> std::io::Result<()> {
+    let marker = home.join(format!("{stem}.version"));
+    let pending_path = home.join(format!("{stem}.pending"));
+    std::fs::create_dir_all(home).map_err(|e| marker_error(&marker, e))?;
+    if !pending.is_empty() {
+        tracing::warn!(migration = stem, pending = pending.len(), measured = true,
+            n_considered = considered, verdict = "identity_migration_pending",
+            retry_after_s = 60, "unfinished identity migration will retry at startup or on identity access");
+        // Even if diagnostics cannot be persisted, the absent completion marker
+        // keeps recovery live. Do not turn an individual I/O failure into an outage.
+        if let Err(error) = write_atomic(&pending_path, &serde_json::to_string(pending)?) {
+            migration_skipped(&pending_path, &error);
+        }
+        return Ok(());
+    }
+    match std::fs::remove_file(&pending_path) {
+        Ok(()) => {},
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+        Err(e) => { migration_skipped(&pending_path, &e); return Ok(()); }
+    }
+    write_atomic(&marker, "1\n").map_err(|e| marker_error(&marker, e))
 }
 
 fn migration_entries(path: &Path) -> (Vec<std::fs::DirEntry>, bool) {
@@ -442,7 +469,9 @@ fn migrate_tokens(home: &Path) -> std::io::Result<()> {
     let marker = home.join("worker-tokens.version");
     if marker_complete(&marker)? { return Ok(()); }
     let dir = home.join("worker-tokens");
-    let (entries, _) = migration_entries(&dir);
+    let (entries, entries_complete) = migration_entries(&dir);
+    let mut pending = Vec::new();
+    if !entries_complete { pending.push(dir.display().to_string()); }
     let (history, history_complete) = match std::fs::read_to_string(record_path(home)) {
         Ok(text) => {
             let complete = text.lines().all(|l| l.trim().is_empty() || parse(l).is_some());
@@ -458,6 +487,8 @@ fn migrate_tokens(home: &Path) -> std::io::Result<()> {
     let records: Vec<Rec> = history.lines().filter_map(parse).collect();
     let newest: HashMap<String, Rec> = records.iter().map(|r| (r.old.clone(), r.clone())).collect();
     let (owned, ownership_complete) = audit_incarnations(home);
+    if !ownership_complete { pending.push(home.join("sessions").display().to_string()); }
+    if !history_complete { pending.push(record_path(home).display().to_string()); }
     let (mut migrated, mut dropped) = (0usize, 0usize);
     for entry in &entries {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -481,7 +512,9 @@ fn migrate_tokens(home: &Path) -> std::io::Result<()> {
                     let target = super::worker_identity::runs_dir(home, &inc);
                     if target == path { return Ok(()); }
                     std::fs::create_dir_all(&target)?;
-                    for hash in migration_entries(&path).0 {
+                    let (hashes, complete) = migration_entries(&path);
+                    if !complete { return Err(std::io::Error::other("run hash scan incomplete")); }
+                    for hash in hashes {
                         if let Err(error) = rekey_hash(&hash.path(), &target.join(hash.file_name())) {
                             migration_skipped(&hash.path(), &error);
                         }
@@ -500,7 +533,10 @@ fn migrate_tokens(home: &Path) -> std::io::Result<()> {
             }
             Ok(())
         })();
-        if let Err(error) = result { migration_skipped(&path, &error); }
+        if let Err(error) = result {
+            migration_skipped(&path, &error);
+            pending.push(path.display().to_string());
+        }
     }
     tracing::info!(migrated, dropped, measured = true, n_considered = entries.len(),
         verdict = "worker_tokens_migrated", "legacy launch and run hashes re-keyed by incarnation");
@@ -508,16 +544,40 @@ fn migrate_tokens(home: &Path) -> std::io::Result<()> {
         tracing::warn!(dropped, measured = true, n_considered = entries.len(),
             verdict = "worker_tokens_legacy_dropped", "unowned legacy token material revoked");
     }
-    std::fs::create_dir_all(home).map_err(|e| marker_error(&marker, e))?;
-    write_atomic(&marker, "1\n").map_err(|e| marker_error(&marker, e))
+    finish_migration(home, "worker-tokens", &pending, entries.len())
 }
 
-/// Settle legacy ownership once, before any lifecycle mutation. The version
-/// marker is published last: interruption leaves an idempotently retryable
-/// rewrite, never a marker claiming unfinished migration succeeded.
+const MIGRATION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+static MIGRATION_ATTEMPTS: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, std::time::Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Startup bypasses the in-process throttle; no retry state survives a restart.
+pub(crate) fn migrate_at_startup(home: &Path) -> std::io::Result<()> {
+    migrate_at(home, std::time::Instant::now(), true)
+}
+
+/// Identity operations retry unfinished work at most once per minute per home.
+/// Completed migrations only read the two small version markers.
 pub(crate) fn ensure_migrated(home: &Path) -> std::io::Result<()> {
+    migrate_at(home, std::time::Instant::now(), false)
+}
+
+fn migrate_at(home: &Path, now: std::time::Instant, startup: bool) -> std::io::Result<()> {
     let result = (|| {
         let _w = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tokens_done = marker_complete(&home.join("worker-tokens.version"))?;
+        let renames_done = marker_complete(&home.join("renames.version"))?;
+        if tokens_done && renames_done { return Ok(()); }
+        {
+            let mut attempts = MIGRATION_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner());
+            if !startup && attempts.get(home).is_some_and(|last| now.saturating_duration_since(*last) < MIGRATION_RETRY_INTERVAL) {
+                return Ok(());
+            }
+            let retry = attempts.contains_key(home);
+            attempts.insert(home.to_path_buf(), now);
+            tracing::info!(retry, startup, measured = true, n_considered = 1,
+                verdict = "identity_migration_attempt", "running bounded identity migration pass");
+        }
         migrate_tokens(home)?;
         let marker = home.join("renames.version");
         if marker_complete(&marker)? { return Ok(()); }
@@ -527,10 +587,12 @@ pub(crate) fn ensure_migrated(home: &Path) -> std::io::Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => {
                 migration_skipped(&path, &e);
-                return write_atomic(&marker, "1\n").map_err(|e| marker_error(&marker, e));
+                return finish_migration(home, "renames", &[path.display().to_string()], 1);
             }
         };
+        let mut pending = Vec::new();
         if text.lines().any(|l| !l.trim().is_empty() && parse(l).is_none()) {
+            pending.push(path.display().to_string());
             tracing::warn!(path = %path.display(), verdict = "identity_migration_record_skipped",
                 measured = true, n_considered = text.lines().filter(|l| !l.trim().is_empty() && parse(l).is_none()).count(),
                 "malformed rename records retained; valid records will still migrate");
@@ -554,6 +616,7 @@ pub(crate) fn ensure_migrated(home: &Path) -> std::io::Result<()> {
                     Ok(inc) => Some(inc),
                     Err(error) => {
                         migration_skipped(&env_file(home, &holder), &error);
+                        pending.push(env_file(home, &holder).display().to_string());
                         out.push_str(line);
                         continue;
                     }
@@ -573,7 +636,7 @@ pub(crate) fn ensure_migrated(home: &Path) -> std::io::Result<()> {
         if !legacy.is_empty() {
             if let Err(error) = write_atomic(&path, &out) {
                 migration_skipped(&path, &error);
-                return write_atomic(&marker, "1\n").map_err(|e| marker_error(&marker, e));
+                return finish_migration(home, "renames", &[path.display().to_string()], 1);
             }
             tracing::info!(
                 migrated,
@@ -593,7 +656,7 @@ pub(crate) fn ensure_migrated(home: &Path) -> std::io::Result<()> {
                 );
             }
         }
-        write_atomic(&marker, "1\n").map_err(|e| marker_error(&marker, e))
+        finish_migration(home, "renames", &pending, legacy.len())
     })();
     if let Err(ref e) = result {
         tracing::warn!(error = %e, verdict = "rename_records_migration_failed", measured = true,
@@ -667,6 +730,143 @@ pub async fn resolve_headers(mut req: Request, next: Next) -> Response {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn round9_pass(home: &Path, seconds: u64) {
+        migrate_at(home, std::time::Instant::now() + std::time::Duration::from_secs(seconds), false).unwrap();
+    }
+
+    fn round9_expire_retry(home: &Path) {
+        MIGRATION_ATTEMPTS.lock().unwrap().insert(home.to_path_buf(),
+            std::time::Instant::now() - std::time::Duration::from_secs(61));
+    }
+
+    fn round9_hash() -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(b"legacy-token"))
+    }
+
+    fn round9_token_fixture() -> tempfile::TempDir {
+        let d = home_with(&["w"]);
+        std::fs::write(env_file(d.path(), "w"), "CC_INCARNATION=round9-inc\n").unwrap();
+        std::fs::create_dir(d.path().join("worker-tokens")).unwrap();
+        std::fs::write(d.path().join("server.env"), "AMUX_CONTRACT_DONE=1\n").unwrap();
+        std::fs::write(d.path().join("worker-tokens/w.sha256"), round9_hash()).unwrap();
+        d
+    }
+
+    #[test]
+    fn round9_permission_repair_retries_without_premature_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = round9_token_fixture();
+        let h = d.path();
+        let dir = h.join("worker-tokens");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let first = ensure_migrated(h);
+        // Restore before any assertion so a failed test leaves removable evidence.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        first.unwrap();
+        assert!(!h.join("worker-tokens.version").exists(), "failed publication must remain retryable");
+        assert!(h.join("worker-tokens.pending").is_file());
+        // Expire just this fixture's clock; a direct authentication operation
+        // must perform recovery without the HTTP middleware or startup hook.
+        round9_expire_retry(h);
+        use super::super::worker_identity as wi;
+        assert_eq!(wi::check(h, "w", Some("legacy-token")), wi::Check::Valid);
+        assert_eq!(std::fs::read_to_string(dir.join("round9-inc.sha256")).unwrap(), round9_hash());
+        assert!(h.join("worker-tokens.version").is_file());
+        assert!(!h.join("worker-tokens.pending").exists());
+    }
+
+    #[test]
+    fn round9_malformed_target_recovers_on_startup() {
+        let d = round9_token_fixture();
+        let h = d.path();
+        let target = h.join("worker-tokens/round9-inc.sha256");
+        std::fs::create_dir(&target).unwrap();
+        ensure_migrated(h).unwrap();
+        assert!(!h.join("worker-tokens.version").exists());
+        std::fs::remove_dir(&target).unwrap();
+        // Startup must bypass the hot-path throttle without a manual marker edit.
+        migrate_at_startup(h).unwrap();
+        assert_eq!(std::fs::read_to_string(target).unwrap(), round9_hash());
+        assert!(h.join("worker-tokens.version").is_file());
+        assert!(!h.join("worker-tokens.pending").exists());
+    }
+
+    #[test]
+    fn round9_rename_read_repair_retries() {
+        let d = home_with(&["w"]);
+        let h = d.path();
+        std::fs::create_dir(record_path(h)).unwrap();
+        ensure_migrated(h).unwrap();
+        assert!(!h.join("renames.version").exists());
+        assert!(h.join("renames.pending").is_file());
+        std::fs::remove_dir(record_path(h)).unwrap();
+        std::fs::write(record_path(h), "{\"old\":\"old\",\"new\":\"w\"}\n").unwrap();
+        round9_pass(h, 61);
+        assert_eq!(current_name(h, "old").as_deref(), Some("w"));
+        assert!(h.join("renames.version").is_file());
+        assert!(!h.join("renames.pending").exists());
+    }
+
+    #[test]
+    fn round9_rename_write_repair_retries() {
+        let d = home_with(&["w"]);
+        let h = d.path();
+        std::fs::write(record_path(h), "{\"old\":\"old\",\"new\":\"w\"}\n").unwrap();
+        let tmp = h.join(format!("renames.jsonl.{}.tmp", std::process::id()));
+        std::fs::create_dir(&tmp).unwrap();
+        ensure_migrated(h).unwrap();
+        assert!(!h.join("renames.version").exists());
+        assert!(h.join("renames.pending").is_file());
+        std::fs::remove_dir(tmp).unwrap();
+        round9_pass(h, 61);
+        assert_eq!(current_name(h, "old").as_deref(), Some("w"));
+        assert!(h.join("renames.version").is_file());
+        assert!(!h.join("renames.pending").exists());
+    }
+
+    #[test]
+    fn round9_retry_window_prevents_rescan_then_identity_access_recovers() {
+        let d = round9_token_fixture();
+        let h = d.path();
+        let target = h.join("worker-tokens/round9-inc.sha256");
+        std::fs::create_dir(&target).unwrap();
+        ensure_migrated(h).unwrap();
+        assert!(!h.join("worker-tokens.version").exists());
+        let pending = std::fs::read(h.join("worker-tokens.pending")).unwrap();
+        std::fs::remove_dir(&target).unwrap();
+        ensure_migrated(h).unwrap();
+        assert!(h.join("worker-tokens/w.sha256").is_file(), "hot identity access must not rescan inside retry window");
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(h.join("worker-tokens.pending")).unwrap(), pending);
+        round9_pass(h, 61);
+        assert_eq!(std::fs::read_to_string(target).unwrap(), round9_hash());
+        assert!(h.join("worker-tokens.version").is_file());
+    }
+
+    #[test]
+    fn round9_partial_run_directory_clears_only_recovered_entries() {
+        let d = round9_token_fixture();
+        let h = d.path();
+        let source = h.join("worker-tokens/w.runs");
+        let target = h.join("worker-tokens/round9-inc.runs");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir_all(target.join("bad.sha256")).unwrap();
+        std::fs::write(source.join("good.sha256"), "good-run").unwrap();
+        std::fs::write(source.join("bad.sha256"), "bad-run").unwrap();
+        ensure_migrated(h).unwrap();
+        assert!(!h.join("worker-tokens.version").exists());
+        assert!(target.join("good.sha256").is_file());
+        assert!(!source.join("good.sha256").exists());
+        assert!(source.join("bad.sha256").is_file());
+        std::fs::remove_dir(target.join("bad.sha256")).unwrap();
+        round9_pass(h, 61);
+        assert_eq!(std::fs::read_to_string(target.join("bad.sha256")).unwrap(), "bad-run");
+        assert!(!source.exists());
+        assert!(!h.join("worker-tokens.pending").exists());
+        assert!(h.join("worker-tokens.version").is_file());
+    }
 
     #[test]
     fn round8_migration_skips_bad_files_and_unknown_marker_contents() {

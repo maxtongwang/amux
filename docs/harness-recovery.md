@@ -283,13 +283,25 @@ a crash can be retried without replacing an already published credential.
 Per-file migration failures emit WARN `identity_migration_file_skipped` with the
 path and leave the failed file in place while startup continues. An unrecognized
 version marker triggers a new pass. Only marker I/O is fatal, with its path and
-`identity_migration_marker_io_fatal`. Skipped files need repair before a fresh
-migration pass; the completion marker records a completed scan, including skips.
+`identity_migration_marker_io_fatal`. Completion markers are withheld while any
+entry or input scan remains unfinished. `worker-tokens.pending` and
+`renames.pending` list the remaining paths; successful retries clear their entries.
+WARN `identity_migration_pending` reports the migration, pending count, considered
+count, and retry interval. Each pass emits `identity_migration_attempt`.
 
-Verification (seven passing regressions, using temporary homes):
+Startup retries unfinished work immediately. Identity operations retry at most
+once per 60 seconds per home, using an in-process monotonic clock; they still read
+successfully migrated credentials and rename records during the wait. No retry
+timer, manual marker edit, or process restart is required after filesystem repair.
+Completed markers bypass directory scans. Failed files and malformed journal lines
+remain on disk for diagnosis; a retry recomputes the pending list from source.
+
+Verification (temporary homes, including permission repair, malformed token targets,
+rename read/write recovery, partial run directories, and the retry window):
 
 ```bash
 amux-isolated scripts/safe-cargo.sh test -p amux-server --lib round8_ -- --skip process_identity
+amux-isolated scripts/safe-cargo.sh test -p amux-server --lib round9_ -- --skip process_identity
 ```
 
 Never run the migration against a real home during verification.

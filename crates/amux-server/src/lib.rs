@@ -341,7 +341,7 @@ async fn async_main() {
             .init(),
     }
 
-    if let Err(error) = api::rename_identity::ensure_migrated(&cfg.amux_home) {
+    if let Err(error) = api::rename_identity::migrate_at_startup(&cfg.amux_home) {
         tracing::error!(%error, verdict = "identity_migration_marker_io_fatal", "cannot start: identity migration marker I/O failed");
         std::process::exit(1);
     }

@@ -6157,3 +6157,19 @@ FIX: Serialize read/assign/persist with env writers and lifecycle file operation
   a shared flock covers CLI registration too. Assign eagerly on env creation,
   duplication and registration. Mint errors log worker_token_mint_failed or
   worker_run_token_mint_failed at WARN and prevent launch/spawn.
+
+## Skipped migration entries permanently lose their retry
+AREA: identity
+SEVERITY: degrades
+STATUS: fixed
+DATE: 2026-10-18
+SESSION: PR-3-round-9
+CARD: maxtongwang/amux#3
+SYMPTOM: A transient token or rename-history I/O failure writes the completion
+  marker anyway; repaired legacy credentials remain unreadable indefinitely.
+COST: Round-8 Codex B1; permission and malformed-target reproductions require
+  manual marker removal before the old implementation can recover.
+FIX: Withhold completion while scans or entries fail, persist pending paths, and
+  retry at startup or once per minute on identity operations. Successful entries
+  leave the pending list; WARN identity_migration_pending reports counts and
+  identity_migration_attempt records each bounded pass.

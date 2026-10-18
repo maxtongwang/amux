@@ -198,6 +198,9 @@ pub fn check(home: &Path, lane: &str, presented: Option<&str>) -> Check {
         return Check::Unenforced;
     }
     if !valid_identity(lane) { return Check::Invalid; }
+    // Direct credential checks share the bounded retry boundary too; callers
+    // need not pass through the HTTP rename resolver to recover after repair.
+    if super::rename_identity::ensure_migrated(home).is_err() { return Check::Invalid; }
     let Some(incarnation) = super::rename_identity::incarnation(home, lane) else {
         return if presented.is_some() { Check::Invalid } else { Check::Unminted };
     };
