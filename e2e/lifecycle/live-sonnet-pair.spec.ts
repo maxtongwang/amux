@@ -1,5 +1,6 @@
+// live-sonnet-pair.spec coverage — use shared browser defaults and route diagnostics.
 import { lifecyclePrefix, expectLifecycleWorker, selectLifecycleProvider, createLifecycleWorker, expectLifecycleTerminal } from './provider';
-import { test, expect, Page } from '@playwright/test';
+import { test, expect, Page } from '../fixtures';
 import { runSonnetUpload } from './sonnet-upload';
 import { runSonnetCrossgroup } from './sonnet-crossgroup';
 import { runSonnetQueue } from './sonnet-queue';

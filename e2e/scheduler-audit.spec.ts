@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// scheduler-audit.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from './fixtures';
 
 // AMUX-2755. GET /api/schedules/audit was routed and the SPA referenced it zero
 // times. The trail existed and reached nobody — in the subsystem whose own

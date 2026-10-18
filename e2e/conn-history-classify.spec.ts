@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// conn-history-classify.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from './fixtures';
 
 // AMUX-3917. Ethan's Connection panel showed "Disconnected (offline) 4h 16m,
 // Aug 29 9:38 PM → 1:55 AM" as its largest incident. That was an iPhone asleep

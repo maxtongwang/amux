@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// msg-id-copy.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from './fixtures';
 import { grantClipboard } from './helpers';
 test('copying a message id puts the MSG- prefix on the clipboard', async ({ page, context, browserName }) => {
   // WebKit has no such permission and asking is a hard error — see grantClipboard.

@@ -1,4 +1,6 @@
-import { test, expect, devices } from '@playwright/test';
+// peek-tab-menu-anchor.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from './fixtures';
+import { devices } from '@playwright/test';
 // Ethan's screenshot is a WIDE viewport (menu was right-pinned, button far left),
 // so assert the anchor on a tablet-width viewport too, not just the phone.
 for (const vp of [{name:'phone', w:375, h:812}, {name:'tablet', w:834, h:1112}]) {

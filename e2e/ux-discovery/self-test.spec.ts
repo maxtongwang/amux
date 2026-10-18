@@ -6,7 +6,7 @@
 // silently misses paths creates false confidence — this suite is what makes
 // "the crawler found everything" a falsifiable claim.
 
-import { test, expect } from '@playwright/test';
+import { test, expect } from '../fixtures';
 import { crawl, captureState } from './crawler';
 import * as path from 'path';
 

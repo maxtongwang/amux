@@ -4,7 +4,7 @@
 // CLI. Live start/peek is therefore gated on both binaries being on PATH —
 // locally that is the real launch; in CI the test still proves the create
 // modal, the stored provider/flags, and the worker card.
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';

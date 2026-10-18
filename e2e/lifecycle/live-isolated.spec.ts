@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// live-isolated.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from '../fixtures';
 import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { auth, boot, checkpoint, getSessionsResilient } from './evidence';

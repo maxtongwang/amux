@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// peek-default-tab.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from './fixtures';
 
 test('a Codex worker opens on Terminal, not Transcript', async ({ page }) => {
   await page.goto('/');

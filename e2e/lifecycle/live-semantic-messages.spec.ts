@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// live-semantic-messages.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from '../fixtures';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { boot, auth, checkpoint, expectDelivered, getSessionsResilient } from './evidence';

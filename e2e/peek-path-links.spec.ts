@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// peek-path-links.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from './fixtures';
 
 // AMUX-3663. Ethan, with a screenshot of these exact links in the Terminal tab:
 // "make sure i can click the links and they work / open the files".

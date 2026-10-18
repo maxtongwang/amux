@@ -5,7 +5,7 @@
 // crawler cannot find in a seed state is a control no acceptance test covers
 // for that state.
 
-import { test, expect } from '@playwright/test';
+import { test, expect } from '../fixtures';
 import { crawl, captureState } from './crawler';
 import * as path from 'path';
 

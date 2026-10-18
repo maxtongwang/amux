@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+// board-slim-consumers.spec coverage — use shared browser defaults and route diagnostics.
+import { test, expect } from './fixtures';
 
 // AMUX-2840. Every board-item consumer that reads desc/log, driven against a
 // REAL slim payload — not a synthetic object, because the point is whether the
