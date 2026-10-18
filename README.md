@@ -313,8 +313,9 @@ dedicated Chrome profile over CDP, so it needs no Screen Recording grant either.
 
 macOS caches TCC decisions per binary. The auto-builder replaces
 `amux-server-rs` on every commit, and an ad-hoc-signed rebuild reads as a *new
-program*, so prompts can reappear. Setting a stable signing identity
-(`AMUX_CODESIGN_IDENTITY`) makes an approval stick across rebuilds.
+program*, so prompts can reappear. Provisioning the stable local signing identity
+using the owner step printed by `bash scripts/codesign-identity.sh --owner-provision`
+makes an approval stick across rebuilds.
 
 Verify a grant by what it *did*, not by the checkbox:
 

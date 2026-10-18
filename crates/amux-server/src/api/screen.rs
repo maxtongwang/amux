@@ -9,16 +9,15 @@
 //! read.
 //!
 //! WHY THE SYSTEM PERMISSION PROMPT, NOT A MANUALLY-ADDED ENTRY: this binary
-//! is signed with a stable LOCAL identity (`amux-dev`, see
-//! scripts/create-codesign-identity.sh) that has no Apple Developer Team ID.
+//! can be signed with a stable LOCAL identity (`amux local code signing`, see
+//! scripts/codesign-identity.sh) that has no Apple Developer Team ID.
 //! macOS's Screen Recording pane in System Settings routinely refuses to
 //! persist an entry added via its own "+" file picker for a binary with no
 //! Team ID — confirmed live, 2026-09-15: `codesign -dv` on amux-server-rs
 //! shows `TeamIdentifier=not set`, and manually adding it did not stick. The
 //! path that DOES work for a self-signed binary is the OS's OWN native
 //! prompt, triggered by an actual capture attempt — and because the signing
-//! identity is stable across rebuilds, one "Allow" on that prompt persists
-//! forever, which is the exact property `amux-dev` exists to provide.
+//! identity is stable across rebuilds, one "Allow" on that prompt persists.
 //!
 //! SCOPE, deliberately narrow for a first cut: loopback-only (`peer.is_
 //! loopback()`), so the tailnet/tunnel-exposed dashboard cannot reach this
@@ -167,8 +166,8 @@ async fn capture(
                         "macOS Screen Recording permission has not been granted to amux-server-rs yet. \
                          Calling this endpoint is itself the trigger for the native permission prompt — \
                          check for it (it may be behind another window) and click Allow, then retry. \
-                         Because amux-server-rs signs with a stable local identity (amux-dev), one Allow \
-                         persists across every future rebuild."
+                         Once amux-server-rs is signed with its stable local identity, one Allow \
+                         persists across future rebuilds."
                     } else {
                         "screencapture exited non-zero for a reason other than permissions; see error"
                     },

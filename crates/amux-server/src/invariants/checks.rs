@@ -16,6 +16,60 @@ use super::{InvariantResult, Status};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The running image must keep the same certificate and identifier across
+/// rebuilds, or macOS grants a new TCC principal on every deployment.
+pub fn server_codesign_identity(probe: Result<(String, String), String>) -> InvariantResult {
+    const ID: &str = "server.stable_codesign_identity";
+    const EXPECTED: &str = "Authority=amux local code signing; Identifier=com.amux.server-rs";
+    match probe {
+        Err(reason) => InvariantResult::unknown(ID, reason).evidence(json!({
+            "measured": false, "n_considered": 0,
+        })),
+        Ok((authority, identifier)) => {
+            let observed = format!("Authority={authority}; Identifier={identifier}");
+            let evidence = json!({
+                "measured": true, "n_considered": 1,
+                "authority": authority, "identifier": identifier,
+            });
+            if observed == EXPECTED {
+                InvariantResult::pass(ID).evidence(evidence)
+            } else {
+                InvariantResult::fail(ID, EXPECTED, observed).evidence(evidence)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod server_codesign_tests {
+    use super::*;
+
+    #[test]
+    fn invariant_negative_control_server_codesign() {
+        let good = server_codesign_identity(Ok((
+            "amux local code signing".into(),
+            "com.amux.server-rs".into(),
+        )));
+        assert_eq!(good.status, Status::Pass);
+        assert_eq!(good.evidence["n_considered"], 1);
+        assert_eq!(good.evidence["authority"], "amux local code signing");
+        assert_eq!(good.evidence["identifier"], "com.amux.server-rs");
+        let adhoc = server_codesign_identity(Ok(("adhoc".into(), "amux_server-hash".into())));
+        assert_eq!(adhoc.status, Status::Fail);
+        assert!(adhoc.observed.contains("adhoc"));
+        assert_eq!(adhoc.evidence["measured"], true);
+        let wrong_identifier = server_codesign_identity(Ok((
+            "amux local code signing".into(),
+            "amux-server-rs-random".into(),
+        )));
+        assert_eq!(wrong_identifier.status, Status::Fail);
+        let unavailable = server_codesign_identity(Err("not macOS".into()));
+        assert_eq!(unavailable.status, Status::Unknown);
+        assert_eq!(unavailable.evidence["measured"], false);
+        assert_eq!(unavailable.evidence["n_considered"], 0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 1. Route contract: every path a CLIENT calls must be mounted.
 // ---------------------------------------------------------------------------

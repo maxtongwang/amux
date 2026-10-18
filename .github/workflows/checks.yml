@@ -12,6 +12,25 @@ on:
   pull_request:
 
 jobs:
+  macos-codesign:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stable local signing and adoption refusal
+        run: |
+          set -o pipefail
+          DRY_RUN=1 bash scripts/test-codesign-identity.sh | bash scripts/test-codesign-identity.sh --check-plan
+          DRY_RUN=1 bash scripts/test-codesign-identity.sh > "$RUNNER_TEMP/codesign.plan"
+          sed 's/ -S apple-tool:\\,apple:\\,codesign: -s -k / -S apple-tool:\\,apple:\\,codesign: -s -t private -l amux\\ local\\ code\\ signing -k /' "$RUNNER_TEMP/codesign.plan" > "$RUNNER_TEMP/scoped.plan"
+          if bash scripts/test-codesign-identity.sh --check-plan < "$RUNNER_TEMP/scoped.plan" > "$RUNNER_TEMP/scoped-check.log" 2>&1; then
+            echo 'FAIL: plan checker accepted a scoped partition-list command' >&2
+            exit 1
+          fi
+          echo 'PASS: scoped partition-list plan rejected'
+          bash scripts/test-codesign-identity.sh
+      - name: One-time owner setup script, against a disposable keychain
+        run: bash scripts/test-codesign-identity-setup.sh
   checks:
     runs-on: ubuntu-latest
     timeout-minutes: 10

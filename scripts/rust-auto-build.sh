@@ -25,6 +25,13 @@ STAMP="${AMUX_RS_BUILD_STAMP:-$HOME/.amux/rust-build-stamp}"
 LOG="${AMUX_RS_BUILD_LOG:-$HOME/.amux/logs/rust-auto-build.log}"
 mkdir -p "$(dirname "$LOG")" "$(dirname "$INSTALL")"
 
+# Every tick, before any early exit: keep the dedicated signing keychain unlocked, so a locked
+# keychain left on the search list after a reboot never makes another app ask Max for its
+# password (Claude review B4 on #32). A no-op before setup; it never fails the tick.
+if [ "$(uname -s)" = "Darwin" ]; then
+  bash "$REPO/scripts/codesign-keychain-unlock.sh" 2>>"$LOG" || true
+fi
+
 LOCK="${AMUX_RS_BUILD_LOCK:-$HOME/.amux/rust-build.lock}"
 
 # ONE cleanup handler, set once. A second `trap ... EXIT` REPLACES the first
@@ -614,7 +621,7 @@ fi
     fi
     local guard_cmd=(python3 "$REPO/scripts/cargo-target-guard.py" clear --target "$root" --path "$candidate")
     [ "${AMUX_RS_DISK_CLEAR_DRYRUN:-}" != 1 ] || guard_cmd+=(--dry-run)
-    if result=$("${guard_cmd[@]}"); then
+    if result=$(${guard_cmd[@]+"${guard_cmd[@]}"}); then
       echo "== cargo_reclaim_result path=$candidate $result"
     else
       echo "== WARN cargo_reclaim_deferred DEFERRED path=$candidate $result; retry after builds finish."
@@ -637,7 +644,7 @@ fi
     else
       reclaim_cmd=(python3 "$REPO/scripts/cargo-target-guard.py" reclaim --target "$HOME/.amux/rust-build-target"
                    --max-gb "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-32}" --to-gb "${AMUX_CARGO_RECLAIM_TO_GB:-25}")
-      if result=$("${reclaim_cmd[@]}"); then
+      if result=$(${reclaim_cmd[@]+"${reclaim_cmd[@]}"}); then
         echo "== Clearing done: cargo_reclaim_result $result"
       else
         echo "== WARN cargo_reclaim_deferred DEFERRED target=$HOME/.amux/rust-build-target $result; retry after builds finish."
@@ -656,7 +663,7 @@ fi
       [ -d "$cand" ] && sweep_cmd+=(--target "$cand")
     done
     if [ "${#sweep_cmd[@]}" -gt 3 ]; then
-      if result=$("${sweep_cmd[@]}"); then
+      if result=$(${sweep_cmd[@]+"${sweep_cmd[@]}"}); then
         echo "== cargo_sweep_result $result"
         date +%F > "$SWEEP_STAMP"
       else
@@ -866,38 +873,33 @@ fi
     # Local State` in integrations/browser.rs — another app's data directory,
     # which is exactly the service the dialog names.)
     #
-    # Signing is OPT-IN and silent-by-absence on purpose: this script is the
-    # deploy path for the whole fleet, so the change must be incapable of
-    # stopping an install. Every signing command below is guarded; with no
-    # identity present the completed temp binary is atomically installed
-    # unchanged, plus one line saying why it remains ad-hoc signed.
-    #
-    # Creating the identity is a KEYCHAIN action and therefore the human's:
-    #   Keychain Access ▸ Certificate Assistant ▸ Create a Certificate…
-    #     name: amux-dev   type: Self Signed Root   Code Signing
-    # then it is picked up here automatically on the next build.
+    # Until provisioning, keep the current ad-hoc deployment behavior. Once
+    # the identity exists, a signing failure is a deployment failure: never
+    # activate an image that loses the grant held by the previous image.
     if [ "$(uname -s)" = "Darwin" ]; then
-      CS_ID="${AMUX_CODESIGN_IDENTITY:-amux-dev}"
-      if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$CS_ID"; then
-        # --identifier IS LOAD-BEARING, and leaving it out silently defeats the
-        # whole fix. Measured: signing two copies of the same binary produced
-        # `amux-server-rs-55554944c0c5…` for one and `amux_server-f10e2da7…` for
-        # the other — codesign derives the identifier from the file when it has
-        # no better source, so it drifts with the filename and with whatever
-        # rustc last embedded. TCC matches on identifier AND certificate, so a
-        # drifting identifier re-prompts exactly like a drifting cdhash, and the
-        # signing would look like it was working. Pinned, both copies came back
-        # `com.amux.server-rs` regardless of filename or content.
-        if codesign --force --sign "$CS_ID" --identifier com.amux.server-rs \
-                    --timestamp=none "$INSTALL_TMP" 2>&1; then
-          echo "== signed as '$CS_ID' — TCC approvals survive this rebuild"
+      CS_ID='amux local code signing'
+      CS_KEYCHAIN="$HOME/Library/Keychains/amux-signing.keychain-db"
+      probe_status=44
+      certificates=''
+      if [ -e "$CS_KEYCHAIN" ]; then
+        probe_status=0
+        certificates=$(security find-certificate -c "$CS_ID" -Z "$CS_KEYCHAIN" 2>&1) || probe_status=$?
+        if [ "$probe_status" -ne 0 ] && [ "$probe_status" -ne 44 ]; then
+          reason=${certificates//$'\n'/ }
+          echo "== WARN verdict=codesign_refused sha=$built_sha reason=identity_probe_failed:${reason:0:500} — keeping the live binary"
+          exit 1
+        fi
+      fi
+      if [ "$probe_status" -eq 0 ] && printf '%s\n' "$certificates" | grep -Fq 'SHA-1 hash:'; then
+        if sign_result=$(bash "$REPO/scripts/codesign-server.sh" "$INSTALL_TMP" 2>&1); then
+          echo "== $sign_result"
         else
-          echo "== WARN codesign as '$CS_ID' FAILED; binary stays adhoc and macOS will re-prompt"
+          reason=${sign_result//$'\n'/ }
+          echo "== WARN verdict=codesign_refused sha=$built_sha reason=${reason:0:500} — keeping the live binary"
+          exit 1
         fi
       else
-        echo "== WARN binary is ADHOC-signed (no '$CS_ID' codesigning identity): macOS treats" \
-             "every rebuild as a new program, so TCC re-prompts and 'Allow' cannot stick." \
-             "Create the identity (see AMUX-3527) or set AMUX_CODESIGN_IDENTITY."
+        echo "== WARN verdict=codesign_identity_missing sha=$built_sha identity='$CS_ID' — adopting ad-hoc binary until provisioning"
       fi
     fi
     PROV_JSON=$(python3 - "$INSTALL_TMP" "$PROV_JSON" "$head" <<'PYIDENTITY'

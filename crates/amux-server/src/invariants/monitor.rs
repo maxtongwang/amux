@@ -137,9 +137,46 @@ fn newest(current: Option<f64>, incoming: Option<f64>) -> Option<f64> {
     }
 }
 
+fn live_server_codesign() -> Result<(String, String), String> {
+    if !cfg!(target_os = "macos") {
+        return Err("unmeasured: code signing is macOS only".into());
+    }
+    let executable = std::env::current_exe().map_err(|e| format!("current executable: {e}"))?;
+    let output = std::process::Command::new("/usr/bin/codesign")
+        .arg("-dvvv")
+        .arg(&executable)
+        .output()
+        .map_err(|e| format!("codesign probe failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "codesign probe exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let details = String::from_utf8_lossy(&output.stderr);
+    let field = |prefix: &str| {
+        details
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or("missing")
+            .to_string()
+    };
+    let authority = if details.contains("Signature=adhoc") {
+        "adhoc".to_string()
+    } else {
+        field("Authority=")
+    };
+    Ok((authority, field("Identifier=")))
+}
+
 pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     let mut out = Vec::new();
     let mut tm = SectionTimer::new();
+
+    // -- 0. does the live server use the stable macOS signing identity?
+    out.push(checks::server_codesign_identity(live_server_codesign()));
+    tm.mark(&out, "0. server code signing");
 
     // -- 1. route contract: do shipped clients call routes that exist?
     let mounted: Vec<(&str, &[&str])> = crate::api::request_log::ROUTE_TABLE
