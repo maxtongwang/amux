@@ -25,6 +25,13 @@ STAMP="${AMUX_RS_BUILD_STAMP:-$HOME/.amux/rust-build-stamp}"
 LOG="${AMUX_RS_BUILD_LOG:-$HOME/.amux/logs/rust-auto-build.log}"
 mkdir -p "$(dirname "$LOG")" "$(dirname "$INSTALL")"
 
+# Every tick, before any early exit: keep the dedicated signing keychain unlocked, so a locked
+# keychain left on the search list after a reboot never makes another app ask Max for its
+# password (Claude review B4 on #32). A no-op before setup; it never fails the tick.
+if [ "$(uname -s)" = "Darwin" ]; then
+  bash "$REPO/scripts/codesign-keychain-unlock.sh" 2>>"$LOG" || true
+fi
+
 LOCK="${AMUX_RS_BUILD_LOCK:-$HOME/.amux/rust-build.lock}"
 
 # ONE cleanup handler, set once. A second `trap ... EXIT` REPLACES the first

@@ -246,7 +246,9 @@ password is stored at `~/.amux/codesign/keychain-password` (mode 0600). The
 keychain is appended last to the user search list, without changing existing
 entries or the default keychain. macOS only resolves `codesign --keychain` identities
 from keychains already on that search list; setup and signing repair a missing entry.
-After setup, Max enables Full Disk Access for `amux-server-rs` once.
+Every builder tick runs `scripts/codesign-keychain-unlock.sh` first, so the keychain
+never sits locked on the search list after a reboot, where another app's search could
+prompt for a password Max never set. After setup, Max enables Full Disk Access for `amux-server-rs` once.
 
 Until the identity exists, the builder emits `verdict=codesign_identity_missing`
 and adopts an ad-hoc binary. Once it exists, unlock/sign/verification failures

@@ -64,6 +64,38 @@ for line in os.environ["PLAN_TEXT"].splitlines():
     echo 'FAIL: /bin/bash signing plan with an empty search list failed' >&2; printf '%s\n' "$empty_list_plan" >&2; exit 1;
   }
   echo 'PASS: empty user search list appends the dedicated keychain and signs'
+  # B4: the builder unlocks the dedicated keychain on every tick, before its first early exit.
+  build="$(dirname "$0")/rust-auto-build.sh"
+  unlock_line=$(grep -n 'codesign-keychain-unlock.sh' "$build" | head -1 | cut -d: -f1 || true)
+  first_exit=$(grep -nE '^[[:space:]]*exit 0' "$build" | head -1 | cut -d: -f1 || true)
+  [ -n "$unlock_line" ] && [ -n "$first_exit" ] && [ "$unlock_line" -lt "$first_exit" ] || {
+    echo "FAIL: builder tick does not unlock the signing keychain before its first exit (unlock=$unlock_line exit=$first_exit)" >&2; exit 1;
+  }
+  unlock_plan=$(HOME="$guard_dir/home" DRY_RUN=1 /bin/bash "$(dirname "$0")/codesign-keychain-unlock.sh" 2>&1)
+  [ "$unlock_plan" = "PLAN: security unlock-keychain -p \<password\> $guard_dir/home/Library/Keychains/amux-signing.keychain-db" ] || {
+    echo "FAIL: unlock plan touches something other than the dedicated keychain: $unlock_plan" >&2; exit 1;
+  }
+  echo 'PASS: every builder tick unlocks only the dedicated signing keychain'
+  # Mocked behavior (no real security runs): fake security records its arguments.
+  mock_home="$guard_dir/mock-home"; mock_bin="$guard_dir/mock-bin"; calls="$guard_dir/security-calls"
+  mkdir -p "$mock_home/Library/Keychains" "$mock_home/.amux/codesign" "$mock_bin"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$calls" > "$mock_bin/security"; chmod +x "$mock_bin/security"
+  run_unlock() { HOME="$mock_home" PATH="$mock_bin:/usr/bin:/bin" /bin/bash "$(dirname "$0")/codesign-keychain-unlock.sh"; }
+  : > "$calls"; run_unlock 2>/dev/null
+  [ ! -s "$calls" ] || { echo 'FAIL: unlock ran security before setup created the keychain' >&2; exit 1; }
+  : > "$mock_home/Library/Keychains/amux-signing.keychain-db"
+  printf 'pw\n' > "$mock_home/.amux/codesign/keychain-password"; chmod 644 "$mock_home/.amux/codesign/keychain-password"
+  run_unlock 2>/dev/null
+  [ ! -s "$calls" ] || { echo 'FAIL: unlock used a password file that is not mode 600' >&2; exit 1; }
+  chmod 600 "$mock_home/.amux/codesign/keychain-password"
+  first=$(run_unlock 2>&1); second=$(run_unlock 2>&1)
+  [ "$(cat "$calls")" = "$(printf 'unlock-keychain -p pw %s\nunlock-keychain -p pw %s' "$mock_home/Library/Keychains/amux-signing.keychain-db" "$mock_home/Library/Keychains/amux-signing.keychain-db")" ] || {
+    echo "FAIL: unlock calls were not exactly two dedicated-keychain unlocks: $(cat "$calls")" >&2; exit 1;
+  }
+  [[ "$first" == *'verdict=codesign_keychain_unlocked'* ]] && [ -z "$second" ] || {
+    echo "FAIL: unlock verdict must be logged once per change (first=[$first] second=[$second])" >&2; exit 1;
+  }
+  echo 'PASS: unlock is a no-op before setup, refuses a loose password file, and logs once per change'
   rm -rf "$guard_dir"
   trap - EXIT
   echo 'PASS: signing plan contains expected commands and no forbidden operation'
