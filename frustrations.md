@@ -6124,3 +6124,20 @@ COST: The isolated-worker flake on #6 could not be reproduced or bisected locall
 FIX: The e2e harness mints a test-only owner identity for the server it starts (its own AMUX_HOME and port)
   and sends it on owner-only steps. The identity is accepted only by that isolated test server, never by
   the live one on 8824.
+
+## Renaming token directories breaks scheduled-run revocation
+AREA: identity
+SEVERITY: degrades
+STATUS: fixed
+DATE: 2026-10-18
+SESSION: PR-3-round-6
+CARD: maxtongwang/amux#3
+SYMPTOM: A scheduled run's guard removed its old pathname after rename moved the
+  directory, leaving the credential valid after completion. A retry after moving
+  the env also adopted an unrelated previous destination holder's token.
+COST: Two blocking findings in the round-5 Codex review; three regression tests
+  fail on c5ac69bc before the structural fix.
+FIX: Bind launch and run token paths to CC_INCARNATION; rename moves no token
+  material. Eager bounded migration re-keys live legacy launch hashes and warns
+  with a dropped count for unowned legacy material. Deletion and retirement
+  revoke incarnation material; failed run revocation logs worker_run_token_revoke_failed.

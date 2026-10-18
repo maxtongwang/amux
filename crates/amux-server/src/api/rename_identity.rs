@@ -87,7 +87,7 @@ fn incarnation_in(path: &Path) -> Option<String> {
     let cfg = super::session_verbs::EnvFile::load(path);
     cfg.get(INCARNATION_KEY)
         .map(str::trim)
-        .filter(|v| !v.is_empty())
+        .filter(|v| *v != "." && *v != ".." && super::session_verbs::valid_session_name(v))
         .map(String::from)
 }
 
@@ -286,6 +286,9 @@ pub(crate) fn release(home: &Path, name: &str) {
     }
     let active = env_file(home, name);
     let inc = incarnation_in(&active).or_else(|| incarnation_in(&active.with_extension("env.reaped")));
+    if let Some(inc) = inc.as_deref() {
+        super::worker_identity::release(home, inc);
+    }
     match release_incarnation(home, name, inc.as_deref()) {
         Ok((0, false)) => {}
         Ok((n, marked)) => tracing::info!(
@@ -338,12 +341,83 @@ fn legacy_holder(home: &Path, newest: &HashMap<String, Rec>, records: &[Rec], st
     }
 }
 
+/// One bounded legacy read, performed under WRITE_LOCK before any env moves.
+/// Run directories are revoked, never moved: their live Drop guards own the
+/// original paths. The marker is last so an interrupted pass retries safely.
+fn migrate_tokens(home: &Path) -> std::io::Result<()> {
+    let marker = home.join("worker-tokens.version");
+    match std::fs::read_to_string(&marker) {
+        Ok(v) if v == "1\n" => return Ok(()),
+        Ok(_) => return Err(std::io::Error::other("unsupported worker token version")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+        Err(e) => return Err(e),
+    }
+    std::fs::create_dir_all(home)?;
+    let dir = home.join("worker-tokens");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    let mut owned = HashSet::new();
+    match std::fs::read_dir(home.join("sessions")) {
+        Ok(envs) => for env in envs {
+            let env = env?;
+            let name = env.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".env") || name.ends_with(".env.reaped") {
+                if let Some(inc) = incarnation_in(&env.path()) { owned.insert(inc); }
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+        Err(e) => return Err(e),
+    }
+    let (mut migrated, mut dropped) = (0usize, 0usize);
+    for entry in &entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(key) = name.strip_suffix(".sha256").or_else(|| name.strip_suffix(".runs")) else { continue };
+        // A retry may see already-rekeyed material; its env proves ownership.
+        if owned.contains(key) { continue; }
+        if key != "." && key != ".." && super::session_verbs::valid_session_name(key) && worker_exists(home, key) {
+            let inc = assign_incarnation(home, key)?;
+            if name.ends_with(".sha256") {
+                let target = super::worker_identity::hash_path(home, &inc);
+                if target != entry.path() {
+                    // Keep a current token if a prior interrupted pass or launch
+                    // already published it. Never replace it with legacy debris.
+                    match std::fs::hard_link(entry.path(), &target) {
+                        Ok(()) => {},
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
+                        Err(e) => return Err(e),
+                    }
+                    std::fs::remove_file(entry.path())?;
+                    migrated += 1;
+                }
+                continue;
+            }
+        }
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+        dropped += 1;
+    }
+    tracing::info!(migrated, dropped, measured = true, n_considered = entries.len(),
+        verdict = "worker_tokens_migrated", "legacy launch hashes re-keyed by incarnation");
+    if dropped > 0 {
+        tracing::warn!(dropped, measured = true, n_considered = entries.len(),
+            verdict = "worker_tokens_legacy_dropped", "unowned legacy token material revoked");
+    }
+    write_atomic(&marker, "1\n")
+}
+
 /// Settle legacy ownership once, before any lifecycle mutation. The version
 /// marker is published last: interruption leaves an idempotently retryable
 /// rewrite, never a marker claiming unfinished migration succeeded.
 pub(crate) fn ensure_migrated(home: &Path) -> std::io::Result<()> {
     let result = (|| {
         let _w = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        migrate_tokens(home)?;
         let marker = home.join("renames.version");
         match std::fs::read_to_string(&marker) {
             Ok(v) if v == "1\n" => return Ok(()),

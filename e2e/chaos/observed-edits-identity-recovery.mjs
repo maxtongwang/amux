@@ -100,9 +100,12 @@ try {
   token = amux.tmux('show-environment', '-t', 'amux-' + name, 'AMUX_WORKER_TOKEN').trim().split('=')[1];
   const digest = crypto.createHash('sha256').update(token).digest('hex');
   const launch = amux.fakeLog().find(x => x.event === 'launch');
+  const incarnation = fs.readFileSync(path.join(amux.home, 'sessions', name + '.env'), 'utf8')
+    .match(/^CC_INCARNATION="?([a-zA-Z0-9_-]+)"?$/m)?.[1];
+  check('worker incarnation persisted before launch', typeof incarnation === 'string' && incarnation.length > 0);
   check('launch and durable credential agree by digest', token.length === 64
     && launch.env_sha256.AMUX_WORKER_TOKEN === digest
-    && fs.readFileSync(path.join(amux.home, 'worker-tokens', name + '.sha256'), 'utf8').trim() === digest);
+    && fs.readFileSync(path.join(amux.home, 'worker-tokens', incarnation + '.sha256'), 'utf8').trim() === digest);
   await markAndWrite('changed.txt');
   check('missing credential remains fail-open but is refused', post(undefined) === ''
     && hookLog().includes('send-failed:HTTPError') && Object.keys(readReports()).length === 0

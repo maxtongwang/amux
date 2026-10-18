@@ -5,7 +5,7 @@
 //! `contract::rule_on(home, lane, "10")` holds:
 //!
 //! - **Identity.** Each launch mints a random token. The server keeps only its
-//!   sha256 (`~/.amux/worker-tokens/<lane>.sha256`, 0600); the value reaches the
+//!   sha256 (`~/.amux/worker-tokens/<incarnation>.sha256`, 0600); the value reaches the
 //!   lane as `AMUX_WORKER_TOKEN` through the vault channel (tmux
 //!   set-environment, then imported by name), never argv or a typed line. The
 //!   CLI and hooks send it as `X-Amux-Worker-Token`. A mutating request over a
@@ -33,8 +33,23 @@ pub const TOKEN_ENV: &str = "AMUX_WORKER_TOKEN";
 pub const TOKEN_HEADER: &str = "x-amux-worker-token";
 pub const RULE: &str = "10";
 
-pub(crate) fn hash_path(home: &Path, lane: &str) -> PathBuf {
-    home.join("worker-tokens").join(format!("{lane}.sha256"))
+pub(crate) fn hash_path(home: &Path, incarnation: &str) -> PathBuf {
+    home.join("worker-tokens").join(format!("{incarnation}.sha256"))
+}
+
+/// Revoke one incarnation, independent of its current or former names.
+pub(crate) fn release(home: &Path, incarnation: &str) {
+    let hash = hash_path(home, incarnation);
+    let runs = runs_dir(home, incarnation);
+    for (path, result) in [(&hash, std::fs::remove_file(&hash)), (&runs, std::fs::remove_dir_all(&runs))] {
+        match result {
+            Ok(()) => tracing::info!(verdict = "worker_token_released", measured = true, n_considered = 1,
+                "released incarnation token material"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => tracing::warn!(path = %path.display(), error = %e, verdict = "worker_token_release_failed",
+                measured = true, n_considered = 1, "could not remove released incarnation token material"),
+        }
+    }
 }
 
 fn digest(token: &str) -> String {
@@ -53,8 +68,10 @@ fn random_token() -> Option<String> {
 /// apply (a stale hash is then removed, so the lane is not held to a token it
 /// no longer receives). The caller delivers the value; it is never logged.
 pub fn mint(home: &Path, lane: &str) -> Option<String> {
-    let path = hash_path(home, lane);
-    if !super::session_verbs::valid_session_name(lane) || !super::contract::rule_on(home, lane, RULE) {
+    if !valid_identity(lane) { return None; }
+    let incarnation = super::rename_identity::ensure_incarnation(home, lane).ok()?;
+    let path = hash_path(home, &incarnation);
+    if !super::contract::rule_on(home, lane, RULE) {
         let _ = std::fs::remove_file(&path);
         return None;
     }
@@ -97,8 +114,8 @@ pub fn mint(home: &Path, lane: &str) -> Option<String> {
 // with the server is ignored and removed after RUN_TOKEN_MAX_AGE_S.
 const RUN_TOKEN_MAX_AGE_S: u64 = 6 * 3600;
 
-pub(crate) fn runs_dir(home: &Path, lane: &str) -> PathBuf {
-    home.join("worker-tokens").join(format!("{lane}.runs"))
+pub(crate) fn runs_dir(home: &Path, incarnation: &str) -> PathBuf {
+    home.join("worker-tokens").join(format!("{incarnation}.runs"))
 }
 
 /// A token for one scheduler-launched run of `lane`. The value goes into the
@@ -110,16 +127,22 @@ pub struct RunToken {
 
 impl Drop for RunToken {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Err(error) = std::fs::remove_file(&self.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(error = %error, verdict = "worker_run_token_revoke_failed",
+                    measured = true, n_considered = 1, "completed scheduled run could not revoke its token");
+            }
+        }
     }
 }
 
 pub fn mint_run(home: &Path, lane: &str) -> Option<RunToken> {
-    if !super::session_verbs::valid_session_name(lane) || !super::contract::rule_on(home, lane, RULE) {
+    if !valid_identity(lane) || !super::contract::rule_on(home, lane, RULE) {
         return None;
     }
     let token = random_token()?;
-    let dir = runs_dir(home, lane);
+    let incarnation = super::rename_identity::ensure_incarnation(home, lane).ok()?;
+    let dir = runs_dir(home, &incarnation);
     std::fs::create_dir_all(&dir).ok()?;
     let d = digest(&token);
     let path = dir.join(format!("{}.sha256", &d[..16]));
@@ -134,8 +157,8 @@ pub fn mint_run(home: &Path, lane: &str) -> Option<RunToken> {
     Some(RunToken { path, value: token })
 }
 
-fn run_token_valid(home: &Path, lane: &str, presented: &str) -> bool {
-    let Ok(entries) = std::fs::read_dir(runs_dir(home, lane)) else { return false };
+fn run_token_valid(home: &Path, incarnation: &str, presented: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(runs_dir(home, incarnation)) else { return false };
     let want = digest(presented);
     let mut ok = false;
     for e in entries.flatten() {
@@ -168,12 +191,16 @@ pub fn check(home: &Path, lane: &str, presented: Option<&str>) -> Check {
     if !super::contract::rule_on(home, lane, RULE) {
         return Check::Unenforced;
     }
+    if !valid_identity(lane) { return Check::Invalid; }
+    let Some(incarnation) = super::rename_identity::incarnation(home, lane) else {
+        return if presented.is_some() { Check::Invalid } else { Check::Unminted };
+    };
     let presented = presented.map(str::trim).filter(|t| !t.is_empty());
-    if presented.is_some_and(|t| run_token_valid(home, lane, t)) {
+    if presented.is_some_and(|t| run_token_valid(home, &incarnation, t)) {
         return Check::Valid;
     }
-    let Ok(want) = std::fs::read_to_string(hash_path(home, lane)) else {
-        return Check::Unminted;
+    let Ok(want) = std::fs::read_to_string(hash_path(home, &incarnation)) else {
+        return if presented.is_some() { Check::Invalid } else { Check::Unminted };
     };
     match presented {
         Some(t) if super::auth::constant_time_eq(digest(t).as_bytes(), want.trim().as_bytes()) => Check::Valid,
@@ -393,7 +420,7 @@ pub fn report(home: &Path, lanes: &[String]) -> Value {
         }
         rows.push(json!({
             "lane": lane,
-            "token_minted": hash_path(home, lane).is_file(),
+            "token_minted": super::rename_identity::incarnation(home, lane).is_some_and(|inc| hash_path(home, &inc).is_file()),
             "credential_keys": keys.into_iter().collect::<Vec<_>>(),
             "bypass_flag": bypass_flag(home, lane),
             "sandboxed": false,
@@ -424,7 +451,7 @@ mod tests {
         let h = d.path();
         assert_eq!(check(h, "w", None), Check::Unminted, "before a launch the header is trusted");
         let t = mint(h, "w").expect("rule 10 on: a token is minted");
-        assert!(!std::fs::read_to_string(hash_path(h, "w")).unwrap().contains(&t), "only the hash is stored");
+        assert!(!std::fs::read_to_string(hash_path(h, &super::super::rename_identity::incarnation(h, "w").unwrap())).unwrap().contains(&t), "only the hash is stored");
         assert_eq!(check(h, "w", Some(&t)), Check::Valid);
         assert_eq!(check(h, "w", None), Check::Invalid, "a bare header is refused");
         assert_eq!(check(h, "w", Some("forged")), Check::Invalid);
@@ -455,9 +482,12 @@ mod tests {
         let d = home_with("AMUX_CONTRACT_DONE=1\n");
         let h = d.path();
         mint(h, "w").unwrap();
-        std::fs::write(h.join("sessions/w.env"), "AMUX_CONTRACT_DONE=1\nAMUX_CONTRACT_RULES_OFF=\"6,7,10\"\n").unwrap();
+        let path = h.join("sessions/w.env");
+        let mut env = super::super::session_verbs::EnvFile::load(&path);
+        env.set("AMUX_CONTRACT_RULES_OFF", "6,7,10");
+        env.write(&path).unwrap();
         assert_eq!(mint(h, "w"), None);
-        assert!(!hash_path(h, "w").exists(), "the lane is not held to a token it no longer receives");
+        assert!(!hash_path(h, &super::super::rename_identity::incarnation(h, "w").unwrap()).exists(), "the lane is not held to a token it no longer receives");
         assert_eq!(check(h, "w", None), Check::Unenforced);
     }
 

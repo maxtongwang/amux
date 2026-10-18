@@ -3836,7 +3836,8 @@ mod tests {
         std::fs::create_dir_all(home.path().join("sessions")).unwrap();
         std::fs::write(home.path().join("sessions/w.env"), "AMUX_CONTRACT_DONE=1\n").unwrap();
         let _g = crate::api::settings::test_env::set_home(home.path());
-        let runs = home.path().join("worker-tokens/w.runs");
+        let inc = crate::api::rename_identity::ensure_incarnation(home.path(), "w").unwrap();
+        let runs = crate::api::worker_identity::runs_dir(home.path(), &inc);
         let (store, _dir) = store();
         let state = crate::api::AppState {
             store: store.clone(),

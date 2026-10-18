@@ -664,7 +664,14 @@ mod tests {
             f.name,
             "control: the alias resolves while the worker holds the name"
         );
+        let hash = crate::api::worker_identity::hash_path(&f.home, &inc);
+        let runs = crate::api::worker_identity::runs_dir(&f.home, &inc);
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(&hash, "launch-hash").unwrap();
+        std::fs::write(runs.join("run.sha256"), "run-hash").unwrap();
         assert_eq!(f.retire(&fleet).await.unwrap(), Outcome::Expired);
+        assert!(!hash.exists(), "retirement revokes the incarnation launch hash");
+        assert!(!runs.exists(), "retirement revokes the incarnation run tokens");
         assert_eq!(
             crate::api::rename_identity::tests::records_of(&f.home, &inc),
             0,

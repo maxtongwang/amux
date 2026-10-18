@@ -18089,28 +18089,13 @@ fn copied_env_is_a_new_incarnation(copy: &Path) -> bool {
     }
 }
 
-/// Release the per-name identity state of a deleted worker: its rule-10
+/// Release the incarnation identity state of a deleted worker: its rule-10
 /// launch-token hash, its scheduled-run token dir, and its incarnation's
 /// rename records (`rename_identity::release`; reads the env file, so call it
 /// before the env file is removed). Each removal failure other than "absent"
 /// is logged.
 fn release_name_state(name: &str) {
     let h = home();
-    let hash = super::worker_identity::hash_path(&h, name);
-    let runs = super::worker_identity::runs_dir(&h, name);
-    for (path, removed) in [
-        (&hash, std::fs::remove_file(&hash)),
-        (&runs, std::fs::remove_dir_all(&runs)),
-    ] {
-        match removed {
-            Ok(()) => tracing::info!(session = name, path = %path.display(), verdict = "worker_token_released",
-                measured = true, n_considered = 1, "a deleted worker's token material was removed"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(session = name, path = %path.display(), error = %e,
-                verdict = "worker_token_release_failed", measured = true, n_considered = 1,
-                "a deleted worker's token material could not be removed; a rename into this name replaces it"),
-        }
-    }
     super::rename_identity::release(&h, name);
 }
 
@@ -32505,59 +32490,6 @@ fn replace_file_keeping_mode(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     wrote
 }
 
-/// Move a token file or run-token dir from the old name to the new one,
-/// REPLACING whatever is at the target (review B1 of c003491).
-///
-/// `move_if` keeps an existing target, which here is wrong: nothing at the
-/// new name can belong to the renamed worker except what this step moved.
-/// A leftover `<new>.sha256` from a deleted worker would otherwise stay the
-/// hash the new name is checked against, and the renamed worker's running
-/// process, whose old-name claims now resolve to the new name, would be
-/// refused (rule 10) until it relaunched.
-///
-/// - Source present: replace the target (a file by an atomic rename, a dir
-///   by removing the target then renaming).
-/// - Source absent, fresh rename: the target is stale; remove it.
-/// - Source absent, resuming a partial rename: the target is what the
-///   earlier attempt moved; keep it.
-fn replace_token_material(
-    old: &Path,
-    new: &Path,
-    label: &str,
-    resuming: bool,
-    steps: &mut Vec<String>,
-) -> Result<(), String> {
-    let remove = |p: &Path| -> std::io::Result<()> {
-        if p.is_dir() {
-            std::fs::remove_dir_all(p)
-        } else {
-            std::fs::remove_file(p)
-        }
-    };
-    let stale = new.symlink_metadata().is_ok();
-    if old.symlink_metadata().is_ok() {
-        if stale && new.is_dir() {
-            remove(new).map_err(|e| format!("{label}: removing the stale target failed: {e}"))?;
-        }
-        std::fs::rename(old, new).map_err(|e| format!("{label}: rename failed: {e}"))?;
-        steps.push(format!(
-            "{label}: moved{}",
-            if stale { " (replaced a stale target)" } else { "" }
-        ));
-    } else if stale && !resuming {
-        remove(new).map_err(|e| format!("{label}: removing the stale target failed: {e}"))?;
-        tracing::info!(target_path = %new.display(), label, verdict = "rename_stale_token_removed",
-            measured = true, n_considered = 1,
-            "a rename target held token material from an earlier worker; removed");
-        steps.push(format!("{label}: stale target removed"));
-    } else if stale {
-        steps.push(format!("{label}: already at target"));
-    } else {
-        steps.push(format!("{label}: nothing to move"));
-    }
-    Ok(())
-}
-
 /// Does this worker run on the shared tmux/herdr terminal pipeline (its
 /// type's execution adapter hands the operation back), as opposed to an
 /// adapter that executes turns itself?
@@ -32706,29 +32638,6 @@ async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response
     }
     if let Err(e) = rewrite_cc_name(&new_env, &new_name, &mut steps) {
         return fail(&steps, e);
-    }
-    // The rule-10 token hashes are keyed by name. The running process keeps
-    // its token, and its old-name header now resolves to the new name
-    // (rename_identity), so the hashes must be found under the new name, and
-    // nothing an earlier holder of the new name left there may stay.
-    {
-        let h = home();
-        for (old_p, new_p, label) in [
-            (
-                super::worker_identity::hash_path(&h, name),
-                super::worker_identity::hash_path(&h, &new_name),
-                "worker-token",
-            ),
-            (
-                super::worker_identity::runs_dir(&h, name),
-                super::worker_identity::runs_dir(&h, &new_name),
-                "worker-run-tokens",
-            ),
-        ] {
-            if let Err(e) = replace_token_material(&old_p, &new_p, label, resuming, &mut steps) {
-                return fail(&steps, e);
-            }
-        }
     }
     if let Err(e) = move_if(&mem_file(name), &mem_file(&new_name), "memory", &mut steps) {
         return fail(&steps, e);
@@ -45973,7 +45882,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         let steps = v["steps"].to_string();
         assert!(steps.contains("cc-name: rewritten"), "{steps}");
         assert!(steps.contains("rename-record: written"), "{steps}");
-        assert!(steps.contains("worker-token: moved"), "{steps}");
+        assert!(!steps.contains("worker-token:"), "incarnation token paths never move: {steps}");
         let env = std::fs::read_to_string(env_path("rid-dst")).unwrap();
         assert!(env.contains("CC_NAME=\"rid-dst\"\n"), "{env}");
         assert!(!env.contains("rid-src"), "{env}");
@@ -45984,7 +45893,8 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             let mode = std::fs::metadata(env_path("rid-dst")).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "the rewrite keeps the env file's mode");
         }
-        assert!(home.path().join("worker-tokens/rid-dst.sha256").exists());
+        let inc = crate::api::rename_identity::incarnation(home.path(), "rid-dst").unwrap();
+        assert!(crate::api::worker_identity::hash_path(home.path(), &inc).exists());
 
         // The old name's send to a same-group peer is accepted and attributed
         // to the new name.
@@ -46095,6 +46005,80 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         }
     }
 
+    #[tokio::test]
+    async fn round6_rename_run_token_revoked_on_drop() {
+        use crate::api::worker_identity::{check, mint, mint_run, Check};
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _dir) = state();
+        rename_fixture_env("r6-old", "CC_AUTO_START=0\nAMUX_CONTRACT_DONE=1\n");
+        mint(home.path(), "r6-old").unwrap();
+        let run = mint_run(home.path(), "r6-old").unwrap();
+        let value = run.value.clone();
+        assert_eq!(check(home.path(), "r6-old", Some(&value)), Check::Valid);
+        let response = rename_session(&state, "r6-old", "r6-new").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(check(home.path(), "r6-new", Some(&value)), Check::Valid);
+        drop(run);
+        assert_eq!(check(home.path(), "r6-new", Some(&value)), Check::Invalid,
+            "completion revokes the renamed run immediately");
+    }
+
+    #[tokio::test]
+    async fn round6_rename_retry_rejects_unrelated_destination_token() {
+        use crate::api::worker_identity::{check, mint, mint_run, Check};
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _dir) = state();
+        rename_fixture_env("r6-new", "CC_AUTO_START=0\nAMUX_CONTRACT_DONE=1\n");
+        let stale = mint(home.path(), "r6-new").unwrap();
+        let stale_run = mint_run(home.path(), "r6-new").unwrap();
+        // Retain an unrelated previous holder's credentials as crash debris.
+        std::fs::remove_file(env_path("r6-new")).unwrap();
+        rename_fixture_env("r6-old", "CC_AUTO_START=0\nAMUX_CONTRACT_DONE=1\n");
+        let own = mint_run(home.path(), "r6-old").unwrap();
+        crate::api::rename_identity::ensure_incarnation(home.path(), "r6-old").unwrap();
+        // Interrupt immediately after the env move, before any later rename step.
+        std::fs::rename(env_path("r6-old"), env_path("r6-new")).unwrap();
+        assert_eq!(rename_session(&state, "r6-old", "r6-new").await.status(), StatusCode::OK);
+        assert_eq!(check(home.path(), "r6-new", Some(&stale)), Check::Invalid,
+            "retry must never adopt the previous holder's launch token");
+        assert_eq!(check(home.path(), "r6-new", Some(&stale_run.value)), Check::Invalid);
+        assert_eq!(check(home.path(), "r6-new", Some(&own.value)), Check::Valid);
+    }
+
+    #[test]
+    fn round6_identity_legacy_hash_rekeyed_eagerly() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        let tokens = home.path().join("worker-tokens");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&tokens).unwrap();
+        std::fs::write(sessions.join("legacy.env"), "CC_INCARNATION=0123456789abcdef0123456789abcdef\n").unwrap();
+        std::fs::write(tokens.join("legacy.sha256"), "legacy-hash").unwrap();
+        std::fs::write(tokens.join("orphan.sha256"), "orphan-hash").unwrap();
+        std::fs::write(tokens.join("fedcba9876543210fedcba9876543210.sha256"), "orphan-incarnation").unwrap();
+        std::fs::write(sessions.join("current.env"), "CC_INCARNATION=current-inc\n").unwrap();
+        std::fs::write(tokens.join("current-inc.sha256"), "current-hash").unwrap();
+        std::fs::write(tokens.join("current.sha256"), "obsolete-hash").unwrap();
+        std::fs::create_dir_all(tokens.join("legacy.runs")).unwrap();
+        std::fs::write(tokens.join("legacy.runs/run.sha256"), "unowned-run").unwrap();
+        // Round 5 installations already carry the rename-record version marker.
+        std::fs::write(home.path().join("renames.version"), "1\n").unwrap();
+        crate::api::rename_identity::ensure_migrated(home.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(tokens.join("0123456789abcdef0123456789abcdef.sha256")).unwrap(), "legacy-hash");
+        assert!(!tokens.join("legacy.sha256").exists());
+        assert!(!tokens.join("orphan.sha256").exists());
+        assert!(!tokens.join("fedcba9876543210fedcba9876543210.sha256").exists());
+        assert_eq!(std::fs::read_to_string(tokens.join("current-inc.sha256")).unwrap(), "current-hash");
+        assert!(!tokens.join("current.sha256").exists());
+        assert!(!tokens.join("legacy.runs").exists(), "legacy run guards cannot follow a moved directory");
+        crate::api::rename_identity::ensure_migrated(home.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(tokens.join("0123456789abcdef0123456789abcdef.sha256")).unwrap(), "legacy-hash");
+    }
+
     /// Write a fixture worker's env file (0600, as amux writes them).
     fn rename_fixture_env(name: &str, body: &str) {
         std::fs::write(env_path(name), body).unwrap();
@@ -46130,8 +46114,10 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         std::fs::write(tokens.join("review-d.sha256"), "stale-digest").unwrap();
         std::fs::create_dir_all(tokens.join("review-d.runs")).unwrap();
         std::fs::write(tokens.join("review-d.runs/dead-run.sha256"), "stale").unwrap();
-        std::fs::create_dir_all(tokens.join("review-c.runs")).unwrap();
-        std::fs::write(tokens.join("review-c.runs/live-run.sha256"), "live").unwrap();
+        let inc = crate::api::rename_identity::incarnation(home.path(), "review-c").unwrap();
+        let live_runs = crate::api::worker_identity::runs_dir(home.path(), &inc);
+        std::fs::create_dir_all(&live_runs).unwrap();
+        std::fs::write(live_runs.join("live-run.sha256"), "live").unwrap();
         let app: Router = Router::new()
             .merge(routes())
             .with_state(state.clone())
@@ -46141,11 +46127,10 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         let (st, v) = call(&app, "PATCH", "/api/sessions/review-c/config", Some(json!({"rename": "review-d"}))).await;
         assert_eq!(st, StatusCode::OK, "{v}");
         let steps = v["steps"].to_string();
-        assert!(steps.contains("worker-token: moved (replaced a stale target)"), "{steps}");
-        assert!(steps.contains("worker-run-tokens: moved (replaced a stale target)"), "{steps}");
-        assert!(!tokens.join("review-c.sha256").exists(), "the source hash moved");
-        assert!(tokens.join("review-d.runs/live-run.sha256").exists(), "{steps}");
-        assert!(!tokens.join("review-d.runs/dead-run.sha256").exists(), "the dead worker's run token is gone");
+        assert!(!steps.contains("worker-token:"), "{steps}");
+        assert!(crate::api::worker_identity::hash_path(home.path(), &inc).exists());
+        assert!(live_runs.join("live-run.sha256").exists());
+        assert_eq!(crate::api::rename_identity::incarnation(home.path(), "review-d").as_deref(), Some(inc.as_str()));
 
         let send = |tok: Option<&str>| {
             let mut b = Request::builder()
@@ -46199,9 +46184,10 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         // A new worker takes the name, with its own token material.
         rename_fixture_env("review-a", "CC_NAME=\"review-a\"\nCC_TAGS=other\nCC_AUTO_START=0\n");
         let tokens = home.path().join("worker-tokens");
-        std::fs::create_dir_all(tokens.join("review-a.runs")).unwrap();
-        std::fs::write(tokens.join("review-a.sha256"), "new-a-digest").unwrap();
-        std::fs::write(tokens.join("review-a.runs/run.sha256"), "run").unwrap();
+        let inc = crate::api::rename_identity::ensure_incarnation(home.path(), "review-a").unwrap();
+        std::fs::create_dir_all(tokens.join(format!("{inc}.runs"))).unwrap();
+        std::fs::write(tokens.join(format!("{inc}.sha256")), "new-a-digest").unwrap();
+        std::fs::write(tokens.join(format!("{inc}.runs/run.sha256")), "run").unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("x-amux-ui-token", ui_token(&state).parse().unwrap());
         let res = delete_post(&state, "review-a", &headers).await;
