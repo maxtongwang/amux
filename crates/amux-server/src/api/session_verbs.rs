@@ -27151,8 +27151,11 @@ async fn post_dispatch(
 ) -> Response {
     // The verbs that rewrite who a worker is (its name, its instructions, its
     // memory) follow the peer-config rule; the rename alias and PATCH config
-    // must not differ.
-    if matches!(action, "rename" | "instructions" | "memory") {
+    // must not differ, lead team renames included.
+    if action == "rename" {
+        let to = rename_verb_target(body);
+        if let Some(refusal) = peer_config_refusal_unless_lead_rename(headers, name, action, Some(to)) { return refusal; }
+    } else if matches!(action, "instructions" | "memory") {
         if let Some(refusal) = peer_config_refusal(headers, name, action) { return refusal; }
     }
     match action {
@@ -27375,12 +27378,7 @@ async fn post_dispatch(
         // Aliases, not reimplementations — they call the identical functions,
         // so the two spellings cannot drift into different behaviour.
         "rename" => {
-            let to = body_str(body, "name");
-            let to = if to.is_empty() {
-                body_str(body, "rename")
-            } else {
-                to
-            };
+            let to = rename_verb_target(body);
             if to.is_empty() {
                 return jresp(
                     StatusCode::BAD_REQUEST,
@@ -27388,7 +27386,7 @@ async fn post_dispatch(
                            "hint": "POST {\"name\": \"<new>\"} (alias of PATCH /config {\"rename\":...})"}),
                 );
             }
-            rename_session(state, name, &to).await
+            rename_session(state, name, to).await
         }
         _ => not_found(),
     }
@@ -32362,7 +32360,8 @@ pub(crate) async fn report_post(
 // ---------------------------------------------------------------------------
 
 async fn patch_dispatch(state: &AppState, name: &str, action: &str, body: &Value, headers: &HeaderMap) -> Response {
-    if let Some(refusal) = peer_config_refusal(headers, name, action) { return refusal; }
+    let rename_to = if action == "config" { config_rename_only(body) } else { None };
+    if let Some(refusal) = peer_config_refusal_unless_lead_rename(headers, name, action, rename_to) { return refusal; }
     if let Some(refusal) = membership_patch_refusal(headers, names_messaging_authority(body)) { return refusal; }
     match action {
         "commit-guard" => commit_guard_patch_verb(name, body),
@@ -33650,9 +33649,10 @@ pub(crate) fn worker_origin(headers: &HeaderMap) -> String {
 /// CONFIGURING ANOTHER WORKER IS THE OWNER'S (review round 3, N2/N3). A worker
 /// may change typed settings on itself only: renaming a peer left the renamed
 /// lane with no stored token (trusted without one), and editing a peer's env,
-/// instructions or memory rewrites what that peer is. Leads have no team-config
-/// role in this codebase, so the rule is owner-only. A worker's own Chat tab
-/// (`w@chat`) counts as `w`. Owners and verified members are unaffected.
+/// instructions or memory rewrites what that peer is. The rule is owner-only
+/// except for one lead rename ([`peer_config_refusal_unless_lead_rename`]).
+/// A worker's own Chat tab (`w@chat`) counts as `w`. Owners and verified
+/// members are unaffected.
 pub(crate) fn peer_config_refusal(headers: &HeaderMap, target: &str, what: &str) -> Option<Response> {
     peer_config_refusal_body(headers, target, what).map(|body| jresp(StatusCode::FORBIDDEN, body))
 }
@@ -33668,6 +33668,73 @@ pub(crate) fn peer_config_refusal_body(headers: &HeaderMap, target: &str, what: 
         n_considered = 1, "a worker tried to configure another worker");
     Some(json!({"ok": false, "code": "peer_config_owner_only",
         "error": format!("'{origin}' may not change {what} of '{target}'; configuring another worker is the owner's")}))
+}
+
+/// Max's owner agent (`agents/owner.md` in ai-config). No lead renames it, and
+/// no lead renames a worker to it.
+pub(crate) const OWNER_AGENT: &str = "mrpopo";
+
+/// THE one exception to [`peer_config_refusal`] (ai-config #203; Max,
+/// 2026-10-17: "Worker name dynamic change with task is still not in right?"),
+/// for every path that renames a session: a verified lead may RENAME a worker
+/// in its own team. `rename_to` is `Some(new name)` only when the request
+/// renames the target and changes nothing else; any other request takes the
+/// owner-only rule unchanged. amux #3 keeps the renamed worker's incarnation,
+/// token and old-name alias, and `rename_session` journals the rename.
+pub(crate) fn peer_config_refusal_unless_lead_rename(
+    headers: &HeaderMap,
+    target: &str,
+    what: &str,
+    rename_to: Option<&str>,
+) -> Option<Response> {
+    if let Some(to) = rename_to {
+        let origin = worker_origin(headers);
+        if origin != target {
+            if let Some(team) = lead_team_rename(&origin, target, to) {
+                tracing::info!(origin = %origin, target, to, ?team, verdict = "lead_team_rename_allowed",
+                    measured = true, n_considered = 1, "a lead renamed a worker in its own team");
+                return None;
+            }
+        }
+    }
+    peer_config_refusal(headers, target, what)
+}
+
+/// Whether verified worker `origin` may rename `target` to `to` as its lead:
+/// `origin` is in `leads`, `target` is not, they share a group other than
+/// `leads`, and neither `target` nor the new name is the owner agent. The
+/// shared groups, or `None`. `origin` is [`worker_origin`]'s verified identity
+/// (an unverified claim names no lane, so it has no groups).
+pub(crate) fn lead_team_rename(origin: &str, target: &str, to: &str) -> Option<std::collections::BTreeSet<String>> {
+    let owner_agent = |n: &str| n.trim().eq_ignore_ascii_case(OWNER_AGENT);
+    if owner_agent(origin) || owner_agent(target) || owner_agent(&sanitize_session_name(to)) {
+        return None;
+    }
+    let (caller, theirs) = (lane_groups(origin), lane_groups(target));
+    if !caller.contains(LEADS_GROUP) || theirs.contains(LEADS_GROUP) {
+        return None;
+    }
+    let shared: std::collections::BTreeSet<String> =
+        caller.intersection(&theirs).filter(|g| *g != LEADS_GROUP).cloned().collect();
+    (!shared.is_empty()).then_some(shared)
+}
+
+/// The new name a config PATCH body asks for when renaming is ALL it does:
+/// an object whose only key is a string `rename`. Anything else is `None`.
+pub(crate) fn config_rename_only(body: &Value) -> Option<&str> {
+    let obj = body.as_object()?;
+    if obj.len() != 1 {
+        return None;
+    }
+    obj.get("rename")?.as_str()
+}
+
+/// The new name `POST .../rename` reads: `name`, else `rename`; empty if neither.
+fn rename_verb_target(body: &Value) -> &str {
+    ["name", "rename"]
+        .iter()
+        .find_map(|k| body.get(*k).and_then(Value::as_str).filter(|s| !s.is_empty()))
+        .unwrap_or("")
 }
 
 /// The group whose members may create workers (Max, 2026-10-16: "Only leads
