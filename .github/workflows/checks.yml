@@ -17,6 +17,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - name: Parse saved keychain dump without keychain access
+        run: python3 scripts/test-keychain-partitions.py
       - name: Stable local signing and adoption refusal
         run: |
           set -o pipefail

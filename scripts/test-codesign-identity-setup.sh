@@ -41,20 +41,7 @@ security import "$work/unrelated.p12" -k "$keychain" -P "$password" -T /usr/bin/
 security set-key-partition-list -S apple-tool:,apple: -s -t private -l "$unrelated" -k "$password" "$keychain" >/dev/null
 security dump-keychain -a "$keychain" > "$work/before.dump"
 partition_for_label() {
-  python3 - "$1" "$2" <<'PY'
-import pathlib
-import sys
-
-label, path = sys.argv[1:]
-blocks = pathlib.Path(path).read_text().split('keychain: ')
-matches = [''.join(line for line in block.splitlines(keepends=True)
-                   if 'partition_id:' in line)
-           for block in blocks if f'"labl"<blob>="{label}"' in block
-           and 'partition_id:' in block]
-if len(matches) != 1:
-    sys.exit(f'expected one partition list for {label}, found {len(matches)}')
-sys.stdout.write(matches[0])
-PY
+  python3 "$repo/scripts/keychain-partitions.py" "$1" "$2"
 }
 unrelated_before=$(partition_for_label "$unrelated" "$work/before.dump")
 [[ "$unrelated_before" == *'apple-tool:'* ]] &&
@@ -88,4 +75,4 @@ amux_partition=$(partition_for_label 'amux local code signing' "$work/after.dump
   [[ "$amux_partition" == *'codesign:'* ]] || {
   echo "FAIL: amux signing key lacks expected partition list: $amux_partition" >&2; exit 1;
 }
-echo 'PASS: unrelated key partition list is unchanged; amux key has signing access'
+echo "PASS: unrelated key partition list unchanged ($unrelated_after); amux key has signing access ($amux_partition)"
