@@ -346,74 +346,170 @@ fn legacy_holder(home: &Path, newest: &HashMap<String, Rec>, records: &[Rec], st
     }
 }
 
-/// One bounded legacy read, performed under WRITE_LOCK before any env moves.
-/// Run directories are revoked, never moved: their live Drop guards own the
-/// original paths. The marker is last so an interrupted pass retries safely.
-fn migrate_tokens(home: &Path) -> std::io::Result<()> {
-    let marker = home.join("worker-tokens.version");
-    match std::fs::read_to_string(&marker) {
-        Ok(v) if v == "1\n" => return Ok(()),
-        Ok(_) => return Err(std::io::Error::other("unsupported worker token version")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
-        Err(e) => return Err(e),
+/// Per-file damage must not keep the fleet offline. Preserve the offending
+/// path and log it; marker I/O is the only fatal migration boundary.
+fn migration_skipped(path: &Path, error: &std::io::Error) {
+    tracing::warn!(path = %path.display(), %error, verdict = "identity_migration_file_skipped",
+        measured = true, n_considered = 1, "identity migration skipped a file; left in place");
+}
+
+fn marker_complete(path: &Path) -> std::io::Result<bool> {
+    match std::fs::read(path) {
+        Ok(v) if v == b"1\n" => Ok(true),
+        Ok(_) => {
+            tracing::warn!(path = %path.display(), verdict = "identity_migration_marker_unrecognized",
+                measured = true, n_considered = 1, "unrecognized marker contents; retrying migration");
+            Ok(false)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(marker_error(path, e)),
     }
-    std::fs::create_dir_all(home)?;
-    let dir = home.join("worker-tokens");
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(e),
-    };
-    let mut owned = HashSet::new();
-    match std::fs::read_dir(home.join("sessions")) {
-        Ok(envs) => for env in envs {
-            let env = env?;
-            let name = env.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".env") || name.ends_with(".env.reaped") {
-                if let Some(inc) = incarnation_in(&env.path()) { owned.insert(inc); }
+}
+
+fn marker_error(path: &Path, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), format!("fatal identity migration marker I/O at {}: {error}", path.display()))
+}
+
+fn migration_entries(path: &Path) -> (Vec<std::fs::DirEntry>, bool) {
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            let mut complete = true;
+            let entries = entries.filter_map(|entry| match entry {
+                Ok(entry) => Some(entry),
+                Err(error) => { migration_skipped(path, &error); complete = false; None }
+            }).collect();
+            (entries, complete)
+        }
+        Err(error) => {
+            let missing = error.kind() == std::io::ErrorKind::NotFound;
+            if !missing { migration_skipped(path, &error); }
+            (Vec::new(), missing)
+        }
+    }
+}
+
+// Hard-link then unlink: retry after a crash preserves the published token,
+// and an existing incarnation token always wins over legacy debris.
+fn rekey_hash(source: &Path, target: &Path) -> std::io::Result<()> {
+    if !std::fs::symlink_metadata(source)?.file_type().is_file() {
+        return Err(std::io::Error::other("token hash is not a regular file"));
+    }
+    match std::fs::hard_link(source, target) {
+        Ok(()) => {},
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !std::fs::symlink_metadata(target)?.file_type().is_file() {
+                return Err(std::io::Error::other("token target is not a regular file"));
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
         Err(e) => return Err(e),
     }
+    std::fs::remove_file(source)
+}
+
+/// Also run at startup when the migration markers already exist: a manual
+/// env copy after upgrade must still announce duplicate ownership.
+pub(crate) fn audit_incarnations(home: &Path) -> (HashSet<String>, bool) {
+    let mut owned = HashSet::new();
+    let mut live_ids = HashMap::new();
+    let (envs, mut complete) = migration_entries(&home.join("sessions"));
+    for env in envs {
+        let name = env.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".env") || name.ends_with(".env.reaped") {
+            if let Err(error) = std::fs::read_to_string(env.path()) {
+                migration_skipped(&env.path(), &error);
+                complete = false;
+                continue;
+            }
+            if let Some(inc) = incarnation_in(&env.path()) {
+                owned.insert(inc.clone());
+                if name.ends_with(".env") {
+                    if let Some(other) = live_ids.insert(inc, name.clone()) {
+                        tracing::warn!(worker = %name, other_worker = %other,
+                            verdict = "worker_incarnation_duplicate", measured = true, n_considered = 2,
+                            "two live worker env files share an incarnation");
+                    }
+                }
+            }
+        }
+    }
+    (owned, complete)
+}
+
+/// A bounded, restart-safe upgrade, under WRITE_LOCK before any env moves.
+/// Legacy rename history identifies the live holder of both launch and run
+/// tokens. Run hashes retain their mtimes and the existing six-hour expiry.
+fn migrate_tokens(home: &Path) -> std::io::Result<()> {
+    let marker = home.join("worker-tokens.version");
+    if marker_complete(&marker)? { return Ok(()); }
+    let dir = home.join("worker-tokens");
+    let (entries, _) = migration_entries(&dir);
+    let (history, history_complete) = match std::fs::read_to_string(record_path(home)) {
+        Ok(text) => {
+            let complete = text.lines().all(|l| l.trim().is_empty() || parse(l).is_some());
+            if !complete {
+                tracing::warn!(path = %record_path(home).display(), verdict = "identity_migration_record_skipped",
+                    measured = true, n_considered = 1, "malformed rename history retained; unclaimed tokens will be kept");
+            }
+            (text, complete)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), true),
+        Err(e) => { migration_skipped(&record_path(home), &e); (String::new(), false) }
+    };
+    let records: Vec<Rec> = history.lines().filter_map(parse).collect();
+    let newest: HashMap<String, Rec> = records.iter().map(|r| (r.old.clone(), r.clone())).collect();
+    let (owned, ownership_complete) = audit_incarnations(home);
     let (mut migrated, mut dropped) = (0usize, 0usize);
     for entry in &entries {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(key) = name.strip_suffix(".sha256").or_else(|| name.strip_suffix(".runs")) else { continue };
-        // A retry may see already-rekeyed material; its env proves ownership.
-        if owned.contains(key) { continue; }
-        if key != "." && key != ".." && super::session_verbs::valid_session_name(key) && worker_exists(home, key) {
-            let inc = assign_incarnation(home, key)?;
-            if name.ends_with(".sha256") {
-                let target = super::worker_identity::hash_path(home, &inc);
-                if target != entry.path() {
-                    // Keep a current token if a prior interrupted pass or launch
-                    // already published it. Never replace it with legacy debris.
-                    match std::fs::hard_link(entry.path(), &target) {
-                        Ok(()) => {},
-                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
-                        Err(e) => return Err(e),
-                    }
-                    std::fs::remove_file(entry.path())?;
-                    migrated += 1;
-                }
-                continue;
+        let path = entry.path();
+        let result = (|| -> std::io::Result<()> {
+            let kind = entry.file_type()?;
+            if (name.ends_with(".sha256") && !kind.is_file()) || (name.ends_with(".runs") && !kind.is_dir()) {
+                return Err(std::io::Error::other("unexpected token material file type"));
             }
-        }
-        if entry.file_type()?.is_dir() {
-            std::fs::remove_dir_all(entry.path())?;
-        } else {
-            std::fs::remove_file(entry.path())?;
-        }
-        dropped += 1;
+            if owned.contains(key) { return Ok(()); }
+            let holder = if key != "." && key != ".." && super::session_verbs::valid_session_name(key) && worker_exists(home, key) {
+                Some(key.to_string())
+            } else { legacy_holder(home, &newest, &records, key) };
+            if let Some(holder) = holder {
+                let inc = assign_incarnation(home, &holder)?;
+                if name.ends_with(".sha256") {
+                    let target = super::worker_identity::hash_path(home, &inc);
+                    if target != path { rekey_hash(&path, &target)?; }
+                } else {
+                    let target = super::worker_identity::runs_dir(home, &inc);
+                    if target == path { return Ok(()); }
+                    std::fs::create_dir_all(&target)?;
+                    for hash in migration_entries(&path).0 {
+                        if let Err(error) = rekey_hash(&hash.path(), &target.join(hash.file_name())) {
+                            migration_skipped(&hash.path(), &error);
+                        }
+                    }
+                    // Failure (including a skipped child) retains the source evidence.
+                    std::fs::remove_dir(&path)?;
+                }
+                migrated += 1;
+            } else {
+                if !ownership_complete || !history_complete {
+                    return Err(std::io::Error::other("ownership scan incomplete; retaining unclaimed token material"));
+                }
+                if kind.is_dir() { std::fs::remove_dir_all(&path)?; }
+                else { std::fs::remove_file(&path)?; }
+                dropped += 1;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result { migration_skipped(&path, &error); }
     }
     tracing::info!(migrated, dropped, measured = true, n_considered = entries.len(),
-        verdict = "worker_tokens_migrated", "legacy launch hashes re-keyed by incarnation");
+        verdict = "worker_tokens_migrated", "legacy launch and run hashes re-keyed by incarnation");
     if dropped > 0 {
         tracing::warn!(dropped, measured = true, n_considered = entries.len(),
             verdict = "worker_tokens_legacy_dropped", "unowned legacy token material revoked");
     }
-    write_atomic(&marker, "1\n")
+    std::fs::create_dir_all(home).map_err(|e| marker_error(&marker, e))?;
+    write_atomic(&marker, "1\n").map_err(|e| marker_error(&marker, e))
 }
 
 /// Settle legacy ownership once, before any lifecycle mutation. The version
@@ -424,19 +520,21 @@ pub(crate) fn ensure_migrated(home: &Path) -> std::io::Result<()> {
         let _w = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         migrate_tokens(home)?;
         let marker = home.join("renames.version");
-        match std::fs::read_to_string(&marker) {
-            Ok(v) if v == "1\n" => return Ok(()),
-            Ok(_) => return Err(std::io::Error::other("unsupported rename records version")),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        std::fs::create_dir_all(home)?;
+        if marker_complete(&marker)? { return Ok(()); }
         let path = record_path(home);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(e),
+            Err(e) => {
+                migration_skipped(&path, &e);
+                return write_atomic(&marker, "1\n").map_err(|e| marker_error(&marker, e));
+            }
         };
+        if text.lines().any(|l| !l.trim().is_empty() && parse(l).is_none()) {
+            tracing::warn!(path = %path.display(), verdict = "identity_migration_record_skipped",
+                measured = true, n_considered = text.lines().filter(|l| !l.trim().is_empty() && parse(l).is_none()).count(),
+                "malformed rename records retained; valid records will still migrate");
+        }
         let records: Vec<Rec> = text.lines().filter_map(parse).collect();
         let legacy: Vec<&Rec> = records.iter().filter(|r| r.legacy()).collect();
         let newest: HashMap<String, Rec> = records.iter().map(|r| (r.old.clone(), r.clone())).collect();
@@ -452,7 +550,14 @@ pub(crate) fn ensure_migrated(home: &Path) -> std::io::Result<()> {
                 continue;
             }
             let inc = match legacy_holder(home, &newest, &records, &rec.old) {
-                Some(holder) => Some(assign_incarnation(home, &holder)?),
+                Some(holder) => match assign_incarnation(home, &holder) {
+                    Ok(inc) => Some(inc),
+                    Err(error) => {
+                        migration_skipped(&env_file(home, &holder), &error);
+                        out.push_str(line);
+                        continue;
+                    }
+                },
                 None => None,
             };
             match inc {
@@ -466,7 +571,10 @@ pub(crate) fn ensure_migrated(home: &Path) -> std::io::Result<()> {
             }
         }
         if !legacy.is_empty() {
-            write_atomic(&path, &out)?;
+            if let Err(error) = write_atomic(&path, &out) {
+                migration_skipped(&path, &error);
+                return write_atomic(&marker, "1\n").map_err(|e| marker_error(&marker, e));
+            }
             tracing::info!(
                 migrated,
                 dropped,
@@ -485,11 +593,11 @@ pub(crate) fn ensure_migrated(home: &Path) -> std::io::Result<()> {
                 );
             }
         }
-        write_atomic(&marker, "1\n")
+        write_atomic(&marker, "1\n").map_err(|e| marker_error(&marker, e))
     })();
     if let Err(ref e) = result {
         tracing::warn!(error = %e, verdict = "rename_records_migration_failed", measured = true,
-            n_considered = 1, "rename identity operation blocked until legacy migration succeeds");
+            n_considered = 1, "fatal marker I/O blocked identity migration; repair the marker path");
     }
     result
 }
@@ -559,6 +667,103 @@ pub async fn resolve_headers(mut req: Request, next: Next) -> Response {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn round8_migration_skips_bad_files_and_unknown_marker_contents() {
+        let d = home_with(&["good"]);
+        let h = d.path();
+        std::fs::create_dir_all(h.join("worker-tokens/bad.sha256")).unwrap();
+        std::fs::write(h.join("worker-tokens/good.sha256"), "good-hash").unwrap();
+        std::fs::write(h.join("worker-tokens.version"), "unexpected\n").unwrap();
+        std::fs::write(h.join("renames.version"), "unexpected\n").unwrap();
+        ensure_migrated(h).expect("bad individual files must not brick startup");
+        assert!(h.join("worker-tokens/bad.sha256").is_dir(), "failed evidence retained");
+        let inc = incarnation(h, "good").unwrap();
+        assert_eq!(std::fs::read_to_string(super::super::worker_identity::hash_path(h, &inc)).unwrap(), "good-hash");
+        ensure_migrated(h).unwrap();
+        std::fs::remove_file(h.join("renames.version")).unwrap();
+        std::fs::create_dir(h.join("renames.version")).unwrap();
+        let error = ensure_migrated(h).unwrap_err();
+        assert!(error.to_string().contains("renames.version"), "fatal marker I/O must identify its path: {error}");
+    }
+
+    #[test]
+    fn round8_pre_pr_renamed_worker_keeps_launch_token() {
+        use super::super::worker_identity as wi;
+        use sha2::{Digest, Sha256};
+        let d = home_with(&["amux-setup-complete"]);
+        let h = d.path();
+        std::fs::write(h.join("server.env"), "AMUX_CONTRACT_DONE=1\n").unwrap();
+        std::fs::create_dir(h.join("worker-tokens")).unwrap();
+        std::fs::write(h.join("worker-tokens/claude-0b.sha256"), format!("{:x}", Sha256::digest(b"legacy-launch"))).unwrap();
+        std::fs::write(record_path(h), "{\"old\":\"claude-0b\",\"new\":\"amux-setup-complete\"}\n").unwrap();
+        ensure_migrated(h).unwrap();
+        assert_eq!(current_name(h, "claude-0b").as_deref(), Some("amux-setup-complete"));
+        assert_eq!(wi::check(h, "amux-setup-complete", Some("legacy-launch")), wi::Check::Valid);
+        ensure_migrated(h).unwrap();
+        assert_eq!(wi::check(h, "amux-setup-complete", Some("legacy-launch")), wi::Check::Valid);
+    }
+
+    #[test]
+    fn round8_inflight_legacy_run_tokens_survive_upgrade() {
+        use super::super::worker_identity as wi;
+        use sha2::{Digest, Sha256};
+        let d = home_with(&["w"]);
+        let h = d.path();
+        std::fs::write(h.join("server.env"), "AMUX_CONTRACT_DONE=1\n").unwrap();
+        let runs = h.join("worker-tokens/w.runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(runs.join("active.sha256"), format!("{:x}", Sha256::digest(b"legacy-run"))).unwrap();
+        ensure_migrated(h).unwrap();
+        assert_eq!(wi::check(h, "w", Some("legacy-run")), wi::Check::Valid);
+        let inc = incarnation(h, "w").unwrap();
+        let migrated = wi::runs_dir(h, &inc).join("active.sha256");
+        assert!(migrated.is_file());
+        std::fs::remove_file(migrated).unwrap();
+        assert_ne!(wi::check(h, "w", Some("legacy-run")), wi::Check::Valid);
+    }
+
+    #[test]
+    fn round8_cli_last_assignment_matches_server_incarnation_validation() {
+        let d = home_with(&["w"]);
+        let path = env_file(d.path(), "w");
+        // The last assignment wins, including an invalid one. The registrar
+        // must not resurrect an earlier ID that the server rejects.
+        std::fs::write(&path, "CC_INCARNATION=earlier\nCC_INCARNATION=invalid/value\n").unwrap();
+        assert_eq!(incarnation(d.path(), "w"), None);
+        let cli = include_str!("../../../../amux");
+        let code = cli.split("<<'PYREGISTER'\n").nth(1).unwrap().split("\nPYREGISTER").next().unwrap();
+        let output = std::process::Command::new("python3").args(["-c", code])
+            .arg(&path).args(["w", "/tmp", "", "", ""]).output().unwrap();
+        assert!(output.status.success(), "registrar failed: {}", String::from_utf8_lossy(&output.stderr));
+        let id = incarnation(d.path(), "w").unwrap();
+        assert_ne!(id, "earlier", "CLI must replace an invalid final assignment, like the server");
+    }
+
+    #[test]
+    fn round8_duplicate_incarnation_warns_with_verdict() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Capture(bytes.clone());
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_max_level(tracing::Level::WARN).with_writer(move || sink.clone()).finish();
+        let d = home_with(&["a", "b"]);
+        for name in ["a", "b"] {
+            std::fs::write(env_file(d.path(), name), "CC_INCARNATION=shared-id\n").unwrap();
+        }
+        tracing::subscriber::with_default(subscriber, || ensure_migrated(d.path()).unwrap());
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("WARN") && log.contains("worker_incarnation_duplicate"), "duplicate must self-announce: {log}");
+        assert!(log.contains("a.env") && log.contains("b.env"), "both workers must be identified: {log}");
+    }
 
     /// The number of records of incarnation `inc` on disk.
     pub(crate) fn records_of(home: &Path, inc: &str) -> usize {

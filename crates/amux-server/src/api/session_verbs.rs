@@ -46137,7 +46137,8 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         assert!(!tokens.join("fedcba9876543210fedcba9876543210.sha256").exists());
         assert_eq!(std::fs::read_to_string(tokens.join("current-inc.sha256")).unwrap(), "current-hash");
         assert!(!tokens.join("current.sha256").exists());
-        assert!(!tokens.join("legacy.runs").exists(), "legacy run guards cannot follow a moved directory");
+        assert!(!tokens.join("legacy.runs").exists(), "legacy runs are re-keyed on upgrade");
+        assert_eq!(std::fs::read_to_string(tokens.join("0123456789abcdef0123456789abcdef.runs/run.sha256")).unwrap(), "unowned-run");
         crate::api::rename_identity::ensure_migrated(home.path()).unwrap();
         assert_eq!(std::fs::read_to_string(tokens.join("0123456789abcdef0123456789abcdef.sha256")).unwrap(), "legacy-hash");
     }

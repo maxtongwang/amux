@@ -965,6 +965,7 @@ fn same_env_body(path: &std::path::Path, content: &str) -> bool {
     let strip = |s: &str| -> String {
         s.lines()
             .filter(|l| !l.trim_start().starts_with("# updated:"))
+            .filter(|l| !l.trim_start().starts_with("CC_INCARNATION="))
             .map(|l| l.trim())
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
@@ -976,34 +977,55 @@ fn same_env_body(path: &std::path::Path, content: &str) -> bool {
 /// Write the env file the same way create_session_legacy does: `# updated:`
 /// header, 0600, atomic rename.
 fn write_env_atomic(path: &std::path::Path, body: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
     let out = format!(
         "# updated: {}\n{}\n",
         chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f"),
         body
     );
-    let tmp = path.with_file_name(format!(
-        ".{}.{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("env"),
-        std::process::id()
-    ));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        f.write_all(out.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
+    // Share both locks and identity preservation with all worker env writers.
+    crate::api::session_verbs::EnvFile::replace_text(path, &out)
+        .inspect_err(|error| tracing::warn!(%error, path = %path.display(),
+            verdict = "worker_env_apply_failed", measured = true, n_considered = 1,
+            "worker env apply could not persist the identity-preserving update"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::sessions_legacy::worker_model_env;
+
+    #[test]
+    fn round8_env_apply_update_preserves_tokens_across_all_writers() {
+        use crate::api::{rename_identity as ri, session_verbs::EnvFile, worker_identity as wi};
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("server.env"), "AMUX_CONTRACT_DONE=1\n").unwrap();
+        let path = d.path().join("sessions/w.env");
+        EnvFile::replace_text(&path, "CC_TAGS=dev\n").unwrap();
+        let id = ri::incarnation(d.path(), "w").unwrap();
+        let launch = wi::mint(d.path(), "w").unwrap().unwrap();
+        let run = wi::mint_run(d.path(), "w").unwrap().unwrap();
+        for writer in 0..5 {
+            match writer {
+                0 => write_env_atomic(&path, "CC_TAGS=changed").unwrap(),
+                1 => EnvFile::default().write(&path).unwrap(),
+                2 => EnvFile::replace_text(&path, "CC_DESC=changed\n").unwrap(),
+                3 => crate::api::sessions_legacy::write_env_file(&path, &[("CC_DESC", "legacy".into())]).unwrap(),
+                _ => EnvFile::merge_plain(&path, &[("CC_INCARNATION".into(), None)]).unwrap(),
+            }
+            assert_eq!(ri::incarnation(d.path(), "w"), Some(id.clone()), "writer {writer}");
+            assert_eq!(wi::check(d.path(), "w", Some(&launch)), wi::Check::Valid, "writer {writer}");
+            assert_eq!(wi::check(d.path(), "w", Some(&run.value)), wi::Check::Valid, "writer {writer}");
+        }
+    }
+
+    #[test]
+    fn round8_env_apply_same_body_ignores_incarnation() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("sessions/w.env");
+        crate::api::session_verbs::EnvFile::replace_text(&path, "CC_TAGS=dev\n").unwrap();
+        assert!(same_env_body(&path, "CC_TAGS=dev"));
+        assert!(!same_env_body(&path, "CC_TAGS=other"));
+    }
 
     // Pull the value of a CC_ key out of render_worker_env's `K="V"` body.
     fn env_val(body: &str, key: &str) -> String {

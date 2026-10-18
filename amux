@@ -846,8 +846,17 @@ with (p.parent / ".incarnation.lock").open("a+") as lock:
     updates = {"CC_NAME": name, "CC_DIR": directory, "CC_FLAGS": flags}
     if wt: updates["CC_WORKTREE"] = "1"
     if profile: updates["CC_WORKTREE_PROFILE"] = profile
-    ids = re.findall(r'^CC_INCARNATION=["\']?([A-Za-z0-9_.-]+)["\']?\s*$', text, re.M)
-    incarnation = ids[-1] if ids and ids[-1] not in (".", "..") else secrets.token_hex(16)
+    # Match EnvFile's last-assignment-wins parsing and ASCII validation.
+    ids = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("CC_INCARNATION="): continue
+        value = line.split("=", 1)[1].strip()
+        if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
+            value = value[1:-1]
+        ids.append(value.strip())
+    valid_id = bool(ids and re.fullmatch(r"[A-Za-z0-9_.-]+", ids[-1]) and ids[-1] not in (".", ".."))
+    incarnation = ids[-1] if valid_id else secrets.token_hex(16)
     updates["CC_INCARNATION"] = incarnation
     if not text:
         for key in ("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "CC_AUTO_PICKUP", "CC_AUTO_CONTINUE", "CC_STANDING_ORDERS", "AMUX_COMMAND_LIFECYCLE", "AMUX_BOARD_FORCE_ADHERENCE"):
@@ -863,7 +872,7 @@ with (p.parent / ".incarnation.lock").open("a+") as lock:
         os.replace(tmp, p)
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
-    if not ids:
+    if not valid_id:
         print("verdict=worker_incarnation_assigned worker=" + name, file=sys.stderr)
 PYREGISTER
   then

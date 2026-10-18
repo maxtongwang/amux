@@ -266,3 +266,30 @@ A registered checkout interrupted before acknowledgement resets in place on rest
 positive remote ancestry adopts a saved push before any reset or replay. Ordinary
 failed creation removes its own locked candidate. Stale cleanup is restricted to
 registered candidates in the same repository, preserving unrelated directories.
+
+## Worker identity upgrade
+
+Worker env rewrites preserve `CC_INCARNATION` under the shared env mutex and
+`sessions/.incarnation.lock`. This includes env apply, legacy create, API/CLI
+registration, raw replacement and scope merges. Duplication creates a fresh ID;
+rename moves the existing ID. Duplicate live IDs emit
+`worker_incarnation_duplicate` with both worker files.
+
+At upgrade, `renames.jsonl` maps old token names to live workers. Launch hashes
+and in-flight `<name>.runs/` hashes migrate to incarnation keys without changing
+run-token mtimes or the six-hour expiry. Publication links before unlinking, so
+a crash can be retried without replacing an already published credential.
+
+Per-file migration failures emit WARN `identity_migration_file_skipped` with the
+path and leave the failed file in place while startup continues. An unrecognized
+version marker triggers a new pass. Only marker I/O is fatal, with its path and
+`identity_migration_marker_io_fatal`. Skipped files need repair before a fresh
+migration pass; the completion marker records a completed scan, including skips.
+
+Verification (seven passing regressions, using temporary homes):
+
+```bash
+amux-isolated scripts/safe-cargo.sh test -p amux-server --lib round8_ -- --skip process_identity
+```
+
+Never run the migration against a real home during verification.

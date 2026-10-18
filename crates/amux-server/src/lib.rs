@@ -342,10 +342,12 @@ async fn async_main() {
     }
 
     if let Err(error) = api::rename_identity::ensure_migrated(&cfg.amux_home) {
-        tracing::error!(%error, "cannot start with unmigrated rename identities");
+        tracing::error!(%error, verdict = "identity_migration_marker_io_fatal", "cannot start: identity migration marker I/O failed");
         std::process::exit(1);
     }
 
+    // Audit even on an already-upgraded home; marker fast paths skip scans.
+    api::rename_identity::audit_incarnations(&cfg.amux_home);
     let running_build = build_hash();
     tracing::info!(port = cfg.port, db = %cfg.db_path.display(), pid = std::process::id(),
         commit = env!("AMUX_BUILD_COMMIT_FULL"), build = %running_build,
