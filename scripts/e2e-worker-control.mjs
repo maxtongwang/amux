@@ -209,5 +209,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   else console.log(formatReport(agg, { all: args.includes('--all') }));
   console.error(JSON.stringify({ verdict: agg.verdict, measured: agg.measured, n_considered: agg.n_considered, sha: agg.sha,
     settings: agg.settings.map(s => ({ workers: s.workers, runs: s.runs, complete: s.complete, unmeasured: s.unmeasured })), errors: agg.errors.length }));
-  process.exitCode = agg.errors.length ? 1 : 0;
+  if (!agg.measured) console.error(`no run was measured: none of ${agg.n_considered} run(s) had an e2e-evidence artifact with a manifest`);
+  process.exitCode = agg.errors.length || !agg.measured ? 1 : 0;
 }

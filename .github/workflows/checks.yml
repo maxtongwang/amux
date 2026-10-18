@@ -48,6 +48,11 @@ jobs:
           npm run test:outbox
           npm run test:offline
           npm run test:state
+      # Fake gh and sleep, a local bare remote; never contacts GitHub.
+      - name: e2e worker control script dispatches, caps in-flight runs and reports honestly
+        run: |
+          set -euo pipefail
+          bash scripts/test-e2e-worker-control.sh
       # rust.yml lets a PR reuse main's compiled server and tests when this key
       # matches. A key that missed a compile input would hand a PR a stale
       # binary and a false green, so its input classes are pinned here.
