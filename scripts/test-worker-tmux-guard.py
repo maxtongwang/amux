@@ -174,9 +174,30 @@ class WorkerTmuxGuardTests(unittest.TestCase):
         self.assert_passed('new-window', '-d', 'rg kill-server scripts')
         self.assert_passed('run-shell', 'env -u TMUX -u TMUX_PANE tmux -L review-private kill-server')
         self.assert_passed('run-shell', 'tmux -S /tmp/p/sock kill-server')
-        self.assert_passed('run-shell', 'echo "x; tmux kill-server"')
+        # Quotes do not exempt harmless text in commands that run arguments.
+        self.assert_refused('run-shell', 'echo "x; tmux kill-server"')
         self.assert_passed('run-shell', 'grep kill-server scripts')
-        self.assert_passed('bind-key', 'X', 'display-message "x; kill-server"')
+        self.assert_refused('bind-key', 'X', 'display-message "x; kill-server"')
+
+    def test_review_repros_refused(self):
+        self.assert_refused('new-window', '-d', '/opt/homebrew/bin/tmux', 'kill-server')
+        self.assert_refused('if-shell', '-t', 'review-pane', '/opt/homebrew/bin/tmux kill-server', 'display-message ok')
+        self.assert_refused('bind-key', 'X', 'run-shell "/opt/homebrew/bin/tmux kill-server"')
+
+    def test_conservative_running_argument_sweep(self):
+        for command in ('new-session', 'new-window', 'split-window', 'respawn-pane',
+                        'respawn-window', 'pipe-pane', 'run-shell', 'display-popup'):
+            with self.subTest(command=command):
+                self.assert_refused(command, '-d', '/opt/homebrew/bin/tmux', 'kill-server')
+        for command in ('if-shell', 'bind-key', 'confirm-before', 'command-prompt',
+                        'display-menu', 'set-hook'):
+            with self.subTest(command=command):
+                self.assert_refused(command, 'display-message "kill-server"')
+        self.assert_refused('run-shell', r'tmux \kill-server')
+        self.assert_refused('run-shell', 'tmux -L review-private kill-server; tmux kill-pane')
+        self.assert_refused('run-shell', f'tmux -S {self.live_sock} kill-server')
+        self.assert_refused('run-shell', 'tmux -L default kill-server')
+        self.assert_passed('run-shell', 'tmux -L review-private kill-server; tmux -S /tmp/p/sock kill-pane')
 
     # --- pass-throughs ---------------------------------------------------------------
     def test_kill_on_other_socket_passes_with_exact_argv(self):

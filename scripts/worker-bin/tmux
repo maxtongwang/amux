@@ -2,12 +2,14 @@
 # Worker-pane tmux guard: refuses kill-server/kill-session/kill-pane (and -K) on the
 # live amux tmux server. Installed to ~/.amux/worker-bin/tmux, which amux prepends to
 # WORKER PANE PATHs only; the amux server never has this directory on its PATH.
-# Everything else, and kills on an explicitly different -S/-L socket, execs the real
-# tmux by absolute path (AMUX_REAL_TMUX, else /opt/homebrew/bin/tmux, /usr/local/bin/tmux,
-# /usr/bin/tmux). Exit 1 on refusal; 127 when no real tmux can be found.
+# Commands that run arguments are scanned as one text after only new-session/new-window
+# -n/-s values are omitted, so harmless quoted text may be refused. A kill word or -K
+# passes only for shell-running text without a tmux word, or when every tmux word
+# immediately selects a different -S socket or non-default -L name.
+# The real tmux is resolved by absolute path. Exit 1 on refusal; 127 if it is missing.
 
 set -u
-set -f  # no globbing when splitting nested command text
+set -f  # no globbing while inspecting command text
 
 die_missing() {
   printf 'tmux guard: %s\n' "$1" >&2
@@ -153,13 +155,11 @@ fi
 
 [ "$have_K" -eq 1 ] && refuse "-K"
 
-# Classify arguments by the interpreter that will run them. Aliases and unique
-# prefixes are included; ordinary tmux arguments remain data.
 command_kind() {
   local w="$1" name
   kind=""
   case "$w" in
-    if) kind=if; return ;;
+    if) kind=tmux; return ;;
     run|new|neww|splitw|respawnp|respawnw|pipep|popup) kind=shell; return ;;
     confirm|bind|menu) kind=tmux; return ;;
   esac
@@ -170,150 +170,52 @@ command_kind() {
   for name in bind-key confirm-before command-prompt display-menu set-hook; do
     case "$name" in "$w"*) kind=tmux; return ;; esac
   done
-  case if-shell in "$w"*) kind=if ;; esac
+  case if-shell in "$w"*) kind=tmux ;; esac
 }
 
-# Inspect one shell simple command. The shell separators are handled below;
-# only the program (also after an env wrapper) can make its arguments tmux options.
-scan_simple_command() {
-  local pos=0 w c val rest j inner_S="" inner_L="" inner_have_S=0 inner_have_L=0 inner_K=0
-  local have_S have_L sock_S sock_L have_K
-  [ "${#simple[@]}" -gt 0 ] || return
-  while [ "$pos" -lt "${#simple[@]}" ]; do
-    w="${simple[$pos]}"
-    case "$w" in *=*) pos=$((pos + 1)) ;; *) break ;; esac
-  done
-  [ "$pos" -lt "${#simple[@]}" ] || return
-  if [ "${simple[$pos]##*/}" = env ]; then
-    pos=$((pos + 1))
-    while [ "$pos" -lt "${#simple[@]}" ]; do
-      w="${simple[$pos]}"
-      case "$w" in
-        -u|--unset|-C|--chdir|-S|--split-string) pos=$((pos + 2)) ;;
-        -*) pos=$((pos + 1)) ;;
-        *=*) pos=$((pos + 1)) ;;
-        *) break ;;
-      esac
-    done
-  fi
-  [ "$pos" -lt "${#simple[@]}" ] || return
-  [ "${simple[$pos]##*/}" = tmux ] || return
-  pos=$((pos + 1))
-  while [ "$pos" -lt "${#simple[@]}" ]; do
-    w="${simple[$pos]}"
-    case "$w" in
-      --) pos=$((pos + 1)); break ;;
-      -?*)
-        j=1
-        while [ "$j" -lt "${#w}" ]; do
-          c="${w:j:1}"
-          case "$c" in
-            c|f|L|S|T)
-              rest="${w:$((j + 1))}"
-              val="$rest"
-              if [ -z "$val" ]; then pos=$((pos + 1)); val="${simple[$pos]:-}"; fi
-              if [ "$c" = S ]; then inner_S="$val"; inner_have_S=1; fi
-              if [ "$c" = L ]; then inner_L="$val"; inner_have_L=1; fi
-              break ;;
-            K) inner_K=1 ;;
-          esac
-          j=$((j + 1))
-        done ;;
-      *) break ;;
-    esac
-    pos=$((pos + 1))
-  done
-  have_S=$inner_have_S; have_L=$inner_have_L; sock_S=$inner_S; sock_L=$inner_L; have_K=$inner_K
-  target_is_live || return
-  [ "$have_K" -eq 1 ] && refuse "nested -K"
-  local expect_command=1
-  while [ "$pos" -lt "${#simple[@]}" ]; do
-    w="${simple[$pos]}"
-    if [ "$w" = ';' ]; then
-      expect_command=1
-    elif [ "$expect_command" -eq 1 ]; then
-      is_protected_word "$w" && refuse "$w (inside shell command)"
-      expect_command=0
-    fi
-    pos=$((pos + 1))
-  done
-}
-
-scan_shell_text() {
-  local input="$1" ch next quote="" outer_quote="" in_backtick=0 word="" k
-  local -a simple=()
+# Split on whitespace, quotes, shell punctuation, and tmux's semicolon separator.
+tokenize_command_text() {
+  local input="$1" ch word="" k
+  tokens=()
   for ((k=0; k<${#input}; k++)); do
     ch="${input:k:1}"
-    next="${input:k+1:1}"
-    if [ "$quote" = "'" ]; then
-      if [ "$ch" = "'" ]; then quote=""; else word+="$ch"; fi
-      continue
-    fi
-    if [ "$ch" = "\\" ] && [ "$next" != "" ]; then
-      k=$((k + 1)); word+="$next"; continue
-    fi
-    if [ "$ch" = '"' ]; then
-      if [ "$quote" = '"' ]; then quote=""; else quote='"'; fi
-      continue
-    fi
-    if [ "$quote" = "" ] && [ "$ch" = "'" ]; then quote="'"; continue; fi
-    if [ "$ch" = '$' ] && [ "$next" = '(' ]; then
-      [ -z "$word" ] || { simple+=("$word"); word=""; }
-      scan_simple_command; simple=(); outer_quote="$quote"; quote=""; k=$((k + 1)); continue
-    fi
-    if [ "$ch" = ')' ] && [ -n "$outer_quote" ]; then
-      [ -z "$word" ] || { simple+=("$word"); word=""; }
-      scan_simple_command; simple=(); quote="$outer_quote"; outer_quote=""; continue
-    fi
-    if [ "$ch" = '`' ]; then
-      [ -z "$word" ] || { simple+=("$word"); word=""; }
-      scan_simple_command; simple=()
-      if [ "$in_backtick" -eq 1 ]; then
-        quote="$outer_quote"; outer_quote=""; in_backtick=0
-      else
-        outer_quote="$quote"; quote=""; in_backtick=1
-      fi
-      continue
-    fi
-    if [ "$quote" = '"' ]; then
-      word+="$ch"; continue
-    fi
     case "$ch" in
-      ';'|'|'|'&'|'`'|'('|')'|'{'|'}'|$'\n')
-        [ -z "$word" ] || { simple+=("$word"); word=""; }
-        scan_simple_command; simple=() ;;
-      ' '|$'\t'|'<'|'>')
-        if [ "$quote" = "" ]; then
-          [ -z "$word" ] || { simple+=("$word"); word=""; }
-        else word+="$ch"; fi ;;
+      ' '|$'\t'|$'\n'|"'"|'"'|$'\\'|';'|'|'|'&'|'`'|'('|')'|'{'|'}'|'<'|'>')
+        [ -z "$word" ] || { tokens+=("$word"); word=""; } ;;
       *) word+="$ch" ;;
     esac
   done
-  [ -z "$word" ] || simple+=("$word")
-  scan_simple_command
+  [ -z "$word" ] || tokens+=("$word")
 }
 
-scan_tmux_text() {
-  local input="$1" ch quote="" first="" have_first=0 k
-  for ((k=0; k<${#input}; k++)); do
-    ch="${input:k:1}"
-    if [ "$ch" = "\\" ] && [ "$quote" != "'" ]; then
-      k=$((k + 1)); first+="${input:k:1}"; continue
+scan_running_arguments() {
+  local text="${running_args[*]}" w next value j has_tmux=0 safe_tmux=1 danger=""
+  local -a tokens=()
+  tokenize_command_text "$text"
+  for ((j=0; j<${#tokens[@]}; j++)); do
+    w="${tokens[$j]}"
+    if [[ "$w" = *tmux ]]; then
+      has_tmux=1
+      next="${tokens[$((j + 1))]:-}"
+      value="${tokens[$((j + 2))]:-}"
+      if [ "$next" = -S ] && [ -n "$value" ]; then
+        same_path "$value" "$live_sock" && safe_tmux=0
+        same_path "$value" "$default_real" && safe_tmux=0
+        same_path "$value" "$default_env" && safe_tmux=0
+      elif [ "$next" = -L ] && [ -n "$value" ] && [ "$value" != default ]; then
+        same_path "${TMUX_TMPDIR:-/tmp}/tmux-$uid/$value" "$live_sock" && safe_tmux=0
+      else
+        safe_tmux=0
+      fi
     fi
-    if [ "$ch" = "$quote" ] && [ -n "$quote" ]; then quote=""; continue; fi
-    if [ -z "$quote" ]; then
-      case "$ch" in
-        "'"|'"') quote="$ch"; continue ;;
-        ';') is_protected_word "$first" && refuse "$first (inside tmux command)"
-             first=""; have_first=0; continue ;;
-        ' '|$'\t'|$'\n')
-          if [ -n "$first" ]; then have_first=1; fi
-          continue ;;
-      esac
+    if is_protected_word "$w" || [ "$w" = -K ] || [[ "$w" = -[A-Za-z]*K* ]]; then
+      danger="$w"
     fi
-    [ "$have_first" -eq 1 ] || first+="$ch"
   done
-  is_protected_word "$first" && refuse "$first (inside tmux command)"
+  [ -n "$danger" ] || return
+  [ "$kind" = shell ] && [ "$has_tmux" -eq 0 ] && return
+  [ "$has_tmux" -eq 1 ] && [ "$safe_tmux" -eq 1 ] && return
+  refuse "$danger (inside running command)"
 }
 
 # --- command chain -----------------------------------------------------------------
@@ -322,13 +224,18 @@ scan_tmux_text() {
 expect_name=1
 kind=""
 skip_value=0
-position=0
+running_args=()
+scan_pending() {
+  [ -z "$kind" ] || scan_running_arguments
+  running_args=()
+}
 i=$cmd_start
 while [ "$i" -lt "$n" ]; do
   a="${ARGV[$i]}"
   i=$((i + 1))
   sep_after=0
   if [ "$a" = ";" ]; then
+    scan_pending
     expect_name=1
     continue
   fi
@@ -341,28 +248,19 @@ while [ "$i" -lt "$n" ]; do
     is_protected_word "$first" && refuse "$first"
     kind=""
     skip_value=0
-    position=0
     names=0
     command_kind "$first"
     case "$first" in new|neww|new-*) names=1 ;; esac
     expect_name=0
   elif [ -n "$kind" ] && [ "$skip_value" -eq 1 ]; then
-    skip_value=0                    # the value of a flag (-n name, -t target, -c dir): data
-  elif [ -n "$kind" ] && [[ "$a" =~ ^-[A-Za-z]+$ ]]; then
-    # Only the NAME of a new session or window (-n / -s) is skipped as data. Every other word is
-    # scanned: guessing option arity per command once let `new-window -k 'tmux kill-server'`
-    # through (-k takes no value), and over-refusing a word is safe where under-refusing is not.
-    [ "$names" -eq 1 ] && case "${a: -1}" in n|s) skip_value=1 ;; esac
+    skip_value=0                    # only new-session/new-window -n/-s values are data
   elif [ -n "$kind" ]; then
-    position=$((position + 1))
-    case "$kind" in
-      shell) scan_shell_text "$a" ;;
-      tmux) scan_tmux_text "$a" ;;
-      if) if [ "$position" -eq 1 ]; then scan_shell_text "$a"; else scan_tmux_text "$a"; fi ;;
-    esac
+    running_args+=("$a")
+    [ "$names" -eq 1 ] && case "$a" in -n|-s) skip_value=1 ;; esac
   fi
 
-  [ "$sep_after" -eq 1 ] && expect_name=1
+  if [ "$sep_after" -eq 1 ]; then scan_pending; expect_name=1; fi
 done
+scan_pending
 
 exec "$REAL" "$@"

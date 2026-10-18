@@ -88,9 +88,13 @@ Verify a hook by what it WROTE, not by the settings file.
 
 **Worker tmux guard.** Worker panes get `~/.amux/worker-bin` first on PATH
 (`worker_tmux_guard_rc` in `api/session_verbs.rs`; installed from
-`scripts/worker-bin/tmux` by `install.sh`). Its `tmux` refuses `kill-server`,
-`kill-session`, `kill-pane` (with abbreviations, chains and `-K`) aimed at the
-live server: no `-S`/`-L`, `-S` equal to `$TMUX`'s socket, or `-L default`.
+`scripts/worker-bin/tmux` by `install.sh`). For commands that run arguments, the
+guard joins all arguments except the value after `-n`/`-s` on `new-session` or
+`new-window`, then refuses any kill word or `-K` unless shell-running text has
+no `tmux` word or every `tmux` word immediately selects a different `-S` socket
+or non-default `-L` name. Quoted harmless text can be refused because the guard
+splits on whitespace, quotes, and shell/tmux separators rather than parsing
+nested commands.
 It exits 1 and logs `verdict=tmux_guard_refused` to `~/.amux/logs/tmux-guard.log`.
 Everything else execs the real tmux (`AMUX_REAL_TMUX`, else Homebrew/system).
 The server's own PATH never contains worker-bin. For a throwaway tmux, use a
