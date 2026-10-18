@@ -437,21 +437,28 @@ async fn keep_alive(state: &AppState, home: &Path, st: &mut WatchState, census: 
     started
 }
 
+/// Observe and persist the pre-start state before any worker start can change tmux's census.
+fn begin_tick(home: &Path, census: &Census, now: f64, boot_at: Option<f64>) -> (WatchState, Decision, WatchState) {
+    let mut st = load_state(home);
+    let before = st.clone();
+    let decision = observe(&mut st, census, now, boot_at);
+    if let Census::Up(workers) = census {
+        write_running_set(home, workers, now);
+    }
+    // A failed save is logged by save_state; the pending set is only durable on success.
+    if st != before {
+        save_state(home, &st);
+    }
+    (st, decision, before)
+}
+
 async fn tick(state: AppState) {
     let home = crate::config::amux_home();
     let census = read_census(None).await;
     let now = now_secs();
-    let mut st = load_state(&home);
-    let before = st.clone();
-    let decision = observe(&mut st, &census, now, crate::runtime_jobs::heartbeat::machine_boot_at());
-    if let Census::Up(workers) = &census {
-        write_running_set(&home, workers, now);
-    }
     // Persist the loss (its pending set) BEFORE any start can change what tmux shows, so an
     // interruption after the keeper's start can never consume it.
-    if st != before {
-        save_state(&home, &st);
-    }
+    let (mut st, decision, before) = begin_tick(&home, &census, now, crate::runtime_jobs::heartbeat::machine_boot_at());
     // Mr Popo first, before anything else, whatever stopped him.
     let kept = keep_alive(&state, &home, &mut st, &census, now).await;
     if st != before {
@@ -796,14 +803,26 @@ mod tests {
         // The boundary review round 2 named: the loss is saved, the keeper starts mrpopo, amux
         // dies before anything else, and on restart tmux shows only mrpopo on the same boot.
         let d = tempfile::tempdir().unwrap();
-        let mut st = WatchState::default();
-        observe(&mut st, &up(&["a", "mrpopo"]), 0.0, Some(-10.0));
-        observe(&mut st, &Census::NoServer, 10.0, Some(-10.0));
-        assert!(save_state(d.path(), &st), "saved before any start");
+        let (_, observed, _) = begin_tick(d.path(), &up(&["a", "mrpopo"]), 0.0, Some(-10.0));
+        assert_eq!(observed, Decision::Quiet);
+        let (_, loss, _) = begin_tick(d.path(), &Census::NoServer, 10.0, Some(-10.0));
+        assert!(matches!(loss, Decision::Lost { .. }));
+        // Simulated crash before keep_alive: discard the returned in-memory state.
         let mut st = load_state(d.path());
+        assert_eq!(st.pending, vec!["a", "mrpopo"], "the production pre-start path persisted the loss");
         assert_eq!(observe(&mut st, &up(&["mrpopo"]), 25.0, Some(-10.0)), Decision::Quiet);
         assert!(st.pending.contains(&"a".to_string()), "a is still owed a restore: {:?}", st.pending);
         assert!(pending_due(&st, 25.0));
+    }
+
+    #[test]
+    fn tick_persists_the_loss_before_the_keeper_can_start() {
+        let source = include_str!("tmux_watch.rs");
+        let tick = source.split("async fn tick(state: AppState) {").nth(1).expect("tick source")
+            .split("\nasync fn drive_pending(").next().expect("tick end");
+        let begin = tick.find("begin_tick(&home, &census, now,").expect("production tick calls begin_tick");
+        let keeper = tick.find("keep_alive(&state, &home,").expect("production tick calls keep_alive");
+        assert!(begin < keeper, "production tick must persist the loss before starting a keeper");
     }
 
     #[test]
