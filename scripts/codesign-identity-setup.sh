@@ -93,7 +93,7 @@ else
     -addext keyUsage=critical,digitalSignature -addext extendedKeyUsage=critical,codeSigning
   run openssl pkcs12 -export -name "$identity" -inkey "$work/key.pem" -in "$work/cert.pem" -out "$work/identity.p12" \
     -passout "pass:$p12_password" -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
-  run security import "$work/identity.p12" -k "$keychain" -P "$p12_password"
+  run security import "$work/identity.p12" -k "$keychain" -P "$p12_password" -T /usr/bin/codesign
 fi
 
 # This is the first operation that checks the typed login keychain password.
