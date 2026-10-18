@@ -800,6 +800,7 @@ jobs:
           bash scripts/test-build-authority-fetch.sh
           ./scripts/test-build-activation-launcher.sh
           ./scripts/test-authority-launcher-sync.sh
+          ./scripts/test-worker-guard-sync.sh
           ./scripts/test-build-shell-run-defer.sh
           python3 scripts/test-claude-rotate.py
           # A replacement is complete and signed before its one visible rename;
