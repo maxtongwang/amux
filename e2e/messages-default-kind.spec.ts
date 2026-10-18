@@ -1,5 +1,6 @@
 // messages-default-kind.spec coverage — use shared browser defaults and route diagnostics.
 import { test, expect } from './fixtures';
+import { clickWhenActionable } from './helpers';
 test('Messages tab opens with the human pill selected', async ({ page }) => {
   const urls: string[] = [];
   page.on('request', r => { if (r.url().includes('/api/history')) urls.push(r.url()); });
@@ -8,7 +9,9 @@ test('Messages tab opens with the human pill selected', async ({ page }) => {
   await page.evaluate(() => (window as any).switchView('messages'));
   // The message log is the "All messages" entry of the Messages sidebar since
   // channels arrived (api/conversations.rs); its default kind is still Human.
-  await page.click('#cv-all-item');
+  // Through the shared actionability contract: a covering overlay (F05/F09/F13,
+  // #wt-tooltip) now fails within 15s and names itself instead of eating the test budget.
+  await clickWhenActionable(page.locator('#cv-all-item'), { label: 'All messages' });
   await page.waitForSelector('#msgs-kind-filter .msg-kind-chip', { timeout: 15000 });
   await page.waitForTimeout(1200);
   const chips = await page.evaluate(() => Array.from(

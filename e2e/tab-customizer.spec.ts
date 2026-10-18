@@ -1,5 +1,6 @@
 // tab-customizer.spec coverage — use shared browser defaults and route diagnostics.
 import { test, expect } from './fixtures';
+import { clickWhenActionable } from './helpers';
 
 // BLOCK THE SERVICE WORKER (AF-46). Nothing here tests offline behaviour, but
 // sw.js reloads the page on `controllerchange` (app.js:24253) as soon as a
@@ -120,7 +121,8 @@ test('the GLOBAL tab customizer opens and its rows are visible on screen', async
 
   const btn = page.locator('.tab-customize-wrap button[onclick*="toggleTabCustomizer"]');
   await expect(btn, 'the global ⊞ button itself is missing').toBeVisible();
-  await btn.click();
+  // Shared actionability contract: F08/F16 were #wt-backdrop intercepting this click.
+  await clickWhenActionable(btn, { label: 'global tab customizer' });
 
   const menu = page.locator('#tab-customizer-menu');
   await expect(menu, 'global menu did not become visible').toBeVisible();
