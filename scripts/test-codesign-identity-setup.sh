@@ -31,6 +31,10 @@ check_identity_plan "$plan"
 prior='"/Users/runner/Library/Keychains/login keychain-db" "/Users/runner/Library/Keychains/second.keychain-db"'
 plan=$(AMUX_CODESIGN_PLAN_SEARCH_LIST="$prior" DRY_RUN=1 bash "$repo/scripts/codesign-identity-setup.sh" 2>&1)
 check_search_list_plan "$plan" "$prior" "$keychain"
+if check_search_list_plan "$plan" '"/Users/runner/Library/Keychains/second.keychain-db" "/Users/runner/Library/Keychains/login keychain-db"' "$keychain" > "$work/reordered-plan.log" 2>&1; then
+  echo 'FAIL: plan checker accepted reordered prior entries'; exit 1
+fi
+echo 'PASS: search-list plan rejects reordered prior entries'
 while IFS= read -r line; do
   case "$line" in
     'PLAN: security list-keychains -d user') ;;
