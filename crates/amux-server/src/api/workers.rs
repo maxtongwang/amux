@@ -2162,9 +2162,13 @@ pub async fn git_dirty_worker(State(state): State<AppState>, Path(key): Path<Str
 }
 
 /// `POST /api/workers/{id}/git/push` — the grouped spelling of `git-push`.
-pub async fn git_push_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+pub async fn git_push_worker(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     match resolve_key(&state, key).await {
-        Ok(name) => crate::api::session_verbs::git_push_verb(&state, &name).await,
+        Ok(name) => crate::api::session_verbs::git_push_verb(&state, &name, &headers).await,
         Err(r) => r,
     }
 }
@@ -2378,6 +2382,7 @@ pub async fn resize_worker(
 pub async fn keys_worker(
     State(state): State<AppState>,
     Path(key): Path<String>,
+    headers: axum::http::HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Response {
     let name = match resolve_key(&state, key).await {
@@ -2388,7 +2393,7 @@ pub async fn keys_worker(
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
-    crate::api::session_verbs::keys_verb(&name, &body).await
+    crate::api::session_verbs::keys_verb(&name, &headers, &body).await
 }
 
 /// `POST /api/workers/{id}/duplicate` — copy a worker's env file and register
