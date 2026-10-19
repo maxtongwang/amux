@@ -556,6 +556,10 @@ fn decide_lead(team: &str, teams: &[String], action: &Action, t: &TargetFacts) -
             }
         }
         Action::RenameWorker { to } if reserved_name(to) => reserved_denied(to),
+        // A "-lead" name grants nothing (lead status comes from groups) but
+        // would mislead peers (amux #41, ai-config #205 N2); the owner may.
+        Action::RenameWorker { to } if on_team_worker && super::session_verbs::is_lead_suffixed(to) => deny("lead_rename_reserved_suffix",
+            format!("a lead may not give a worker in its team '{team}' a name ending in '-lead' ('{to}'); only the owner may")),
         Action::RenameWorker { .. } | Action::StopWorker | Action::Lifecycle { .. } if on_team_worker => Decision::Allow,
         Action::SetConfig { keys } if on_team_worker => match keys.iter().find(|k| key_class(k) != KeyClass::LeadOk) {
             None => Decision::Allow,
@@ -873,6 +877,12 @@ pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, target: &Target, 
     tracing::info!(actor = %origin, class = %class.label(), target = %target.name(), action = %action.label(),
         evidence_row = ?evidence_row, verdict = "delegation_allowed", measured = true, n_considered = 1,
         "a non-owner change passed the delegation table");
+    // Authorization only (amux #41, ai-config #205 N6): the rename runs after
+    // this, and `rename_session` logs its outcome (session_rename_done/failed).
+    if let (Class::Lead { team, .. }, Action::RenameWorker { to }) = (&class, action) {
+        tracing::info!(origin = %origin, target = %target.name(), to = %to, team = %team, verdict = "lead_team_rename_authorized",
+            measured = true, n_considered = 1, "a lead was authorized to rename a worker in its own team");
+    }
     Ok(Some(Grant { actor: origin, class, action: action.label(), target: target.name(), grant, evidence_row, why }))
 }
 
@@ -1107,6 +1117,12 @@ mod tests {
         assert_eq!(code(decide(&lead("dev"), &rename("dev-b"), &PEER_LEAD)), "peer_config_owner_only");
         assert_eq!(code(decide(&lead("dev"), &rename("dev-b"), &OTHER)), "peer_config_owner_only");
         assert_eq!(code(decide(&lead("dev"), &rename("mrpopo"), &TEAM)), "reserved_name");
+        // amux #41: a lead-looking name is the owner's to give.
+        for to in ["dev-b-lead", "Dev-B-LEAD"] {
+            assert_eq!(code(decide(&lead("dev"), &rename(to), &TEAM)), "lead_rename_reserved_suffix", "{to}");
+        }
+        assert_eq!(code(decide(&lead("dev"), &rename("dev-leader"), &TEAM)), "allow");
+        assert_eq!(code(decide(&Class::Owner, &rename("dev-b-lead"), &TEAM)), "allow");
     }
 
     #[test]
