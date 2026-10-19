@@ -52,7 +52,7 @@
 //!   shutil.which quietly fails there.
 
 use super::fs::{
-    expanduser, git_show_file, is_dangerous_write, is_path_allowed, j, mtime_secs, not_found,
+    expanduser, git_show_file, is_dangerous_write, is_path_allowed, j, mtime_secs, not_found, resolve_nonstrict,
     parse_body, parse_qs, pystr, qs_get, real_list_dirs, resolve_rel_candidates,
     resolve_rel_descend,
 };
@@ -786,7 +786,9 @@ async fn put_file(req: Request) -> Response {
             json!({"error": "refused: writing this file could execute code"}),
         );
     }
-    if let Some(parent) = p.parent() {
+    // The gates above already judged the file a symlink names
+    // (resolve_nonstrict); the write below lands there too.
+    if let Some(parent) = resolve_nonstrict(&p).parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             return j(500, json!({"error": e.to_string()}));
         }
@@ -814,9 +816,13 @@ async fn put_file(req: Request) -> Response {
             Ok(bytes) => write_atomic(&p, &bytes),
             Err(e) => return j(400, json!({"error": format!("content_base64 is not base64: {e}")})),
         },
+        // Text too: written in place, a reader (a live peer reloading the
+        // drawing, a worker, a test reading the file) could see it empty or cut
+        // short mid-write ("Unexpected end of JSON input", draw-realtime,
+        // e2e control 7ca1c0d3).
         None => {
             let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            std::fs::write(&p, content)
+            write_atomic(&p, content.as_bytes())
         }
     };
     match written {
@@ -824,7 +830,12 @@ async fn put_file(req: Request) -> Response {
             200,
             json!({"ok": true, "path": pystr(&p), "etag": current_etag(&p).unwrap_or_default()}),
         ),
-        Err(e) => j(500, json!({"error": e.to_string()})),
+        Err(e) => {
+            tracing::warn!(target: "amux::file", path = %pystr(&p), error = %e,
+                measured = true, n_considered = 1, verdict = "file_save_failed",
+                "file save failed; the previous version is kept");
+            j(500, json!({"error": e.to_string()}))
+        }
     }
 }
 
@@ -838,13 +849,23 @@ fn current_etag(p: &std::path::Path) -> Option<String> {
     Some(format!("\"{}-{}\"", mtime_secs(&meta), meta.len()))
 }
 
+static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Write via a sibling temp file and rename, so a reader (or a worker opening
-/// the workbook) never sees a half-written spreadsheet.
+/// the file) never sees it half-written. The temp name is unique per write, so
+/// two saves of one file never share it; the file keeps its permissions (a
+/// script stays executable) and a symlink keeps pointing where it did: the
+/// rename lands on the file it names (the same resolution the write gates use).
 fn write_atomic(p: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let tmp = p.with_file_name(format!(".{name}.amux-save-{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, p).inspect_err(|_| {
+    let target = resolve_nonstrict(p);
+    let name = target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let seq = SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = target.with_file_name(format!(".{name}.amux-save-{}-{seq}", std::process::id()));
+    let staged = std::fs::write(&tmp, bytes).and_then(|()| match std::fs::metadata(&target) {
+        Ok(m) => std::fs::set_permissions(&tmp, m.permissions()),
+        Err(_) => Ok(()),
+    });
+    staged.and_then(|()| std::fs::rename(&tmp, &target)).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
 }
@@ -3063,6 +3084,80 @@ pub(crate) mod tests {
             "content_base64": b64(b"hi")}))).await;
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    }
+
+    /// A text save replaces the file in one rename, never in place: a reader
+    /// sees the old bytes or the new ones, not an empty or cut-short file
+    /// (draw-realtime read "Unexpected end of JSON input" from a drawing the
+    /// saver was rewriting). The mode is kept and a symlink stays a symlink.
+    #[cfg(unix)]
+    // Several worker threads, so the concurrent saves below really overlap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn put_file_saves_text_atomically_keeping_mode_and_links() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let app = app();
+        let dir = tempfile::tempdir().unwrap();
+        let put = |path: &std::path::Path, content: &str| {
+            HttpRequest::builder().method("PUT").uri("/api/file")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"path": path.to_str().unwrap(), "content": content}).to_string())).unwrap()
+        };
+        let target = dir.path().join("scene.excalidraw");
+        std::fs::write(&target, "{\"old\":true}").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ino_before = std::fs::metadata(&target).unwrap().ino();
+        let (status, _, body) = send(&app, put(&target, "{\"new\":true}")).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"new\":true}");
+        assert_ne!(std::fs::metadata(&target).unwrap().ino(), ino_before,
+            "the save is a rename of a complete file, not a rewrite in place");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755, "the mode is kept");
+
+        // Through a symlink: the link stays a link and its file gets the bytes.
+        let link = dir.path().join("link.excalidraw");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let (status, _, _) = send(&app, put(&link, "{\"via\":\"link\"}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link is still a link");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"via\":\"link\"}");
+
+        // A link to a file that may not be written is refused, not followed.
+        let rc = dir.path().join(".bashrc");
+        std::fs::write(&rc, "# rc").unwrap();
+        let sneaky = dir.path().join("notes.md");
+        std::os::unix::fs::symlink(&rc, &sneaky).unwrap();
+        let (status, _, _) = send(&app, put(&sneaky, "echo pwned")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(std::fs::read_to_string(&rc).unwrap(), "# rc");
+
+        // Concurrent saves of one file each use their own temp file: every
+        // read is one whole version and nothing is left behind.
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let app = app.clone();
+            let t = target.clone();
+            tasks.push(tokio::spawn(async move {
+                for k in 0..20 {
+                    let (status, _, _) = send(&app, HttpRequest::builder().method("PUT").uri("/api/file")
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({"path": t.to_str().unwrap(), "content": format!("{{\"w\":{i},\"k\":{k}}}")}).to_string())).unwrap()).await;
+                    assert_eq!(status, StatusCode::OK);
+                }
+            }));
+        }
+        let reader = {
+            let t = target.clone();
+            std::thread::spawn(move || {
+                for _ in 0..400 {
+                    let s = std::fs::read_to_string(&t).unwrap();
+                    assert!(serde_json::from_str::<Value>(&s).is_ok(), "partial read: {s:?}");
+                }
+            })
+        };
+        for t in tasks { t.await.unwrap(); }
+        reader.join().unwrap();
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains("amux-save")),
+            "no temp file is left behind");
     }
 
     #[tokio::test]
