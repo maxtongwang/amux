@@ -334,7 +334,8 @@ fn copy_profile_tree(src: &Path, dst: &Path, stats: &mut (u64, u64)) -> anyhow::
         if import_entry_is_volatile(&label) {
             continue;
         }
-        let ty = match std::fs::metadata(entry.path()) {
+        // lstat, not stat: a profile symlink must be skipped below, never followed.
+        let ty = match entry.file_type() {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
@@ -517,6 +518,7 @@ pub fn list_profiles_with_discovery(
         Err(status) => (Default::default(), Some(status)),
     };
     let mut names: std::collections::BTreeSet<String> = registry.keys().cloned().collect();
+    let mut skipped_symlinks = 0usize;
     let profiles_dir = home.join("playwright-auth").join("profiles");
     match std::fs::read_dir(&profiles_dir) {
         Ok(entries) => {
@@ -532,6 +534,11 @@ pub fn list_profiles_with_discovery(
                 match entry.file_type() {
                     Ok(kind) if kind.is_dir() && !name.starts_with('.') => {
                         names.insert(name);
+                    }
+                    Ok(kind) if kind.is_symlink() => {
+                        skipped_symlinks += 1;
+                        tracing::warn!(verdict = "browser_profile_symlink_skipped", path = %entry.path().display(),
+                            "saved browser profile entry is a symlink; not listed");
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -560,6 +567,7 @@ pub fn list_profiles_with_discovery(
     let mut discovery =
         failure.unwrap_or_else(|| DiscoveryStatus::measured(n, "no_saved_profiles_configured"));
     discovery.n_considered = n;
+    discovery.skipped_symlinks = skipped_symlinks;
     let chrome_dir = chrome_user_data_dir();
     let profiles = names
         .into_iter()
@@ -6497,6 +6505,54 @@ mod tests {
             .path()
             .join("playwright-auth/profiles/missing")
             .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chrome_profile_import_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+        let home = fake_home();
+        let chrome = home.path().join("fake-chrome-udd");
+        let source = chrome.join("probe");
+        let outside = home.path().join("outside");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"outside").unwrap();
+        std::fs::write(source.join("Preferences"), b"prefs").unwrap();
+        symlink(&outside, source.join("linked_dir")).unwrap();
+        symlink(outside.join("secret.txt"), source.join("linked_file")).unwrap();
+        symlink(&source, source.join("loop")).unwrap();
+        std::fs::write(chrome.join("Local State"), r#"{"profile":{"info_cache":{"probe":{}}}}"#)
+            .unwrap();
+
+        let imported = import_chrome_profile(home.path(), &chrome, "probe")
+            .unwrap()
+            .expect("import completes despite links");
+        let dest = imported.destination.join("Default");
+        assert_eq!(std::fs::read(dest.join("Preferences")).unwrap(), b"prefs");
+        for link in ["linked_dir", "linked_file", "loop"] {
+            assert!(
+                std::fs::symlink_metadata(dest.join(link)).is_err(),
+                "{link}: a symlink must not be followed or copied out of the profile tree"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_counts_symlinked_profile_dirs() {
+        let home = fake_home();
+        let profiles = home.path().join("playwright-auth/profiles");
+        let outside = home.path().join("outside-profile");
+        std::fs::create_dir_all(profiles.join("real")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, profiles.join("linked")).unwrap();
+
+        let (list, discovery) = list_profiles_with_discovery(home.path(), false);
+        let names: Vec<&str> = list.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["real"], "a symlinked entry is not listed");
+        assert!(discovery.measured);
+        assert_eq!(discovery.skipped_symlinks, 1, "the skipped link is counted, not dropped silently");
     }
 
     #[test]

@@ -9,6 +9,8 @@ pub struct DiscoveryStatus {
     pub why_unmeasured: Option<String>,
     pub empty_reason: Option<String>,
     pub owner_step: Option<String>,
+    /// Entries skipped because they are symlinks; counted so a skip is never a silent omission.
+    pub skipped_symlinks: usize,
 }
 
 impl DiscoveryStatus {
@@ -19,6 +21,7 @@ impl DiscoveryStatus {
             why_unmeasured: None,
             empty_reason: (n == 0).then(|| empty_reason.to_owned()),
             owner_step: None,
+            skipped_symlinks: 0,
         }
     }
 
@@ -42,6 +45,7 @@ impl DiscoveryStatus {
             why_unmeasured: Some(why),
             empty_reason: None,
             owner_step: Some(owner_step.into()),
+            skipped_symlinks: 0,
         }
     }
 
