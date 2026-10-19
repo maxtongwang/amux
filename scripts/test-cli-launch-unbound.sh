@@ -99,6 +99,7 @@ verb=""
 for a in "$@"; do
   case "$a" in -*) continue ;; *) verb="$a"; break ;; esac
 done
+[ "$verb" = set-option ] && [ -n "${TMUX_STUB_STATE:-}" ] && printf '%s\n' "$*" >> "${TMUX_STUB_STATE}/set-option.log"
 case "$verb" in
   has-session) [ -n "${TMUX_STUB_STATE:-}" ] && [ -f "$marker" ] && exit 0; exit 1 ;;
   new-session) [ -n "${TMUX_STUB_STATE:-}" ] && : > "$marker"; exit 0 ;;
@@ -116,7 +117,7 @@ export TMUX_STUB_STATE="$STUB_STATE"
 run_launch() {
   # Each case starts with no pane, so has-session answers "not running" on the
   # way in and "running" after the launch — one launch per case, no carry-over.
-  rm -f "$STUB_STATE/spawned"
+  rm -f "$STUB_STATE/spawned" "$STUB_STATE/set-option.log"
   env -u AMUX_API -u AMUX_URL \
     PATH="$STUB:$PATH" HOME="$FAKE_HOME" CC_HOME="$CC" \
     AMUX_SESSION=af78smoke-test AMUX_WORKER=af78smoke-test \
@@ -133,6 +134,16 @@ if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "started" \
   ok "current CLI reaches the launch inject with AMUX_API unset (no unbound var)"
 else
   bad "current CLI failed the launch smoke (rc=$RC)" "$OUT"
+fi
+
+# ── 1b. the worker status bar shows the plain name, not "amux-<name>" ────────
+# Pane-form target: set-option given the bare "=amux-<n>" sets nothing.
+SETS=$(cat "$STUB_STATE/set-option.log" 2>/dev/null || true)
+if printf '%s\n' "$SETS" | grep -qxF 'set-option -t =amux-af78smoke: status-left [#{s/^amux-//:session_name}] ' \
+   && printf '%s\n' "$SETS" | grep -qxF 'set-option -t =amux-af78smoke: status-left-length 40'; then
+  ok "launch sets the plain-name status bar on the worker session"
+else
+  bad "launch did not set the plain-name status bar" "set-option calls: $SETS"
 fi
 
 # ── 2. self-check / negative control: the AMUX-3145 specimen must be caught ────

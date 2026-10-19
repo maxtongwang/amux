@@ -1423,6 +1423,27 @@ async fn tmux(args: &[&str]) -> Option<std::process::Output> {
     run_cmd("tmux", args, OP_TIMEOUT).await
 }
 
+/// The status bar shows the plain worker name, not `amux-<name>`
+/// (backend::tmux::WORKER_STATUS_LEFT). Display only: a failure is logged.
+/// `ptq` is the pane form (`=amux-<n>:`): set-option given the bare session
+/// form answers "no such session" and sets nothing.
+async fn set_worker_status_name(ptq: &str, name: &str) {
+    use crate::backend::tmux::{WORKER_STATUS_LEFT, WORKER_STATUS_LEFT_LENGTH};
+    for (opt, val) in [
+        ("status-left", WORKER_STATUS_LEFT),
+        ("status-left-length", WORKER_STATUS_LEFT_LENGTH),
+    ] {
+        let out = tmux(&["set-option", "-t", ptq, opt, val]).await;
+        if !matches!(out, Some(ref o) if o.status.success()) {
+            tracing::warn!(
+                verdict = "worker_status_name_unset", option = opt, worker = %name,
+                measured = true, n_considered = 1,
+                "could not set the worker status bar option; it shows the tmux session name"
+            );
+        }
+    }
+}
+
 /// Workers with a live tmux session (`amux-<name>`), by worker name. The
 /// Vault uses it to tell "receives at next start" from "running now".
 pub(crate) async fn running_workers() -> std::collections::BTreeSet<String> {
@@ -16741,6 +16762,7 @@ pub(crate) async fn start_session(
         let _ = tmux(&["set-option", "-t", &stq, "remain-on-exit", "on"]).await;
         let _ = tmux(&["set-option", "-t", &stq, "allow-rename", "off"]).await;
         let _ = tmux(&["set-window-option", "-t", &stq, "automatic-rename", "off"]).await;
+        set_worker_status_name(&pt(name), name).await;
         let _ = tmux(&["rename-window", "-t", &stq, name]).await;
         // The secrets kept out of argv above, handed over the tmux control
         // socket and then imported by the shell (AMUX-4803). Order matters:
@@ -44954,6 +44976,41 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             !any_non_zombie("   \n  \n"),
             "whitespace is not a live child"
         );
+    }
+
+    /// Max saw "amux-" in every worker's status bar: tmux's default
+    /// status-left is the session name. The plain name must show, and keep
+    /// showing after a worker rename (rename-session), on a private socket.
+    #[tokio::test]
+    async fn worker_status_bar_shows_the_plain_name_across_a_rename() {
+        struct Pane(String);
+        impl Drop for Pane {
+            fn drop(&mut self) {
+                let st = session_target(&self.0);
+                let _ = tmux_command().args(["kill-session", "-t", &st]).output();
+            }
+        }
+        let name = format!("status-name-{}", std::process::id());
+        let mut pane = Pane(tmux_name(&name));
+        let created = tmux(&["new-session", "-d", "-s", &pane.0, "/bin/sh"])
+            .await
+            .expect("tmux required for status-name proof");
+        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+        let shown = |ptq: String| async move {
+            let o = tmux(&["display-message", "-p", "-t", &ptq, "#{T:status-left}|#{status-left-length}"])
+                .await
+                .expect("display-message");
+            String::from_utf8_lossy(&o.stdout).trim_end().to_string()
+        };
+        set_worker_status_name(&pt(&name), &name).await;
+        assert_eq!(shown(pt(&name)).await, format!("[{name}] |40"));
+
+        let renamed = format!("{name}-renamed");
+        let stq = st(&name);
+        let r = tmux(&["rename-session", "-t", &stq, &tmux_name(&renamed)]).await.unwrap();
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+        pane.0 = tmux_name(&renamed);
+        assert_eq!(shown(pt(&renamed)).await, format!("[{renamed}] |40"));
     }
 
     #[tokio::test]
