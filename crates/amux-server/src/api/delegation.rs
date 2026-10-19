@@ -25,6 +25,22 @@
 //! | SelfWorker | settings in [`SELF_ENV_KEYS`] / SelfOk config fields, rename (not to a reserved name), stop and lifecycle verbs | nothing |
 //! | Worker | nothing | nothing |
 //!
+//! COMPOSED WITH #19 (dev-lead's round-2 ruling): the worker-input rules.
+//! "Self" is a worker on itself or its own Chat tab; Lead acts on a non-lead
+//! worker in its team; Worker is a plain worker on another worker. "send gate"
+//! is #19's (`send_group_refusal`, `worker_send_refusal`): allowed and stamped
+//! inside a shared group, `worker_group_boundary` outside, for every class.
+//! Own and other cards, membership, git-push and env apply groups are rows of
+//! `decide`; send, kickoff and env apply messages are the send gate.
+//!
+//! | Actor | own cards | other's cards | send/kickoff | membership | git-push self | git-push other | env apply groups | env apply prompts | env apply messages |
+//! |---|---|---|---|---|---|---|---|---|---|
+//! | Owner | - | allow | allow, unstamped | allow | - | allow | allow | allow, unstamped | allow, as owner or named sender |
+//! | Self | allow | - | allow, unchanged | `worker_group_membership_refused` | allow (Chat tab too) | - | `env_apply_groups_owner_only` | - | - |
+//! | Lead | allow | `env_apply_card_other_worker` | send gate | `worker_group_membership_refused`; removing its own team tag: allow (#18 row) | allow | `peer_config_owner_only` | `env_apply_groups_owner_only` | team: allow, stamped, sender kept; outside: `worker_create_tags_outside_team` | send gate; `env_message_sender_refused` for another sender |
+//! | Mrpopo | allow | `env_apply_card_other_worker` | send gate | grant Max approves | allow | `peer_config_owner_only` | `env_apply_groups_owner_only` | `worker_create_requires_lead` | send gate; `env_message_sender_refused` |
+//! | Worker | - | `env_apply_card_other_worker` | send gate | `worker_group_membership_refused` | - | `peer_config_owner_only` | `env_apply_groups_owner_only` | `worker_create_requires_lead` | send gate; `env_message_sender_refused` |
+//!
 //! Never delegated: secret values ([`is_secret_key`]) and everything in
 //! [`HELD_FOR_MAX`] (one line each, so delegating one later is a one-line
 //! change). A lead rename keeps the worker's token and old-name alias (amux
@@ -125,6 +141,16 @@ pub(crate) enum Action {
     SetSecret { key: String },
     /// Making a lead in ONE write: CC_ORCHESTRATOR=1 plus the `leads` tag.
     MakeLead,
+    /// `git-push`: delivers a server-written push instruction into the pane
+    /// as owner input (#19). The worker itself or its own Chat tab only; into
+    /// another worker it is the owner's, with no lead row and no mrpopo row.
+    GitPush,
+    /// An env apply's `cards` on the target worker's board (#19, ai-config
+    /// #159): the worker's own board only, as `amux board add` allows.
+    SeedCards,
+    /// An env apply's `groups` section (department and goal): the owner's,
+    /// for every worker; a lead uses PATCH /api/groups/<g>/config instead.
+    EnvApplyGroups,
 }
 
 impl Action {
@@ -142,6 +168,9 @@ impl Action {
             Action::SetRouting => "set_routing".into(),
             Action::SetSecret { .. } => "set_secret".into(),
             Action::MakeLead => "make_lead".into(),
+            Action::GitPush => "git_push".into(),
+            Action::SeedCards => "seed_cards".into(),
+            Action::EnvApplyGroups => "env_apply_groups".into(),
         }
     }
 }
@@ -502,6 +531,26 @@ pub(crate) fn decide(class: &Class, action: &Action, t: &TargetFacts) -> Decisio
                 held_reason("mrpopo:own-config")));
         }
     }
+    // git-push is "owner or self" (#19; dev-lead's #18 ruling): the worker
+    // itself (mrpopo too: its own pane widens nothing) or its own Chat tab.
+    // Into any other worker it is owner-only, leads and mrpopo included: the
+    // instruction lands in that pane as owner input.
+    // Env apply cards follow the same own-only shape (#19, ai-config #159),
+    // and env apply groups are the owner's for every worker.
+    let own_only = |code: &'static str, what: &str| if *class == Class::SelfWorker || t.is_actor {
+        Allow
+    } else {
+        deny(code, format!("{what} is the owner's on another worker; no delegation row grants it"))
+    };
+    match action {
+        Action::GitPush => return own_only("peer_config_owner_only",
+            "git-push into a pane (owner input there; a peer asks through send, which stamps and gates)"),
+        Action::SeedCards => return own_only("env_apply_card_other_worker",
+            "adding cards to a board through an env apply (a worker seeds only its own board)"),
+        Action::EnvApplyGroups => return deny("env_apply_groups_owner_only",
+            "configuring groups through an env apply is the owner's, leads and mrpopo included; a lead sets its own team's config with PATCH /api/groups/<g>/config".into()),
+        _ => {}
+    }
     match class {
         Class::Owner => Allow,
         Class::SelfWorker => decide_self(action),
@@ -745,12 +794,15 @@ pub(crate) fn decide_for(headers: &HeaderMap, target: &Target, action: &Action) 
     let origin = verified_origin(headers);
     // A worker acting on ITSELF is not configuring another worker (dev-lead,
     // #18). An unproven claim still reaches only decide_self's non-privileged
-    // set, as on main; on any other target it stays unverified.
+    // set, as on main; on any other target it stays unverified. A worker's own
+    // Chat tab counts as the worker (#19's peer-config rule): it reaches the
+    // same decide_self set an unproven claim of the worker itself reaches, so
+    // it adds no power; on any other target M12 leaves it unverified.
     let claimed = super::session_verbs::worker_origin(headers);
     let self_claim = origin == super::worker_identity::UNVERIFIED_IDENTITY
         && !claimed.is_empty()
         && claimed != super::worker_identity::UNVERIFIED_IDENTITY
-        && matches!(target, Target::Worker(w) if *w == claimed);
+        && matches!(target, Target::Worker(w) if *w == claimed || super::chat_worker::companion_parent(&claimed) == Some(w.as_str()));
     // Forced, not classified: an unproven "mrpopo" or lead claim on itself
     // must not pick up that class's powers.
     let (origin, class) = if self_claim { (claimed, Class::SelfWorker) } else { let c = classify(&origin, target, action); (origin, c) };
@@ -1065,6 +1117,51 @@ mod tests {
             Decision::NeedsGrant => "grant".into(),
         }
     }
+
+    // ---- the composed #18 + #19 table (dev-lead's round-2 ruling) ------------
+    // One test per cell, named table_<actor>_<column>; route-level cells (send
+    // and kickoff, git-push, env apply prompts and messages, the env apply
+    // wiring) are in session_verbs::tests and messages::tests under the same
+    // naming. A Chat tab acting on its own worker is SelfWorker but not the
+    // actor itself.
+    const CHAT_TAB: TargetFacts = TargetFacts { in_team: false, privileged: false, is_actor: false, covers_actor: false };
+    macro_rules! cell {
+        ($name:ident, $class:expr, $action:expr, $facts:expr, $want:expr) => {
+            #[test]
+            fn $name() {
+                assert_eq!(code(decide(&$class, &$action, &$facts)), $want);
+            }
+        };
+    }
+    cell!(table_owner_other_cards, Class::Owner, Action::SeedCards, OTHER, "allow");
+    cell!(table_self_own_cards, Class::SelfWorker, Action::SeedCards, ME, "allow");
+    cell!(table_self_own_cards_from_chat_tab, Class::SelfWorker, Action::SeedCards, CHAT_TAB, "allow");
+    cell!(table_lead_own_cards, lead("dev"), Action::SeedCards, ME, "allow");
+    cell!(table_lead_other_cards, lead("dev"), Action::SeedCards, TEAM, "env_apply_card_other_worker");
+    cell!(table_mrpopo_own_cards, Class::Mrpopo, Action::SeedCards, ME, "allow");
+    cell!(table_mrpopo_other_cards, Class::Mrpopo, Action::SeedCards, OTHER, "env_apply_card_other_worker");
+    cell!(table_worker_other_cards, Class::Worker, Action::SeedCards, OTHER, "env_apply_card_other_worker");
+
+    cell!(table_owner_membership, Class::Owner, tags(&["dev"], &["dev", "leads"]), OTHER, "allow");
+    cell!(table_self_membership, Class::SelfWorker, tags(&["dev"], &["dev", "ops"]), ME, "worker_group_membership_refused");
+    cell!(table_lead_membership_add, lead("dev"), tags(&["dev"], &["dev", "ops"]), TEAM, "worker_group_membership_refused");
+    cell!(table_lead_membership_remove_own_team_tag, lead("dev"), tags(&["dev"], &[]), TEAM, "allow");
+    cell!(table_mrpopo_membership, Class::Mrpopo, tags(&["dev"], &["dev", "leads"]), OTHER, "grant");
+    cell!(table_worker_membership, Class::Worker, tags(&["dev"], &["dev", "ops"]), OTHER, "worker_group_membership_refused");
+
+    cell!(table_owner_git_push_other_pure, Class::Owner, Action::GitPush, OTHER, "allow");
+    cell!(table_self_git_push_self_pure, Class::SelfWorker, Action::GitPush, ME, "allow");
+    cell!(table_self_git_push_own_chat_tab_pure, Class::SelfWorker, Action::GitPush, CHAT_TAB, "allow");
+    cell!(table_lead_git_push_other_pure, lead("dev"), Action::GitPush, TEAM, "peer_config_owner_only");
+    cell!(table_mrpopo_git_push_self_pure, Class::Mrpopo, Action::GitPush, ME, "allow");
+    cell!(table_mrpopo_git_push_other_pure, Class::Mrpopo, Action::GitPush, OTHER, "peer_config_owner_only");
+    cell!(table_worker_git_push_other_pure, Class::Worker, Action::GitPush, OTHER, "peer_config_owner_only");
+
+    cell!(table_owner_env_apply_groups, Class::Owner, Action::EnvApplyGroups, OTHER, "allow");
+    cell!(table_self_env_apply_groups, Class::SelfWorker, Action::EnvApplyGroups, MY_LAYER, "env_apply_groups_owner_only");
+    cell!(table_lead_env_apply_groups, lead("dev"), Action::EnvApplyGroups, MY_LAYER, "env_apply_groups_owner_only");
+    cell!(table_mrpopo_env_apply_groups, Class::Mrpopo, Action::EnvApplyGroups, OTHER, "env_apply_groups_owner_only");
+    cell!(table_worker_env_apply_groups, Class::Worker, Action::EnvApplyGroups, OTHER, "env_apply_groups_owner_only");
 
     #[test]
     fn delegation_owner_may_do_anything() {

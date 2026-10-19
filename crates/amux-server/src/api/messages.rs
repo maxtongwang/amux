@@ -1371,7 +1371,11 @@ mod tests {
         let _guard = crate::api::settings::test_env::set_home(dir.path());
         let sessions = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
-        std::fs::write(sessions.join("review-lead.env"), "CC_TAGS=leads,alpha\n").unwrap();
+        // A lead is CC_ORCHESTRATOR=1 in `leads` (#18). #18's create rule
+        // refuses a lead's worker outside its teams before #19's kickoff
+        // check, so that check no longer has a case of its own here: it
+        // stays as defence in depth (an untagged worker is outside every team).
+        std::fs::write(sessions.join("review-lead.env"), "CC_TAGS=leads,alpha\nCC_ORCHESTRATOR=1\n").unwrap();
         for (name, groups, expected) in [
             ("review-new", json!([]), StatusCode::FORBIDDEN),
             ("review-team", json!(["alpha"]), StatusCode::OK),
@@ -1387,7 +1391,7 @@ mod tests {
             let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(status, expected, "{body}");
             if expected == StatusCode::FORBIDDEN {
-                assert_eq!(body["code"], "env_apply_prompt_outside_group");
+                assert_eq!(body["code"], "worker_create_tags_outside_team", "{body}");
                 assert!(!sessions.join(format!("{name}.env")).exists());
             } else {
                 assert!(body["errors"].as_array().unwrap().is_empty(), "{body}");
@@ -1408,7 +1412,7 @@ mod tests {
         let sessions = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         std::fs::create_dir_all(dir.path().join("env")).unwrap();
-        std::fs::write(sessions.join("review-lead.env"), "CC_TAGS=leads,alpha\n").unwrap();
+        std::fs::write(sessions.join("review-lead.env"), "CC_TAGS=leads,alpha\nCC_ORCHESTRATOR=1\n").unwrap();
         std::fs::write(dir.path().join("env/alpha.env"), "CC_RECEIVE_DENY=leads\n").unwrap();
         let response = app.oneshot(Request::builder().method("POST").uri("/api/env/apply")
             .header(header::CONTENT_TYPE, "application/json")
@@ -1428,6 +1432,192 @@ mod tests {
         let queued: i64 = store.read().unwrap().query_row(
             "SELECT count(*) FROM steering_queue WHERE session='review-denied'", [], |r| r.get(0)).unwrap();
         assert_eq!(queued, 0);
+    }
+
+    // ---- the composed #18 + #19 table (dev-lead's round-2 ruling) ------------
+    // The env apply cells, one test each, named table_<actor>_env_apply_<col>.
+    // The owner's and a plain worker's messages cells are
+    // env_apply_messages_from_a_worker_are_its_own_and_answer_to_the_group_gate;
+    // a plain worker's own and other cards cells are
+    // env_apply_cards_and_groups_from_a_worker_are_gated.
+
+    async fn env_apply(app: &axum::Router, session: Option<&str>, body: Value) -> (StatusCode, Value) {
+        let mut b = Request::builder().method("POST").uri("/api/env/apply").header(header::CONTENT_TYPE, "application/json");
+        if let Some(s) = session {
+            b = b.header("X-Amux-Session", s);
+        }
+        let res = app.clone().oneshot(b.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        let st = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (st, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+    }
+
+    /// A verified lead of `alpha` and mrpopo (in `leads` only), as env files.
+    fn table_env(dir: &std::path::Path) -> std::path::PathBuf {
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("review-lead.env"), "CC_TAGS=leads,alpha\nCC_ORCHESTRATOR=1\n").unwrap();
+        std::fs::write(sessions.join("mrpopo.env"), "CC_TAGS=leads\n").unwrap();
+        std::fs::write(sessions.join("review-dev-a.env"), "CC_TAGS=alpha\n").unwrap();
+        sessions
+    }
+
+    fn assert_refused(cell: (StatusCode, Value), code: &str) {
+        assert_eq!((cell.0, cell.1["code"].clone()), (StatusCode::FORBIDDEN, json!(code)), "{}", cell.1);
+    }
+
+    #[tokio::test]
+    async fn table_owner_env_apply_other_cards() {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        let w = create_worker(&app, "seeded", None).await;
+        let (st, v) = env_apply(&app, None, json!({"cards": [{"worker": queries_name(&store, &w), "title": "owner card"}]})).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let n: i64 = store.read().unwrap().query_row("SELECT count(*) FROM issues WHERE title='owner card'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn table_lead_env_apply_own_cards() {
+        let (app, _store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        table_env(dir.path());
+        let (st, v) = env_apply(&app, Some("review-lead"), json!({"cards": [{"worker": "review-lead", "title": "lead card"}]})).await;
+        assert!(st.is_success() && v.get("code").is_none(), "its own board: {st} {v}");
+    }
+
+    #[tokio::test]
+    async fn table_lead_env_apply_other_cards() {
+        let (app, _store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        table_env(dir.path());
+        assert_refused(env_apply(&app, Some("review-lead"), json!({"cards": [{"worker": "review-dev-a", "title": "x"}]})).await,
+            "env_apply_card_other_worker");
+    }
+
+    #[tokio::test]
+    async fn table_mrpopo_env_apply_other_cards() {
+        let (app, _store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        table_env(dir.path());
+        assert_refused(env_apply(&app, Some("mrpopo"), json!({"cards": [{"worker": "review-dev-a", "title": "x"}]})).await,
+            "env_apply_card_other_worker");
+    }
+
+    #[tokio::test]
+    async fn table_lead_env_apply_groups() {
+        let (app, _store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        table_env(dir.path());
+        assert_refused(env_apply(&app, Some("review-lead"), json!({"groups": [{"name": "alpha", "goal": "its own team"}]})).await,
+            "env_apply_groups_owner_only");
+    }
+
+    #[tokio::test]
+    async fn table_mrpopo_env_apply_groups() {
+        let (app, _store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        table_env(dir.path());
+        assert_refused(env_apply(&app, Some("mrpopo"), json!({"groups": [{"name": "alpha", "goal": "x"}]})).await,
+            "env_apply_groups_owner_only");
+    }
+
+    /// The kickoff row a new worker's prompt was queued as: (sender, text).
+    fn kickoff_row(store: &SharedStore, name: &str) -> Option<(String, String)> {
+        store.read().unwrap().query_row("SELECT sender, text FROM steering_queue WHERE session=?1", [name],
+            |r| Ok((r.get(0)?, r.get(1)?))).optional().unwrap()
+    }
+
+    fn kickoff(name: &str, groups: Value) -> Value {
+        json!({"workers": [{"name": name, "groups": groups, "prompt": "kickoff task"}]})
+    }
+
+    #[tokio::test]
+    async fn table_owner_env_apply_prompts() {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        table_env(dir.path());
+        let (st, v) = env_apply(&app, None, kickoff("review-owned", json!(["beta"]))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(kickoff_row(&store, "review-owned"), Some((String::new(), "kickoff task".into())), "owner input, unstamped");
+    }
+
+    #[tokio::test]
+    async fn table_lead_env_apply_prompts() {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        table_env(dir.path());
+        let (st, v) = env_apply(&app, Some("review-lead"), kickoff("review-teamed", json!(["alpha"]))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (sender, text) = kickoff_row(&store, "review-teamed").expect("queued");
+        assert_eq!(sender, "review-lead", "the lead stays the sender for the delivery recheck");
+        assert!(text.starts_with("[amux-origin: review-lead ") && text.ends_with("kickoff task"), "stamped: {text}");
+    }
+
+    #[tokio::test]
+    async fn table_lead_env_apply_prompts_outside_team() {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = table_env(dir.path());
+        assert_refused(env_apply(&app, Some("review-lead"), kickoff("review-outside", json!(["beta"]))).await,
+            "worker_create_tags_outside_team");
+        assert!(!sessions.join("review-outside.env").exists() && kickoff_row(&store, "review-outside").is_none());
+    }
+
+    #[tokio::test]
+    async fn table_mrpopo_env_apply_prompts() {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = table_env(dir.path());
+        assert_refused(env_apply(&app, Some("mrpopo"), kickoff("review-by-popo", json!(["alpha"]))).await, "worker_create_requires_lead");
+        assert!(!sessions.join("review-by-popo.env").exists() && kickoff_row(&store, "review-by-popo").is_none());
+    }
+
+    #[tokio::test]
+    async fn table_worker_env_apply_prompts() {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = table_env(dir.path());
+        assert_refused(env_apply(&app, Some("review-dev-a"), kickoff("review-by-a", json!(["alpha"]))).await, "worker_create_requires_lead");
+        assert!(!sessions.join("review-by-a.env").exists() && kickoff_row(&store, "review-by-a").is_none());
+    }
+
+    /// Env apply messages from `caller` (a native worker in group `own`): to a
+    /// teammate they are its own, to a worker outside its groups refused with
+    /// send's code. Same gate for every worker class.
+    async fn messages_cell(caller: &str) {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        table_env(dir.path());
+        let own = GroupId::from_ulid(ulid::Ulid::new());
+        let other = GroupId::from_ulid(ulid::Ulid::new());
+        let me = create_worker(&app, caller, Some(own.as_str())).await;
+        let teammate = create_worker(&app, "teammate", Some(own.as_str())).await;
+        let outsider = create_worker(&app, "outsider", Some(other.as_str())).await;
+        let from = |body: &str| -> Vec<String> {
+            let conn = store.read().unwrap();
+            let mut q = conn.prepare("SELECT from_actor FROM _amux_messages WHERE body=?1").unwrap();
+            let r = q.query_map([body], |r| r.get::<_, String>(0)).unwrap().flatten().collect();
+            r
+        };
+        let (_, v) = env_apply(&app, Some(caller), json!({"messages": [{"to": teammate, "text": "inside"}]})).await;
+        assert!(v["errors"].as_array().unwrap().is_empty(), "{v}");
+        assert!(from("inside").first().is_some_and(|f| f.contains(&me) && !f.contains("human")), "its own message: {:?}", from("inside"));
+        let (_, v) = env_apply(&app, Some(caller), json!({"messages": [{"to": outsider, "text": "outside"}]})).await;
+        assert!(v["errors"].as_array().unwrap().iter().any(|e| e["code"] == "worker_group_boundary"), "{v}");
+        let (_, v) = env_apply(&app, Some(caller), json!({"messages": [{"to": teammate, "from": "owner", "text": "posing"}]})).await;
+        assert!(v["errors"].as_array().unwrap().iter().any(|e| e["code"] == "env_message_sender_refused"), "{v}");
+        assert!(from("outside").is_empty() && from("posing").is_empty());
+    }
+
+    #[tokio::test]
+    async fn table_lead_env_apply_messages() {
+        messages_cell("review-lead").await;
+    }
+
+    #[tokio::test]
+    async fn table_mrpopo_env_apply_messages() {
+        messages_cell("mrpopo").await;
     }
 
     fn queries_name(store: &crate::db::SharedStore, id: &str) -> String {
