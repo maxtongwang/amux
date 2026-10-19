@@ -2,19 +2,24 @@
 // and that response must count a row this spec seeded; other workers share the shard's server.
 import { test, expect } from './fixtures';
 import { clickWhenActionable } from './helpers';
+import { cleanup } from './teardown';
 
 const CHIP_KEYS = { All: 'all', Human: 'human', Session: 'session', Scheduled: 'schedule', amux: 'amux', Unstamped: 'unstamped', Unclassified: 'unknown' };
 
 test('Messages tab opens with the human pill selected', async ({ page, request }, info) => {
   const urls: string[] = [];
-  // Counts bodies in request order. A slot stays null until its body arrives,
-  // so "latest" is the newest request, never whichever body parsed last.
+  // Counts bodies in response-arrival order. A slot stays null until its body
+  // parses, so "latest" is the newest response, never whichever body parsed last.
+  // Only the Messages view's global fetch: peek and command history fetch
+  // counts=1&session=, which is not what these chips render.
   const seen: (Record<string, number> | null)[] = [];
+  const badBodies: string[] = [];
   page.on('request', r => { if (r.url().includes('/api/history')) urls.push(r.url()); });
   page.on('response', r => {
-    if (!r.url().includes('/api/history?counts=1')) return;
+    const u = new URL(r.url());
+    if (u.pathname !== '/api/history' || u.searchParams.get('counts') !== '1' || u.searchParams.has('session')) return;
     const slot = seen.push(null) - 1;
-    r.json().then(b => { seen[slot] = b; }, () => {});
+    r.json().then(b => { seen[slot] = b; }, e => { badBodies.push(`${r.status()} ${String(e).slice(0, 80)}`); });
   });
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any).switchView === 'function', { timeout: 20000 });
@@ -55,7 +60,7 @@ test('Messages tab opens with the human pill selected', async ({ page, request }
     await expect.poll(async () => {
       chips = await readChips();
       rendered = seen.length ? seen[seen.length - 1] : null;
-      if (!rendered) return ['no counts response rendered yet'];
+      if (!rendered) return [badBodies.length ? `counts response not JSON: ${badBodies.join('; ')}` : 'no counts response rendered yet'];
       return Object.entries(CHIP_KEYS).flatMap(([label, key]) => {
         const chip = chips.find(c => c.label.startsWith(label + ' '));
         if (!chip) return [`${label}: chip missing`];
@@ -82,6 +87,6 @@ test('Messages tab opens with the human pill selected', async ({ page, request }
       .map(k => `${k} ${rendered![k] || 0}->${live[k] || 0}`);
     if (drift.length) console.log('[COUNTS-DRIFT] history changed on the shared server during the test: ' + drift.join(', '));
   } finally {
-    await request.delete(`/api/sessions/${seed}`, { headers }).catch(() => {});
+    await cleanup('delete seed worker', () => request.delete(`/api/sessions/${seed}`, { headers }), info);
   }
 });
