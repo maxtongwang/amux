@@ -29,8 +29,11 @@ async function token(page: Page): Promise<string> {
 }
 async function create(request: APIRequestContext, tok: string, data: Record<string, unknown>): Promise<string> {
   const r = await request.post('/api/schedules', {
-    headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json', 'X-Amux-Session': 'e2e-scheduler' },
-    data,
+    // The owner creates these (ai-config#210: a WORKER may schedule only itself
+    // or a same-group lane), labelled with a claimed `by` so History still
+    // shows the attributed create.
+    headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
+    data: { by: 'e2e-scheduler', ...data },
   });
   expect(r.status(), await r.text()).toBe(201);
   return (await r.json()).id;
