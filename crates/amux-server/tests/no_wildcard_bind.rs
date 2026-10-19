@@ -1,390 +1,244 @@
-//! Source audit: test binaries must not raise the macOS incoming-connections
-//! dialog. Scan Rust bind/listen arguments, including local address aliases;
-//! only the production HTTP listener may deliberately accept all interfaces.
-//! This is a lexical guard, not whole-program dataflow: computed addresses and
-//! parameters still need review (notably libc sockaddr construction).
+//! Source audit: nothing a test, example, script or fixture starts may listen on
+//! a wildcard address, because a freshly built binary doing so raises the macOS
+//! incoming-connections dialog. Fail-closed on the ADDRESS, not on function
+//! names: every wildcard literal and every empty-host listen form is a finding
+//! unless an ALLOW entry names it with a reason. Computed addresses (arithmetic,
+//! values read at run time) are outside a lexical audit and still need review.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug)]
-struct Token<'a> {
-    text: &'a str,
-    at: usize,
+/// (repo-relative path, text on the finding's line, reason). Each entry must
+/// match at least one finding, so a stale entry fails like a new finding does.
+const ALLOW: &[(&str, &str, &str)] = &[
+    ("crates/amux-server/src/lib.rs", "([0, 0, 0, 0], cfg.port)",
+     "the production listener: reachable over Tailscale; AMUX_BIND (PR #30) makes it configurable"),
+    ("crates/amux-server/src/api/process_identity.rs", "server listens on 0.0.0.0",
+     "doc comment describing the production listener"),
+    ("crates/amux-server/src/tls.rs", "on a 0.0.0.0 listener",
+     "comment describing the production listener"),
+    ("crates/amux-server/src/api/mdai.rs", "fan_in(serial_dir.path(), &[0, 0, 0, 0], None)",
+     "four zero counters, not an address"),
+    ("crates/amux-server/src/integrations/computer.rs", "x.starts_with(\"0.0.0.0\")",
+     "reads a Docker port mapping; binds nothing"),
+    ("crates/amux-server/src/api/proxies.rs", "validate(\"\", 8080)",
+     "a proxy-config validation case with an empty host; binds nothing"),
+    ("scripts/amux-playwright-mcp.sh", "--host 0.0.0.0",
+     "Linux systemd Playwright MCP wrapper; localhost resolves IPv6-only there (see CLAUDE.md); never runs on macOS"),
+    ("scripts/rebuild-rust-base.sh", "never 0.0.0.0",
+     "comment"),
+    ("e2e/operands-core.test.mjs", "matchesPath('::', ['/'])",
+     "a path string, not an address"),
+];
+
+const WILDCARD: &[&str] = &[
+    r"0\.0\.0\.0",
+    r"\[::\]",
+    r#"["']::["']\s*,"#,
+    r"\[\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\]",
+    // Only in a (address, port) tuple: a bare [0; 16] is usually a zeroed buffer.
+    r"\(\s*\[\s*0\s*;\s*(?:4|16)\s*\]\s*,",
+    r"Ipv[46]Addr::UNSPECIFIED",
+    r"Ipv4Addr::new\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)",
+    r"Ipv6Addr::new\(\s*0\s*(?:,\s*0\s*){7}\)",
+    r"(?:Ipv[46]Addr|IpAddr)::from\(\s*0(?:u32|u128)?\s*\)",
+    // Empty host with a port: Python ("", port), Rust ("", 0).
+    r#"(?i)\(\s*(?:""|'')\s*,\s*(?:\d+|[\w.]*port\w*)\s*\)"#,
+];
+
+fn wildcard() -> &'static [regex::Regex] {
+    static RE: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+    RE.get_or_init(|| WILDCARD.iter().map(|p| regex::Regex::new(p).unwrap()).collect())
 }
 
-// Keep strings opaque (including raw fixture strings), discard nested comments,
-// and preserve byte offsets so every diagnostic points at the actual call.
-fn tokens(src: &str) -> Vec<Token<'_>> {
-    let b = src.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        let start = i;
-        if b[i].is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-        if b[i..].starts_with(b"//") {
-            i += 2;
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if b[i..].starts_with(b"/*") {
-            i += 2;
-            let mut depth = 1;
-            while i < b.len() && depth > 0 {
-                if b[i..].starts_with(b"/*") {
-                    depth += 1;
-                    i += 2;
-                } else if b[i..].starts_with(b"*/") {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            assert_eq!(depth, 0, "unterminated source comment at {start}");
-            continue;
-        }
-        let mut quote = i;
-        if b[i] == b'r' {
-            quote += 1;
-            while quote < b.len() && b[quote] == b'#' {
-                quote += 1;
-            }
-        }
-        if b.get(quote) == Some(&b'"') {
-            if quote > i {
-                let end = format!("\"{}", "#".repeat(quote - i - 1));
-                let tail = quote + 1;
-                i = tail + src[tail..].find(&end).expect("unterminated raw string") + end.len();
-            } else {
-                i += 1;
-                while i < b.len() && b[i] != b'"' {
-                    i += if b[i] == b'\\' { 2 } else { 1 };
-                }
-                assert!(i < b.len(), "unterminated string at {start}");
-                i += 1;
-            }
-        } else if b[i] == b'\'' && b.get(i + 1) == Some(&b'\\') {
-            // Escaped character literal, not a lifetime.
-            i += 1;
-            while i < b.len() && b[i] != b'\'' {
-                i += if b[i] == b'\\' { 2 } else { 1 };
-            }
-            assert!(i < b.len(), "unterminated character at {start}");
-            i += 1;
-        } else if b[i] == b'\''
-            && src[i + 1..]
-                .chars()
-                .next()
-                .is_some_and(|c| b.get(i + 1 + c.len_utf8()) == Some(&b'\''))
-        {
-            i += 2 + src[i + 1..].chars().next().unwrap().len_utf8();
-        } else if b[i].is_ascii_alphanumeric() || b[i] == b'_' {
-            i += 1;
-            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                i += 1;
-            }
-        } else {
-            i += src[i..].chars().next().unwrap().len_utf8();
-        }
-        out.push(Token {
-            text: &src[start..i],
-            at: start,
-        });
-    }
-    out
+fn netcat_listen() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\bnc\b.*\s-l").unwrap())
 }
 
-fn compact(ts: &[Token<'_>]) -> String {
-    ts.iter().map(|t| t.text).collect()
-}
-
-fn wildcard(expr: &str) -> bool {
-    // These are address forms, not arbitrary zero-filled buffers. Called only
-    // on bind/listen argument expressions or their local initializers.
-    let patterns = [
-        r#""(?:0\.0\.0\.0(?::[^"]*)?|\[::\](?::[^"]*)?|::)""#,
-        r"Ipv[46]Addr::UNSPECIFIED\b",
-        r"Ipv4Addr::new\(0,0,0,0,?\)",
-        r"Ipv6Addr::new\(0,0,0,0,0,0,0,0,?\)",
-        r"\[(?:(?:0,){3}0,?|(?:0,){7}0,?|(?:0,){15}0,?|0;(?:4|8|16))\]",
-        r"\(0,0,0,0(?:,0,0,0,0)?,?\)",
-        r"(?:Ipv[46]Addr|IpAddr|SocketAddr[V46]*)::(?:from\(0(?:u32|u128)?\)|default\(\))",
-    ];
-    // Typed and radix-spelled zeroes denote the same wildcard address.
-    static ZERO: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let expr = ZERO
-        .get_or_init(|| {
-            regex::Regex::new(r"\b(?:0x0+|0o0+|0b0+|0)(?:[ui](?:8|16|32|64|128|size))?\b").unwrap()
-        })
-        .replace_all(expr, "0");
-    static PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
-    PATTERNS
-        .get_or_init(|| {
-            patterns
-                .iter()
-                .map(|p| regex::Regex::new(p).unwrap())
-                .collect()
-        })
-        .iter()
-        .any(|p| p.is_match(&expr))
-}
-
-// Follow simple `let addr = ...; bind(addr)` chains, using the nearest preceding
-// declaration. Stop at parameters/other computed values; never read fixture text
-// as Rust. No runtime sockets are opened by this audit.
-fn address_expr<'a>(ts: &'a [Token<'a>], before: usize, expr: &'a [Token<'a>]) -> String {
-    let mut value = String::new();
-    let mut pending = vec![(before, expr)];
-    let mut visited = HashSet::new();
-    while let Some((before, expr)) = pending.pop() {
-        value.push_str(&compact(expr));
-        for (index, token) in expr.iter().enumerate() {
-            if !token
-                .text
-                .starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-            {
-                continue;
-            }
-            // Calls and path qualifiers are computed values, not address aliases.
-            // In particular, do not trace a local closure's body as an address
-            // or mistake `*const libc::...` for a constant named `libc`.
-            if expr.get(index + 1).is_some_and(|t| t.text == "(")
-                || (expr.get(index + 1).is_some_and(|t| t.text == ":")
-                    && expr.get(index + 2).is_some_and(|t| t.text == ":"))
-            {
-                continue;
-            }
-            if let Some(start) = (0..before.saturating_sub(2)).rev().find(|&i| {
-                matches!(ts[i].text, "let" | "const" | "static")
-                    && (ts[i + 1].text == token.text
-                        || (ts[i + 1].text == "mut" && ts[i + 2].text == token.text))
-            }) {
-                if !visited.insert((token.text, start)) {
-                    continue;
-                }
-                let tail = &ts[start..before];
-                let mut nesting = 0;
-                let end = tail
-                    .iter()
-                    .position(|t| {
-                        match t.text {
-                            "(" | "[" | "{" => nesting += 1,
-                            ")" | "]" | "}" => nesting -= 1,
-                            ";" if nesting == 0 => return true,
-                            _ => {}
-                        }
-                        false
-                    })
-                    .unwrap_or(tail.len());
-                if let Some(eq) = tail[..end].iter().position(|t| t.text == "=") {
-                    // An initializer sees only declarations strictly before its own.
-                    // Unresolved names remain computed addresses requiring review.
-                    pending.push((start, &tail[eq + 1..end]));
-                }
-            }
-        }
-    }
-    value
-}
-
-fn scan(src: &str) -> Vec<(usize, String)> {
-    let ts = tokens(src);
-    let mut bad = Vec::new();
-    for i in 0..ts.len().saturating_sub(1) {
-        if !(matches!(ts[i].text, "bind" | "listen" | "adopt_or_bind") && ts[i + 1].text == "(") {
-            continue;
-        }
-        // Exclude function declarations; their callers are what we audit.
-        if i > 0 && ts[i - 1].text == "fn" {
-            continue;
-        }
-        let mut depth = 1;
-        let mut end = i + 2;
-        while end < ts.len() && depth > 0 {
-            match ts[end].text {
-                "(" => depth += 1,
-                ")" => depth -= 1,
+/// A JS/TS `.listen(` whose host argument is missing listens on every interface.
+/// Accept only a loopback literal or a host-named expression as the second
+/// argument, or a `host:` key in an options object.
+fn js_listen_without_host(line: &str) -> bool {
+    let mut rest = line;
+    while let Some(i) = rest.find(".listen(") {
+        let args = &rest[i + ".listen(".len()..];
+        let (mut depth, mut end) = (0i32, args.len());
+        for (j, c) in args.char_indices() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' if depth == 0 => { end = j; break; }
+                ')' | ']' | '}' => depth -= 1,
                 _ => {}
             }
-            if depth > 0 {
-                end += 1;
-            }
         }
-        assert_eq!(depth, 0, "unclosed bind/listen call");
-        let expr = address_expr(&ts, i, &ts[i + 2..end]);
-        if wildcard(&expr) {
-            bad.push((ts[i].at, compact(&ts[i..=end])));
+        let call = &args[..end];
+        let host = if call.trim_start().starts_with('{') {
+            call.contains("host")
+        } else {
+            let mut parts = call.splitn(3, ',');
+            parts.next();
+            parts.next().is_some_and(|h| {
+                let h = h.trim();
+                h.contains("127.0.0.1") || h.contains("'::1'") || h.contains("\"::1\"")
+                    || h.contains("localhost") || h.to_ascii_lowercase().contains("host")
+            })
+        };
+        if !host {
+            return true;
         }
+        rest = &args[end..];
     }
-    bad
+    false
 }
 
-fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Shell listeners whose default is every interface.
+fn shell_listener_without_host(line: &str) -> bool {
+    let loopback = line.contains("127.0.0.1") || line.contains("localhost");
+    (line.contains("http.server") && line.contains("-m") && !line.contains("--bind") && !line.contains(" -b "))
+        || (line.contains("TCP-LISTEN:") && !line.contains("bind="))
+        || (netcat_listen().is_match(line) && !loopback)
+}
+
+fn scan(path: &str, src: &str) -> Vec<(usize, String)> {
+    let wildcard = wildcard();
+    let ext = path.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    let js = matches!(ext, "js" | "mjs" | "cjs" | "ts" | "tsx");
+    let shell = matches!(ext, "sh" | "bash") || src.starts_with("#!/bin/") || src.starts_with("#!/usr/bin/env bash");
+    src.lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            wildcard.iter().any(|r| r.is_match(line))
+                || (js && js_listen_without_host(line))
+                || (shell && shell_listener_without_host(line))
+        })
+        .map(|(n, line)| (n + 1, line.trim().to_string()))
+        .collect()
+}
+
+const EXTS: &[&str] = &["rs", "js", "mjs", "cjs", "ts", "tsx", "py", "sh", "bash"];
+const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".claude", ".worktrees", "dist", "static"];
+
+/// Tests, examples, scripts, fixtures and server sources. Production docs, the
+/// site and the cloud gateway are not started by tests and are out of scope.
+fn in_scope(rel: &str, src: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let ext = name.rsplit_once('.').map(|(_, e)| e);
+    let code = ext.is_some_and(|e| EXTS.contains(&e))
+        || (ext.is_none() && rel.starts_with("scripts/") && src.starts_with("#!"));
+    let place = ["scripts/", "tests/", "e2e/"].iter().any(|p| rel.starts_with(p))
+        || ["/tests/", "/examples/", "/benches/"].iter().any(|p| rel.contains(p))
+        || (rel.starts_with("crates/") && rel.contains("/src/"))
+        || ["test", "spec", "fixture"].iter().any(|w| name.contains(w));
+    code && place
+}
+
+fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
         if path.is_dir() {
-            rust_sources(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
-}
-
-#[test]
-fn no_wildcard_bind_outside_the_production_listener() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let mut files = Vec::new();
-    rust_sources(root, &mut files);
-    assert!(!files.is_empty(), "no Rust sources audited");
-    files.sort();
-    let mut bad = Vec::new();
-    let mut allowed = 0;
-    for file in files {
-        let src = std::fs::read_to_string(&file).unwrap();
-        for (at, call) in scan(&src) {
-            // HTTP must be reachable from the LAN/cloud gateway. lib.rs builds
-            // ([0,0,0,0], cfg.port); listener_handoff binds it or adopts its fd.
-            // Exact file AND expression, never a whole-file exemption for tests.
-            if file.strip_prefix(root).unwrap() == Path::new("amux-server/src/lib.rs")
-                && call == "adopt_or_bind(addr)"
-            {
-                allowed += 1;
-                continue;
+            if !SKIP_DIRS.contains(&name.as_str()) {
+                walk(root, &path, out);
             }
-            let line = src[..at].bytes().filter(|&b| b == b'\n').count() + 1;
-            bad.push(format!("{}:{line}: wildcard {call}", file.display()));
+            continue;
+        }
+        let rel = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+        let Ok(src) = std::fs::read_to_string(&path) else { continue };
+        if in_scope(&rel, &src) {
+            out.push((rel, src));
         }
     }
-    // 0 once the listener takes its address from config (AMUX_BIND, PR #30):
-    // its wildcard default then lives outside any bind call. Never more than
-    // the one production listener.
-    assert!(allowed <= 1, "more than one production listener matched the allow-list: {allowed}");
-    assert!(
-        bad.is_empty(),
-        "wildcard binds can raise the macOS firewall dialog:\n{}",
-        bad.join("\n")
-    );
 }
 
 #[test]
-fn audit_detects_address_forms_and_aliases_but_ignores_comments_and_fixtures() {
-    for expr in [
-        "\"0.0.0.0:0\"",
-        "(\"0.0.0.0\", 0)",
-        "\"[::]:0\"",
-        "(\"::\", 0)",
-        "(Ipv4Addr::UNSPECIFIED, 0)",
-        "(Ipv6Addr::UNSPECIFIED, 0)",
-        "SocketAddr::from(([0, 0, 0, 0], 0))",
-        "([0; 4], 0)",
-        "([0; 8], 0)",
-        "([0; 16], 0)",
-        "([0u8; 4], 0)",
-        "([0x00, 0, 0, 0], 0)",
-        "([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], 0)",
-        "((0,0,0,0), 0)",
-        "(Ipv4Addr::from(0u32), 0)",
-        "(Ipv6Addr::from(0u128), 0)",
-        "(Ipv4Addr::default(), 0)",
-        "(Ipv6Addr::default(), 0)",
-        r##"r#"0.0.0.0:0"#"##,
-        "([0,0,0,0,0,0,0,0], 0)",
-        "(Ipv4Addr::new(0,0,0,0), 0)",
-        "(Ipv6Addr::new(0,0,0,0,0,0,0,0), 0)",
-    ] {
-        for verb in ["TcpListener::bind", "socket.bind", "listen"] {
-            let direct = format!("{verb}(\n{expr}\n);");
-            assert_eq!(scan(&direct).len(), 1, "missed {direct}");
-            let alias = format!("let ip = {expr}; let addr = ip; {verb}(addr);");
-            assert_eq!(scan(&alias).len(), 1, "missed {alias}");
-            let constant = format!("const ADDR: SocketAddr = {expr}; {verb}(ADDR);");
-            assert_eq!(scan(&constant).len(), 1, "missed {constant}");
+fn no_wildcard_listener_outside_the_allow_list() {
+    let root: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let mut files = Vec::new();
+    walk(&root, &root, &mut files);
+    files.sort();
+    // The audit's own fixtures are the patterns it detects.
+    files.retain(|(rel, _)| rel != "crates/amux-server/tests/no_wildcard_bind.rs");
+    assert!(files.len() > 100, "audit saw only {} files; scope is broken", files.len());
+    let mut used = vec![0usize; ALLOW.len()];
+    let mut bad = Vec::new();
+    for (rel, src) in &files {
+        for (line, text) in scan(rel, src) {
+            match ALLOW.iter().position(|(p, needle, _)| p == rel && text.contains(needle)) {
+                Some(i) => used[i] += 1,
+                None => bad.push(format!("{rel}:{line}: {text}")),
+            }
         }
     }
-    let safe = r####"
-        // TcpListener::bind("0.0.0.0:0");
-        /* outer /* socket.bind(Ipv6Addr::UNSPECIFIED); */ listen("[::]:0"); */
-        let fixture = r###"TcpListener::bind("0.0.0.0:0");"###;
-        let url = "http://example.test/*not a comment*/";
-        TcpListener::bind("127.0.0.1:0");
-        TcpListener::bind("[::1]:0");
-        let addr = ([127,0,0,1], 0); socket.bind(addr);
-    "####;
-    assert!(
-        scan(safe).is_empty(),
-        "comments, fixtures and loopback are safe"
-    );
-    assert_eq!(
-        scan("// ignored\nTcpListener::bind(\"0.0.0.0:0\");")[0].0,
-        24
-    );
+    let stale: Vec<_> = ALLOW.iter().zip(&used).filter(|(_, n)| **n == 0).map(|(a, _)| format!("{}: {}", a.0, a.1)).collect();
+    assert!(stale.is_empty() && bad.is_empty(),
+        "wildcard listeners can raise the macOS firewall dialog; bind 127.0.0.1 or add a reasoned ALLOW entry:\n{}\n\
+         allow-list entries that match nothing (remove them):\n{}",
+        bad.join("\n"), stale.join("\n"));
 }
 
 #[test]
-fn audit_stops_at_unresolved_shadowing_and_cycles() {
-    for src in [
-        "let addr = addr; TcpListener::bind(addr);",
-        "let addr = other; let other = addr; TcpListener::bind(other);",
-        "let addr = addr.clone(); TcpListener::bind(addr);",
-        "for addr in addresses { let addr = normalize(addr); TcpListener::bind(addr); }",
-    ] {
-        assert!(scan(src).is_empty(), "computed address needs review: {src}");
+fn every_wildcard_form_is_detected_in_every_language() {
+    let cases = [
+        ("a.rs", r#"TcpListener::bind("0.0.0.0:0")"#),
+        ("a.rs", r#"TcpListener::bind("[::]:0")"#),
+        ("a.rs", r#"TcpListener::bind(("::", 0))"#),
+        ("a.rs", "axum_server::bind_rustls(([0, 0, 0, 0], port).into(), tls)"),
+        ("a.rs", "SocketAddr::from(([0; 4], 0))"),
+        ("a.rs", "(Ipv4Addr::UNSPECIFIED, 0)"),
+        ("a.rs", "(Ipv6Addr::UNSPECIFIED, 0)"),
+        ("a.rs", "Ipv4Addr::new(0, 0, 0, 0)"),
+        ("a.rs", "IpAddr::from(0u32)"),
+        ("a.rs", r#"let addr = "0.0.0.0:0"; // later bound"#),
+        ("a.mjs", "site.listen(0,'0.0.0.0',r)"),
+        ("a.mjs", "site.listen(0, r)"),
+        ("a.ts", "server.listen(port)"),
+        ("a.mjs", "server.listen({ port: 0 })"),
+        ("a.mjs", "server.listen(0, '::', cb)"),
+        ("a.py", "socket.bind((\"\", 8080))"),
+        ("a.py", "HTTPServer(('', port), H)"),
+        ("a.py", "HTTPServer(('0.0.0.0', args.port), H)"),
+        ("a.sh", "python3 -m http.server 8000"),
+        ("a.sh", "socat TCP-LISTEN:9000,fork -"),
+        ("a.sh", "nc -l 9000"),
+    ];
+    for (path, line) in cases {
+        assert_eq!(scan(path, line).len(), 1, "{path}: not detected: {line}");
     }
 }
 
 #[test]
-fn audit_follows_shadowing_back_to_a_wildcard() {
-    let src = r#"
-        let addr = "0.0.0.0:0";
-        let other = addr;
-        let addr = other;
-        let addr = addr.clone();
-        TcpListener::bind(addr);
-    "#;
-    assert_eq!(scan(src).len(), 1, "wildcard behind shadowing was missed");
-    let unresolved = r#"let addr = combine(addr, "0.0.0.0:0"); socket.bind(addr);"#;
-    assert_eq!(scan(unresolved).len(), 1, "unresolved alias hid a wildcard");
-}
-
-#[test]
-fn audit_follows_deep_finite_alias_chains() {
-    for address in ["127.0.0.1:0", "0.0.0.0:0"] {
-        let mut src = format!("let addr0 = {address:?};");
-        for i in 1..128 {
-            src.push_str(&format!("let addr{i} = addr{};", i - 1));
-        }
-        src.push_str("TcpListener::bind(addr127);");
-        assert_eq!(scan(&src).len(), usize::from(address == "0.0.0.0:0"));
+fn loopback_and_non_address_text_pass() {
+    let cases = [
+        ("a.rs", r#"TcpListener::bind("127.0.0.1:0")"#),
+        ("a.rs", r#"TcpListener::bind("[::1]:0")"#),
+        ("a.rs", r#"callee.split("::").collect()"#),
+        ("a.rs", "let bytes: [u8; 16] = hash[..16].try_into().unwrap_or([0; 16]);"),
+        ("a.rs", r#"if owner == "" { return; }"#),
+        ("a.mjs", "site.listen(0, '127.0.0.1', r)"),
+        ("a.mjs", "site.listen(0, process.env.AMUX_ROUTING_FIXTURE_HOST || '127.0.0.1', r)"),
+        ("a.mjs", "server.listen(PORT, HOST, () => {})"),
+        ("a.mjs", "server.listen({ port: 0, host: '127.0.0.1' })"),
+        ("a.mjs", "parts.join('::')"),
+        ("a.py", "owner in (\"\", \"(unknown)\")"),
+        ("a.py", "ThreadingHTTPServer(('127.0.0.1', args.port), H)"),
+        ("a.sh", "python3 -m http.server 8000 --bind 127.0.0.1"),
+        ("a.sh", "socat TCP-LISTEN:9000,bind=127.0.0.1 -"),
+        ("a.sh", "nc -l 127.0.0.1 9000"),
+    ];
+    for (path, line) in cases {
+        assert!(scan(path, line).is_empty(), "{path}: false positive: {line}");
     }
 }
 
 #[test]
-fn audit_leaves_closure_bodies_computed_but_checks_their_arguments() {
-    let computed = r#"
-        let sin = |ip, port| SockAddr { ip, port, padding: [0; 8] };
-        let local = sin(local_ip, local_port);
-        let len = size_of::<libc::sockaddr_in>();
-        libc::bind(fd, (&local as *const libc::sockaddr_in).cast(), len);
-    "#;
-    assert!(
-        scan(computed).is_empty(),
-        "sockaddr construction needs review"
-    );
-    let wildcard_argument = r#"
-        let sin = |ip, port| SockAddr { ip, port, padding: [0; 8] };
-        let ip = "0.0.0.0";
-        let local = sin(ip, 0);
-        socket.bind(local);
-    "#;
-    assert_eq!(
-        scan(wildcard_argument).len(),
-        1,
-        "wildcard argument was missed"
-    );
+fn scope_covers_every_language_and_place() {
+    for rel in ["tests/x.mjs", "e2e/x.spec.ts", "scripts/x.py", "scripts/x.sh",
+        "crates/amux-server/examples/x.rs", "crates/amux-server/tests/x.rs",
+        "crates/amux-server/src/api/x.rs", "business-ui/tests/fixture-server.mjs", "cloud/x_test.py"] {
+        assert!(in_scope(rel, ""), "{rel} must be audited");
+    }
+    assert!(in_scope("scripts/worker-bin/tmux", "#!/bin/bash\n"));
+    for rel in ["site/guides/x.md", "cloud/gateway/gateway.py", "README.md"] {
+        assert!(!in_scope(rel, ""), "{rel} is out of scope");
+    }
 }

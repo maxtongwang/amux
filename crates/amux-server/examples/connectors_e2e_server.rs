@@ -47,7 +47,7 @@ async fn main() {
     let tls = amux_server::tls::build_server_config(&owner_home.join("tls")).unwrap();
     let tls = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls));
     tracing::info!(port, "private connectors E2E rig ready");
-    axum_server::bind_rustls(([0, 0, 0, 0], port).into(), tls)
+    axum_server::bind_rustls((bind_ip(), port).into(), tls)
         .serve(
             router(state)
                 .merge(
@@ -103,4 +103,13 @@ async fn approve(
         ("state", q.get("state").unwrap()),
     ]);
     axum::response::Redirect::to(redirect.as_str()).into_response()
+}
+
+/// Loopback unless AMUX_BIND names another address, so running this rig never
+/// raises the macOS incoming-connections dialog.
+fn bind_ip() -> std::net::IpAddr {
+    match std::env::var("AMUX_BIND") {
+        Ok(v) => v.parse().unwrap_or_else(|_| panic!("AMUX_BIND must be an IP address, got {v:?}")),
+        Err(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+    }
 }
