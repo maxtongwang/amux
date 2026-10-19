@@ -59287,7 +59287,7 @@ function _drawS() {
       saving: false, saveAgain: false, saveTimer: null, status: 'idle', statusMsg: '',
       pollTimer: null, pollTick: 0, applying: false, conflict: null, opening: false, openSeq: 0, savedCount: 0,
       libItems: [], libHash: null, libEtag: null, libSaveTimer: null, libLoaded: false,
-      recents: [], recentsLoaded: false, recentsTimer: null, thumbAt: 0,
+      recents: [], recentsLoaded: false, recentsTimer: null, recentsSaving: null, recentsAgain: false, thumbAt: 0,
       libTab: 'components', settings: { grid: false, align: true, connect: true },
       settingsLoaded: false, live: false, selCount: 0, selLocked: false, svgCache: new Map(),
       themeObs: null, penColor: _DRAW_PEN_COLORS[1], penWidth: 2,
@@ -60520,34 +60520,60 @@ async function _drawRememberRecent(force) {
   if (d.recentsTimer) clearTimeout(d.recentsTimer);
   d.recentsTimer = setTimeout(_drawSaveRecents, 1500);
 }
-async function _drawSaveRecents() {
+// One save at a time per tab, and `recentsSaving` stays set until the write
+// has landed, so "no timer" never reads as "saved". A save asked for while one
+// is in flight runs once after it: two overlapping saves each read the file
+// before the other wrote, and the later write erased what the earlier merged.
+function _drawSaveRecents() {
   const d = _draw;
   d.recentsTimer = null;
-  try {
-    // Merge with what is on disk: every tab and device writes this one file,
-    // and writing only this tab's list erased drawings another tab had
-    // opened. Newest entry per path wins; paths this tab renamed away stay out.
-    let disk = [];
+  if (d.recentsSaving) { d.recentsAgain = true; return d.recentsSaving; }
+  d.recentsSaving = (async () => {
     try {
-      const g = await fetch(API + '/api/file/raw?path=' + encodeURIComponent(_drawRecentsPath()), { cache: 'no-store' });
-      if (g.ok) { const data = await g.json(); if (Array.isArray(data.recents)) disk = data.recents; }
-    } catch (e) {}
-    const dropped = d.recentsDropped || new Set();
-    const byPath = new Map();
-    for (const x of d.recents.concat(disk)) {
-      if (!x || !x.path || dropped.has(x.path)) continue;
-      const have = byPath.get(x.path);
-      if (!have || (x.ts || 0) > (have.ts || 0)) byPath.set(x.path, x);
+      do { d.recentsAgain = false; await _drawWriteRecents(d); } while (d.recentsAgain);
+    } finally { d.recentsSaving = null; }
+  })();
+  return d.recentsSaving;
+}
+const _DRAW_RECENTS_TRIES = 3;
+async function _drawWriteRecents(d) {
+  try {
+    for (let attempt = 1; ; attempt++) {
+      // Merge with what is on disk: every tab and device writes this one file,
+      // and writing only this tab's list erased drawings another tab had
+      // opened. Newest entry per path wins; paths this tab renamed away stay out.
+      let disk = [], etag = null;
+      try {
+        const g = await fetch(API + '/api/file/raw?path=' + encodeURIComponent(_drawRecentsPath()), { cache: 'no-store' });
+        if (g.ok) { etag = g.headers.get('etag'); const data = await g.json(); if (Array.isArray(data.recents)) disk = data.recents; }
+      } catch (e) {}
+      const dropped = d.recentsDropped || new Set();
+      const byPath = new Map();
+      for (const x of d.recents.concat(disk)) {
+        if (!x || !x.path || dropped.has(x.path)) continue;
+        const have = byPath.get(x.path);
+        if (!have || (x.ts || 0) > (have.ts || 0)) byPath.set(x.path, x);
+      }
+      const merged = [...byPath.values()].sort((p, q) => (q.ts || 0) - (p.ts || 0)).slice(0, _DRAW_RECENTS_MAX);
+      if (merged.length > d.recents.length) _drawBeacon('recents-merged', { measured: true, n_considered: disk.length, added: merged.length - d.recents.length });
+      d.recents = merged;
+      // Written only over the copy just merged: another tab's write between
+      // the read and this PUT changes the ETag, the server answers 409
+      // (verdict file_save_conflict) and the merge runs again on its version.
+      const body = { path: _drawRecentsPath(), content: JSON.stringify({ recents: d.recents }) };
+      if (etag) body.expected_etag = etag;
+      const r = await fetch(API + '/api/file', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body), _skipOutbox: true });
+      if (r.status === 409 && attempt < _DRAW_RECENTS_TRIES) {
+        _drawBeacon('recents-save-conflict', { measured: true, n_considered: disk.length, attempt });
+        continue;
+      }
+      if (!r.ok) throw new Error('HTTP ' + r.status + (r.status === 409 ? ' after ' + attempt + ' merges' : ''));
+      // No re-render here: entries merged in from another tab would shift the
+      // list under a pointer that is about to click. They show on the next
+      // render the user causes.
+      return;
     }
-    const merged = [...byPath.values()].sort((p, q) => (q.ts || 0) - (p.ts || 0)).slice(0, _DRAW_RECENTS_MAX);
-    if (merged.length > d.recents.length) _drawBeacon('recents-merged', { measured: true, n_considered: disk.length, added: merged.length - d.recents.length });
-    d.recents = merged;
-    const r = await fetch(API + '/api/file', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: _drawRecentsPath(), content: JSON.stringify({ recents: d.recents }) }), _skipOutbox: true });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    // No re-render here: entries merged in from another tab would shift the
-    // list under a pointer that is about to click. They show on the next
-    // render the user causes.
   } catch (e) { _drawBeacon('recents-save-failed', { error: String(e && e.message || e) }); }
 }
 async function _drawRenderDrawings(body, q) {

@@ -23,6 +23,14 @@ async function setTool(page: Page, type: string) {
   await page.waitForFunction((t) => (window as unknown as Win)._draw.api.getAppState().activeTool.type === t, type);
 }
 
+// The recents write is done when no save is pending AND none is in flight.
+// recentsTimer alone clears when a save STARTS, so a test that wrote the file
+// "after the save" raced that save's own read and write (draw-tab control,
+// 7ca1c0d3: 4 of 40 runs lost OtherTab this way).
+async function recentsSettled(page: Page) {
+  await page.waitForFunction(() => { const d = (window as unknown as Win)._draw; return !d.recentsTimer && !d.recentsSaving; }, null, { timeout: 10_000 });
+}
+
 async function openDraw(page: Page) {
   await page.waitForFunction(() => typeof (window as unknown as Win).switchView === 'function');
   await expect(page.locator('#tab-draw')).toHaveCount(1);
@@ -406,8 +414,7 @@ test('Draw: clicking a drawing in Recent or In this folder opens it, and no file
 
     // After a reload the list still opens what it shows. (The recents list
     // is written 1.5s after a change; let that write land first.)
-    await page.waitForFunction(() => !(window as unknown as Win)._draw.recentsTimer, null, { timeout: 10_000 });
-    await page.waitForTimeout(500);
+    await recentsSettled(page);
     await page.reload();
     await openDraw(page);
     await expect.poll(() => sceneIds(page)).toEqual(['beta-diamond', 'beta-new']);
@@ -777,7 +784,7 @@ test('Draw: saving recents keeps entries another tab wrote', async ({ page, requ
     await openDraw(page);
     await page.evaluate(p => (window as any)._drawOpen(p), mine);
     await expect.poll(() => sceneIds(page)).toEqual(['mine-rect']);
-    await page.waitForFunction(() => !(window as unknown as Win)._draw.recentsTimer, null, { timeout: 10_000 });
+    await recentsSettled(page);
     // Another tab's write lands on disk after this tab loaded its list.
     const other = join(dir, 'OtherTab.excalidraw');
     await page.evaluate(async o => {
@@ -787,7 +794,7 @@ test('Draw: saving recents keeps entries another tab wrote', async ({ page, requ
       await fetch('/api/file', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(cur) }) });
     }, other);
     await page.evaluate(() => (window as any)._drawRememberRecent(true));
-    await page.waitForFunction(() => !(window as unknown as Win)._draw.recentsTimer, null, { timeout: 10_000 });
+    await recentsSettled(page);
     await expect.poll(() => page.evaluate(async () => {
       const path = (window as any)._drawRecentsPath();
       const res = await fetch('/api/file/raw?path=' + encodeURIComponent(path), { cache: 'no-store' }); const raw = res.ok ? await res.text() : ''; const cur = raw ? JSON.parse(raw) : { recents: [] };
@@ -813,5 +820,66 @@ test('Draw: saving recents keeps entries another tab wrote', async ({ page, requ
     });
     expect(kept.before, 'the list scrolled at all').toBeGreaterThan(0);
     expect(kept.after, 'scroll kept across a re-render').toBe(kept.before);
+  });
+});
+
+// The lost update itself, made deterministic: this tab's save has read the
+// file and its PUT is held while another tab writes. The held write must not
+// erase that entry (the server refuses it on the changed ETag and the merge
+// reruns), its own update must still land, and a save asked for meanwhile must
+// wait instead of reading the file mid-write.
+test('Draw: a recents save that read before another tab wrote merges it instead of erasing it', async ({ page, request }, info) => {
+  test.setTimeout(90_000);
+  await withDrawPrefs(page, request, info, 'amux-draw-recents-cas-', async dir => {
+    const mine = join(dir, 'Mine.excalidraw');
+    const other = join(dir, 'OtherTab.excalidraw');
+    const recents = join(dir, 'recents.json');
+    await writeFile(mine, sceneOf([{ id: 'mine-rect', type: 'rectangle', x: 0 }]));
+    await page.reload();
+    await page.waitForFunction(() => typeof (window as any)._drawRecentsPath === 'function');
+    await page.evaluate(p => { (window as any)._drawRecentsPath = () => p; }, recents);
+    await openDraw(page);
+    await page.evaluate(p => (window as any)._drawOpen(p), mine);
+    await expect.poll(() => sceneIds(page)).toEqual(['mine-rect']);
+    await recentsSettled(page);
+    const beacons: string[] = [];
+    page.on('request', r => {
+      if (r.method() === 'POST' && r.url().includes('/api/client-debug')) { try { beacons.push(r.postDataJSON()?.event); } catch {} }
+    });
+    const isRecentsGet = (r: { method(): string; url(): string }) =>
+      r.method() === 'GET' && r.url().includes('/api/file/raw') && decodeURIComponent(r.url()).includes(recents);
+    let held = false;
+    let markHeld!: () => void;
+    let release!: () => void;
+    const heldSeen = new Promise<void>(r => { markHeld = r; });
+    const gate = new Promise<void>(r => { release = r; });
+    await page.route('**/api/file', async route => {
+      const req = route.request();
+      let path = '';
+      try { path = req.postDataJSON()?.path || ''; } catch {}
+      if (req.method() === 'PUT' && !held && path === recents) { held = true; markHeld(); await gate; }
+      await route.continue();
+    });
+    await page.evaluate(() => (window as any)._drawRememberRecent(true));
+    await heldSeen;
+    const myTs = await page.evaluate(p => (window as unknown as Win)._draw.recents.find((x: any) => x.path === p).ts, mine);
+    // Another tab writes between this save's read and its write.
+    await page.evaluate(async ({ path, o }) => {
+      const res = await fetch('/api/file/raw?path=' + encodeURIComponent(path), { cache: 'no-store' });
+      const cur = res.ok ? await res.json() : { recents: [] };
+      cur.recents.unshift({ path: o, title: 'OtherTab', ts: Date.now() + 60_000 });
+      const w = await fetch('/api/file', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content: JSON.stringify(cur) }) });
+      if (!w.ok) throw new Error('other-tab write failed: HTTP ' + w.status);
+    }, { path: recents, o: other });
+    // A save asked for now must queue behind the held one, not read the file.
+    const early = page.waitForRequest(isRecentsGet, { timeout: 1500 }).then(() => true, () => false);
+    await page.evaluate(() => { (window as any)._drawSaveRecents(); });
+    expect(await early, 'a second save read the file while the first was mid-write').toBe(false);
+    release();
+    await recentsSettled(page);
+    const disk = JSON.parse(await readFile(recents, 'utf8')).recents;
+    expect(disk.map((x: any) => x.path), 'the other tab\'s entry survived the stale write').toEqual(expect.arrayContaining([mine, other]));
+    expect(disk.find((x: any) => x.path === mine).ts, 'this save\'s own update landed after the merge').toBe(myTs);
+    await expect.poll(() => beacons, { message: 'the conflict announced itself' }).toContain('recents-save-conflict');
   });
 });
