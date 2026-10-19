@@ -6,7 +6,7 @@
 //!   `pane_prompts::record` from the provider's UserPromptSubmit hook after it
 //!   ruled out an amux delivery (Claude Remote Control input lands here too).
 //! - OWNER SEND: `type='user'`, `delivery` `direct` or `queued`, and
-//!   `process_origin` `outside`, `remote` or `remote-forwarded` (migration 0125), proven by process
+//!   `process_origin` `outside`, `remote` or `remote-forwarded` (migration 0124), proven by process
 //!   attribution (`process_identity`), not by a header the client chose.
 //!
 //! Every candidate then passes [`is_amux_delivery`], which refuses an `[amux`

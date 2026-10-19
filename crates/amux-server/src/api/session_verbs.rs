@@ -6805,7 +6805,7 @@ pub(crate) fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Resu
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN msg_id TEXT", []);
     // Same migration: set when a row's delivery was inferred from its TEXT.
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN reconciled_at INTEGER", []);
-    // Migration 0125 carries the same ADDCOL for migrated DBs (ai-config#160).
+    // Migration 0124 carries the same ADDCOL for migrated DBs (ai-config#160).
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN process_origin TEXT", []);
     // Dead-lettered vs delivered must be distinguishable in history
     // (AMUX-3110; migration 0024 carries the same ADDCOL for migrated DBs,

@@ -599,7 +599,17 @@ pub(crate) fn verified_origin(headers: &HeaderMap) -> String {
 /// Classify and decide for a request's headers, with no grant handling.
 pub(crate) fn decide_for(headers: &HeaderMap, target: &Target, action: &Action) -> (String, Class, Decision) {
     let origin = verified_origin(headers);
-    let class = classify(&origin, target, action);
+    // A worker acting on ITSELF is not configuring another worker (dev-lead,
+    // #18). An unproven claim still reaches only decide_self's non-privileged
+    // set, as on main; on any other target it stays unverified.
+    let claimed = super::session_verbs::worker_origin(headers);
+    let self_claim = origin == super::worker_identity::UNVERIFIED_IDENTITY
+        && !claimed.is_empty()
+        && claimed != super::worker_identity::UNVERIFIED_IDENTITY
+        && matches!(target, Target::Worker(w) if *w == claimed);
+    // Forced, not classified: an unproven "mrpopo" or lead claim on itself
+    // must not pick up that class's powers.
+    let (origin, class) = if self_claim { (claimed, Class::SelfWorker) } else { let c = classify(&origin, target, action); (origin, c) };
     let decision = decide(&class, action, &facts(&origin, &class, target, action));
     (origin, class, decision)
 }
@@ -1083,5 +1093,40 @@ mod tests {
             assert!(FIELDS.iter().any(|(f, _)| *f == k) || GRANT_ROWS.contains(&k),
                 "config PATCH field '{k}' has no delegation row");
         }
+    }
+
+    /// An unproven claim acting on ITSELF is not configuring another worker
+    /// (dev-lead, #18): it reaches decide_self's non-privileged set, as on
+    /// main. A privileged key on itself stays the owner's (ai-config #160),
+    /// and on any other target the claim stays unverified.
+    #[test]
+    fn an_unproven_self_claim_reaches_only_the_non_privileged_self_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        let mut h = HeaderMap::new();
+        h.insert("x-amux-session", "lane-x".parse().unwrap());
+        let me = Target::Worker("lane-x".into());
+        let (origin, class, d) = decide_for(&h, &me, &Action::Lifecycle { verb: "pause".into() });
+        assert_eq!((origin.as_str(), &class, code(d).as_str()), ("lane-x", &Class::SelfWorker, "allow"));
+        assert_eq!(code(decide_for(&h, &me, &cfg(&["scope:memory"])).2), "allow");
+        for k in ["scope:connectors", "scope:gates"] {
+            assert_eq!(code(decide_for(&h, &me, &cfg(&[k])).2), "owner_only_key", "{k} on itself stays the owner's");
+        }
+        let (origin, class, d) = decide_for(&h, &Target::Worker("lane-y".into()), &cfg(&["scope:memory"]));
+        assert_eq!(origin, super::super::worker_identity::UNVERIFIED_IDENTITY);
+        assert_eq!((class, code(d).as_str()), (Class::Worker, "peer_config_owner_only"));
+    }
+
+    /// The unproven self case is forced to SelfWorker, never classified: a
+    /// claim to be mrpopo acting on mrpopo gets no Mrpopo powers.
+    #[test]
+    fn an_unproven_mrpopo_self_claim_gets_no_mrpopo_powers() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        let mut h = HeaderMap::new();
+        h.insert("x-amux-session", MRPOPO.parse().unwrap());
+        let (_, class, d) = decide_for(&h, &Target::Worker(MRPOPO.into()), &cfg(&["scope:connectors"]));
+        assert_eq!(class, Class::SelfWorker);
+        assert_eq!(code(d), "owner_only_key");
     }
 }
