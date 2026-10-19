@@ -45028,7 +45028,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         impl Drop for Pane {
             fn drop(&mut self) {
                 let st = session_target(&self.0);
-                let _ = std::process::Command::new("tmux")
+                let _ = tmux_command()
                     .args(["kill-session", "-t", &st])
                     .output();
             }
@@ -45534,7 +45534,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         // And nothing was created. This is the assertion the incident needed:
         // the test could not tell it had spawned, because from inside every
         // call returned as though it worked.
-        let live = tokio::process::Command::new("tmux")
+        let live = tmux_command_async()
             .args(["list-sessions", "-F", "#{session_name}"])
             .output()
             .await
@@ -49075,7 +49075,7 @@ mod submission_gate_tests {
         impl Drop for Pane {
             fn drop(&mut self) {
                 let st = session_target(&self.0);
-                let _ = std::process::Command::new("tmux")
+                let _ = tmux_command()
                     .args(["kill-session", "-t", &st])
                     .output();
             }
@@ -49111,7 +49111,7 @@ with open(sys.argv[3],'ab',buffering=0) as log:
         if key in (b'\r',b'\n'): paint(sys.argv[2])
 "#
         );
-        let output = std::process::Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -49169,7 +49169,7 @@ with open(sys.argv[3],'ab',buffering=0) as log:
         impl Drop for Pane {
             fn drop(&mut self) {
                 let stq = session_target(&self.0);
-                let _ = std::process::Command::new("tmux")
+                let _ = tmux_command()
                     .args(["kill-session", "-t", &stq])
                     .output();
             }
@@ -49187,7 +49187,7 @@ with open(sys.argv[3],'ab',buffering=0) as log:
                 (now_f64() * 1_000_000.0) as u64
             );
             let pane = Pane(tmux_name(&lane));
-            let output = std::process::Command::new("tmux").args([
+            let output = tmux_command().args([
                 "new-session", "-d", "-s", &pane.0, "-x", "200", "-y", "24",
                 "python3", "-c", "import pathlib,sys,time;print(pathlib.Path(sys.argv[1]).read_text(),flush=True);time.sleep(20)",
                 path.to_str().unwrap(),
@@ -56600,7 +56600,7 @@ mod composer_guard_tests {
         impl Drop for Pane {
             fn drop(&mut self) {
                 let st = session_target(&self.0);
-                let _ = std::process::Command::new("tmux").args(["kill-session", "-t", &st]).output();
+                let _ = tmux_command().args(["kill-session", "-t", &st]).output();
             }
         }
         for (label, frame) in [("claude", claude("yes add both")), ("codex", codex("yes add both"))] {
@@ -56609,7 +56609,7 @@ mod composer_guard_tests {
             std::fs::write(&path, &frame).unwrap();
             let lane = format!("guard-{label}-{}-{}", std::process::id(), (now_f64() * 1_000_000.0) as u64);
             let pane = Pane(tmux_name(&lane));
-            let out = std::process::Command::new("tmux").args([
+            let out = tmux_command().args([
                 "new-session", "-d", "-s", &pane.0, "-x", "200", "-y", "24",
                 "python3", "-c", "import pathlib,sys,time;sys.stdout.write(pathlib.Path(sys.argv[1]).read_text());sys.stdout.flush();time.sleep(20)",
                 path.to_str().unwrap(),
