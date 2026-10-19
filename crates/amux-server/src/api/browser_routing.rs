@@ -162,13 +162,11 @@ pub fn routes() -> Router<AppState> {
         .route("/request", post(request))
 }
 async fn config() -> Response {
-    let chrome_root = crate::integrations::browser::chrome_user_data_dir();
-    let v: Value = std::fs::read(chrome_root.join("Local State"))
-        .ok()
-        .and_then(|s| serde_json::from_slice(&s).ok())
-        .unwrap_or(Value::Null);
-    let profiles:Vec<Value>=v.pointer("/profile/info_cache").and_then(Value::as_object).map(|cache|cache.iter().map(|(name,m)|json!({"name":name,"label":m.get("name"),"identity":m.get("user_name"),"on_disk":chrome_root.join(name).is_dir()})).collect()).unwrap_or_default();
-    Json(json!({"config":load(),"chrome_profiles":profiles,"measured":true,"n_considered":profiles.len(),"ladder":["amux","cdp","cua"],"note":"CDP uses a persistent isolated copy of the selected Chrome profile. CUA uses the selected saved Amux profile; sandbox transfer currently covers cookies only."})).into_response()
+    let result = crate::integrations::browser::discover_chrome_profiles();
+    Json(json!({"config":load(),"chrome_profiles":result.profiles,
+        "measured":result.discovery.measured,"n_considered":result.discovery.n_considered,
+        "discovery":result.discovery,"ladder":["amux","cdp","cua"],
+        "note":"CDP uses a persistent isolated copy of the selected Chrome profile. CUA uses the selected saved Amux profile; sandbox transfer currently covers cookies only."})).into_response()
 }
 async fn save(headers: HeaderMap, Json(mut c): Json<Config>) -> Response {
     // The fallback identity is an owner choice, never a worker's silent edit.
@@ -416,17 +414,10 @@ async fn request(
         .find(|p| p.name == c.cua_profile)
         .map(|p| p.identity.as_str())
         .unwrap_or(""));
-    let chrome_state: Value =
-        std::fs::read(crate::integrations::browser::chrome_user_data_dir().join("Local State"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or(Value::Null);
-    context["chrome_identity"] = chrome_state
-        .pointer("/profile/info_cache")
-        .and_then(|v| v.get(&c.chrome_profile))
-        .and_then(|v| v.get("user_name"))
-        .cloned()
-        .unwrap_or(json!(""));
+    let chrome = crate::integrations::browser::discover_chrome_profiles();
+    context["chrome_identity"] = json!(chrome.profiles.iter()
+        .find(|p| p.name == c.chrome_profile).and_then(|p| p.identity.as_deref()).unwrap_or(""));
+    context["chrome_discovery"] = json!(chrome.discovery);
     let input = json!({"context":context,"verb":r.verb,"body":r.body});
     let mut child = match tokio::process::Command::new("node")
         .arg(script)

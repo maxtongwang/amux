@@ -6053,7 +6053,21 @@ for p in rows:
         r = a["you"].get("rule") or {}
         print(f"     not for you: {r.get('key')}={r.get('value')} at {r.get('scope')}")
 whom = me or "the owner (no worker identity)"
-print(f"{len(rows)} profile(s) discovered (use --all for QA and deprecated); {n_ok} shown and allowed for {whom}. '+' = you may use it, 'x' = out of your scope.")
+statuses = [("Chrome", d.get("discovery") or {}), ("saved Amux", d.get("saved_discovery") or {})]
+incomplete = False
+for source, status in statuses:
+    if status.get("measured") is not True:
+        incomplete = True
+        print(f"{source} profile discovery unavailable: {status.get('why_unmeasured') or 'server did not report discovery status'}")
+        if status.get("owner_step"): print("Owner step: " + status["owner_step"])
+    elif status.get("empty_reason"):
+        print(f"{source}: {status['empty_reason']}")
+if incomplete:
+    print(f"Profile discovery incomplete; {len(rows)} saved profile row(s) returned; {n_ok} shown and allowed for {whom}.")
+else:
+    print(f"{len(rows)} saved Amux profile(s) discovered (use --all for QA and deprecated); {n_ok} shown and allowed for {whom}. '+' = you may use it, 'x' = out of your scope.")
+    print(f"{len(d.get('chrome_profiles', []))} Chrome profile(s) discovered separately (routing/config).")
+if incomplete: sys.exit(1)
 PYEOF
       ;;
     ""|help|-h|--help)
