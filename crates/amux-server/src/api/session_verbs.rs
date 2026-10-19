@@ -12631,18 +12631,27 @@ pub(crate) struct AutoDelivery {
 /// Three outcomes and no fourth: delivered (verified), queued (with the row id),
 /// or refused (with the reason). `ok == true` never means "delivered" on its
 /// own — read `submitted`.
-/// A schedule's delivery guard (`sched:<id>`, set by the scheduler).
+/// A schedule's delivery guard, set by the scheduler: `sched:<id>` for a
+/// schedule the OWNER authored, `wsched:<id>` for one a worker authored
+/// (ai-config#210). Both are schedules for run bookkeeping.
 pub(crate) fn is_schedule_guard(guard: &str) -> bool {
-    guard.starts_with("sched:")
+    guard.starts_with("sched:") || guard.starts_with(WORKER_SCHEDULE_GUARD)
 }
 
+/// Prefix of a worker-authored schedule's delivery guard. It is a schedule,
+/// never owner configuration: delivered as automation, origin-stamped with its
+/// author, and refused by an isolated worker like any peer input.
+pub(crate) const WORKER_SCHEDULE_GUARD: &str = "wsched:";
+
 /// Guards for deliveries that carry the OWNER's own standing configuration
-/// rather than amux steering: a schedule (`sched:`) and the goal keeper
-/// continuing an owner-set /goal (`goal:`, Ethan 2026-09-26: "this needs to
-/// have been continued automatically on the harness level. especially since
-/// its a /goal"). Both reach isolated workers, as owner input.
+/// rather than amux steering: an owner-authored schedule (`sched:`) and the
+/// goal keeper continuing an owner-set /goal (`goal:`, Ethan 2026-09-26: "this
+/// needs to have been continued automatically on the harness level. especially
+/// since its a /goal"). Both reach isolated workers, as owner input. A
+/// worker-authored schedule (`wsched:`) is NOT one: only text the owner set up
+/// is owner input (ai-config#210).
 pub(crate) fn is_owner_configured_guard(guard: &str) -> bool {
-    is_schedule_guard(guard) || guard.starts_with("goal:")
+    guard.starts_with("sched:") || guard.starts_with("goal:")
 }
 
 pub(crate) async fn deliver_automated(
@@ -38166,6 +38175,10 @@ mod tests {
         assert!(is_owner_configured_guard("sched:SCHED-12") && is_owner_configured_guard("goal:gs-10"));
         assert!(!is_owner_configured_guard("board-drive") && !is_owner_configured_guard("")
             && !is_owner_configured_guard("project-steering"));
+        // A WORKER-authored schedule is a schedule, never owner configuration
+        // (ai-config#210): it must not reach an isolated worker as owner input.
+        assert!(is_schedule_guard("wsched:SCHED-12"));
+        assert!(!is_owner_configured_guard("wsched:SCHED-12"));
         assert!(!body.contains("send_text(state, name, text, false, SendOrigin::Automation)"),
             "the direct send must use the computed origin");
     }
