@@ -1423,6 +1423,29 @@ async fn tmux(args: &[&str]) -> Option<std::process::Output> {
     run_cmd("tmux", args, OP_TIMEOUT).await
 }
 
+/// Window options every worker pane gets at spawn: `remain-on-exit` keeps a
+/// dead pane observable (AMUX-2644 reads it), and the two rename locks keep
+/// the window named after the worker. Pane form: `set-option -t =amux-<n>`
+/// answers "no such session" on tmux 3.6a and sets nothing, which is how
+/// these three silently never applied on this path (tmux_target_audit now
+/// refuses the session form for set-option). A failure is logged.
+async fn lock_worker_window(ptq: &str, name: &str) {
+    for (verb, opt, val) in [
+        ("set-option", "remain-on-exit", "on"),
+        ("set-option", "allow-rename", "off"),
+        ("set-window-option", "automatic-rename", "off"),
+    ] {
+        let out = tmux(&[verb, "-t", ptq, opt, val]).await;
+        if !matches!(out, Some(ref o) if o.status.success()) {
+            tracing::warn!(
+                verdict = "worker_window_option_unset", option = opt, worker = %name,
+                measured = true, n_considered = 1,
+                "could not set a worker window option at spawn"
+            );
+        }
+    }
+}
+
 /// The status bar shows the plain worker name, not `amux-<name>`
 /// (backend::tmux::WORKER_STATUS_LEFT). Display only: a failure is logged.
 /// `ptq` is the pane form (`=amux-<n>:`): set-option given the bare session
@@ -16759,9 +16782,7 @@ pub(crate) async fn start_session(
             None => return (false, "tmux not found or timed out".into()),
         }
         let stq = st(name);
-        let _ = tmux(&["set-option", "-t", &stq, "remain-on-exit", "on"]).await;
-        let _ = tmux(&["set-option", "-t", &stq, "allow-rename", "off"]).await;
-        let _ = tmux(&["set-window-option", "-t", &stq, "automatic-rename", "off"]).await;
+        lock_worker_window(&pt(name), name).await;
         set_worker_status_name(&pt(name), name).await;
         let _ = tmux(&["rename-window", "-t", &stq, name]).await;
         // The secrets kept out of argv above, handed over the tmux control
@@ -44976,6 +44997,31 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             !any_non_zombie("   \n  \n"),
             "whitespace is not a live child"
         );
+    }
+
+    /// The spawn-time window options must actually land: on the session form
+    /// they never did. Read back with show-options on a private socket.
+    #[tokio::test]
+    async fn worker_window_options_apply_at_spawn() {
+        struct Pane(String);
+        impl Drop for Pane {
+            fn drop(&mut self) {
+                let st = session_target(&self.0);
+                let _ = tmux_command().args(["kill-session", "-t", &st]).output();
+            }
+        }
+        let name = format!("window-opts-{}", std::process::id());
+        let pane = Pane(tmux_name(&name));
+        let created = tmux(&["new-session", "-d", "-s", &pane.0, "/bin/sh"])
+            .await
+            .expect("tmux required for window-options proof");
+        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+        lock_worker_window(&pt(&name), &name).await;
+        let ptq = pt(&name);
+        for (opt, want) in [("remain-on-exit", "on"), ("allow-rename", "off"), ("automatic-rename", "off")] {
+            let o = tmux(&["show-options", "-wv", "-t", &ptq, opt]).await.expect("show-options");
+            assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), want, "{opt} not set on the window");
+        }
     }
 
     /// Max saw "amux-" in every worker's status bar: tmux's default
