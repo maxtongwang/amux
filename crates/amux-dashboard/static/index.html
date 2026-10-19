@@ -416,6 +416,16 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           </label>
           <div id="settings-taskguard-status" style="font-size:0.7rem;color:var(--dim);margin-top:4px;"></div>
         </div>
+        <div class="settings-sep"></div>
+        <!-- ai-config#160: changes leads, mrpopo and workers made on the owner's behalf. -->
+        <div class="settings-section" id="delegation-log-section">
+          <details class="settings-fold" ontoggle="if(this.open)_delegationLogLoad()"><summary class="settings-section-label">Delegated changes</summary>
+          <p class="ui-help">Configuration changes made on your behalf, newest first. Append-only; secret values are stored as &lt;redacted&gt;. Each one is also posted to the leads.</p>
+          <p class="ui-help">Grants: widening changes mrpopo made by citing your own words (cite mode), each undoable in one step; in passkey mode they wait here for Approve from your phone over the tailnet.</p>
+          <div id="delegation-grants-list"><p class="ui-help">Loading…</p></div>
+          <div id="delegation-log-list"><p class="ui-help">Loading…</p></div>
+          </details>
+        </div>
         </div>
         <div class="settings-tab-panel" id="stab-notifications" data-stab="notifications">
         <div class="settings-section">

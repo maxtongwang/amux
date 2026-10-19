@@ -6797,6 +6797,8 @@ pub(crate) fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Resu
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN msg_id TEXT", []);
     // Same migration: set when a row's delivery was inferred from its TEXT.
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN reconciled_at INTEGER", []);
+    // Migration 0125 carries the same ADDCOL for migrated DBs (ai-config#160).
+    let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN process_origin TEXT", []);
     // Dead-lettered vs delivered must be distinguishable in history
     // (AMUX-3110; migration 0024 carries the same ADDCOL for migrated DBs,
     // this covers a DB bootstrapped through this legacy path).
@@ -7091,6 +7093,12 @@ pub(crate) struct DeliveryMeta<'a> {
     /// The earlier owner message this one repeats (F8(e), migration 0088).
     /// None for everything that is not a detected repeat.
     pub repeat_of: Option<i64>,
+    /// The process-attribution verdict of the request that sent an OWNER
+    /// message (`outside` or `remote`, from `process_identity`), migration
+    /// 0125. `max_ref::row_qualifies` accepts an owner send as the owner's own words only on
+    /// one of those two. None on every other row: peer, member, schedule,
+    /// pane, and every row written before 0125.
+    pub process_origin: Option<&'a str>,
 }
 
 impl DeliveryMeta<'_> {
@@ -7101,6 +7109,7 @@ impl DeliveryMeta<'_> {
             submit_verdict: Some("accepted"),
             client_meta: None,
             repeat_of: None,
+            process_origin: None,
         }
     }
     /// A send handed straight to a live lane, with nothing to verify.
@@ -7135,6 +7144,7 @@ impl DeliveryMeta<'_> {
             submit_verdict: None,
             client_meta: None,
             repeat_of: None,
+            process_origin: None,
         }
     }
 }
@@ -7847,6 +7857,9 @@ pub(crate) async fn cmd_hist_record_with_id(
     if session.is_empty() || text.is_empty() {
         return 0;
     }
+    // A typed `amux grant <code>` approves a pending grant (ai-config #160);
+    // the grant module decides whether this row qualifies.
+    let grant_text = (!super::delegation_grants::codes_in(text).is_empty()).then(|| text.to_string());
     if ctype == "user" {
         spawn_task_title(session, text);
     }
@@ -7859,6 +7872,11 @@ pub(crate) async fn cmd_hist_record_with_id(
     let submit_verdict = meta.submit_verdict.map(|v| v.to_string());
     let queued_at_ms = meta.queued_at_ms;
     let repeat_of = meta.repeat_of;
+    // Only the two owner verdicts are stored; anything else is not evidence.
+    let process_origin = meta
+        .process_origin
+        .filter(|v| matches!(*v, "outside" | "remote"))
+        .map(str::to_string);
     // Bounded, and only if it parses as a JSON OBJECT. This lands in a column
     // the Messages tab renders and the Ask panel feeds to a model, so a client
     // must not be able to write a megabyte of arbitrary text into it, nor a
@@ -8006,12 +8024,12 @@ pub(crate) async fn cmd_hist_record_with_id(
                 dup_prior_ts_w.store(pts, std::sync::atomic::Ordering::SeqCst);
             }
             conn.execute(
-                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, repeat_of) \
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, repeat_of, process_origin) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rusqlite::params![
                     text, ctype, session, now_ms, origin,
                     delivery, queued_at_ms, delivered_at_ms, submit_verdict, capture_pending,
-                    client_meta, repeat_of
+                    client_meta, repeat_of, process_origin
                 ],
             )?;
             let row_id = conn.last_insert_rowid();
@@ -8154,7 +8172,11 @@ pub(crate) async fn cmd_hist_record_with_id(
             .await;
         }
     }
-    msg_row_id.load(std::sync::atomic::Ordering::SeqCst)
+    let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
+    if let Some(t) = grant_text.filter(|_| row_id > 0) {
+        Box::pin(super::delegation_grants::on_row(state, row_id, &t)).await;
+    }
+    row_id
 }
 
 async fn link_queued_message(state: &AppState, session: &str, row_id: i64, queue_id: &str) {
@@ -8956,8 +8978,9 @@ fn steer_row_source(conn: &rusqlite::Connection, id: &str) -> (Option<String>, O
 ///
 /// Membership is by producer, not by heuristic, so adding a content-bearing
 /// producer is a deliberate edit here rather than something that has to be
-/// noticed later.
-const NON_COALESCING_GUARDS: &[&str] = &["board-progress"];
+/// noticed later. The delegated-change feed is one: each notice names a
+/// different change, so a second one must not overwrite the first.
+const NON_COALESCING_GUARDS: &[&str] = &["board-progress", super::delegation_log::FEED_GUARD];
 
 /// Whether `guard` names a content-bearing producer (see
 /// [`NON_COALESCING_GUARDS`]). Guards stay non-empty for these, so the isolation
@@ -18674,6 +18697,7 @@ async fn wake_session(state: &AppState, name: &str) -> (bool, String) {
             axum::extract::State(state.clone()),
             None,
             axum::extract::Path(name.to_string()),
+            axum::http::HeaderMap::new(),
         )
         .await;
         let ok = resp.status().is_success();
@@ -27295,13 +27319,50 @@ async fn post_dispatch(
 ) -> Response {
     // The verbs that rewrite who a worker is (its name, its instructions, its
     // memory) follow the peer-config rule; the rename alias and PATCH config
-    // must not differ, lead team renames included.
-    if action == "rename" {
-        let to = rename_verb_target(body);
-        if let Some(refusal) = peer_config_refusal_unless_lead_rename(headers, name, action, Some(to)) { return refusal; }
-    } else if matches!(action, "instructions" | "memory") {
-        if let Some(refusal) = peer_config_refusal(headers, name, action) { return refusal; }
+    // must not differ.
+    // Through the delegation table (ai-config #160); `stop` joined these: a
+    // worker stops itself, a lead its team, anyone else is refused.
+    if matches!(action, "rename" | "instructions" | "memory" | "stop" | "start" | "reset" | "clear" | "git" | "git-push" | "worktree" | "archive" | "keys") {
+        use super::delegation::{authorize, reserved_name_refusal, Action, Target};
+        let act = match action {
+            "rename" => {
+                let to = body_str(body, "name");
+                let to = if to.is_empty() { body_str(body, "rename") } else { to };
+                if let Some(r) = reserved_name_refusal(headers, &to) { return r; }
+                Action::RenameWorker { to }
+            }
+            "stop" => Action::StopWorker,
+            // keys: self only (a pane writer); never a lead power.
+            "instructions" | "memory" | "keys" => Action::SetConfig { keys: vec![action.to_string()] },
+            other => Action::Lifecycle { verb: other.to_string() },
+        };
+        let grant = match authorize(state, headers, &Target::Worker(name.to_string()), &act, Some(body)) {
+            Ok(g) => g,
+            Err(r) => return r,
+        };
+        if let Some(g) = grant {
+            let resp = post_dispatch_inner(state, name, action, headers, body).await;
+            if resp.status().is_success() {
+                let after = match &act {
+                    Action::RenameWorker { to } => json!({"name": to}),
+                    Action::StopWorker => json!({"stopping": true}),
+                    _ => json!({"updated": action}),
+                };
+                g.commit(state, json!({"name": name}), after);
+            }
+            return resp;
+        }
     }
+    post_dispatch_inner(state, name, action, headers, body).await
+}
+
+async fn post_dispatch_inner(
+    state: &AppState,
+    name: &str,
+    action: &str,
+    headers: &HeaderMap,
+    body: &Value,
+) -> Response {
     match action {
         "transcripts" => match backup_session_jsonl(name, "manual") {
             Some(path) => j200(json!({"ok": true, "path": path})),
@@ -27473,8 +27534,11 @@ async fn post_dispatch(
         "clear" => clear_verb(name).await,
         "duplicate" => duplicate_verb(state, name, headers, body),
         "clone" => {
-            if let Some(refusal) = copy_refusal(name, headers) { return refusal; }
-            clone_post(state, name, body).await
+            let new_name = body_str(body, "new_name");
+            if let Some(refusal) = copy_refusal(name, headers, Some(new_name.trim())) { return refusal; }
+            let resp = clone_post(state, name, body).await;
+            if resp.status().is_success() { log_copy(state, headers, name, new_name.trim(), "clone"); }
+            resp
         }
         "archive" => {
             if !session_destructive_allowed(state, headers) {
@@ -28053,6 +28117,13 @@ async fn get_cross_group_config() -> Response {
 /// cross-group channel, which is the escalation the scope policy exists to stop.
 /// A request carrying no worker origin is the dashboard.
 async fn put_cross_group_config(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    // Routing is a delegation row (ai-config #160): mrpopo through a grant only.
+    // This legacy endpoint can only CLEAR the override and has no AppState to
+    // store a grant, so every worker gets the table's refusal here; the
+    // header check below stays for verified members.
+    if let Some(refusal) = super::delegation::refusal_value(&headers, &super::delegation::Target::Fleet, &super::delegation::Action::SetRouting) {
+        return jresp(StatusCode::FORBIDDEN, refusal);
+    }
     if ["x-amux-session", "x-amux-worker"].iter().any(|h| {
         headers
             .get(*h)
@@ -29134,6 +29205,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             // invent a sender context for a machine.
             client_meta: None,
             repeat_of,
+            process_origin: None,
         };
         if record_history {
             let email = headers
@@ -29141,8 +29213,23 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             let author = member_actor.as_deref().unwrap_or(email);
+            // The process verdict, recorded only for the OWNER's own send: no
+            // member actor and no worker identity (a worker pane's request
+            // carries its worker header after attribution, whatever it sent).
+            let process_origin = if member_actor.is_none() && hdr_worker(headers).trim().is_empty() {
+                headers
+                    .get(super::process_identity::PROCESS_ORIGIN_HEADER)
+                    .and_then(|v| v.to_str().ok())
+            } else {
+                None
+            };
+            tracing::info!(session = %name, process_origin = process_origin.unwrap_or(""),
+                forwarded = process_origin == Some(super::process_identity::REMOTE_FORWARDED),
+                verdict = "owner_send_process_origin", measured = true, n_considered = 1,
+                "an owner send and its process origin (only a non-local Remote one approves a pending grant)");
             let meta = DeliveryMeta {
                 client_meta: client_meta_raw.as_deref(),
+                process_origin,
                 ..meta
             };
             let row_id =
@@ -29231,6 +29318,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                 submit_verdict: Some(verdict),
                 client_meta: None,
                 repeat_of,
+                process_origin: None,
             };
             if record_history {
                 let email = headers
@@ -30804,7 +30892,7 @@ pub(crate) async fn peek_verb(state: &AppState, name: &str, qs: &[(String, Strin
 pub(crate) fn duplicate_verb(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
     // A copy inherits the source's groups (env file and store row), so it is a
     // create with those groups: only a lead, and only inside its own team.
-    if let Some(refusal) = copy_refusal(name, headers) { return refusal; }
+    if let Some(refusal) = copy_refusal(name, headers, Some(body_str(body, "new_name").trim())) { return refusal; }
     let new_name = body_str(body, "new_name").trim().to_string();
     if new_name.is_empty() {
         return jresp(
@@ -30841,6 +30929,7 @@ pub(crate) fn duplicate_verb(state: &AppState, name: &str, headers: &HeaderMap, 
             );
         }
     };
+    log_copy(state, headers, name, &new_name, "duplicate");
     j200(json!({
         "ok": true,
         "message": format!("duplicated as {new_name}"),
@@ -32564,14 +32653,33 @@ pub(crate) async fn report_post(
 // ---------------------------------------------------------------------------
 
 async fn patch_dispatch(state: &AppState, name: &str, action: &str, body: &Value, headers: &HeaderMap) -> Response {
-    let rename_to = if action == "config" { config_rename_only(body) } else { None };
-    if let Some(refusal) = peer_config_refusal_unless_lead_rename(headers, name, action, rename_to) { return refusal; }
-    if let Some(refusal) = membership_patch_refusal(headers, names_messaging_authority(body)) { return refusal; }
+    // Both verbs go through the delegation table (ai-config #160).
     match action {
-        "commit-guard" => commit_guard_patch_verb(name, body),
-        "config" => config_patch(state, name, body).await,
+        "commit-guard" => {
+            let target = super::delegation::Target::Worker(name.to_string());
+            let act = super::delegation::Action::SetConfig { keys: vec!["commit-guard".into()] };
+            let grant = match super::delegation::authorize(state, headers, &target, &act, Some(body)) {
+                Ok(g) => g,
+                Err(r) => return r,
+            };
+            let resp = commit_guard_patch_verb(name, body);
+            if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+                g.commit(state, Value::Null, body.clone());
+            }
+            resp
+        }
+        "config" => super::delegation::guarded_config_patch(state, headers, name, body).await,
         _ => not_found(),
     }
+}
+
+/// Every key a config PATCH reads, for the delegation sweep test: the
+/// operations table, `create`, and the modifiers handled inside a branch.
+#[cfg(test)]
+pub(crate) fn config_patch_fields_for_delegation() -> Vec<&'static str> {
+    let mut v = config_patch_operations_keys();
+    v.extend(["force", "toggle_auto_continue"]);
+    v
 }
 
 /// The provider/model/effort/yolo restart choreography shared by four config
@@ -33826,34 +33934,8 @@ async fn apply_live_config_change(
     }
 }
 
-/// THE membership rule: a worker-originated request may not set or change a
-/// worker's messaging authority. Every path that writes group membership calls
-/// this one predicate, so the rule and its error code have one definition.
-///
-/// Messaging authority is group membership (`CC_TAGS`, `_amux_workers.group`)
-/// plus the two settings that act as membership of every group: the chat
-/// worker type, which speaks for the owner (`chat_speaks_for_owner`), and a
-/// group's open-inbound switch. `membership_named` is the caller's statement
-/// that the request would set one of those.
-///
-/// This governs EXISTING workers: no worker may change any worker's groups,
-/// its own included. Creating a worker is [`worker_create_refusal`]'s rule.
-/// Owners, the dashboard and verified human members are unaffected.
-pub(crate) fn membership_patch_refusal(headers: &HeaderMap, membership_named: bool) -> Option<Response> {
-    membership_refusal_body(headers, membership_named).map(|body| jresp(StatusCode::FORBIDDEN, body))
-}
 
-/// [`membership_patch_refusal`]'s decision and 403 body, for a handler whose
-/// return type is not a `Response`.
-pub(crate) fn membership_refusal_body(headers: &HeaderMap, membership_named: bool) -> Option<Value> {
-    let origin = worker_origin(headers);
-    if !membership_named || origin.is_empty() { return None; }
-    tracing::warn!(verdict="worker_group_membership_refused", measured=true, n_considered=1,
-        worker = %origin,
-        "worker cannot widen messaging authority by editing group membership");
-    Some(json!({"ok":false,"code":"worker_group_membership_refused",
-        "error":"Group membership changes require direct owner input."}))
-}
+
 
 /// The worker this request speaks for, from the one verified identity
 /// (`worker_identity::verified_worker`): empty for the owner/dashboard and
@@ -33865,110 +33947,10 @@ pub(crate) fn worker_origin(headers: &HeaderMap) -> String {
     }
 }
 
-/// CONFIGURING ANOTHER WORKER IS THE OWNER'S (review round 3, N2/N3). A worker
-/// may change typed settings on itself only: renaming a peer left the renamed
-/// lane with no stored token (trusted without one), and editing a peer's env,
-/// instructions or memory rewrites what that peer is. The rule is owner-only
-/// except for one lead rename ([`peer_config_refusal_unless_lead_rename`]).
-/// A worker's own Chat tab (`w@chat`) counts as `w`. Owners and verified
-/// members are unaffected.
-pub(crate) fn peer_config_refusal(headers: &HeaderMap, target: &str, what: &str) -> Option<Response> {
-    peer_config_refusal_body(headers, target, what).map(|body| jresp(StatusCode::FORBIDDEN, body))
-}
-
-/// [`peer_config_refusal`]'s decision and 403 body, for a handler whose return
-/// type is not a `Response`.
-pub(crate) fn peer_config_refusal_body(headers: &HeaderMap, target: &str, what: &str) -> Option<Value> {
-    let origin = worker_origin(headers);
-    if origin.is_empty() || origin == target || super::chat_worker::companion_parent(&origin) == Some(target) {
-        return None;
-    }
-    tracing::warn!(origin = %origin, target, what, verdict = "peer_config_owner_only", measured = true,
-        n_considered = 1, "a worker tried to configure another worker");
-    Some(json!({"ok": false, "code": "peer_config_owner_only",
-        "error": format!("'{origin}' may not change {what} of '{target}'; configuring another worker is the owner's")}))
-}
-
-/// Max's owner agent (`agents/owner.md` in ai-config). No lead renames it, and
-/// no lead renames a worker to it.
-pub(crate) const OWNER_AGENT: &str = "mrpopo";
-
-/// THE one exception to [`peer_config_refusal`] (ai-config #203; Max,
-/// 2026-10-17: "Worker name dynamic change with task is still not in right?"),
-/// for every path that renames a session: a verified lead may RENAME a worker
-/// in its own team. `rename_to` is `Some(new name)` only when the request
-/// renames the target and changes nothing else; any other request takes the
-/// owner-only rule unchanged. amux #3 keeps the renamed worker's incarnation,
-/// token and old-name alias, and `rename_session` journals the rename.
-pub(crate) fn peer_config_refusal_unless_lead_rename(
-    headers: &HeaderMap,
-    target: &str,
-    what: &str,
-    rename_to: Option<&str>,
-) -> Option<Response> {
-    if let Some(to) = rename_to {
-        let origin = worker_origin(headers);
-        if origin != target {
-            if let Some(team) = lead_team_rename(&origin, target, to) {
-                // A "-lead" name grants nothing (lead status comes from
-                // groups) but would mislead peers (ai-config #205 N2).
-                if is_lead_suffixed(to) {
-                    tracing::warn!(origin = %origin, target, to, verdict = "lead_rename_reserved_suffix",
-                        measured = true, n_considered = 1, "a lead tried to give a team worker a '-lead' name");
-                    return Some(jresp(StatusCode::FORBIDDEN, json!({"ok": false, "code": "lead_rename_reserved_suffix",
-                        "error": format!("a lead may not give '{target}' a name ending in '-lead' ('{to}'); only the owner may")})));
-                }
-                // Authorization only: the rename runs after this, and
-                // rename_session logs its outcome (ai-config #205 N6).
-                tracing::info!(origin = %origin, target, to, ?team, verdict = "lead_team_rename_authorized",
-                    measured = true, n_considered = 1, "a lead was authorized to rename a worker in its own team");
-                return None;
-            }
-        }
-    }
-    peer_config_refusal(headers, target, what)
-}
-
-/// Whether verified worker `origin` may rename `target` to `to` as its lead:
-/// `origin` is in `leads`, `target` is not, they share a group other than
-/// `leads`, and neither `target` nor the new name is the owner agent. The
-/// shared groups, or `None`. `origin` is [`worker_origin`]'s verified identity
-/// (an unverified claim names no lane, so it has no groups).
-pub(crate) fn lead_team_rename(origin: &str, target: &str, to: &str) -> Option<std::collections::BTreeSet<String>> {
-    let owner_agent = |n: &str| n.trim().eq_ignore_ascii_case(OWNER_AGENT);
-    if owner_agent(origin) || owner_agent(target) || owner_agent(&sanitize_session_name(to)) {
-        return None;
-    }
-    let (caller, theirs) = (lane_groups(origin), lane_groups(target));
-    if !caller.contains(LEADS_GROUP) || theirs.contains(LEADS_GROUP) {
-        return None;
-    }
-    let shared: std::collections::BTreeSet<String> =
-        caller.intersection(&theirs).filter(|g| *g != LEADS_GROUP).cloned().collect();
-    (!shared.is_empty()).then_some(shared)
-}
-
-/// Whether `to` (sanitized) ends in `-lead`: a lead-looking name.
+/// Whether `to` (sanitized) ends in `-lead`: a lead-looking name
+/// (ai-config #205 N2; a lead may not give one, see `delegation::decide_lead`).
 pub(crate) fn is_lead_suffixed(to: &str) -> bool {
     sanitize_session_name(to).to_ascii_lowercase().ends_with("-lead")
-}
-
-/// The new name a config PATCH body asks for when renaming is ALL it does:
-/// an object whose only key is a string `rename`. Anything else is `None`.
-pub(crate) fn config_rename_only(body: &Value) -> Option<&str> {
-    let obj = body.as_object()?;
-    if obj.len() != 1 {
-        return None;
-    }
-    obj.get("rename")?.as_str()
-}
-
-/// The new name `POST .../rename` reads: `name`, else `rename`; empty if neither.
-fn rename_verb_target(body: &Value) -> &str {
-    ["name", "rename"]
-        .iter()
-        .find_map(|k| body.get(*k).and_then(Value::as_str).filter(|s| !s.is_empty()))
-        .unwrap_or("")
 }
 
 /// The group whose members may create workers (Max, 2026-10-16: "Only leads
@@ -33985,6 +33967,9 @@ pub(crate) struct CreateRequest<'a> {
     /// Something only the owner may grant at create: the chat worker type
     /// (it speaks for the owner) or a store `group` id.
     pub owner_only: Option<&'static str>,
+    /// Every other setting the create writes, classified by the delegation
+    /// table (`create:<field>`, `row:<field>`, `env:<KEY>`; design review B3).
+    pub settings: Vec<String>,
 }
 
 /// THE create rule, for every path that makes a worker: session create, store
@@ -34024,28 +34009,28 @@ pub(crate) fn worker_create_refusal_body(headers: &HeaderMap, req: &CreateReques
     let adds_no_group = req.owner_only.is_none()
         && req.tags.iter().map(|t| norm_label(t)).filter(|t| !t.is_empty()).all(|t| caller.contains(&t));
     if req.name == Some(origin.as_str()) && adds_no_group && env_path(&origin).exists() {
+        // Self-registration writes nothing new about groups, but its settings
+        // (a row's environment, permissions) still go through the table as
+        // settings on itself (review B4): no early return before them.
+        if !req.settings.is_empty() {
+            let keys: Vec<String> = req.settings.iter().map(|k| k.strip_prefix("create:").map(str::to_string).unwrap_or_else(|| k.clone())).collect();
+            if let Some(body) = super::delegation::refusal_value(headers, &super::delegation::Target::Worker(origin.clone()),
+                &super::delegation::Action::SetConfig { keys }) {
+                return Some(body);
+            }
+        }
         tracing::info!(worker = %origin, verdict = "worker_self_registration", measured = true, n_considered = 1,
             "a worker registered its own existing session; not a worker creation");
         return None;
     }
-    if !caller.contains(LEADS_GROUP) {
-        tracing::warn!(worker = %origin, verdict = "worker_create_requires_lead", measured = true, n_considered = 1,
-            "a worker outside the leads group tried to create a worker");
-        return Some(json!({"ok": false, "code": "worker_create_requires_lead",
-            "error": format!("Only leads can create workers; '{origin}' is not in the '{LEADS_GROUP}' group.")}));
+    // The create rule is a delegation-table row (ai-config #160): only a lead
+    // (CC_ORCHESTRATOR=1 and `leads`), only with its own team tag.
+    if let Some(name) = req.name.filter(|n| super::delegation::reserved_name(n)) {
+        return Some(super::delegation::refusal_body("reserved_name",
+            &format!("'{name}' is a reserved identity; only the owner may give a worker that name")));
     }
-    let team: std::collections::BTreeSet<String> = caller.iter().filter(|g| *g != LEADS_GROUP).cloned().collect();
-    let outside: Vec<String> = req.tags.iter().map(|t| norm_label(t)).filter(|t| !t.is_empty() && !team.contains(t)).collect();
-    if outside.is_empty() && req.owner_only.is_none() { return None; }
-    tracing::warn!(worker = %origin, ?outside, owner_only = req.owner_only.unwrap_or(""), ?team,
-        verdict = "worker_create_tags_outside_team", measured = true, n_considered = 1,
-        "a lead tried to create a worker outside its own team");
-    let what = match req.owner_only {
-        Some(o) => format!("{o} is the owner's to grant"),
-        None => format!("tags {outside:?} are outside the lead's team {team:?} ('{LEADS_GROUP}' is the owner's to grant)"),
-    };
-    Some(json!({"ok": false, "code": "worker_create_tags_outside_team",
-        "error": format!("A lead may create workers only inside its own team: {what}."), "team": team}))
+    super::delegation::refusal_value(headers, &super::delegation::Target::NewWorker,
+        &super::delegation::Action::CreateWorker { tags: req.tags.to_vec(), settings: req.settings.clone(), owner_only: req.owner_only })
 }
 
 /// The groups a create request names, from a `tags` array or a comma string,
@@ -34086,18 +34071,23 @@ pub(crate) fn requests_chat_type(body: &Value) -> bool {
     body.get("worker_type").and_then(Value::as_str).is_some_and(is_chat_type)
 }
 
-/// Whether a config-style body names messaging authority: a `tags` edit of any
-/// shape (clearing counts, as before) or a switch to the chat worker type.
-pub(crate) fn names_messaging_authority(body: &Value) -> bool {
-    body.get("tags").is_some() || requests_chat_type(body)
-}
 
 /// The create rule for a copy of `source` (duplicate/clone): the copy carries
 /// the source's groups and worker type, so it is a create with those.
-fn copy_refusal(source: &str, headers: &HeaderMap) -> Option<Response> {
+/// Log a delegated copy (duplicate/clone) after it succeeded.
+fn log_copy(state: &AppState, headers: &HeaderMap, source: &str, new_name: &str, verb: &str) {
+    let tags: Vec<String> = lane_groups(source).into_iter().collect();
+    let action = super::delegation::Action::CreateWorker { tags: tags.clone(), settings: super::delegation::copy_settings(source), owner_only: None };
+    if let Some(g) = super::delegation::grant_if_allowed(headers, &super::delegation::Target::NewWorker, &action) {
+        g.commit(state, json!({"source": source}), json!({"verb": verb, "name": new_name, "tags": tags}));
+    }
+}
+
+fn copy_refusal(source: &str, headers: &HeaderMap, new_name: Option<&str>) -> Option<Response> {
     let tags: Vec<String> = lane_groups(source).into_iter().collect();
     let chat = crate::api::worker_exec::worker_type_of(source).as_str() == "chat";
-    worker_create_refusal(headers, &CreateRequest { name: None, tags: &tags, owner_only: chat.then_some("the chat worker type") })
+    worker_create_refusal(headers, &CreateRequest { name: new_name.filter(|n| !n.is_empty()), tags: &tags, owner_only: chat.then_some("the chat worker type"),
+        settings: super::delegation::copy_settings(source) })
 }
 
 /// The first string in a config body (top-level values and string arrays) the
@@ -39878,6 +39868,7 @@ mod tests {
                 submit_verdict: Some("stuck"),
                 client_meta: None,
                 repeat_of: None,
+                process_origin: None,
             },
         )
         .await;
@@ -39933,6 +39924,7 @@ mod tests {
                 submit_verdict: Some("stuck"),
                 client_meta: None,
                 repeat_of: None,
+                process_origin: None,
             },
         )
         .await;
@@ -40068,6 +40060,7 @@ mod tests {
                 submit_verdict: Some("retried"),
                 client_meta: None,
                 repeat_of: None,
+                process_origin: None,
             },
         )
         .await;
@@ -41364,6 +41357,7 @@ mod tests {
                     submit_verdict: Some("confirmed"),
                     client_meta: None,
                     repeat_of: None,
+                    process_origin: None,
                 },
             )
             .await;
@@ -41488,6 +41482,7 @@ mod tests {
                 submit_verdict: Some("confirmed"),
                 client_meta: None,
                 repeat_of: None,
+                process_origin: None,
             },
         )
         .await;
@@ -41516,6 +41511,7 @@ mod tests {
                 submit_verdict: Some("confirmed"),
                 client_meta: None,
                 repeat_of: None,
+                process_origin: None,
             },
         )
         .await;
