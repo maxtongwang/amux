@@ -142,7 +142,7 @@ test('call log: Playwright\'s action log is extracted from the last error, ANSI 
 });
 
 const FIELDS = ['project', 'shard', 'worker', 'elapsed_ms', 'budget_ms', 'selector', 'label', 'phase',
-  'reason', 'rect', 'viewport', 'cover', 'cover_measured', 'screenshot', 'call_log'];
+  'reason', 'interrupted_phase', 'rect', 'viewport', 'cover', 'cover_measured', 'screenshot', 'call_log'];
 
 test('failure: ActionableTimeout carries every diagnostic field and the verdict line is measured', () => {
   const { error, line } = buildNotActionable({
@@ -320,3 +320,37 @@ for (const step of ['enabled', 'stable']) {
   });
 }
 
+// The deadline rule must not swallow real step failures. Playwright errors
+// below carry a call log the verdict has to keep.
+const withLog = (ms, line) => Object.assign(new Error(`Timeout ${ms}ms exceeded.\nCall log:\n  - ${line}\n`), { name: 'TimeoutError' });
+
+test('deadline: a step timing out at its own cap with budget left is a step failure, call log kept', async () => {
+  // isEnabled is capped at 2 s; here it gives up at once with most of a 1 s budget left.
+  const loc = fakeLocator({ isEnabled: async () => { throw withLog(2000, 'waiting for locator(\'#fake\') to be enabled'); } });
+  let err;
+  await assert.rejects(waitForActionableWith(loc, { budgetMs: 1_000 }, quiet), e => { err = e; return e instanceof ActionableTimeout; });
+  assert.equal(err.phase, 'enabled');
+  assert.match(err.details.reason, /^enabled step threw: Timeout 2000ms exceeded/, err.details.reason);
+  assert.deepEqual(err.details.call_log, ["- waiting for locator('#fake') to be enabled"]);
+  assert.equal(err.details.interrupted_phase, null);
+});
+
+test('deadline: a hit-test timing out at the deadline keeps its own call log', async () => {
+  const loc = fakeLocator();
+  loc.click = async opts => { await sleep(opts.timeout); throw withLog(opts.timeout, '<div id="wt-tooltip"> intercepts pointer events'); };
+  let err;
+  await assert.rejects(waitForActionableWith(loc, { budgetMs: BUDGET }, quiet), e => { err = e; return e instanceof ActionableTimeout; });
+  assert.equal(err.phase, 'hit-test');
+  assert.match(err.details.reason, /^trial click did not pass/, 'a covered target, not "budget ended"');
+  assert.deepEqual(err.details.call_log, ['- <div id="wt-tooltip"> intercepts pointer events']);
+});
+
+test('deadline: with no attempt finished, the timed-out step\'s call log stays in the verdict', async () => {
+  const loc = fakeLocator({ isEnabled: async opts => { await sleep(opts.timeout); throw withLog(opts.timeout, 'waiting for locator(\'#fake\')'); } });
+  let err;
+  await assert.rejects(waitForActionableWith(loc, { budgetMs: BUDGET }, quiet), e => { err = e; return e instanceof ActionableTimeout; });
+  assert.equal(err.phase, 'enabled');
+  assert.equal(err.details.reason, 'budget ended during enabled');
+  assert.deepEqual(err.details.call_log, ["- waiting for locator('#fake')"]);
+})
+;
