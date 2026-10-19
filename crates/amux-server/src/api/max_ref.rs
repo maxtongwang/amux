@@ -1,5 +1,5 @@
 // Which Messages rows are the owner's own words: the row-qualification check for typed grant approvals — refs maxtongwang/ai-config#160 (piece b).
-// Phrase matching and `max_ref` citations were replaced by structured grants (api/delegation_grants.rs); this keeps the human-typed verifier.
+// It also verifies cite mode's (ask, reply) citation pair (review B4); grants themselves live in api/delegation_grants.rs.
 //! HUMAN-TYPED. A `cmd_history` row is the owner's own words in exactly two
 //! shapes:
 //! - PANE: `type='user'`, `delivery='pane'`, `origin='pane'`, written only by
@@ -15,15 +15,18 @@
 //! `cmd_history` rows). A relayed text that matches exactly never counts.
 //!
 //! TWO RULES (dev-lead, 2026-10-17), each one function:
-//! - CITATION ([`cite_source_allowed`], cite mode, the default): a widening
-//!   change cites one of Max's rows. It qualifies when it is human-typed, not
-//!   an amux delivery, fresh, within the window of the cited time, and in a
-//!   lane OTHER than the actor's own; in the actor's own lane only a
-//!   non-local Remote owner send counts (a lane can mint its own pane rows
-//!   through `/report`, and a worker reaches Outside or the forwarded Remote
-//!   through `launchctl submit`). Accepted limit (ai-config#136): ANOTHER lane
-//!   can mint a pane row the same way; in cite mode that is mitigated by the
-//!   audit log, the leads feed and one-step undo, not prevented.
+//! - CITATION ([`cite_pair`], cite mode, the default; ruling dev-lead
+//!   2026-10-19, PR #18 review B4): a widening change cites a PAIR. (1) The
+//!   ask: a message the requesting agent sent into a session (a `session` row
+//!   whose origin is the agent) that names the target worker or layer AND
+//!   each setting in plain words. (2) The reply: Max's own FIRST typed row in
+//!   that session after the ask (human-typed, not an amux delivery), within
+//!   [`ASK_REPLY_WINDOW_S`] of it and at most a day old. In the agent's own
+//!   lane only a non-local Remote owner send counts as the reply
+//!   ([`cite_source_allowed`]). Matching is whole words, computed; no model
+//!   judges relevance. Accepted limit (ai-config#136): another lane can mint
+//!   a pane row through its own `/report`; in cite mode that is mitigated by
+//!   the audit log, the leads feed and one-step undo, not prevented.
 //! - APPROVAL ([`approval_source_allowed`], passkey mode): a pending grant is
 //!   approved only by an owner send from a NON-LOCAL Remote peer (the phone or
 //!   another device on the tailnet). A tailscale-serve forward over loopback
@@ -40,10 +43,21 @@ pub(crate) enum MaxRefRefusal {
     NotRemoteOwnerSend,
     /// No citation was given.
     Missing,
-    /// The cited time is too far from the cited row.
-    OutsideWindow,
     /// A citation in the actor's own lane that is not a non-local Remote owner send.
     OwnLane,
+    /// A single quoted row instead of the (ask, reply) pair.
+    PairRequired,
+    AskNotFound,
+    /// The ask row is not a message the requesting agent sent.
+    AskNotFromActor,
+    AskMissingTarget,
+    AskMissingSetting,
+    /// The reply is in a different session from the ask.
+    WrongSession,
+    /// The reply is not Max's first typed message after the ask.
+    ReplyNotFirst,
+    /// The reply came more than [`ASK_REPLY_WINDOW_S`] after the ask.
+    ReplyOutsideWindow,
 }
 
 impl MaxRefRefusal {
@@ -54,14 +68,19 @@ impl MaxRefRefusal {
             Self::Stale => "max_ref_stale",
             Self::NotRemoteOwnerSend => "max_ref_not_remote_owner_send",
             Self::Missing => "cite_missing",
-            Self::OutsideWindow => "max_ref_outside_window",
             Self::OwnLane => "max_ref_own_lane",
+            Self::PairRequired => "cite_pair_required",
+            Self::AskNotFound => "cite_ask_not_found",
+            Self::AskNotFromActor => "cite_ask_not_from_actor",
+            Self::AskMissingTarget => "cite_ask_missing_target",
+            Self::AskMissingSetting => "cite_ask_missing_setting",
+            Self::WrongSession => "cite_reply_wrong_session",
+            Self::ReplyNotFirst => "cite_reply_not_first",
+            Self::ReplyOutsideWindow => "cite_reply_outside_window",
         }
     }
 }
 
-/// |row.ts - cited time| must not exceed this.
-pub(crate) const CITE_WINDOW_S: f64 = 600.0;
 /// now - row.ts must not exceed this.
 pub(crate) const MAX_REF_MAX_AGE_S: f64 = 86_400.0;
 /// Bounds every query; a lane writes a few rows a minute.
@@ -80,6 +99,8 @@ struct Row {
     text: String,
     ts: f64,
     source: Option<HumanSource>,
+    ctype: String,
+    origin: String,
     /// process_origin = remote: a non-local peer (owner proof); never the forwarded verdict.
     remote: bool,
 }
@@ -116,6 +137,8 @@ fn rows(state: &AppState, sql_where: &str, params: &[&dyn rusqlite::ToSql]) -> R
                 ts: r.get::<_, i64>(7)? as f64 / 1000.0,
                 source: human_source(&ctype, &origin, &delivery, &po),
                 remote: po == super::process_identity::REMOTE_DIRECT,
+                ctype,
+                origin,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -191,26 +214,46 @@ fn row_qualifies_at(state: &AppState, row_id: i64, now: f64) -> Result<(), MaxRe
     Ok(())
 }
 
-/// A citation of one of Max's rows: its id, or a session and time (the
-/// nearest qualifying row within [`CITE_WINDOW_S`]).
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]
+/// A citation (ruling, dev-lead 2026-10-19, review B4): the PAIR of
+/// (1) `ask_row_id`, the asking message the requesting agent sent into a
+/// session, naming the target and the setting in plain words, and
+/// (2) `reply_row_id`, Max's own FIRST typed message in that same session
+/// after it, within [`ASK_REPLY_WINDOW_S`]. A single quoted row (`row_id`, or
+/// `session` and `time`) no longer qualifies.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Default)]
 pub(crate) struct Cite {
+    #[serde(default)]
+    pub ask_row_id: Option<i64>,
+    #[serde(default)]
+    pub reply_row_id: Option<i64>,
+    /// The retired single-row forms, kept only to answer them precisely.
     #[serde(default)]
     pub row_id: Option<i64>,
     #[serde(default)]
     pub session: Option<String>,
-    /// Unix seconds.
-    #[serde(default)]
-    pub time: Option<f64>,
 }
 
-/// The row a citation resolved to.
+/// The pair a citation resolved to. `row_id`/`excerpt` are the reply's.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Cited {
     pub row_id: i64,
     pub session: String,
     pub excerpt: String,
+    pub ask_row_id: i64,
+    pub ask_text: String,
+    pub reply_text: String,
 }
+
+/// What the ask must name: the target (any one spelling) and EACH setting
+/// (any one spelling per setting). Built by `delegation::cite_terms`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct CiteTerms {
+    pub target: Vec<String>,
+    pub settings: Vec<Vec<String>>,
+}
+
+/// The reply must come within this long after the ask.
+pub(crate) const ASK_REPLY_WINDOW_S: f64 = 7_200.0;
 
 /// THE citation rule (cite mode): another lane's human row counts; in the
 /// actor's own lane only a non-local Remote owner send.
@@ -219,62 +262,110 @@ pub(crate) fn cite_source_allowed(actor: &str, session: &str, source: HumanSourc
     !own || (source == HumanSource::OwnerSend && remote)
 }
 
-fn qualify_cited(state: &AppState, row: &Row, actor: &str, now: f64) -> Result<(), MaxRefRefusal> {
-    let source = row.source.ok_or(MaxRefRefusal::NotHumanTyped)?;
-    if now - row.ts > MAX_REF_MAX_AGE_S {
-        return Err(MaxRefRefusal::Stale);
+/// Max's own typed row in its lane: human-typed, not an amux delivery.
+fn typed_by_max(state: &AppState, row: &Row) -> Option<HumanSource> {
+    let source = row.source?;
+    (!is_amux_delivery(state, &row.session, row.id, &row.text, row.ts, source)).then_some(source)
+}
+
+/// `name` appears in `text` as a whole name: case-insensitive, and not part
+/// of a longer name (no letter, digit, `-`, `_` or `.` on either side).
+pub(crate) fn names_exactly(text: &str, name: &str) -> bool {
+    let (t, n) = (text.to_lowercase(), name.trim().to_lowercase());
+    if n.is_empty() {
+        return false;
     }
-    if is_amux_delivery(state, &row.session, row.id, &row.text, row.ts, source) {
-        return Err(MaxRefRefusal::NotHumanTyped);
+    let part = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '.');
+    t.match_indices(&n).any(|(i, _)| {
+        let before = t[..i].chars().next_back();
+        let after = t[i + n.len()..].chars().next();
+        !before.is_some_and(part) && !after.is_some_and(part)
+    })
+}
+
+/// Lowercase, `-`/`_`/`:` as spaces, whitespace collapsed.
+fn plain(s: &str) -> String {
+    s.to_lowercase().chars().map(|c| if matches!(c, '-' | '_' | ':') { ' ' } else { c }).collect::<String>()
+        .split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `phrase` appears in `text` as whole words (a plural `s` allowed), with
+/// `-`, `_` and spaces interchangeable: "auto-continue" names auto continue.
+pub(crate) fn names_phrase(text: &str, phrase: &str) -> bool {
+    let (t, p) = (plain(text), plain(phrase));
+    if p.is_empty() {
+        return false;
     }
-    if !cite_source_allowed(actor, &row.session, source, row.remote) {
+    t.match_indices(&p).any(|(i, _)| {
+        let before = t[..i].chars().next_back();
+        let rest = &t[i + p.len()..];
+        let rest = rest.strip_prefix("es").or_else(|| rest.strip_prefix('s')).filter(|r| !r.starts_with(char::is_alphanumeric)).unwrap_or(rest);
+        !before.is_some_and(char::is_alphanumeric) && !rest.starts_with(char::is_alphanumeric)
+    })
+}
+
+/// Resolve and verify a citation pair for `actor` asking for `terms`.
+pub(crate) fn cite_pair(state: &AppState, cite: Option<&Cite>, actor: &str, terms: &CiteTerms) -> Result<Cited, MaxRefRefusal> {
+    cite_pair_at(state, cite, actor, terms, crate::config::now_f64())
+}
+
+fn one(state: &AppState, id: i64) -> Result<Option<Row>, MaxRefRefusal> {
+    rows(state, "id=?1", &[&id]).map(|r| r.into_iter().next()).map_err(|_| MaxRefRefusal::NoSuchRow)
+}
+
+fn cite_pair_at(state: &AppState, cite: Option<&Cite>, actor: &str, terms: &CiteTerms, now: f64) -> Result<Cited, MaxRefRefusal> {
+    let cite = cite.ok_or(MaxRefRefusal::Missing)?;
+    let (Some(ask_id), Some(reply_id)) = (cite.ask_row_id, cite.reply_row_id) else {
+        return Err(if cite.row_id.is_some() || cite.session.is_some() || cite.ask_row_id.is_some() || cite.reply_row_id.is_some() {
+            MaxRefRefusal::PairRequired
+        } else {
+            MaxRefRefusal::Missing
+        });
+    };
+    // (1) The ask: a message the actor itself sent into the session.
+    let ask = one(state, ask_id)?.ok_or(MaxRefRefusal::AskNotFound)?;
+    if ask.ctype != "session" || ask.origin != actor {
+        return Err(MaxRefRefusal::AskNotFromActor);
+    }
+    if !terms.target.iter().any(|n| names_exactly(&ask.text, n)) {
+        return Err(MaxRefRefusal::AskMissingTarget);
+    }
+    if !terms.settings.iter().all(|alts| alts.iter().any(|p| names_phrase(&ask.text, p))) {
+        return Err(MaxRefRefusal::AskMissingSetting);
+    }
+    // (2) The reply: Max's own typed row in the same session.
+    let reply = one(state, reply_id)?.ok_or(MaxRefRefusal::NoSuchRow)?;
+    if reply.session != ask.session {
+        return Err(MaxRefRefusal::WrongSession);
+    }
+    let source = typed_by_max(state, &reply).ok_or(MaxRefRefusal::NotHumanTyped)?;
+    if !cite_source_allowed(actor, &reply.session, source, reply.remote) {
         return Err(MaxRefRefusal::OwnLane);
     }
-    Ok(())
-}
-
-/// Resolve and qualify `cite` for `actor`.
-pub(crate) fn cite_row(state: &AppState, cite: Option<&Cite>, actor: &str) -> Result<Cited, MaxRefRefusal> {
-    cite_row_at(state, cite, actor, crate::config::now_f64())
-}
-
-fn cite_row_at(state: &AppState, cite: Option<&Cite>, actor: &str, now: f64) -> Result<Cited, MaxRefRefusal> {
-    let cite = cite.ok_or(MaxRefRefusal::Missing)?;
-    let cited = |row: Row| Cited { row_id: row.id, session: row.session, excerpt: row.text.chars().take(200).collect() };
-    if let Some(id) = cite.row_id {
-        let row = rows(state, "id=?1", &[&id]).map_err(|_| MaxRefRefusal::NoSuchRow)?.into_iter().next().ok_or(MaxRefRefusal::NoSuchRow)?;
-        if cite.time.is_some_and(|t| (row.ts - t).abs() > CITE_WINDOW_S) {
-            return Err(MaxRefRefusal::OutsideWindow);
-        }
-        qualify_cited(state, &row, actor, now)?;
-        return Ok(cited(row));
+    if now - reply.ts > MAX_REF_MAX_AGE_S {
+        return Err(MaxRefRefusal::Stale);
     }
-    let (Some(session), Some(time)) = (cite.session.as_deref().filter(|s| !s.trim().is_empty()), cite.time.filter(|t| t.is_finite())) else {
-        return Err(MaxRefRefusal::Missing);
-    };
-    let near = rows(state, "session=?1 AND ts BETWEEN ?2 AND ?3", &[&session, &ms(time - CITE_WINDOW_S), &ms(time + CITE_WINDOW_S)])
-        .map_err(|_| MaxRefRefusal::NoSuchRow)?;
-    if near.is_empty() {
-        return Err(MaxRefRefusal::NoSuchRow);
+    if reply.id <= ask.id || reply.ts < ask.ts {
+        return Err(MaxRefRefusal::ReplyNotFirst);
     }
-    let mut best: Option<(Row, f64)> = None;
-    let mut first_err = MaxRefRefusal::NotHumanTyped;
-    for row in near {
-        match qualify_cited(state, &row, actor, now) {
-            Ok(()) => {
-                let d = (row.ts - time).abs();
-                if best.as_ref().is_none_or(|(_, bd)| d < *bd) {
-                    best = Some((row, d));
-                }
-            }
-            Err(e) => {
-                if first_err == MaxRefRefusal::NotHumanTyped && e != MaxRefRefusal::NotHumanTyped {
-                    first_err = e;
-                }
-            }
-        }
+    if reply.ts - ask.ts > ASK_REPLY_WINDOW_S {
+        return Err(MaxRefRefusal::ReplyOutsideWindow);
     }
-    best.map(|(r, _)| cited(r)).ok_or(first_err)
+    // FIRST: no typed row of Max's sits between the ask and the reply. A
+    // bounded read that comes back full cannot prove that, so it refuses.
+    let between = rows(state, "session=?1 AND id>?2 AND id<?3 ORDER BY id", &[&ask.session, &ask.id, &reply.id])
+        .map_err(|_| MaxRefRefusal::ReplyNotFirst)?;
+    if between.len() as i64 >= ROW_LIMIT || between.iter().any(|r| typed_by_max(state, r).is_some()) {
+        return Err(MaxRefRefusal::ReplyNotFirst);
+    }
+    Ok(Cited {
+        row_id: reply.id,
+        session: reply.session,
+        excerpt: reply.text.chars().take(200).collect(),
+        ask_row_id: ask.id,
+        ask_text: ask.text.chars().take(2000).collect(),
+        reply_text: reply.text.chars().take(2000).collect(),
+    })
 }
 
 #[cfg(test)]
@@ -415,6 +506,11 @@ mod tests {
             (MaxRefRefusal::NotHumanTyped, "max_ref_not_human_typed"),
             (MaxRefRefusal::Stale, "max_ref_stale"),
             (MaxRefRefusal::NotRemoteOwnerSend, "max_ref_not_remote_owner_send"),
+            (MaxRefRefusal::PairRequired, "cite_pair_required"),
+            (MaxRefRefusal::AskMissingTarget, "cite_ask_missing_target"),
+            (MaxRefRefusal::AskMissingSetting, "cite_ask_missing_setting"),
+            (MaxRefRefusal::ReplyNotFirst, "cite_reply_not_first"),
+            (MaxRefRefusal::ReplyOutsideWindow, "cite_reply_outside_window"),
         ] {
             assert_eq!(r.code(), c);
         }
@@ -433,44 +529,146 @@ mod tests {
         assert_eq!(row_qualifies_at(&st, id, now), Err(MaxRefRefusal::NotRemoteOwnerSend));
     }
 
-    fn cite_id(id: i64) -> Cite {
-        Cite { row_id: Some(id), session: None, time: None }
+    const DESK: &str = "test-desk";
+    const ACTOR: &str = "test-actor";
+    const YOLO_ASK: &str = "Max, may I turn on yolo for test-alpha? Reply yes or no.";
+
+    fn terms() -> CiteTerms {
+        CiteTerms { target: vec!["test-alpha".into()], settings: vec![vec!["yolo".into(), "CC_FLAGS".into()]] }
+    }
+
+    /// The ask: a message `from` sent into `session` (a peer send's row shape).
+    fn ask(st: &AppState, session: &str, from: &str, text: &str, ts: f64) -> i64 {
+        put(st, R(session, text, "session", from, "direct", None, ts))
+    }
+
+    fn pair(a: i64, r: i64) -> Cite {
+        Cite { ask_row_id: Some(a), reply_row_id: Some(r), ..Default::default() }
+    }
+
+    fn check(st: &AppState, c: &Cite) -> Result<Cited, MaxRefRefusal> {
+        cite_pair_at(st, Some(c), ACTOR, &terms(), NOW)
+    }
+
+    /// Review B4 ruling: the ask names target and setting, the reply is Max's
+    /// first typed message after it in that session, within 2 hours.
+    #[test]
+    fn a_correct_pair_passes_and_carries_both_texts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let a = ask(&st, DESK, ACTOR, YOLO_ASK, NOW - 600.0);
+        let r = put(&st, pane(DESK, "yes", NOW - 500.0));
+        let got = check(&st, &pair(a, r)).unwrap();
+        assert_eq!((got.row_id, got.ask_row_id, got.session.as_str()), (r, a, DESK));
+        assert_eq!((got.ask_text.as_str(), got.reply_text.as_str()), (YOLO_ASK, "yes"));
+        // An owner send from the Mac counts as Max's typed reply too.
+        let a2 = ask(&st, "test-desk2", ACTOR, "turn on CC_FLAGS for test-alpha?", NOW - 100.0);
+        let r2 = put(&st, R("test-desk2", "go ahead", "user", "", "direct", Some("outside"), NOW - 50.0));
+        assert!(check(&st, &pair(a2, r2)).is_ok());
     }
 
     #[test]
-    fn a_citation_of_another_lanes_typed_row_qualifies() {
+    fn an_ask_missing_the_target_or_the_setting_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let st = state(tmp.path());
-        let p = put(&st, pane("test-desk", "make test-alpha a lead", NOW - 30.0));
-        let got = cite_row_at(&st, Some(&cite_id(p)), "test-actor", NOW).unwrap();
-        assert_eq!((got.row_id, got.session.as_str()), (p, "test-desk"));
-        // By session and time: the nearest qualifying row in the window.
-        let by_time = Cite { row_id: None, session: Some("test-desk".into()), time: Some(NOW) };
-        assert_eq!(cite_row_at(&st, Some(&by_time), "test-actor", NOW).unwrap().row_id, p);
-        let mac = put(&st, R("test-mac", ASK, "user", "", "direct", Some("outside"), NOW));
-        assert!(cite_row_at(&st, Some(&cite_id(mac)), "test-actor", NOW).is_ok(), "another lane's Outside send");
+        for (i, (text, want)) in [
+            ("Max, may I turn on yolo for test-beta?", MaxRefRefusal::AskMissingTarget),
+            ("Max, may I turn on yolo for test-alpha2?", MaxRefRefusal::AskMissingTarget),
+            ("Max, may I change test-alpha's settings?", MaxRefRefusal::AskMissingSetting),
+            ("Max, may I turn on yolomode for test-alpha?", MaxRefRefusal::AskMissingSetting),
+        ].into_iter().enumerate() {
+            let lane = format!("test-lane-{i}");
+            let a = ask(&st, &lane, ACTOR, text, NOW - 60.0);
+            let r = put(&st, pane(&lane, "yes", NOW - 30.0));
+            assert_eq!(check(&st, &pair(a, r)).map(|_| ()), Err(want), "{text}");
+        }
     }
 
     #[test]
-    fn own_lane_delivered_stale_or_missing_citations_are_refused() {
+    fn an_owner_reply_that_is_not_the_first_after_the_ask_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let st = state(tmp.path());
-        assert_eq!(cite_row_at(&st, None, "test-actor", NOW), Err(MaxRefRefusal::Missing));
-        let own = put(&st, pane("test-actor", ASK, NOW));
-        assert_eq!(cite_row_at(&st, Some(&cite_id(own)), "test-actor", NOW), Err(MaxRefRefusal::OwnLane), "own-lane pane row");
-        let own_out = put(&st, R("test-actor", "amux x outside", "user", "", "direct", Some("outside"), NOW));
-        assert_eq!(cite_row_at(&st, Some(&cite_id(own_out)), "test-actor", NOW), Err(MaxRefRefusal::OwnLane), "own-lane Outside");
-        let own_fwd = put(&st, R("test-actor", "amux x forwarded", "user", "", "direct", Some("remote-forwarded"), NOW));
-        assert_eq!(cite_row_at(&st, Some(&cite_id(own_fwd)), "test-actor", NOW), Err(MaxRefRefusal::OwnLane), "own-lane forwarded Remote");
-        let own_remote = put(&st, R("test-actor", "amux x remote", "user", "", "direct", Some("remote"), NOW));
-        assert!(cite_row_at(&st, Some(&cite_id(own_remote)), "test-actor", NOW).is_ok(), "own-lane non-local Remote");
-        let stamped = put(&st, pane("test-desk", &format!("[amux-origin: test-peer] {ASK}"), NOW));
-        assert_eq!(cite_row_at(&st, Some(&cite_id(stamped)), "test-actor", NOW), Err(MaxRefRefusal::NotHumanTyped), "delivered");
-        let old = put(&st, pane("test-desk2", ASK, NOW - MAX_REF_MAX_AGE_S - 1.0));
-        assert_eq!(cite_row_at(&st, Some(&cite_id(old)), "test-actor", NOW), Err(MaxRefRefusal::Stale));
-        let far = Cite { row_id: Some(old), session: None, time: Some(NOW) };
-        assert_eq!(cite_row_at(&st, Some(&far), "test-actor", NOW), Err(MaxRefRefusal::OutsideWindow));
-        assert_eq!(cite_row_at(&st, Some(&cite_id(999_999)), "test-actor", NOW), Err(MaxRefRefusal::NoSuchRow));
+        let a = ask(&st, DESK, ACTOR, YOLO_ASK, NOW - 600.0);
+        let first = put(&st, pane(DESK, "one sec", NOW - 500.0));
+        let later = put(&st, pane(DESK, "ok", NOW - 400.0));
+        assert_eq!(check(&st, &pair(a, later)).map(|_| ()), Err(MaxRefRefusal::ReplyNotFirst));
+        assert!(check(&st, &pair(a, first)).is_ok(), "the first typed reply is the one that counts");
+        // A reply BEFORE the ask is not an answer to it.
+        let early = put(&st, pane("test-desk3", "yes", NOW - 900.0));
+        let a3 = ask(&st, "test-desk3", ACTOR, YOLO_ASK, NOW - 800.0);
+        assert_eq!(check(&st, &pair(a3, early)).map(|_| ()), Err(MaxRefRefusal::ReplyNotFirst));
+        // An amux delivery between them is not a reply of Max's.
+        let a4 = ask(&st, "test-desk4", ACTOR, YOLO_ASK, NOW - 300.0);
+        put(&st, pane("test-desk4", "[amux-origin: test-peer] status update", NOW - 200.0));
+        let r4 = put(&st, pane("test-desk4", "yes", NOW - 100.0));
+        assert!(check(&st, &pair(a4, r4)).is_ok());
+    }
+
+    #[test]
+    fn a_reply_outside_the_two_hour_window_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let a = ask(&st, DESK, ACTOR, YOLO_ASK, NOW - ASK_REPLY_WINDOW_S - 120.0);
+        let r = put(&st, pane(DESK, "yes", NOW - 60.0));
+        assert_eq!(check(&st, &pair(a, r)).map(|_| ()), Err(MaxRefRefusal::ReplyOutsideWindow));
+        // An old "ok" stays stale whatever it answers.
+        let a2 = ask(&st, "test-desk2", ACTOR, YOLO_ASK, NOW - MAX_REF_MAX_AGE_S - 200.0);
+        let r2 = put(&st, pane("test-desk2", "ok", NOW - MAX_REF_MAX_AGE_S - 100.0));
+        assert_eq!(check(&st, &pair(a2, r2)).map(|_| ()), Err(MaxRefRefusal::Stale));
+    }
+
+    #[test]
+    fn a_citation_of_an_unrelated_message_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let lunch = put(&st, pane(DESK, "what time is lunch?", NOW - 60.0));
+        // The retired single-row forms.
+        for c in [Cite { row_id: Some(lunch), ..Default::default() }, Cite { session: Some(DESK.into()), ..Default::default() },
+            Cite { reply_row_id: Some(lunch), ..Default::default() }] {
+            assert_eq!(check(&st, &c).map(|_| ()), Err(MaxRefRefusal::PairRequired), "{c:?}");
+        }
+        assert_eq!(cite_pair_at(&st, None, ACTOR, &terms(), NOW).map(|_| ()), Err(MaxRefRefusal::Missing));
+        // Max's own row, or another agent's message, is not the actor's ask.
+        let r = put(&st, pane(DESK, "yes", NOW - 30.0));
+        assert_eq!(check(&st, &pair(lunch, r)).map(|_| ()), Err(MaxRefRefusal::AskNotFromActor));
+        let peer = ask(&st, DESK, "test-peer", YOLO_ASK, NOW - 50.0);
+        assert_eq!(check(&st, &pair(peer, r)).map(|_| ()), Err(MaxRefRefusal::AskNotFromActor));
+        // An unrelated ask of the actor's.
+        let chat = ask(&st, "test-desk5", ACTOR, "lunch at noon?", NOW - 50.0);
+        let r5 = put(&st, pane("test-desk5", "yes", NOW - 30.0));
+        assert_eq!(check(&st, &pair(chat, r5)).map(|_| ()), Err(MaxRefRefusal::AskMissingTarget));
+        assert_eq!(check(&st, &pair(999_998, r5)).map(|_| ()), Err(MaxRefRefusal::AskNotFound));
+    }
+
+    #[test]
+    fn the_reply_must_be_maxs_typed_row_in_the_asks_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let a = ask(&st, DESK, ACTOR, YOLO_ASK, NOW - 600.0);
+        let elsewhere = put(&st, pane("test-other", "yes", NOW - 500.0));
+        assert_eq!(check(&st, &pair(a, elsewhere)).map(|_| ()), Err(MaxRefRefusal::WrongSession));
+        let stamped = put(&st, pane(DESK, "[amux-origin: test-peer] yes", NOW - 400.0));
+        assert_eq!(check(&st, &pair(a, stamped)).map(|_| ()), Err(MaxRefRefusal::NotHumanTyped));
+        let peer_row = put(&st, R(DESK, "yes", "session", "test-peer", "direct", None, NOW - 300.0));
+        assert_eq!(check(&st, &pair(a, peer_row)).map(|_| ()), Err(MaxRefRefusal::NotHumanTyped));
+        assert_eq!(check(&st, &pair(a, 999_997)).map(|_| ()), Err(MaxRefRefusal::NoSuchRow));
+        // In the actor's own lane only a non-local Remote owner send counts.
+        let own = ask(&st, ACTOR, ACTOR, YOLO_ASK, NOW - 300.0);
+        let own_pane = put(&st, pane(ACTOR, "yes", NOW - 200.0));
+        assert_eq!(check(&st, &pair(own, own_pane)).map(|_| ()), Err(MaxRefRefusal::OwnLane));
+        let own2 = ask(&st, ACTOR, ACTOR, YOLO_ASK, NOW - 150.0);
+        let own_remote = put(&st, remote(ACTOR, "yes", NOW - 100.0));
+        assert!(check(&st, &pair(own2, own_remote)).is_ok(), "own lane, non-local Remote");
+    }
+
+    #[test]
+    fn names_and_phrases_match_whole_words_only() {
+        assert!(names_exactly("for Test-Alpha?", "test-alpha"));
+        assert!(!names_exactly("for test-alpha2", "test-alpha") && !names_exactly("for xtest-alpha", "test-alpha"));
+        assert!(!names_exactly("for test-alpha.b", "test-alpha"));
+        assert!(names_phrase("turn on auto-continue", "auto continue") && names_phrase("set CC_FLAGS", "cc_flags"));
+        assert!(names_phrase("the gates", "gate") && names_phrase("two connectors", "connector"));
+        assert!(!names_phrase("yolomode", "yolo") && !names_phrase("leader", "lead"));
     }
 
     #[test]

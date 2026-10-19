@@ -7094,10 +7094,10 @@ pub(crate) struct DeliveryMeta<'a> {
     /// None for everything that is not a detected repeat.
     pub repeat_of: Option<i64>,
     /// The process-attribution verdict of the request that sent an OWNER
-    /// message (`outside` or `remote`, from `process_identity`), migration
-    /// 0125. `max_ref::row_qualifies` accepts an owner send as the owner's own words only on
-    /// one of those two. None on every other row: peer, member, schedule,
-    /// pane, and every row written before 0125.
+    /// message (`outside`, `remote` or `remote-forwarded`, from
+    /// `process_identity`), migration 0124. `max_ref` accepts an owner send as
+    /// the owner's own words only with one of those. None on every other row:
+    /// peer, member, schedule, pane, and every row written before 0124.
     pub process_origin: Option<&'a str>,
 }
 
@@ -32676,9 +32676,7 @@ async fn patch_dispatch(state: &AppState, name: &str, action: &str, body: &Value
 /// operations table, `create`, and the modifiers handled inside a branch.
 #[cfg(test)]
 pub(crate) fn config_patch_fields_for_delegation() -> Vec<&'static str> {
-    let mut v = config_patch_operations_keys();
-    v.extend(["force", "toggle_auto_continue"]);
-    v
+    config_patch_operations_keys()
 }
 
 /// The provider/model/effort/yolo restart choreography shared by four config
@@ -34158,22 +34156,28 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
 /// Every key a config PATCH reads, flattened from [`config_patch_operations`]'s
 /// table plus `create` (sent with `branch`).
 fn config_patch_operations_keys() -> Vec<&'static str> {
-    let mut v: Vec<&'static str> = CONFIG_PATCH_OPS.iter().flat_map(|k| k.iter().copied()).collect();
-    v.push("create");
-    v
+    CONFIG_PATCH_OPS.iter().flat_map(|k| k.iter().copied()).collect()
 }
 
+/// EVERY key [`config_patch_with_liveness`] reads, grouped by the branch that
+/// reads it (review B1: `toggle_auto_continue` and the six board-automation
+/// fields were missing, so a body pairing one of them with `tags` passed the
+/// guard and the earlier branch applied it). `config_patch_ops_cover_every_key_the_handler_reads`
+/// scans the handler's source, so a new `body.get` without a row fails.
 const CONFIG_PATCH_OPS: &[&[&str]] = &[
     &["worktree_verify"], &["worktree_base"], &["rename"], &["worker_type"],
-    &["provider"], &["model", "effort"], &["dir"], &["task_summary"], &["desc"],
-    &["toggle_pin"], &["isolated"], &["toggle_yolo"], &["external_email_allowed"],
-    &["send_allow", "spans_groups"], &["worktree_profile"], &["branch"], &["tags"],
+    &["provider"], &["model", "effort", "force"], &["dir"], &["task_summary"], &["desc"],
+    &["toggle_pin"], &["isolated"], &["toggle_yolo", "toggle_auto_continue"],
+    &["auto_drain_backlog"], &["board_auto_pickup"], &["board_auto_continue"], &["board_standing_orders"],
+    &["board_decompose"], &["board_force_adherence"], &["external_email_allowed"],
+    &["send_allow", "spans_groups"], &["worktree_profile"], &["branch", "create"], &["tags"],
     &["mcp"], &["new_conversation", "restart"],
 ];
 
 /// The settings a config PATCH body names. Keys handled together by one
-/// branch count as one setting: model with effort, send_allow with
-/// spans_groups, new_conversation with restart.
+/// branch count as one setting: model with effort and force, toggle_yolo with
+/// toggle_auto_continue, send_allow with spans_groups, branch with create,
+/// new_conversation with restart.
 fn config_patch_operations(body: &Value) -> Vec<String> {
     CONFIG_PATCH_OPS.iter()
         .filter(|keys| keys.iter().any(|k| body.get(*k).is_some()))

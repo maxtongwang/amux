@@ -1,12 +1,11 @@
 // Structured grants: the audit unit for every widening change mrpopo makes — cite-and-apply by default, passkey-approved when the owner sets it — refs maxtongwang/ai-config#160.
-// Replaces max_ref phrase matching (dev-lead, 2026-10-17). Max's rule: automation is not traded for security; audit, feed and one-step undo are the control.
+// Cite mode verifies an (ask, reply) citation pair (review B4); Max's rule: automation is not traded for security, so audit, feed and one-step undo are the control.
 //! MODES (`AMUX_DELEGATION_APPROVAL`, global; owner-only, in HELD_FOR_MAX):
-//! - `cite` (default): mrpopo submits the change WITH `cite` (a row id, or a
-//!   session and time) pointing at one of Max's typed rows. The row must
-//!   qualify (`max_ref::cite_row`: human-typed, not an amux delivery, fresh,
-//!   in the window, in a lane other than mrpopo's own unless it is a
-//!   non-local Remote owner send). The server records a grant (code, exact
-//!   change, cited row and excerpt, actor) and the change APPLIES at once.
+//! - `cite` (default): mrpopo submits the change WITH `cite`
+//!   `{ask_row_id, reply_row_id}`: its own message into a session naming the
+//!   target and the setting, and Max's first typed reply there within 2 hours
+//!   (`max_ref::cite_pair`, ruling of review B4). The server records a grant
+//!   (code, exact change, both texts, actor) and the change APPLIES at once.
 //! - `passkey`: the change is stored as a PENDING grant (202 with the code and
 //!   the exact sentence) and applies only with an approval proof
 //!   ([`approval_proof_ok`], the one extension point a passkey follow-up
@@ -23,7 +22,10 @@
 //!
 //! UNDO. `POST /api/delegation/grants/<code>/undo` (the owner, or mrpopo)
 //! restores the stored before-state when nothing changed since; otherwise it
-//! refuses and names what changed. A worker that is running keeps its
+//! refuses and names what changed. Every store a grant kind writes is in the
+//! snapshot (env files, rules/memory text, and whole rows of [`TABLES`]);
+//! table rows come back by UPDATE of the changed columns. An undo with
+//! nothing to restore refuses (`grant_undo_nothing_restorable`). A worker that is running keeps its
 //! process until its next restart; the files are restored exactly.
 //!
 //! ACCEPTED LIMIT (ai-config#136): another lane's process can mint a pane row
@@ -100,13 +102,74 @@ fn process_origin(headers: &HeaderMap) -> &str {
     headers.get(super::process_identity::PROCESS_ORIGIN_HEADER).and_then(|v| v.to_str().ok()).unwrap_or("")
 }
 
-/// The files a delegated config change can write, as they read now:
-/// env files key by key, rules/memory text whole.
+/// The state a delegated config change can write, as it reads now: env files
+/// key by key, rules/memory text whole, and every row of each table in
+/// [`TABLES`] with ALL of its columns (review B2: a grant stored in `prefs`
+/// was invisible to undo, and the four-column group_config copy wiped
+/// `execution_policy`/`execution_rev` on restore).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Snapshot {
     env: BTreeMap<String, BTreeMap<String, String>>,
+    /// Each env file's exact bytes, so undo can write a file back as it was.
+    env_raw: BTreeMap<String, String>,
     text: BTreeMap<String, String>,
-    group_config: BTreeMap<String, Value>,
+    /// table -> row key (its key columns as JSON) -> the whole row.
+    tables: BTreeMap<String, BTreeMap<String, Map<String, Value>>>,
+}
+
+/// Every table a grant kind writes, with its key columns:
+/// `prefs` (connectors at every level, skins from an instance apply),
+/// `session_gates` (worker and group gates), `statuses` (global gates, column
+/// labels/positions from an instance apply), `group_config` (group config and
+/// group create). Undo restores rows here by UPDATE of the changed columns.
+const TABLES: &[(&str, &[&str])] = &[
+    ("prefs", &["key"]),
+    ("session_gates", &["session", "status"]),
+    ("statuses", &["id"]),
+    ("group_config", &["name"]),
+];
+
+fn sql_value(v: rusqlite::types::ValueRef<'_>) -> Value {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(i) => json!(i),
+        ValueRef::Real(f) => json!(f),
+        ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
+        ValueRef::Blob(b) => json!({"blob": b.iter().map(|x| format!("{x:02x}")).collect::<String>()}),
+    }
+}
+
+fn to_sql(v: &Value) -> rusqlite::types::Value {
+    use rusqlite::types::Value as S;
+    match v {
+        Value::Null => S::Null,
+        Value::Bool(b) => S::Integer(*b as i64),
+        Value::Number(n) => n.as_i64().map(S::Integer).unwrap_or_else(|| S::Real(n.as_f64().unwrap_or(0.0))),
+        Value::String(t) => S::Text(t.clone()),
+        Value::Object(o) if o.contains_key("blob") => {
+            let h = o["blob"].as_str().unwrap_or("");
+            S::Blob((0..h.len() / 2).filter_map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).ok()).collect())
+        }
+        other => S::Text(other.to_string()),
+    }
+}
+
+/// Every row of `table` as {key -> row}; a missing table reads as empty.
+fn table_rows(conn: &rusqlite::Connection, table: &str, keys: &[&str]) -> BTreeMap<String, Map<String, Value>> {
+    let mut out = BTreeMap::new();
+    let Ok(mut st) = conn.prepare(&format!("SELECT * FROM {table}")) else { return out };
+    let cols: Vec<String> = st.column_names().into_iter().map(str::to_string).collect();
+    let Ok(mut rows) = st.query([]) else { return out };
+    while let Ok(Some(r)) = rows.next() {
+        let mut row = Map::new();
+        for (i, c) in cols.iter().enumerate() {
+            row.insert(c.clone(), r.get_ref(i).map(sql_value).unwrap_or(Value::Null));
+        }
+        let key = Value::Array(keys.iter().map(|k| row.get(*k).cloned().unwrap_or(Value::Null)).collect()).to_string();
+        out.insert(key, row);
+    }
+    out
 }
 
 fn rel(home: &std::path::Path, p: &std::path::Path) -> String {
@@ -129,10 +192,15 @@ fn snapshot(state: &AppState) -> Snapshot {
             let p = e.path();
             if p.extension().and_then(|x| x.to_str()) == Some("env") && p.is_file() {
                 snap.env.insert(rel(&home, &p), config_pairs(&p));
+                if let Ok(t) = std::fs::read_to_string(&p) {
+                    snap.env_raw.insert(rel(&home, &p), t);
+                }
             }
         }
     }
-    for dir in [home.join("memory"), home.join("memory").join("tags")] {
+    // `rules/<w>.md` is derived from group rules; restoring it with the rules
+    // leaves every worker's context exactly as before.
+    for dir in [home.join("memory"), home.join("memory").join("tags"), home.join("rules")] {
         for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             let p = e.path();
             if p.extension().and_then(|x| x.to_str()) == Some("md") && p.is_file() {
@@ -143,14 +211,8 @@ fn snapshot(state: &AppState) -> Snapshot {
         }
     }
     if let Ok(conn) = state.store.read() {
-        if let Ok(mut st) = conn.prepare("SELECT name, department, goal, kpis, human_cost FROM group_config") {
-            let rows = st.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, json!({"department": r.get::<_, String>(1)?, "goal": r.get::<_, String>(2)?,
-                    "kpis": r.get::<_, String>(3)?, "human_cost": r.get::<_, i64>(4)?})))
-            });
-            if let Ok(rows) = rows {
-                snap.group_config.extend(rows.flatten());
-            }
+        for (t, keys) in TABLES {
+            snap.tables.insert(t.to_string(), table_rows(&conn, t, keys));
         }
     }
     snap
@@ -160,6 +222,7 @@ fn snapshot(state: &AppState) -> Snapshot {
 /// config row, each as {before, after}. A secret key is never stored.
 fn diff(before: &Snapshot, after: &Snapshot) -> (Value, bool) {
     let mut env = Map::new();
+    let mut env_raw = Map::new();
     let mut undoable = true;
     let files: std::collections::BTreeSet<&String> = before.env.keys().chain(after.env.keys()).collect();
     let empty = BTreeMap::new();
@@ -177,6 +240,11 @@ fn diff(before: &Snapshot, after: &Snapshot) -> (Value, bool) {
         }
         if !changed.is_empty() {
             env.insert(f.clone(), Value::Object(changed));
+            // The exact bytes, only for a file that holds no secret key: a
+            // grant never stores a secret value (review B2).
+            if !b.keys().chain(a.keys()).any(|k| super::delegation::is_secret_key(k)) {
+                env_raw.insert(f.clone(), json!({"before": before.env_raw.get(f), "after": after.env_raw.get(f)}));
+            }
         }
     }
     let mut text = Map::new();
@@ -184,14 +252,28 @@ fn diff(before: &Snapshot, after: &Snapshot) -> (Value, bool) {
     for f in tfiles.into_iter().filter(|f| before.text.get(*f) != after.text.get(*f)) {
         text.insert(f.clone(), json!({"before": before.text.get(f), "after": after.text.get(f)}));
     }
-    let mut groups = Map::new();
-    let gnames: std::collections::BTreeSet<&String> = before.group_config.keys().chain(after.group_config.keys()).collect();
-    for g in gnames.into_iter().filter(|g| before.group_config.get(*g) != after.group_config.get(*g)) {
-        groups.insert(g.clone(), json!({"before": before.group_config.get(g), "after": after.group_config.get(g)}));
+    let mut tables = Map::new();
+    let empty_t = BTreeMap::new();
+    for (t, _) in TABLES {
+        let (b, a) = (before.tables.get(*t).unwrap_or(&empty_t), after.tables.get(*t).unwrap_or(&empty_t));
+        let rows: std::collections::BTreeSet<&String> = b.keys().chain(a.keys()).collect();
+        let mut changed = Map::new();
+        for k in rows.into_iter().filter(|k| b.get(*k) != a.get(*k)) {
+            // A secret-looking pref key's value is never stored.
+            if super::delegation::is_secret_key(&k.replace(['[', ']', '"'], "")) {
+                undoable = false;
+                changed.insert(k.clone(), json!({"secret": true}));
+            } else {
+                changed.insert(k.clone(), json!({"before": b.get(k), "after": a.get(k)}));
+            }
+        }
+        if !changed.is_empty() {
+            tables.insert(t.to_string(), Value::Object(changed));
+        }
     }
     // Env files the change created: undo removes them again once empty.
     let created: Vec<&String> = after.env.keys().filter(|f| !before.env.contains_key(*f)).collect();
-    (json!({"env": env, "text": text, "group_config": groups, "created": created}), undoable)
+    (json!({"env": env, "env_raw": env_raw, "text": text, "tables": tables, "created": created}), undoable)
 }
 
 /// The mutating request being handled, and the grant it applies (if any).
@@ -305,12 +387,13 @@ fn insert(state: &AppState, g: &NewGrant, c: &Captured) -> Result<(String, Strin
         let text = sentence(&code, g.actor, g.action, g.target, c);
         let row = (code.clone(), g.actor.to_string(), g.class.to_string(), g.action.to_string(), g.target.to_string(),
             c.method.clone(), c.path.clone(), change_body(&c.body).to_string(), text.clone(), g.why.clone(), g.status.to_string(),
-            g.cited.map(|x| x.row_id), g.cited.map(|x| x.excerpt.clone()), mode_str(mode()).to_string());
+            g.cited.map(|x| x.row_id), g.cited.map(|x| x.excerpt.clone()), mode_str(mode()).to_string(),
+            g.cited.map(|x| x.ask_row_id), g.cited.map(|x| x.ask_text.clone()), g.cited.map(|x| x.reply_text.clone()));
         let inserted = state.store.write(move |conn| {
             let n = conn.execute(
-                "INSERT OR IGNORE INTO _amux_delegation_grants (code, actor, class, action, target, method, path, body, sentence, why, created_at, expires_at, status, evidence_row, cited_excerpt, mode) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
-                rusqlite::params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, created, created + GRANT_TTL_S, row.10, row.11, row.12, row.13],
+                "INSERT OR IGNORE INTO _amux_delegation_grants (code, actor, class, action, target, method, path, body, sentence, why, created_at, expires_at, status, evidence_row, cited_excerpt, mode, ask_row, ask_text, reply_text) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                rusqlite::params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, created, created + GRANT_TTL_S, row.10, row.11, row.12, row.13, row.14, row.15, row.16],
             )?;
             Ok(crate::db::WriteOutcome { applied: n == 1, events: vec![] })
         });
@@ -343,7 +426,7 @@ pub(crate) fn begin_cited(state: &AppState, actor: &str, class: &str, action: &s
     if !arm(state, &code) {
         return Err(forbid("grant_unavailable", "the grant could not be armed".into()));
     }
-    tracing::info!(actor, action, target, grant = %code, cited_row = cited.row_id, cited_session = %cited.session,
+    tracing::info!(actor, action, target, grant = %code, cited_row = cited.row_id, ask_row = cited.ask_row_id, cited_session = %cited.session,
         verdict = "delegation_grant_cited", measured = true, n_considered = 1, "a cited widening change is applying as a grant");
     let _ = text;
     Ok(code)
@@ -383,15 +466,19 @@ pub(crate) struct GrantRow {
     pub evidence_row: Option<i64>,
     pub cited_excerpt: Option<String>,
     pub changes: Option<String>,
+    /// The citation pair (0126): the ask's row and both texts.
+    pub ask_row: Option<i64>,
+    pub ask_text: Option<String>,
+    pub reply_text: Option<String>,
 }
 
-const COLS: &str = "code, actor, class, action, target, method, path, body, sentence, status, expires_at, evidence_row, cited_excerpt, changes";
+const COLS: &str = "code, actor, class, action, target, method, path, body, sentence, status, expires_at, evidence_row, cited_excerpt, changes, ask_row, ask_text, reply_text";
 
 fn map_row(r: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
     Ok(GrantRow {
         code: r.get(0)?, actor: r.get(1)?, class: r.get(2)?, action: r.get(3)?, target: r.get(4)?, method: r.get(5)?,
         path: r.get(6)?, body: r.get(7)?, sentence: r.get(8)?, status: r.get(9)?, expires_at: r.get(10)?, evidence_row: r.get(11)?,
-        cited_excerpt: r.get(12)?, changes: r.get(13)?,
+        cited_excerpt: r.get(12)?, changes: r.get(13)?, ask_row: r.get(14)?, ask_text: r.get(15)?, reply_text: r.get(16)?,
     })
 }
 
@@ -450,7 +537,8 @@ fn finalize(state: &AppState, code: &str, before: &Snapshot, status: StatusCode)
         return;
     }
     log_transition(state, code, to, &g.actor, &g.class, &g.target,
-        json!({"sentence": g.sentence, "cited_excerpt": g.cited_excerpt, "status": status.as_u16(), "changes": changes, "undoable": undoable}), None);
+        json!({"sentence": g.sentence, "cited_excerpt": g.cited_excerpt, "ask_text": g.ask_text, "reply_text": g.reply_text,
+            "status": status.as_u16(), "changes": changes, "undoable": undoable}), None);
     tracing::info!(grant = code, actor = %g.actor, status = status.as_u16(), undoable,
         verdict = if to == "applied" { "delegation_grant_applied" } else { "delegation_grant_failed" }, measured = true, n_considered = 1,
         "a grant's change ran");
@@ -618,7 +706,9 @@ async fn deny(State(state): State<AppState>, uri: Uri, headers: HeaderMap, Path(
 
 /// Restore every changed key/file/row of an applied grant, when each still
 /// reads as the grant left it.
-fn restore(state: &AppState, changes: &Value) -> Result<usize, String> {
+/// Returns how many items came back, and whether every env file came back
+/// byte for byte.
+fn restore(state: &AppState, changes: &Value) -> Result<(usize, bool), String> {
     let home = crate::config::amux_home();
     let now_snap = snapshot(state);
     let mut conflicts = Vec::new();
@@ -639,20 +729,42 @@ fn restore(state: &AppState, changes: &Value) -> Result<usize, String> {
             conflicts.push(f.clone());
         }
     }
-    for (g, ba) in changes["group_config"].as_object().into_iter().flatten() {
-        if now_snap.group_config.get(g).cloned().unwrap_or(Value::Null) != ba["after"] {
-            conflicts.push(format!("group_config:{g}"));
+    let empty_t = BTreeMap::new();
+    for (t, rows) in changes["tables"].as_object().into_iter().flatten() {
+        if !TABLES.iter().any(|(n, _)| n == t) {
+            return Err(format!("{t} is not a table undo restores"));
+        }
+        let cur = now_snap.tables.get(t).unwrap_or(&empty_t);
+        for (k, ba) in rows.as_object().into_iter().flatten() {
+            if ba.get("secret").is_some() {
+                return Err(format!("{t}:{k} is a secret value; it was never stored, so this grant cannot be undone"));
+            }
+            if cur.get(k).cloned().map(Value::Object).unwrap_or(Value::Null) != ba["after"] {
+                conflicts.push(format!("{t}:{k}"));
+            }
         }
     }
     if !conflicts.is_empty() {
         return Err(format!("changed since the grant applied: {}; undo by hand", conflicts.join(", ")));
     }
     let mut n = 0usize;
+    let mut exact = true;
     for (f, keys) in changes["env"].as_object().into_iter().flatten() {
         let updates: Vec<(String, Option<String>)> = keys.as_object().into_iter().flatten()
             .map(|(k, ba)| (k.clone(), ba["before"].as_str().map(str::to_string))).collect();
         n += updates.len();
-        super::session_verbs::EnvFile::merge_plain(&home.join(f), &updates).map_err(|e| format!("{f}: {e}"))?;
+        let p = home.join(f);
+        let raw = &changes["env_raw"][f];
+        // Untouched since the grant: write the before bytes back exactly.
+        if raw.is_object() && now_snap.env_raw.get(f).map(String::as_str) == raw["after"].as_str() {
+            match raw["before"].as_str() {
+                Some(t) => super::session_verbs::EnvFile::replace_text(&p, t).map_err(|e| format!("{f}: {e}"))?,
+                None => std::fs::remove_file(&p).map_err(|e| format!("{f}: {e}"))?,
+            }
+            continue;
+        }
+        exact = false;
+        super::session_verbs::EnvFile::merge_plain(&p, &updates).map_err(|e| format!("{f}: {e}"))?;
     }
     for f in changes["created"].as_array().into_iter().flatten().filter_map(Value::as_str) {
         let p = home.join(f);
@@ -668,20 +780,54 @@ fn restore(state: &AppState, changes: &Value) -> Result<usize, String> {
         }
         n += 1;
     }
-    for (g, ba) in changes["group_config"].as_object().into_iter().flatten() {
-        let (g, before) = (g.clone(), ba["before"].clone());
-        state.store.write(move |conn| {
-            conn.execute("DELETE FROM group_config WHERE name=?1", [&g])?;
-            if before.is_object() {
-                conn.execute("INSERT INTO group_config (name, department, goal, kpis, human_cost, updated) VALUES (?1,?2,?3,?4,?5,?6)",
-                    rusqlite::params![g, before["department"].as_str().unwrap_or(""), before["goal"].as_str().unwrap_or(""),
-                        before["kpis"].as_str().unwrap_or("[]"), before["human_cost"].as_i64().unwrap_or(0), chrono::Utc::now().timestamp()])?;
+    let table_changes = changes["tables"].clone();
+    let rows_restored = state.store.write(move |conn| {
+        let mut n = 0usize;
+        for (t, keys) in TABLES {
+            for ba in table_changes[*t].as_object().into_iter().flatten().map(|(_, ba)| ba) {
+                n += restore_row(conn, t, keys, &ba["before"], &ba["after"])?;
             }
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-        }).map_err(|e| e.to_string())?;
-        n += 1;
+        }
+        Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+    }).map_err(|e| e.to_string())?;
+    if rows_restored.applied {
+        n += changes["tables"].as_object().into_iter().flatten().map(|(_, r)| r.as_object().map_or(0, |o| o.len())).sum::<usize>();
     }
-    Ok(n)
+    Ok((n, exact))
+}
+
+/// Put one row back: a row the grant created is deleted, one it deleted is
+/// re-inserted whole, and one it changed gets an UPDATE of exactly the
+/// columns that differ, so a column the grant never touched is never written.
+fn restore_row(conn: &rusqlite::Connection, table: &str, keys: &[&str], before: &Value, after: &Value) -> rusqlite::Result<usize> {
+    let ident = |c: &str| format!("\"{}\"", c.replace('"', "\"\""));
+    let key_of = |row: &Value| -> Vec<rusqlite::types::Value> { keys.iter().map(|k| to_sql(&row[*k])).collect() };
+    let where_keys = |from: usize| keys.iter().enumerate().map(|(i, k)| format!("{}=?{}", ident(k), from + i)).collect::<Vec<_>>().join(" AND ");
+    match (before.as_object(), after.as_object()) {
+        (None, Some(_)) => {
+            let sql = format!("DELETE FROM {table} WHERE {}", where_keys(1));
+            conn.execute(&sql, rusqlite::params_from_iter(key_of(after)))
+        }
+        (Some(b), None) => {
+            let cols: Vec<&String> = b.keys().collect();
+            let sql = format!("INSERT INTO {table} ({}) VALUES ({})", cols.iter().map(|c| ident(c)).collect::<Vec<_>>().join(","),
+                (1..=cols.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(","));
+            conn.execute(&sql, rusqlite::params_from_iter(cols.iter().map(|c| to_sql(&b[*c]))))
+        }
+        (Some(b), Some(a)) => {
+            let changed: Vec<&String> = b.keys().chain(a.keys()).collect::<std::collections::BTreeSet<_>>().into_iter()
+                .filter(|c| b.get(*c) != a.get(*c)).collect();
+            if changed.is_empty() {
+                return Ok(0);
+            }
+            let sets = changed.iter().enumerate().map(|(i, c)| format!("{}=?{}", ident(c), i + 1)).collect::<Vec<_>>().join(", ");
+            let sql = format!("UPDATE {table} SET {sets} WHERE {}", where_keys(changed.len() + 1));
+            let mut params: Vec<rusqlite::types::Value> = changed.iter().map(|c| to_sql(b.get(*c).unwrap_or(&Value::Null))).collect();
+            params.extend(key_of(before));
+            conn.execute(&sql, rusqlite::params_from_iter(params))
+        }
+        (None, None) => Ok(0),
+    }
 }
 
 /// `POST /api/delegation/grants/<code>/undo`: the owner, or mrpopo.
@@ -706,13 +852,26 @@ async fn undo(State(state): State<AppState>, uri: Uri, headers: HeaderMap, Path(
     }
     let changes: Value = g.changes.as_deref().and_then(|c| serde_json::from_str(c).ok()).unwrap_or(Value::Null);
     match restore(&state, &changes) {
-        Ok(n) => {
+        // Review B2: an undo that restored nothing is not an undo. The grant
+        // stays `applied` and the caller hears why, instead of
+        // {undone:true, restored:0} over a change that is still live.
+        Ok((0, _)) => {
+            tracing::warn!(grant = %g.code, verdict = "delegation_grant_undo_nothing_restorable", measured = true, n_considered = 0,
+                "an undo found no recorded before-state to restore; the grant stays applied");
+            (StatusCode::CONFLICT, Json(super::delegation::refusal_body("grant_undo_nothing_restorable", &format!(
+                "grant {} recorded no before-state that undo can restore; it stays applied. Undo it by hand: {}", g.code, g.sentence)))).into_response()
+        }
+        Ok((n, byte_exact)) => {
             if !set_status(&state, &g.code, "applied", "undone", &by, None) {
                 return (StatusCode::CONFLICT, Json(super::delegation::refusal_body("grant_not_applied", "already undone"))).into_response();
             }
+            if !byte_exact {
+                tracing::info!(grant = %g.code, verdict = "delegation_grant_undo_keys_only", measured = true, n_considered = n,
+                    "an env file was restored key by key: it changed elsewhere since, or holds a secret whose bytes a grant never stores");
+            }
             log_transition(&state, &g.code, "undone", &by, if by == "owner" { "owner" } else { "mrpopo" }, &g.target,
-                json!({"sentence": g.sentence, "restored": n, "changes": changes}), None);
-            Json(json!({"ok": true, "grant_code": g.code, "undone": true, "restored": n})).into_response()
+                json!({"sentence": g.sentence, "restored": n, "byte_exact": byte_exact, "changes": changes}), None);
+            Json(json!({"ok": true, "grant_code": g.code, "undone": true, "restored": n, "byte_exact": byte_exact})).into_response()
         }
         Err(why) => (StatusCode::CONFLICT, Json(super::delegation::refusal_body("grant_undo_conflict", &why))).into_response(),
     }
@@ -735,7 +894,7 @@ async fn list(State(state): State<AppState>, uri: Uri, headers: HeaderMap) -> Re
         let status = if g.status == "pending" && now() > g.expires_at { "expired" } else { g.status.as_str() };
         json!({"code": g.code, "actor": g.actor, "class": g.class, "action": g.action, "target": g.target, "sentence": g.sentence,
             "status": status, "expires_at": g.expires_at, "method": g.method, "path": g.path, "cited_row": g.evidence_row,
-            "cited_excerpt": g.cited_excerpt, "body": serde_json::from_str::<Value>(&g.body).unwrap_or(Value::Null)})
+            "cited_excerpt": g.cited_excerpt, "ask_row": g.ask_row, "ask_text": g.ask_text, "reply_text": g.reply_text, "body": serde_json::from_str::<Value>(&g.body).unwrap_or(Value::Null)})
     }).collect();
     Json(json!({"grants": rows, "mode": mode_str(mode()), "measured": true, "n_considered": rows.len()})).into_response()
 }
@@ -854,8 +1013,43 @@ mod tests {
         state.store.read().unwrap().query_row("SELECT code FROM _amux_delegation_grants ORDER BY created_at DESC LIMIT 1", [], |r| r.get(0)).unwrap()
     }
 
-    /// Cite mode (the default): a valid citation of another lane's typed row
-    /// applies the change at once as a grant, logged and fed to the leads, and
+    /// A citation pair (review B4): mrpopo's ask into `session`, then Max's
+    /// reply typed in that session's pane.
+    fn pair(state: &AppState, session: &str, ask_text: &str, reply: &str) -> Value {
+        let ask = put_row(state, session, ask_text, "session", "mrpopo", "direct", None, now() - 60.0);
+        let reply = put_row(state, session, reply, "user", "pane", "pane", None, now() - 30.0);
+        json!({"ask_row_id": ask, "reply_row_id": reply})
+    }
+
+    /// Every row of every table undo restores, and every file under the home
+    /// except the store and the append-only audit log: the before-state.
+    /// (table -> row key -> row, file -> bytes).
+    type WholeState = (BTreeMap<String, BTreeMap<String, Map<String, Value>>>, BTreeMap<String, Vec<u8>>);
+
+    fn whole_state(state: &AppState, dir: &std::path::Path) -> WholeState {
+        let conn = state.store.read().unwrap();
+        let tables = TABLES.iter().map(|(t, k)| (t.to_string(), table_rows(&conn, t, k))).collect();
+        let mut files = BTreeMap::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                let r = rel(dir, &p);
+                if r.starts_with("audit") || r.starts_with("t.db") || r.ends_with(".lock") {
+                    continue;
+                }
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    files.insert(r, std::fs::read(&p).unwrap());
+                }
+            }
+        }
+        (tables, files)
+    }
+
+    /// Cite mode (the default): a valid citation pair applies the change at
+    /// once as a grant, stores BOTH texts, is logged and fed to the leads, and
     /// undo restores the files exactly.
     #[tokio::test]
     async fn cite_mode_applies_at_once_and_undo_restores_exactly() {
@@ -864,18 +1058,21 @@ mod tests {
         let state = test_state(tmp.path());
         let app = super::super::router(state.clone());
         let before = config_pairs(&tmp.path().join("sessions/test-dev-a.env"));
-        let row = pane(&state, "test-desk", "turn on yolo for test-dev-a");
+        let ask = "Max, may I turn on yolo for test-dev-a? It needs to run unattended tonight.";
+        let cite = pair(&state, "test-desk", ask, "yes, go ahead");
         let (st, v, h) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("mrpopo"),
-            json!({"toggle_yolo": true, "cite": {"row_id": row}, "why": "Max asked"}), None).await;
+            json!({"toggle_yolo": true, "cite": cite, "why": "Max asked"}), None).await;
         assert!(st.is_success(), "{st} {v}");
         let code = h.get(GRANT_CODE_HEADER).and_then(|v| v.to_str().ok()).unwrap().to_string();
         let g = load(&state, &code).unwrap();
-        assert_eq!((g.status.as_str(), g.evidence_row), ("applied", Some(row)));
-        assert_eq!(g.cited_excerpt.as_deref(), Some("turn on yolo for test-dev-a"));
+        assert_eq!((g.status.as_str(), g.evidence_row, g.ask_row), ("applied", cite["reply_row_id"].as_i64(), cite["ask_row_id"].as_i64()));
+        assert_eq!(g.cited_excerpt.as_deref(), Some("yes, go ahead"));
+        // Review B4: the grant row stores both texts.
+        assert_eq!((g.ask_text.as_deref(), g.reply_text.as_deref()), (Some(ask), Some("yes, go ahead")));
         assert!(yolo_on(tmp.path()));
         assert_eq!(logged(tmp.path(), "grant:applied"), 1);
         let line = std::fs::read_to_string(super::super::delegation_log::log_path(tmp.path())).unwrap();
-        assert!(line.contains("turn on yolo for test-dev-a"), "the cited excerpt is logged: {line}");
+        assert!(line.contains("yes, go ahead") && line.contains("run unattended tonight"), "both texts are logged: {line}");
         // Undo: a lead may not; mrpopo (or the owner) may; it restores exactly.
         let (st, _, _) = call(&app, "POST", &format!("/api/delegation/grants/{code}/undo"), Some("test-dev-lead"), Value::Null, None).await;
         assert_eq!(st, StatusCode::FORBIDDEN);
@@ -894,8 +1091,8 @@ mod tests {
         let _home = crate::api::settings::test_env::set_home(tmp.path());
         let state = test_state(tmp.path());
         let app = super::super::router(state.clone());
-        let row = pane(&state, "test-desk", "make test-dev-a isolated");
-        let (st, v, h) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("mrpopo"), json!({"isolated": true, "cite": {"row_id": row}}), None).await;
+        let cite = pair(&state, "test-desk", "Max: make test-dev-a isolated?", "yes");
+        let (st, v, h) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("mrpopo"), json!({"isolated": true, "cite": cite}), None).await;
         assert!(st.is_success(), "{st} {v}");
         let code = h.get(GRANT_CODE_HEADER).and_then(|v| v.to_str().ok()).unwrap().to_string();
         super::super::session_verbs::EnvFile::merge_plain(&tmp.path().join("sessions/test-dev-a.env"), &[("CC_ISOLATED".into(), Some("".into()))]).unwrap();
@@ -910,18 +1107,148 @@ mod tests {
         let _home = crate::api::settings::test_env::set_home(tmp.path());
         let state = test_state(tmp.path());
         let app = super::super::router(state.clone());
-        let own = pane(&state, "mrpopo", "turn on yolo for test-dev-a");
-        let stamped = pane(&state, "test-desk", "[amux-origin: test-peer] turn on yolo for test-dev-a");
-        let stale = put_row(&state, "test-desk", "turn on yolo", "user", "pane", "pane", None, now() - 90_000.0);
-        let fwd = put_row(&state, "mrpopo", "turn on yolo", "user", "", "direct", Some("remote-forwarded"), now());
-        for (cite, code) in [(json!(null), "cite_missing"), (json!({"row_id": own}), "max_ref_own_lane"), (json!({"row_id": stamped}), "max_ref_not_human_typed"),
-            (json!({"row_id": stale}), "max_ref_stale"), (json!({"row_id": fwd}), "max_ref_own_lane")] {
+        let ask = "Max, may I turn on yolo for test-dev-a?";
+        let own = pair(&state, "mrpopo", ask, "yes");
+        let desk = |text: &str, reply: &str| pair(&state, &format!("test-desk-{}", text.len() + reply.len()), text, reply);
+        let stamped = desk(ask, "[amux-origin: test-peer] yes");
+        let unrelated = desk("what time is lunch?", "noon");
+        let a = put_row(&state, "test-old", ask, "session", "mrpopo", "direct", None, now() - 90_100.0);
+        let r = put_row(&state, "test-old", "yes", "user", "pane", "pane", None, now() - 90_000.0);
+        let stale = json!({"ask_row_id": a, "reply_row_id": r});
+        let a = put_row(&state, "mrpopo", ask, "session", "mrpopo", "direct", None, now() - 20.0);
+        let r = put_row(&state, "mrpopo", "ok", "user", "", "direct", Some("remote-forwarded"), now() - 10.0);
+        let fwd = json!({"ask_row_id": a, "reply_row_id": r});
+        let lunch = pane(&state, "test-desk", "what time is lunch?");
+        for (cite, code) in [(json!(null), "cite_missing"), (json!({"row_id": lunch}), "cite_pair_required"), (own, "max_ref_own_lane"),
+            (stamped, "max_ref_not_human_typed"), (stale, "max_ref_stale"), (fwd, "max_ref_own_lane"), (unrelated, "cite_ask_missing_target")] {
             let (st, v, _) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("mrpopo"), json!({"toggle_yolo": true, "cite": cite}), None).await;
             assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(code)), "{cite}: {v}");
         }
         assert!(!yolo_on(tmp.path()));
         let n: i64 = state.store.read().unwrap().query_row("SELECT COUNT(*) FROM _amux_delegation_grants", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0, "a refused citation creates no grant");
+    }
+
+    /// Review B2: every grant kind records its before-state and undo puts it
+    /// back byte for byte: env files, rules text (and the derived per-worker
+    /// rules), prefs rows (connectors), session_gates rows (gates), and the
+    /// whole group_config row, execution_policy and execution_rev included.
+    #[tokio::test]
+    async fn every_grant_kind_undoes_to_its_before_state_byte_for_byte() {
+        let kinds: Vec<(&str, &str, &str, Value, &str)> = vec![
+            ("env (yolo)", "PATCH", "/api/sessions/test-dev-a/config", json!({"toggle_yolo": true}), "turn on yolo for test-dev-a"),
+            ("connectors (prefs)", "PUT", "/api/scope", json!({"level": "worker", "name": "test-dev-a", "capability": "connectors",
+                "value": {"gmail": {"enabled": true}}}), "enable the gmail connector for test-dev-a"),
+            ("gates (session_gates)", "PUT", "/api/scope", json!({"level": "worker", "name": "test-dev-a", "capability": "gates",
+                "value": {"review": true}}), "add a review gate for test-dev-a"),
+            ("group gates (session_gates)", "PUT", "/api/scope", json!({"level": "group", "name": "dev", "capability": "gates",
+                "value": {"review": true}}), "add a review gate for dev"),
+            ("group config (group_config)", "PATCH", "/api/groups/dev/config", json!({"department": "eng", "goal": "ship it"}),
+                "set the goal for dev"),
+            ("group rules (text)", "PUT", "/api/scope", json!({"level": "group", "name": "dev", "capability": "rules",
+                "value": "Dev: report blockers first."}), "update the rules for dev"),
+        ];
+        let mut failures = Vec::new();
+        for (name, method, path, body, ask) in kinds {
+            let tmp = tempfile::tempdir().unwrap();
+            let _home = crate::api::settings::test_env::set_home(tmp.path());
+            let state = test_state(tmp.path());
+            state.store.write(|c| {
+                c.execute("INSERT INTO group_config (name, department, goal, kpis, human_cost, updated, execution_policy, execution_rev) \
+                    VALUES ('dev','old','old goal','[]',3,1700000000,'{\"mode\":\"tasks\",\"max_executors\":2}',7)", [])?;
+                c.execute("INSERT INTO prefs (key, value) VALUES ('connectors:worker:test-dev-a', '{\"slack\":{\"enabled\":false}}')", [])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            }).unwrap();
+            let app = super::super::router(state.clone());
+            // Warm the fixture the way a live home already is: one owner env
+            // write (canonical quoting, the worker's minted CC_INCARNATION,
+            // which undo never touches) and one refused worker request (the
+            // identity layer's lazy `renames.version`). The before-state then
+            // differs from the after-state only by what the grant wrote.
+            let (st, v, _) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", None, json!({"desc": "fixture"}), None).await;
+            assert!(st.is_success(), "warm-up: {st} {v}");
+            let (st, _, _) = call(&app, method, path, Some("mrpopo"), body.clone(), None).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{name}: uncited is refused");
+            let before = whole_state(&state, tmp.path());
+            let mut b = body.clone();
+            b["cite"] = pair(&state, "test-desk", &format!("Max, may I {ask}?"), "yes");
+            let (st, v, h) = call(&app, method, path, Some("mrpopo"), b, None).await;
+            let Some(code) = h.get(GRANT_CODE_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string).filter(|_| st.is_success()) else {
+                failures.push(format!("{name}: the grant did not apply: {st} {v}"));
+                continue;
+            };
+            let applied = whole_state(&state, tmp.path());
+            if applied == before {
+                failures.push(format!("{name}: the grant changed nothing, so its undo proves nothing"));
+                continue;
+            }
+            let (st, v, _) = call(&app, "POST", &format!("/api/delegation/grants/{code}/undo"), None, Value::Null, None).await;
+            if !st.is_success() || v["restored"].as_u64().unwrap_or(0) == 0 || v["byte_exact"] != json!(true) {
+                failures.push(format!("{name}: undo answered {st} {v}"));
+                continue;
+            }
+            let after = whole_state(&state, tmp.path());
+            if after.0 != before.0 {
+                failures.push(format!("{name}: table rows differ after undo:\n before {:?}\n after  {:?}", before.0, after.0));
+            }
+            for (f, bytes) in before.1.iter().chain(after.1.iter()) {
+                if before.1.get(f) != after.1.get(f) {
+                    failures.push(format!("{name}: {f} differs after undo: {:?} vs {:?}", before.1.get(f).map(|b| String::from_utf8_lossy(b).into_owned()),
+                        after.1.get(f).map(|b| String::from_utf8_lossy(b).into_owned())));
+                    let _ = bytes;
+                    break;
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{} grant kinds not undone exactly:\n{}", failures.len(), failures.join("\n"));
+    }
+
+    /// Review B2: the table restore covers the kinds mrpopo can no longer
+    /// reach after B3 (instance apply and global gates write `statuses` and
+    /// `prefs` skins) and puts back only the columns that changed.
+    #[test]
+    fn a_table_change_is_restored_by_update_of_the_changed_columns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        state.store.write(|c| {
+            c.execute("INSERT INTO statuses (id, label, position, is_builtin, gate) VALUES ('review-col','Review',5,0,'')", [])?;
+            c.execute("INSERT INTO prefs (key, value) VALUES ('skin:global', '{\"a\":1}')", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let before = snapshot(&state);
+        state.store.write(|c| {
+            c.execute("UPDATE statuses SET label='Renamed', gate='human', gate_custom=1 WHERE id='review-col'", [])?;
+            c.execute("UPDATE prefs SET value='{\"a\":2}' WHERE key='skin:global'", [])?;
+            c.execute("INSERT INTO prefs (key, value) VALUES ('skin:group:dev', '{}')", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let (changes, undoable) = diff(&before, &snapshot(&state));
+        assert!(undoable);
+        assert_eq!(changes["tables"]["prefs"].as_object().map(|o| o.len()), Some(2), "{changes}");
+        assert_eq!(restore(&state, &changes).unwrap().0, 3, "one statuses row and two prefs rows");
+        assert_eq!(snapshot(&state).tables, before.tables, "every table row reads as before");
+        // An empty change restores nothing: undo must refuse, not report success.
+        assert_eq!(restore(&state, &json!({"env": {}, "text": {}, "tables": {}, "created": []})).unwrap().0, 0);
+    }
+
+    /// Review B2: an undo with nothing to restore fails loudly and leaves the
+    /// grant applied, never {undone:true, restored:0}.
+    #[tokio::test]
+    async fn an_undo_with_nothing_restorable_fails_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        state.store.write(|c| {
+            c.execute("INSERT INTO _amux_delegation_grants (code, actor, class, action, target, method, path, body, sentence, created_at, expires_at, status, changes, undoable) \
+                VALUES ('ZZZZ','mrpopo','mrpopo','set_config:scope:connectors','test-dev-a','PUT','/api/scope','{}','amux grant ZZZZ',1,2,'applied', \
+                '{\"env\":{},\"text\":{},\"group_config\":{},\"created\":[]}',1)", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let app = super::super::router(state.clone());
+        let (st, v, _) = call(&app, "POST", "/api/delegation/grants/ZZZZ/undo", None, Value::Null, None).await;
+        assert_eq!((st, v["ok"].clone(), v["code"].clone()), (StatusCode::CONFLICT, json!(false), json!("grant_undo_nothing_restorable")), "{v}");
+        assert_eq!(load(&state, "ZZZZ").unwrap().status, "applied", "the grant is not marked undone");
     }
 
     /// Passkey mode: grants are created PENDING; only the approval proof (a
