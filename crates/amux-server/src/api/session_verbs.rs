@@ -27442,7 +27442,9 @@ async fn post_dispatch(
     // must not differ.
     // Through the delegation table (ai-config #160); `stop` joined these: a
     // worker stops itself, a lead its team, anyone else is refused.
-    if matches!(action, "rename" | "instructions" | "memory" | "stop" | "start" | "reset" | "clear" | "git" | "git-push" | "worktree" | "archive" | "keys") {
+    // git-push is not here: git_push_verb asks the table itself (GitPush), so
+    // the sessions and workers routes cannot differ.
+    if matches!(action, "rename" | "instructions" | "memory" | "stop" | "start" | "reset" | "clear" | "git" | "worktree" | "archive" | "keys") {
         use super::delegation::{authorize, reserved_name_refusal, Action, Target};
         let act = match action {
             "rename" => {
@@ -30506,11 +30508,23 @@ pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Valu
 /// `/api/workers/{id}/git/...` surface (AF-291).
 pub(crate) async fn git_push_verb(state: &AppState, name: &str, headers: &HeaderMap) -> Response {
     // Delivers a server-written push instruction into the pane as owner input,
-    // so it follows the peer-config rule (the owner, the worker itself or its
-    // own Chat tab); a peer asks through `send`, which stamps and gates.
-    if let Some(refusal) = peer_config_refusal(headers, name, "git-push") {
-        return refusal;
+    // so the delegation table's GitPush row decides it: the owner, the worker
+    // itself or its own Chat tab (#19); into another worker it is owner-only,
+    // leads and mrpopo included. A peer asks through `send`, which stamps and
+    // gates. Both routes (sessions and workers) reach the table only here.
+    use super::delegation::{authorize, Action, Target};
+    let grant = match authorize(state, headers, &Target::Worker(name.to_string()), &Action::GitPush, None) {
+        Ok(g) => g,
+        Err(refusal) => return refusal,
+    };
+    let resp = git_push_deliver(state, name).await;
+    if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(state, json!({"name": name}), json!({"updated": "git-push"}));
     }
+    resp
+}
+
+async fn git_push_deliver(state: &AppState, name: &str) -> Response {
     if !is_running(name).await {
         return jresp(
             StatusCode::BAD_REQUEST,
@@ -37574,9 +37588,143 @@ mod tests {
             let body: Value = serde_json::from_slice(&axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap();
             assert_eq!(body["code"], json!("peer_config_owner_only"), "{target}: {body}");
         }
+        // The rule is the delegation table's GitPush row (#18 removed
+        // peer_config_refusal): the same decision the verb asks for.
+        use crate::api::delegation::{refusal_value, Action, Target};
         for allowed in [axum::http::HeaderMap::new(), worker_headers("caller"), worker_headers("caller@chat")] {
-            assert!(peer_config_refusal(&allowed, "caller", "git-push").is_none(), "{allowed:?}");
+            assert!(refusal_value(&allowed, &Target::Worker("caller".into()), &Action::GitPush).is_none(), "{allowed:?}");
         }
+    }
+
+    // ---- the composed #18 + #19 table (dev-lead's round-2 ruling) ------------
+    // Route-level cells, one test each, named table_<actor>_<column>; the
+    // pure decide() cells are in delegation::tests under the same names.
+
+    /// `lanes` plus a verified lead of `alpha` and mrpopo (in `leads` only).
+    fn table_lanes(dir: &std::path::Path) {
+        lanes(dir);
+        let sessions = dir.join("sessions");
+        std::fs::write(sessions.join("review-lead.env"), "CC_TAGS=leads,alpha\nCC_ORCHESTRATOR=1\n").unwrap();
+        std::fs::write(sessions.join("mrpopo.env"), "CC_TAGS=leads\n").unwrap();
+    }
+
+    /// A worker claim with the identity proof the rule-10 layer stamps.
+    fn proven(name: &str) -> axum::http::HeaderMap {
+        let mut h = worker_headers(name);
+        h.insert(crate::api::worker_identity::PROOF_HEADER, name.parse().unwrap());
+        h
+    }
+
+    async fn code_of(r: Response) -> (StatusCode, Value) {
+        let st = r.status();
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        (st, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    /// A refused git-push: the verb answers 403 with the table's code before
+    /// anything reaches the pane.
+    async fn git_push_cell(caller: axum::http::HeaderMap, target: &str) -> (StatusCode, Value) {
+        let (state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        table_lanes(dir.path());
+        code_of(git_push_verb(&state, target, &caller).await).await
+    }
+
+    /// An allowed git-push, read from the decision the verb asks for (the
+    /// verb itself would go on to tmux, which unit tests never touch).
+    fn git_push_allowed(caller: &axum::http::HeaderMap, target: &str) -> bool {
+        let (_state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        table_lanes(dir.path());
+        use crate::api::delegation::{refusal_value, Action, Target};
+        refusal_value(caller, &Target::Worker(target.into()), &Action::GitPush).is_none()
+    }
+
+    #[tokio::test]
+    async fn table_owner_git_push_other() {
+        assert!(git_push_allowed(&axum::http::HeaderMap::new(), "teammate"));
+    }
+
+    #[tokio::test]
+    async fn table_self_git_push_self() {
+        assert!(git_push_allowed(&proven("teammate"), "teammate"));
+    }
+
+    #[tokio::test]
+    async fn table_self_git_push_own_chat_tab() {
+        assert!(git_push_allowed(&worker_headers("teammate@chat"), "teammate"), "its own Chat tab is the worker");
+    }
+
+    #[tokio::test]
+    async fn table_lead_git_push_self() {
+        assert!(git_push_allowed(&proven("review-lead"), "review-lead"));
+    }
+
+    #[tokio::test]
+    async fn table_lead_git_push_other() {
+        let (st, v) = git_push_cell(proven("review-lead"), "teammate").await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("peer_config_owner_only")), "no lead row: {v}");
+    }
+
+    #[tokio::test]
+    async fn table_mrpopo_git_push_other() {
+        let (st, v) = git_push_cell(proven("mrpopo"), "teammate").await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("peer_config_owner_only")), "no mrpopo row: {v}");
+    }
+
+    #[tokio::test]
+    async fn table_mrpopo_git_push_self() {
+        assert!(git_push_allowed(&proven("mrpopo"), "mrpopo"), "mrpopo's own pane");
+    }
+
+    #[tokio::test]
+    async fn table_worker_git_push_other() {
+        let (st, v) = git_push_cell(proven("caller"), "teammate").await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("peer_config_owner_only")), "{v}");
+    }
+
+    /// The send/kickoff column: a `/start` prompt to another worker takes
+    /// send's gate (#19) for every worker class alike; no class widens it.
+    async fn kickoff_cell(caller: axum::http::HeaderMap, target: &str) -> Result<String, (StatusCode, Value)> {
+        let (_state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        table_lanes(dir.path());
+        match start_prompt_for(&caller, target, "do this".into()) {
+            Ok(text) => Ok(text),
+            Err(r) => Err(code_of(*r).await),
+        }
+    }
+
+    #[tokio::test]
+    async fn table_owner_send_kickoff() {
+        assert_eq!(kickoff_cell(axum::http::HeaderMap::new(), "outsider").await.unwrap(), "do this", "owner input, unstamped");
+    }
+
+    #[tokio::test]
+    async fn table_self_send_kickoff() {
+        assert_eq!(kickoff_cell(proven("teammate"), "teammate").await.unwrap(), "do this", "its own input, unstamped");
+    }
+
+    #[tokio::test]
+    async fn table_lead_send_kickoff() {
+        let text = kickoff_cell(proven("review-lead"), "teammate").await.unwrap();
+        assert!(text.starts_with("[amux-origin: review-lead "), "inside its team: stamped: {text}");
+        let (st, v) = kickoff_cell(proven("review-lead"), "outsider").await.unwrap_err();
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "outside its groups: {v}");
+    }
+
+    #[tokio::test]
+    async fn table_mrpopo_send_kickoff() {
+        let (st, v) = kickoff_cell(proven("mrpopo"), "teammate").await.unwrap_err();
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "mrpopo has no send row: {v}");
+    }
+
+    #[tokio::test]
+    async fn table_worker_send_kickoff() {
+        let text = kickoff_cell(proven("caller"), "teammate").await.unwrap();
+        assert!(text.starts_with("[amux-origin: caller "), "{text}");
+        let (st, v) = kickoff_cell(proven("caller"), "outsider").await.unwrap_err();
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "{v}");
     }
 
     /// A queued `/start` prompt from another worker keeps that worker as its
