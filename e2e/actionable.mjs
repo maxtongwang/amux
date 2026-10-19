@@ -290,8 +290,12 @@ export async function waitForActionableWith(target, options, env) {
       // "enabled step threw: Timeout 2ms exceeded" (e2e control 7ca1c0d3).
       const budgetEnded = e?.name === 'TimeoutError' && phase !== 'hit-test' && deadline.remaining() <= BUDGET_END_SLACK_MS;
       if (e instanceof DeadlineExceeded || budgetEnded) {
-        if (!outcome) reason = `budget ended during ${phase}`;
-        else if (outcome.phase !== phase) interrupted = phase;
+        if (!outcome) {
+          reason = `budget ended during ${phase}`;
+          // Nothing finished, so Playwright's own error is the best evidence
+          // of where the step was stuck: keep its call log in the verdict.
+          if (budgetEnded) lastError = e;
+        } else if (outcome.phase !== phase) interrupted = phase;
         break;
       }
       lastError = e; // keep Playwright's own error: its message carries the call log
