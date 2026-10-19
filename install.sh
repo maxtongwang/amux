@@ -339,6 +339,9 @@ for observed_half in pre post; do
   install_hook_from_head "scripts/claude-hooks/observed-edits-${observed_half}.py" \
     "$AMUX_HOME/hooks/observed-edits-${observed_half}.py"
 done
+# Isolated-run endpoint guard loaded by the hooks in $AMUX_HOME/hooks.
+install_hook_from_head "scripts/lib/amux_endpoint.py" "$AMUX_HOME/hooks/amux_endpoint.py" \
+  || warn "scripts/lib/amux_endpoint.py not found; hooks refuse every endpoint under amux-isolated"
 
 # Shared-checkout git guard (AMUX-3033). The PreToolUse Bash hook runs
 # ~/.amux/hooks/git-shared-guard.py on EVERY Bash tool call across the fleet, so

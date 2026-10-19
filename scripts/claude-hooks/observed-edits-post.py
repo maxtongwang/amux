@@ -21,6 +21,18 @@ import sys
 import time
 import urllib.request
 
+# Isolated-run endpoint guard: scripts/lib/amux_endpoint.py, installed beside
+# hook copies. Under AMUX_ISOLATED_RUN=1 a live URL becomes a dead port.
+import os, sys  # noqa: E401
+_AE_HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path[:0] = [p for p in (_AE_HERE, os.path.join(_AE_HERE, "lib"),
+                            os.path.join(_AE_HERE, os.pardir, "lib")) if p not in sys.path]
+try:
+    from amux_endpoint import guard as _endpoint_guard
+except ImportError:  # an install without the shared file: refuse only when isolated
+    def _endpoint_guard(url, client):
+        return "http://127.0.0.1:9" if os.environ.get("AMUX_ISOLATED_RUN") == "1" else url
+
 # Pruned for CORRECTNESS, not for speed (AMUX-3920, mixpeek-cicd's specimen).
 #
 # The speed argument does not survive measurement and I am recording that rather
@@ -383,6 +395,7 @@ def main():
             url = (ep.get("canonical_url") or url).rstrip("/")
     except Exception:
         pass
+    url = _endpoint_guard(url, "observed-edits-post")
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False

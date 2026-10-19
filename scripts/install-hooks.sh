@@ -326,6 +326,9 @@ install -m 0755 "$ROOT/scripts/git-hooks/prepare-commit-msg" "$HOOKS/prepare-com
 install -m 0755 "$ROOT/scripts/git-hooks/pre-push" "$HOOKS/pre-push"
 install -m 0755 "$ROOT/scripts/git-hooks/append-only-push-guard" "$HOOKS/append-only-push-guard"
 install -m 0755 "$ROOT/scripts/git-hooks/post-commit" "$HOOKS/post-commit"
+# The isolated-run endpoint guard the hooks above load from their own directory.
+install -m 0644 "$ROOT/scripts/lib/amux_endpoint.py" "$HOOKS/amux_endpoint.py"
+install -m 0644 "$ROOT/scripts/lib/amux-endpoint.sh" "$HOOKS/amux-endpoint.sh"
 
 # THE FIFTH GUARD, which is not a git hook and had no installer at all (AF-409).
 #
@@ -348,6 +351,7 @@ install -m 0755 "$ROOT/scripts/git-hooks/post-commit" "$HOOKS/post-commit"
 SHARED_GUARD_DEST="${AMUX_SHARED_GUARD_DEST:-$HOME/.amux/hooks/git-shared-guard.py}"
 if [ -d "$(dirname "$SHARED_GUARD_DEST")" ]; then
   install -m 0755 "$ROOT/scripts/git-hooks/git-shared-guard.py" "$SHARED_GUARD_DEST"
+  install -m 0644 "$ROOT/scripts/lib/amux_endpoint.py" "$(dirname "$SHARED_GUARD_DEST")/amux_endpoint.py"
 fi
 
 # THE READ ROUTER, the same shape as the guard above (AMUX-4544). settings.json
@@ -390,6 +394,14 @@ for h in pre-commit amux-staged-guard prepare-commit-msg pre-push post-commit ap
     echo "  ok   $HOOKS/$h matches scripts/git-hooks/$h"
   else
     echo "  FAIL $HOOKS/$h differs from scripts/git-hooks/$h" >&2
+    fail=1
+  fi
+done
+for h in amux_endpoint.py amux-endpoint.sh; do
+  if cmp -s "$ROOT/scripts/lib/$h" "$HOOKS/$h"; then
+    echo "  ok   $HOOKS/$h matches scripts/lib/$h"
+  else
+    echo "  FAIL $HOOKS/$h differs from scripts/lib/$h" >&2
     fail=1
   fi
 done
@@ -455,6 +467,8 @@ import importlib.machinery, sys
 m = importlib.machinery.SourceFileLoader('amux_guard', '$ROOT/scripts/git-hooks/amux-staged-guard').load_module()
 print(m.amux_base_url())" 2>/dev/null)" || BASE=""
 [ -n "$BASE" ] || BASE="${AMUX_URL:-https://localhost:8824}"
+. "$ROOT/scripts/lib/amux-endpoint.sh"
+BASE=$(amux_endpoint_guard "$BASE" install-hooks)
 URL="$BASE/api/git/staged-guard"
 code=$(curl -sk -o /dev/null -w '%{http_code}' -m 3 -X POST \
         -H 'Content-Type: application/json' -d '{}' "$URL" 2>/dev/null || echo 000)

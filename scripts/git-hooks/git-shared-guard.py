@@ -25,6 +25,18 @@ never grants permission or executes/expands the proposed command.
 """
 import sys, json, os, re, time, pathlib
 
+# Isolated-run endpoint guard: scripts/lib/amux_endpoint.py, installed beside
+# hook copies. Under AMUX_ISOLATED_RUN=1 a live URL becomes a dead port.
+import os, sys  # noqa: E401
+_AE_HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path[:0] = [p for p in (_AE_HERE, os.path.join(_AE_HERE, "lib"),
+                            os.path.join(_AE_HERE, os.pardir, "lib")) if p not in sys.path]
+try:
+    from amux_endpoint import guard as _endpoint_guard
+except ImportError:  # an install without the shared file: refuse only when isolated
+    def _endpoint_guard(url, client):
+        return "http://127.0.0.1:9" if os.environ.get("AMUX_ISOLATED_RUN") == "1" else url
+
 # GIT'S GLOBAL-OPTION PREFIX, shared by every detector that must find a
 # SUBCOMMAND in command text (AF-489).
 #
@@ -208,6 +220,10 @@ _HEREDOC_INTRO = re.compile(r'<<-?\s*([\'"]?)(\w+)\1')
 _SHELL_SINK = re.compile(r'\b(?:ba|z|da|k)?sh\b|\beval\b|\bsource\b')
 
 def amux_base_url():
+    return _endpoint_guard(_amux_base_url_unguarded(), 'git-shared-guard')
+
+
+def _amux_base_url_unguarded():
     """Where to reach the amux server, self-healing a STALE INHERITED PORT.
 
     This hook is a PreToolUse hook: it runs once per Bash tool call, as a child
@@ -1001,7 +1017,8 @@ def _amend_staged_check(scrubbed, run_dir):
                 mod = importlib.machinery.SourceFileLoader("_asg", sib).load_module()
                 base = mod.amux_base_url()
             except Exception:
-                base = os.environ.get("AMUX_URL") or "https://localhost:8824"
+                base = _endpoint_guard(os.environ.get("AMUX_URL") or "https://localhost:8824",
+                                       "git-shared-guard")
         req = urllib.request.Request(
             base + "/api/git/staged-guard", data=body, method="POST",
             headers={"Content-Type": "application/json", "X-Amux-Session": sess})

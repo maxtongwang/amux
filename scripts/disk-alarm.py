@@ -23,6 +23,18 @@ import sys
 import time
 import urllib.request
 
+# Isolated-run endpoint guard: scripts/lib/amux_endpoint.py, installed beside
+# hook copies. Under AMUX_ISOLATED_RUN=1 a live URL becomes a dead port.
+import os, sys  # noqa: E401
+_AE_HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path[:0] = [p for p in (_AE_HERE, os.path.join(_AE_HERE, "lib"),
+                            os.path.join(_AE_HERE, os.pardir, "lib")) if p not in sys.path]
+try:
+    from amux_endpoint import guard as _endpoint_guard
+except ImportError:  # an install without the shared file: refuse only when isolated
+    def _endpoint_guard(url, client):
+        return "http://127.0.0.1:9" if os.environ.get("AMUX_ISOLATED_RUN") == "1" else url
+
 GB = 1024 ** 3
 RANK = {'ok': 0, 'leads': 1, 'owner': 2}
 
@@ -51,7 +63,8 @@ def leads():
     named = os.environ.get('AMUX_DISK_ALARM_TO')
     if named:
         return [n.strip() for n in named.split(',') if n.strip()]
-    url = os.environ.get('AMUX_URL', 'https://localhost:8824').rstrip('/') + '/api/sessions'
+    url = _endpoint_guard(os.environ.get('AMUX_URL', 'https://localhost:8824'),
+                          'disk-alarm').rstrip('/') + '/api/sessions'
     ctx = ssl.create_default_context()
     ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
     with urllib.request.urlopen(url, context=ctx, timeout=5) as r:
