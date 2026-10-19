@@ -2,6 +2,7 @@
 // endpoints, so the peek poller's reloads re-render the same replies instead of a 404 (refs e2e control 7ca1c0d3).
 import {test,expect} from './fixtures';
 import {cleanup} from './teardown';
+import {stubChat} from './chat-fixture';
 
 declare const _chat:any;
 
@@ -32,11 +33,8 @@ test(`Read aloud sits beside Copy and speaks one reply at a time (${variant.name
  const beacons:any[]=[];
  page.on('request',r=>{if(r.url().endsWith('/api/client-debug')&&r.method()==='POST'){try{const x=r.postDataJSON();if(x.kind==='chat-read-aloud')beacons.push(x);}catch{}}});
  await page.route(/\/api\/sessions(?:\?.*)?$/,r=>r.fulfill({json:[{name:'chat-ra-fixture',provider:'claude',chat_companion:true,running:false,dir:'/tmp'}]}));
- let chat=[...MSGS],chatLoads=0,releaseStream=()=>{};
- const streamHeld=new Promise<void>(r=>{releaseStream=r;});
- await page.route(/\/api\/sessions\/[^/?]+\/chat(?:\?.*)?$/,r=>{chatLoads++;return r.fulfill({json:{messages:chat,cursor:'e2e:1',busy:false,queued:0}});});
- // An open, silent stream: the chat counts as connected (no "Stream disconnected").
- await page.route(/\/api\/sessions\/[^/?]+\/chat\/stream/,async r=>{await streamHeld;await r.abort().catch(()=>{});});
+ let chat=[...MSGS];
+ const fixture=await stubChat(page,()=>({messages:chat}));
  await page.route(/\/api\/tts$/,async r=>{
   tts.push(r.request().postDataJSON());
   if(mode==='fail')return r.fulfill({status:503,json:{error:'No TTS engine: install piper or enable say'}});
@@ -54,10 +52,11 @@ test(`Read aloud sits beside Copy and speaks one reply at a time (${variant.name
   // The app mounts the chat itself and loads the fixture from the stub; a new
   // turn is the same endpoint answering with one more reply, loaded the way
   // the app loads it.
-  const render=async(extra:any[]=[])=>{chat=[...MSGS,...extra];await page.evaluate(()=>(window as any)._chatLoad(_chat.name));};
+  const render=async(extra:any[]=[])=>{chat=[...MSGS,...extra];await fixture.load();};
 
   const metas=page.locator('.chat-msg.chat-assistant .chat-meta');
   await expect(metas).toHaveCount(2);
+  await fixture.noLoadFailure(); // the app's own mount load
   const read=page.locator('.chat-read-btn');
   await expect(read).toHaveCount(2);
   // Directly after Copy, on every reply.
@@ -136,15 +135,14 @@ test(`Read aloud sits beside Copy and speaks one reply at a time (${variant.name
   }
   expect(await page.locator('#peek-body').evaluate(el=>el.scrollWidth-el.clientWidth)).toBeLessThanOrEqual(1);
   // Three laid-out buttons, the rightmost edge inside the viewport.
-  await expect.poll(()=>page.evaluate(vw=>{const r=Array.from(document.querySelectorAll('.chat-read-btn')).map(el=>el.getBoundingClientRect()).filter(b=>b.width>0&&b.height>0);
+  await expect.poll(()=>page.evaluate(vw=>{const r=Array.from(document.querySelectorAll('.chat-read-btn'))
+   .filter(el=>(el as any).checkVisibility({opacityProperty:true,visibilityProperty:true})).map(el=>el.getBoundingClientRect()).filter(b=>b.width>0&&b.height>0);
    return {shown:r.length,inside:r.every(b=>b.x+b.width<=vw+1)};},vw),{message:'every Read aloud is visible inside the viewport'}).toEqual({shown:3,inside:true});
   // Signal: the stubbed endpoint answered every reload, so the chat never fell
-  // back to the load-failure banner; the reload count shows how often the app
-  // re-fetched under the test.
-  await expect(page.locator('#peek-body .chat-empty',{hasText:'Could not load the chat'})).toHaveCount(0);
-  console.log('[CHAT-RELOADS] '+chatLoads);
+  // back to a load-failure banner ([CHAT-RELOADS] in finally counts them).
+  await fixture.noLoadFailure();
   // Evidence only. A page shot: the chat log can re-render between frames, and an element shot then fails as detached.
   await page.screenshot({path:info.outputPath('chat-read-aloud.png')});
- }finally{releaseStream();await cleanup('stop playback',()=>page.evaluate(()=>{try{eval('_ttsCancel()');}catch{}}),info);}
+ }finally{fixture.finish();await cleanup('stop playback',()=>page.evaluate(()=>{try{eval('_ttsCancel()');}catch{}}),info);}
 });
 }
