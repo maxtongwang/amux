@@ -5,6 +5,33 @@
 # takeover loop. This launcher is the single normal activation authority: it
 # runs the committed builder only from a clean detached worktree at origin/main.
 set -euo pipefail
+# >>> amux-endpoint-guard (rule: scripts/lib/amux-endpoint.sh; every copy identical, test-enforced)
+_ae_dir=$(dirname "$0")
+for _ae in "$_ae_dir/amux-endpoint.sh" "$_ae_dir/lib/amux-endpoint.sh" "$_ae_dir/../lib/amux-endpoint.sh" \
+           "$(eval echo "~$(id -un 2>/dev/null)" 2>/dev/null)/.amux/hooks/amux-endpoint.sh"; do
+  [ -r "$_ae" ] && . "$_ae" && break
+done
+command -v amux_endpoint_guard >/dev/null 2>&1 || amux_endpoint_guard() {  # stand-in: same shape, fixed live ports
+  _aeg_bad=""
+  if [ "${AMUX_ISOLATED_RUN:-}" = 1 ]; then
+    if [ "$(printf '%s' "$1" | wc -l | tr -d ' ')" != 0 ] || ! printf '%s\n' "$1" | LC_ALL=C grep -Eq \
+        '^(https?://(127\.0\.0\.1|localhost|\[::1\]):[1-9][0-9]{0,4}(/[^[:space:][:cntrl:]\\@]*)?|file:///[^[:space:][:cntrl:]\\@]*)$'; then
+      _aeg_bad=1
+    else
+      case "$1" in file:*) ;; *)
+        _aeg_p=${1#*://}; _aeg_p=${_aeg_p%%/*}; _aeg_p=${_aeg_p##*:}
+        if [ "$_aeg_p" -gt 65535 ] || [ "$_aeg_p" = 8824 ] || [ "$_aeg_p" = 8822 ]; then _aeg_bad=1; fi ;;
+      esac
+    fi
+  fi
+  if [ -n "$_aeg_bad" ]; then
+    printf '[amux] verdict=isolated_live_endpoint_refused client=%s from=%s reason=stand_in to=http://127.0.0.1:9 measured=true n_considered=1\n' "$2" "${1:-<unset>}" >&2
+    echo "http://127.0.0.1:9"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+# <<< amux-endpoint-guard
 
 REPO="${AMUX_AUTHORITY_REPO:-}"
 REF="${AMUX_RS_ACTIVATION_REF:-origin/main}"
@@ -124,7 +151,7 @@ if [ "${AMUX_DEPLOY_CI_GATE:-1}" != "0" ]; then
     # commit, holding it is the gate's whole effect: activating the older green
     # commit would run an old binary over a newer schema (migrations only go
     # forward) and undo work nobody asked to undo.
-    live=$(curl -sk --max-time 4 "${AMUX_RS_HEALTH_URL:-https://localhost:${AMUX_RS_PORT:-8824}/api/health}" 2>/dev/null \
+    live=$(curl -sk --max-time 4 "$(amux_endpoint_guard "${AMUX_RS_HEALTH_URL:-https://localhost:${AMUX_RS_PORT:-8824}/api/health}" rust-auto-build-authority)" 2>/dev/null \
       | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("commit_full") or d.get("commit") or "").replace("-dirty",""))' 2>/dev/null || true)
     if [ -n "$live" ] && live_full=$(git -C "$REPO" rev-parse --verify -q "${live}^{commit}" 2>/dev/null) \
        && [ "$live_full" != "$target" ] && git -C "$REPO" merge-base --is-ancestor "$target" "$live_full"; then

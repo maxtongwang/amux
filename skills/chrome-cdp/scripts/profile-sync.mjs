@@ -22,6 +22,28 @@ import { appendFileSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
 
+// >>> amux-endpoint-guard (rule: scripts/lib/amux_endpoint.py; every copy identical, test-enforced)
+function amuxEndpointGuard(url, client) {
+  const u = String(url || '');
+  const m = /^(?:https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):([1-9][0-9]{0,4})(?:\/[^\s\\@\x00-\x1f\x7f]*)?|file:\/\/\/[^\s\\@\x00-\x1f\x7f]*)$/.exec(u);
+  const port = m && m[1] ? Number(m[1]) : 0;
+  const live = new Set([8824, 8822]);
+  const mod = (m) => process.getBuiltinModule(m);
+  const e = process.env;
+  for (const h of [mod('path').join(mod('os').userInfo().homedir, '.amux'), e.AMUX_HOME, e.CC_HOME, e.HOME && `${e.HOME}/.amux`]) {
+    try {
+      const ep = JSON.parse(mod('fs').readFileSync(`${h}/endpoint.json`, 'utf8'));
+      for (const n of [ep.canonical_port, ep.legacy_port, ...(ep.retired_ports || [])]) if (Number.isInteger(n)) live.add(n);
+    } catch {}
+  }
+  if (e.AMUX_ISOLATED_RUN === '1' && (!m || port > 65535 || live.has(port))) {
+    process.stderr.write(`[amux] verdict=isolated_live_endpoint_refused client=${client} from=${JSON.stringify(u)} reason=not_test_shape_or_live_port to=http://127.0.0.1:9 measured=true n_considered=1\n`);
+    return 'http://127.0.0.1:9';
+  }
+  return url;
+}
+// <<< amux-endpoint-guard
+
 const LOG_DIR = resolve(homedir(), '.cache', 'cdp');
 const LOG = resolve(LOG_DIR, 'profile-sync.log');
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -71,8 +93,8 @@ export function fingerprint(cookies, site) {
 }
 
 function amuxBase() {
-  try { return execFileSync('amux', ['url'], { encoding: 'utf8', timeout: 5000 }).trim(); }
-  catch { return (process.env.AMUX_URL || 'https://localhost:8824').trim(); }
+  try { return amuxEndpointGuard(execFileSync('amux', ['url'], { encoding: 'utf8', timeout: 5000 }).trim(), 'profile-sync'); }
+  catch { return amuxEndpointGuard((process.env.AMUX_URL || 'https://localhost:8824').trim(), 'profile-sync'); }
 }
 
 function api(method, path, body) {

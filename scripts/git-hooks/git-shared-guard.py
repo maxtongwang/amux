@@ -25,6 +25,29 @@ never grants permission or executes/expands the proposed command.
 """
 import sys, json, os, re, time, pathlib
 
+# >>> amux-endpoint-guard (rule: scripts/lib/amux_endpoint.py; every copy identical, test-enforced)
+import os, sys  # noqa: E401
+_AE_HERE = os.path.dirname(os.path.realpath(__file__))
+for _ae_dir in (_AE_HERE, os.path.join(_AE_HERE, "lib"), os.path.join(_AE_HERE, os.pardir, "lib"),
+                os.path.join(__import__("pwd").getpwuid(os.getuid()).pw_dir, ".amux", "hooks")):
+    if _ae_dir not in sys.path:
+        sys.path.append(_ae_dir)
+try:
+    from amux_endpoint import guard as _endpoint_guard
+except ImportError:  # no shared file anywhere: the same allowed shape, fixed live ports
+    def _endpoint_guard(url, client):
+        import re
+        m = re.fullmatch(r"(?:https?://(?:127\.0\.0\.1|localhost|\[::1\]):([1-9][0-9]{0,4})"
+                         r"(?:/[^\s\\@\x00-\x1f\x7f]*)?|file:///[^\s\\@\x00-\x1f\x7f]*)", url or "")
+        port = int(m.group(1)) if m and m.group(1) else 0
+        if os.environ.get("AMUX_ISOLATED_RUN") == "1" and (m is None or port > 65535 or port in (8824, 8822)):
+            print("[amux] verdict=isolated_live_endpoint_refused client=%s from=%r reason=stand_in "
+                  "to=http://127.0.0.1:9 measured=true n_considered=1" % (client, url or "<unset>"),
+                  file=sys.stderr)
+            return "http://127.0.0.1:9"
+        return url
+# <<< amux-endpoint-guard
+
 # GIT'S GLOBAL-OPTION PREFIX, shared by every detector that must find a
 # SUBCOMMAND in command text (AF-489).
 #
@@ -208,6 +231,10 @@ _HEREDOC_INTRO = re.compile(r'<<-?\s*([\'"]?)(\w+)\1')
 _SHELL_SINK = re.compile(r'\b(?:ba|z|da|k)?sh\b|\beval\b|\bsource\b')
 
 def amux_base_url():
+    return _endpoint_guard(_amux_base_url_unguarded(), 'git-shared-guard')
+
+
+def _amux_base_url_unguarded():
     """Where to reach the amux server, self-healing a STALE INHERITED PORT.
 
     This hook is a PreToolUse hook: it runs once per Bash tool call, as a child
@@ -242,7 +269,7 @@ def amux_base_url():
                 return canonical
     except Exception:
         pass
-    return url or "https://localhost:8824"
+    return _endpoint_guard(url or "https://localhost:8824", 'git-shared-guard')
 
 
 def _strip_heredoc_bodies(cmd):
@@ -1001,7 +1028,8 @@ def _amend_staged_check(scrubbed, run_dir):
                 mod = importlib.machinery.SourceFileLoader("_asg", sib).load_module()
                 base = mod.amux_base_url()
             except Exception:
-                base = os.environ.get("AMUX_URL") or "https://localhost:8824"
+                base = _endpoint_guard(os.environ.get("AMUX_URL") or "https://localhost:8824",
+                                       "git-shared-guard")
         req = urllib.request.Request(
             base + "/api/git/staged-guard", data=body, method="POST",
             headers={"Content-Type": "application/json", "X-Amux-Session": sess})

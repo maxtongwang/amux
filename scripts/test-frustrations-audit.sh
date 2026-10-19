@@ -348,3 +348,5 @@ check_lacks "(s5) and is not counted as partially missing" "ids resolve" multi_i
 
 
 echo "test-frustrations-audit: $PASS passed, $FAIL failed"
+# A failed case must fail the run; it used to exit 0 with failures, so CI could not see them.
+[ "$FAIL" -eq 0 ]

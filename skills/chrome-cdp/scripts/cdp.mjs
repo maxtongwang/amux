@@ -21,6 +21,28 @@ import { spawn, execFileSync } from 'child_process';
 import net from 'net';
 import { syncSite, siteOf, fingerprint, profilesIndex, coveringProfile, isSessionBound, log as syncLog } from './profile-sync.mjs';
 
+// >>> amux-endpoint-guard (rule: scripts/lib/amux_endpoint.py; every copy identical, test-enforced)
+function amuxEndpointGuard(url, client) {
+  const u = String(url || '');
+  const m = /^(?:https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):([1-9][0-9]{0,4})(?:\/[^\s\\@\x00-\x1f\x7f]*)?|file:\/\/\/[^\s\\@\x00-\x1f\x7f]*)$/.exec(u);
+  const port = m && m[1] ? Number(m[1]) : 0;
+  const live = new Set([8824, 8822]);
+  const mod = (m) => process.getBuiltinModule(m);
+  const e = process.env;
+  for (const h of [mod('path').join(mod('os').userInfo().homedir, '.amux'), e.AMUX_HOME, e.CC_HOME, e.HOME && `${e.HOME}/.amux`]) {
+    try {
+      const ep = JSON.parse(mod('fs').readFileSync(`${h}/endpoint.json`, 'utf8'));
+      for (const n of [ep.canonical_port, ep.legacy_port, ...(ep.retired_ports || [])]) if (Number.isInteger(n)) live.add(n);
+    } catch {}
+  }
+  if (e.AMUX_ISOLATED_RUN === '1' && (!m || port > 65535 || live.has(port))) {
+    process.stderr.write(`[amux] verdict=isolated_live_endpoint_refused client=${client} from=${JSON.stringify(u)} reason=not_test_shape_or_live_port to=http://127.0.0.1:9 measured=true n_considered=1\n`);
+    return 'http://127.0.0.1:9';
+  }
+  return url;
+}
+// <<< amux-endpoint-guard
+
 const TIMEOUT = 15000;
 const NAVIGATION_TIMEOUT = 30000;
 const IDLE_TIMEOUT = 20 * 60 * 1000;
@@ -81,8 +103,9 @@ function amuxCdpPort() {
   try {
     base = execFileSync('amux', ['url'], { encoding: 'utf8', timeout: 5000 }).trim();
   } catch {
-    base = (process.env.AMUX_URL || 'https://localhost:8824').trim();
+    base = amuxEndpointGuard((process.env.AMUX_URL || 'https://localhost:8824').trim(), 'chrome-cdp');
   }
+  base = amuxEndpointGuard(base, 'chrome-cdp');
   let body;
   try {
     // -k: the server uses a self-signed cert, as every recipe in this repo does.

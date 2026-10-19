@@ -77,6 +77,29 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+# >>> amux-endpoint-guard (rule: scripts/lib/amux_endpoint.py; every copy identical, test-enforced)
+import os, sys  # noqa: E401
+_AE_HERE = os.path.dirname(os.path.realpath(__file__))
+for _ae_dir in (_AE_HERE, os.path.join(_AE_HERE, "lib"), os.path.join(_AE_HERE, os.pardir, "lib"),
+                os.path.join(__import__("pwd").getpwuid(os.getuid()).pw_dir, ".amux", "hooks")):
+    if _ae_dir not in sys.path:
+        sys.path.append(_ae_dir)
+try:
+    from amux_endpoint import guard as _endpoint_guard
+except ImportError:  # no shared file anywhere: the same allowed shape, fixed live ports
+    def _endpoint_guard(url, client):
+        import re
+        m = re.fullmatch(r"(?:https?://(?:127\.0\.0\.1|localhost|\[::1\]):([1-9][0-9]{0,4})"
+                         r"(?:/[^\s\\@\x00-\x1f\x7f]*)?|file:///[^\s\\@\x00-\x1f\x7f]*)", url or "")
+        port = int(m.group(1)) if m and m.group(1) else 0
+        if os.environ.get("AMUX_ISOLATED_RUN") == "1" and (m is None or port > 65535 or port in (8824, 8822)):
+            print("[amux] verdict=isolated_live_endpoint_refused client=%s from=%r reason=stand_in "
+                  "to=http://127.0.0.1:9 measured=true n_considered=1" % (client, url or "<unset>"),
+                  file=sys.stderr)
+            return "http://127.0.0.1:9"
+        return url
+# <<< amux-endpoint-guard
+
 IS_MACOS = sys.platform == "darwin"
 IS_DOCKER = Path("/.dockerenv").exists()
 
@@ -88,7 +111,7 @@ IS_DOCKER = Path("/.dockerenv").exists()
 # docs/rust-migration/server-boundary.md.)
 AMUX_PORT = int(os.environ.get("AMUX_RS_PORT", os.environ.get("AMUX_PORT", 8824)))
 _SCHEME = "https" if IS_MACOS else "http"
-HEALTH_URL = os.environ.get("WATCHDOG_HEALTH_URL", f"{_SCHEME}://localhost:{AMUX_PORT}/health")
+HEALTH_URL = _endpoint_guard(os.environ.get("WATCHDOG_HEALTH_URL", f"{_SCHEME}://localhost:{AMUX_PORT}/health"), "watchdog")
 LAUNCHD_LABEL = os.environ.get("WATCHDOG_LAUNCHD_LABEL", "com.amux.server-rs")
 LAUNCHD_PLIST = Path(
     os.environ.get(

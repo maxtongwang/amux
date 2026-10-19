@@ -41,6 +41,29 @@ import subprocess
 import sys
 from pathlib import Path
 
+# >>> amux-endpoint-guard (rule: scripts/lib/amux_endpoint.py; every copy identical, test-enforced)
+import os, sys  # noqa: E401
+_AE_HERE = os.path.dirname(os.path.realpath(__file__))
+for _ae_dir in (_AE_HERE, os.path.join(_AE_HERE, "lib"), os.path.join(_AE_HERE, os.pardir, "lib"),
+                os.path.join(__import__("pwd").getpwuid(os.getuid()).pw_dir, ".amux", "hooks")):
+    if _ae_dir not in sys.path:
+        sys.path.append(_ae_dir)
+try:
+    from amux_endpoint import guard as _endpoint_guard
+except ImportError:  # no shared file anywhere: the same allowed shape, fixed live ports
+    def _endpoint_guard(url, client):
+        import re
+        m = re.fullmatch(r"(?:https?://(?:127\.0\.0\.1|localhost|\[::1\]):([1-9][0-9]{0,4})"
+                         r"(?:/[^\s\\@\x00-\x1f\x7f]*)?|file:///[^\s\\@\x00-\x1f\x7f]*)", url or "")
+        port = int(m.group(1)) if m and m.group(1) else 0
+        if os.environ.get("AMUX_ISOLATED_RUN") == "1" and (m is None or port > 65535 or port in (8824, 8822)):
+            print("[amux] verdict=isolated_live_endpoint_refused client=%s from=%r reason=stand_in "
+                  "to=http://127.0.0.1:9 measured=true n_considered=1" % (client, url or "<unset>"),
+                  file=sys.stderr)
+            return "http://127.0.0.1:9"
+        return url
+# <<< amux-endpoint-guard
+
 ROOT = Path(__file__).resolve().parent.parent
 LEDGER = ROOT / "frustrations.md"
 ARCHIVE = ROOT / "frustrations-archive.md"
@@ -139,6 +162,10 @@ def field(block, key):
 
 
 def _api():
+    return _endpoint_guard(_api_unguarded(), 'frustrations-archive')
+
+
+def _api_unguarded():
     """The server-written endpoint, so a port move cannot point this at a dead
     port (the same guard frustrations_retire.py grew after a silent failure)."""
     try:
@@ -148,7 +175,7 @@ def _api():
             return u.split()[0]
     except Exception:
         pass
-    return "https://localhost:8824"
+    return _endpoint_guard("https://localhost:8824", "frustrations-archive")
 
 
 def carry_to_card(block, who, superseded=False):

@@ -16,6 +16,33 @@
 
 set -uo pipefail
 
+# >>> amux-endpoint-guard (rule: scripts/lib/amux-endpoint.sh; every copy identical, test-enforced)
+_ae_dir=$(dirname "$0")
+for _ae in "$_ae_dir/amux-endpoint.sh" "$_ae_dir/lib/amux-endpoint.sh" "$_ae_dir/../lib/amux-endpoint.sh" \
+           "$(eval echo "~$(id -un 2>/dev/null)" 2>/dev/null)/.amux/hooks/amux-endpoint.sh"; do
+  [ -r "$_ae" ] && . "$_ae" && break
+done
+command -v amux_endpoint_guard >/dev/null 2>&1 || amux_endpoint_guard() {  # stand-in: same shape, fixed live ports
+  _aeg_bad=""
+  if [ "${AMUX_ISOLATED_RUN:-}" = 1 ]; then
+    if [ "$(printf '%s' "$1" | wc -l | tr -d ' ')" != 0 ] || ! printf '%s\n' "$1" | LC_ALL=C grep -Eq \
+        '^(https?://(127\.0\.0\.1|localhost|\[::1\]):[1-9][0-9]{0,4}(/[^[:space:][:cntrl:]\\@]*)?|file:///[^[:space:][:cntrl:]\\@]*)$'; then
+      _aeg_bad=1
+    else
+      case "$1" in file:*) ;; *)
+        _aeg_p=${1#*://}; _aeg_p=${_aeg_p%%/*}; _aeg_p=${_aeg_p##*:}
+        if [ "$_aeg_p" -gt 65535 ] || [ "$_aeg_p" = 8824 ] || [ "$_aeg_p" = 8822 ]; then _aeg_bad=1; fi ;;
+      esac
+    fi
+  fi
+  if [ -n "$_aeg_bad" ]; then
+    printf '[amux] verdict=isolated_live_endpoint_refused client=%s from=%s reason=stand_in to=http://127.0.0.1:9 measured=true n_considered=1\n' "$2" "${1:-<unset>}" >&2
+    echo "http://127.0.0.1:9"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+# <<< amux-endpoint-guard
 LOG="${HOME}/.amux/logs/tmux-watchdog.log"
 AMUX_BIN="${AMUX_BIN:-$(cd "$(dirname "$0")/.." && pwd)/amux}"
 STAGGER="${AMUX_START_ALL_STAGGER:-2}"
@@ -63,7 +90,7 @@ log "tmux server restored (${session_count} sessions). Starting fleet..."
 date +%s > "$COOLDOWN_FILE"
 
 # Notify the amux server so this shows up in the log analyzer.
-base="$("$AMUX_BIN" url 2>/dev/null || echo "https://localhost:8824")"
+base=$(amux_endpoint_guard "$("$AMUX_BIN" url 2>/dev/null || echo "https://localhost:8824")" tmux-watchdog)
 curl -sk --max-time 5 -X POST -H 'Content-Type: application/json' \
     -d '{"level":"warn","message":"tmux-watchdog: tmux server was dead, recovered and restarting fleet","source":"tmux-watchdog"}' \
     "$base/api/log" >/dev/null 2>&1 || true

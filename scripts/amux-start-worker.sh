@@ -16,6 +16,34 @@
 # internal error handling; it drives the HTTP API directly per lane so a
 # single failure can never truncate the loop.
 LOG_FILE="$HOME/.amux/worker-start.log"
+# >>> amux-endpoint-guard (rule: scripts/lib/amux-endpoint.sh; every copy identical, test-enforced)
+_ae_dir=$(dirname "$0")
+for _ae in "$_ae_dir/amux-endpoint.sh" "$_ae_dir/lib/amux-endpoint.sh" "$_ae_dir/../lib/amux-endpoint.sh" \
+           "$(eval echo "~$(id -un 2>/dev/null)" 2>/dev/null)/.amux/hooks/amux-endpoint.sh"; do
+  [ -r "$_ae" ] && . "$_ae" && break
+done
+command -v amux_endpoint_guard >/dev/null 2>&1 || amux_endpoint_guard() {  # stand-in: same shape, fixed live ports
+  _aeg_bad=""
+  if [ "${AMUX_ISOLATED_RUN:-}" = 1 ]; then
+    if [ "$(printf '%s' "$1" | wc -l | tr -d ' ')" != 0 ] || ! printf '%s\n' "$1" | LC_ALL=C grep -Eq \
+        '^(https?://(127\.0\.0\.1|localhost|\[::1\]):[1-9][0-9]{0,4}(/[^[:space:][:cntrl:]\\@]*)?|file:///[^[:space:][:cntrl:]\\@]*)$'; then
+      _aeg_bad=1
+    else
+      case "$1" in file:*) ;; *)
+        _aeg_p=${1#*://}; _aeg_p=${_aeg_p%%/*}; _aeg_p=${_aeg_p##*:}
+        if [ "$_aeg_p" -gt 65535 ] || [ "$_aeg_p" = 8824 ] || [ "$_aeg_p" = 8822 ]; then _aeg_bad=1; fi ;;
+      esac
+    fi
+  fi
+  if [ -n "$_aeg_bad" ]; then
+    printf '[amux] verdict=isolated_live_endpoint_refused client=%s from=%s reason=stand_in to=http://127.0.0.1:9 measured=true n_considered=1\n' "$2" "${1:-<unset>}" >&2
+    echo "http://127.0.0.1:9"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+# <<< amux-endpoint-guard
+AMUX_START_BASE=$(amux_endpoint_guard "https://localhost:8824" amux-start-worker)
 SESSIONS_DIR="$HOME/.amux/sessions"
 
 echo "$(date): Starting worker startup script" >> "$LOG_FILE"
@@ -34,7 +62,7 @@ while true; do
     sleep "$wait_time"
 
     # Try to reach the health endpoint
-    if /usr/bin/curl -sk --connect-timeout 2 --max-time 5 "https://localhost:8824/health" > /dev/null 2>&1; then
+    if /usr/bin/curl -sk --connect-timeout 2 --max-time 5 "$AMUX_START_BASE/health" > /dev/null 2>&1; then
         echo "$(date): Server is responding, attempting to start workers..." >> "$LOG_FILE"
         break
     fi
@@ -85,7 +113,7 @@ verify_running() {
     local name="$1" tries=0
     while [ $tries -lt 5 ]; do
         sleep 2
-        if /usr/bin/curl -sk --connect-timeout 3 --max-time 5 "https://localhost:8824/api/sessions/$name" 2>/dev/null \
+        if /usr/bin/curl -sk --connect-timeout 3 --max-time 5 "$AMUX_START_BASE/api/sessions/$name" 2>/dev/null \
           | grep -q '"running":true'; then
             return 0
         fi
@@ -97,7 +125,7 @@ verify_running() {
 for f in "${lane_files[@]}"; do
     name=$(basename "$f" .env)
     echo "$(date): Calling amux API to start worker: $name..." >> "$LOG_FILE"
-    RESPONSE=$(/usr/bin/curl -sk --connect-timeout 5 --max-time 10 -X POST "https://localhost:8824/api/sessions/$name/start" \
+    RESPONSE=$(/usr/bin/curl -sk --connect-timeout 5 --max-time 10 -X POST "$AMUX_START_BASE/api/sessions/$name/start" \
       -H "Content-Type: application/json" \
       -d '{"backend": "tmux"}' 2>&1)
     CURL_RC=$?
