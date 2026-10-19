@@ -328,6 +328,11 @@ mod tests {
             std::fs::write(self.home().join("sessions").join(format!("{name}.env")), format!("CC_TAGS={tags}\n"))
                 .unwrap();
         }
+        /// A lead: `leads` plus `CC_ORCHESTRATOR=1` (`delegation::is_lead`).
+        fn lead(&self, name: &str, tags: &str) {
+            std::fs::write(self.home().join("sessions").join(format!("{name}.env")), format!("CC_TAGS={tags}\nCC_ORCHESTRATOR=1\n"))
+                .unwrap();
+        }
         fn lines(&self) -> Vec<Value> {
             std::fs::read_to_string(log_path(self.home()))
                 .unwrap_or_default()
@@ -458,7 +463,7 @@ mod tests {
     #[tokio::test]
     async fn owner_and_leads_read_the_log_and_other_workers_get_403() {
         let iso = iso();
-        iso.worker("review-lead", "leads,dev");
+        iso.lead("review-lead", "leads,dev");
         iso.worker("review-worker", "dev");
         let st = state(iso.home());
         record(&st, change("review-lead", "review-worker")).unwrap();
