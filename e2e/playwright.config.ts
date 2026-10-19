@@ -260,6 +260,7 @@ export default defineConfig({
     timeout: 600_000,
     env: {
       AMUX_HOME: homes[t.name],
+      AMUX_BIND: '127.0.0.1',
       AMUX_RS_PORT: String(t.port),
       // A browser test necessarily connects over loopback, which the server
       // deliberately auth-bypasses (Python parity). Without this, every
