@@ -243,7 +243,7 @@ function fakeLocator(over = {}) {
     isVisible: async () => true,
     async isEnabled(opts) { record('enabled', opts); return over.isEnabled ? over.isEnabled(opts) : true; },
     async scrollIntoViewIfNeeded(opts) { record('scroll', opts); if (over.scroll) await over.scroll(opts); },
-    async evaluate(_fn, _arg, opts) { record('stable', opts); return { rects: [REST, REST, REST], viewport: { width: 400, height: 800 } }; },
+    async evaluate(_fn, _arg, opts) { record('stable', opts); return over.evaluate ? over.evaluate(opts) : { rects: [REST, REST, REST], viewport: { width: 400, height: 800 } }; },
     async click(opts) {
       record(opts?.trial ? 'trial' : 'click', opts);
       if (opts?.trial) { calls.trial++; return; }
@@ -291,3 +291,32 @@ for (const [phase, over] of [
     }
   });
 }
+
+// A finished verdict survives the budget ending inside the NEXT attempt. CI
+// (e2e control 7ca1c0d3, 3 of 40 runs): an off-screen target had already been
+// judged "viewport", then the retry's isEnabled/evaluate got the last 1-2 ms,
+// Playwright threw TimeoutError, and that replaced the verdict with
+// "enabled step threw: Timeout 2ms exceeded".
+const OFF = R(20, 4000);
+for (const step of ['enabled', 'stable']) {
+  test(`deadline: a ${step} step timing out at the deadline keeps the finished viewport verdict`, async () => {
+    let attempts = 0;
+    const hang = async opts => { await sleep(opts.timeout); throw timeoutError(opts.timeout); };
+    const loc = fakeLocator({
+      isEnabled: async opts => (step === 'enabled' && attempts > 0 ? hang(opts) : true),
+      evaluate: async opts => {
+        if (step === 'stable' && attempts > 0) return hang(opts);
+        attempts++;
+        return { rects: [OFF, OFF, OFF], viewport: { width: 400, height: 800 } };
+      },
+    });
+    let err;
+    await assert.rejects(waitForActionableWith(loc, { budgetMs: BUDGET, scroll: false }, quiet), e => { err = e; return e instanceof ActionableTimeout; });
+    assert.equal(attempts, 1, 'one attempt finished before the budget ran out in the next');
+    assert.equal(err.phase, 'viewport', `reported ${err.phase}: ${err.details.reason}`);
+    assert.match(err.details.reason, /scrolling is disabled/);
+    assert.equal(err.details.interrupted_phase, step, 'the verdict line names where the budget cut in');
+    assert.equal(err.details.call_log, null, 'the deadline timeout is not reported as the step\'s own failure');
+  });
+}
+

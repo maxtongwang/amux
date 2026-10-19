@@ -75,6 +75,9 @@ export function createDeadline(budgetMs = ACTIONABLE_DEFAULT_BUDGET_MS, now = Da
   };
 }
 
+/** A step timeout this close to the deadline is the deadline ending (timers fire a few ms apart). */
+const BUDGET_END_SLACK_MS = 50;
+
 /** Settle with `promise`, or reject with DeadlineExceeded when the budget ends first. */
 export function raceDeadline(promise, deadline, what) {
   Promise.resolve(promise).catch(() => {}); // a loser rejecting later is not an unhandled rejection
@@ -146,6 +149,9 @@ export function buildNotActionable(f) {
     label: f.label ?? null,
     phase: f.phase,
     reason: f.reason ?? null,
+    // The phase the budget cut into, when that was not the reported one: the
+    // verdict is the last FINISHED attempt's, not the interrupted step's.
+    interrupted_phase: f.interruptedPhase ?? null,
     rect: f.rect ?? null,
     viewport: f.viewport ?? null,
     cover,
@@ -193,7 +199,7 @@ const nextFrame = (target, deadline) =>
 
 const firstLine = e => String(e?.message ?? e).split('\n')[0];
 
-async function notActionable(target, label, deadline, phase, reason, lastError, env) {
+async function notActionable(target, label, deadline, phase, reason, lastError, env, interruptedPhase) {
   const elapsedMs = deadline.elapsed();
   const context = env?.failureContext ? await env.failureContext(target, label) : { coverWhy: 'no failure probe supplied' };
   const { error, line } = buildNotActionable({
@@ -204,6 +210,7 @@ async function notActionable(target, label, deadline, phase, reason, lastError, 
     label,
     phase,
     reason,
+    interruptedPhase,
     callLog: extractCallLog(lastError?.message),
   });
   (env?.log ?? console.log)(line);
@@ -224,6 +231,7 @@ export async function waitForActionableWith(target, options, env) {
   // The last FINISHED attempt's verdict. A budget that runs out early in a fresh
   // attempt must not overwrite it, or a covered target would report "resolve".
   let outcome = null;
+  let interrupted = null;
   const finish = () => { outcome = { phase, reason }; };
   while (!deadline.expired() && !target.page().isClosed()) {
     try {
@@ -276,8 +284,14 @@ export async function waitForActionableWith(target, options, env) {
       await target.click({ trial: true, timeout: deadline.timeout() });
       return { deadline, rect };
     } catch (e) {
-      if (e instanceof DeadlineExceeded) {
+      // Playwright's own timeout on a step that was handed the rest of the
+      // budget is the deadline ending too, not a finding about the target.
+      // Recorded as one, it replaced a finished "viewport" verdict with
+      // "enabled step threw: Timeout 2ms exceeded" (e2e control 7ca1c0d3).
+      const budgetEnded = e?.name === 'TimeoutError' && phase !== 'hit-test' && deadline.remaining() <= BUDGET_END_SLACK_MS;
+      if (e instanceof DeadlineExceeded || budgetEnded) {
         if (!outcome) reason = `budget ended during ${phase}`;
+        else if (outcome.phase !== phase) interrupted = phase;
         break;
       }
       lastError = e; // keep Playwright's own error: its message carries the call log
@@ -291,7 +305,7 @@ export async function waitForActionableWith(target, options, env) {
   }
   const final = outcome ?? { phase, reason };
   if (target.page().isClosed()) final.reason = `page closed during ${phase}; ${final.reason}`;
-  throw await notActionable(target, opts.label, deadline, final.phase, final.reason, lastError, env);
+  throw await notActionable(target, opts.label, deadline, final.phase, final.reason, lastError, env, interrupted);
 }
 
 /**
