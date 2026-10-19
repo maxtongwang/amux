@@ -3422,7 +3422,8 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "owner sets environment: {v}");
     }
 
-    /// The ai-config #203 fleet: two teams with a lead each, a second dev lead,
+    /// The ai-config #203 fleet: two teams with a lead each (`leads` plus
+    /// CC_ORCHESTRATOR=1, the delegation table's lead), a second dev lead,
     /// the owner agent (in `dev` only, so nothing but the owner-agent rule can
     /// refuse renaming it), and team workers. Fake panes, no auto-start: a
     /// rename never reaches tmux.
@@ -3434,7 +3435,8 @@ mod tests {
             ("mrpopo", "dev"), ("review-dev-a", "dev"), ("review-dev-b", "dev"), ("review-ops-a", "ops"),
         ] {
             std::fs::write(s.join(format!("{n}.env")),
-                format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{t}\"\nCC_AUTO_START=0\nCC_TEST_FAKE_PANE=1\n")).unwrap();
+                format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{t}\"\nCC_AUTO_START=0\nCC_TEST_FAKE_PANE=1\n{}",
+                    if t.starts_with("leads") { "CC_ORCHESTRATOR=1\n" } else { "" })).unwrap();
         }
     }
 
@@ -3476,30 +3478,33 @@ mod tests {
         let (app, _db) = app();
         let lead: &[(&str, &str)] = &[("X-Amux-Session", "review-dev-lead")];
         let worker: &[(&str, &str)] = &[("X-Amux-Session", "review-dev-a")];
-        type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str, &'a str, Value);
+        // The rule is the delegation table's (ai-config #160): each refusal
+        // carries the table's code for it.
+        type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str, &'a str, Value, &'a str);
+        const PEER: &str = "peer_config_owner_only";
         let cases: Vec<Case> = vec![
-            ("another lead, same team", lead, "POST", "/api/sessions/review-dev-lead2/rename", json!({"name": "x-renamed"})),
-            ("another lead, same team (config)", lead, "PATCH", "/api/workers/review-dev-lead2/config", json!({"rename": "x-renamed"})),
-            ("the owner agent", lead, "POST", "/api/sessions/mrpopo/rename", json!({"name": "x-renamed"})),
-            ("the owner agent (config)", lead, "PATCH", "/api/sessions/mrpopo/config", json!({"rename": "x-renamed"})),
-            ("a worker in another team", lead, "POST", "/api/sessions/review-ops-a/rename", json!({"name": "x-renamed"})),
-            ("a worker in another team (config)", lead, "PATCH", "/api/workers/review-ops-a/config", json!({"rename": "x-renamed"})),
-            ("a team worker renamed to the owner agent", lead, "POST", "/api/sessions/review-dev-a/rename", json!({"name": "mrpopo"})),
-            ("a non-rename field", lead, "PATCH", "/api/sessions/review-dev-a/config", json!({"desc": "x"})),
-            ("rename plus another field", lead, "PATCH", "/api/workers/review-dev-a/config", json!({"rename": "x-renamed", "desc": "x"})),
-            ("a non-string rename", lead, "PATCH", "/api/sessions/review-dev-a/config", json!({"rename": ["x-renamed"]})),
-            ("instructions", lead, "POST", "/api/sessions/review-dev-a/instructions", json!({"instructions": "x"})),
-            ("memory", lead, "POST", "/api/workers/review-dev-a/memory", json!({"content": "x"})),
-            ("a non-lead renaming a peer", worker, "POST", "/api/sessions/review-dev-b/rename", json!({"name": "x-renamed"})),
-            ("a non-lead renaming a peer (config)", worker, "PATCH", "/api/sessions/review-dev-b/config", json!({"rename": "x-renamed"})),
+            ("another lead, same team", lead, "POST", "/api/sessions/review-dev-lead2/rename", json!({"name": "x-renamed"}), PEER),
+            ("another lead, same team (config)", lead, "PATCH", "/api/workers/review-dev-lead2/config", json!({"rename": "x-renamed"}), PEER),
+            ("the owner agent", lead, "POST", "/api/sessions/mrpopo/rename", json!({"name": "x-renamed"}), PEER),
+            ("the owner agent (config)", lead, "PATCH", "/api/sessions/mrpopo/config", json!({"rename": "x-renamed"}), PEER),
+            ("a worker in another team", lead, "POST", "/api/sessions/review-ops-a/rename", json!({"name": "x-renamed"}), PEER),
+            ("a worker in another team (config)", lead, "PATCH", "/api/workers/review-ops-a/config", json!({"rename": "x-renamed"}), PEER),
+            ("a team worker renamed to the owner agent", lead, "POST", "/api/sessions/review-dev-a/rename", json!({"name": "mrpopo"}), "reserved_name"),
+            ("a non-rename field", lead, "PATCH", "/api/sessions/review-dev-a/config", json!({"desc": "x"}), PEER),
+            ("rename plus another field", lead, "PATCH", "/api/workers/review-dev-a/config", json!({"rename": "x-renamed", "desc": "x"}), PEER),
+            ("a non-string rename", lead, "PATCH", "/api/sessions/review-dev-a/config", json!({"rename": ["x-renamed"]}), PEER),
+            ("instructions", lead, "POST", "/api/sessions/review-dev-a/instructions", json!({"instructions": "x"}), PEER),
+            ("memory", lead, "POST", "/api/workers/review-dev-a/memory", json!({"content": "x"}), PEER),
+            ("a non-lead renaming a peer", worker, "POST", "/api/sessions/review-dev-b/rename", json!({"name": "x-renamed"}), PEER),
+            ("a non-lead renaming a peer (config)", worker, "PATCH", "/api/sessions/review-dev-b/config", json!({"rename": "x-renamed"}), PEER),
         ];
         // This in-process router bypasses async_main: run its startup
         // migration first so only the requests can change files.
         crate::api::rename_identity::ensure_migrated(home.path()).unwrap();
         let before = snapshot(home.path());
-        for (label, headers, m, path, body) in &cases {
+        for (label, headers, m, path, body, code) in &cases {
             let (st, _, v) = send_with(&app, m, path, Some(body.clone()), headers).await;
-            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("peer_config_owner_only")), "{label}: {m} {path} {body}: {v}");
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(code)), "{label}: {m} {path} {body}: {v}");
         }
         let after = snapshot(home.path());
         let changed: Vec<_> = after.iter().filter(|(p, b)| before.get(*p) != Some(*b)).map(|(p, _)| p.clone())
@@ -3507,26 +3512,13 @@ mod tests {
         assert!(changed.is_empty(), "refused requests changed files: {changed:?}");
         // An unverified lead claim: a rule-10 lead without its token is refused before any handler.
         std::fs::write(home.path().join("sessions/review-dev-lead.env"),
-            "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads,dev\"\nCC_AUTO_START=0\nCC_TEST_FAKE_PANE=1\nAMUX_CONTRACT_DONE=1\n").unwrap();
+            "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads,dev\"\nCC_AUTO_START=0\nCC_TEST_FAKE_PANE=1\nCC_ORCHESTRATOR=1\nAMUX_CONTRACT_DONE=1\n").unwrap();
         crate::api::worker_identity::mint(home.path(), "review-dev-lead").unwrap().expect("rule 10 mints");
         let (st, v) = status_and_body(&app, socket_request("POST", "/api/sessions/review-dev-a/rename",
             json!({"name": "x-renamed"}), lead)).await;
         assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_refused")), "unverified lead: {v}");
         assert!(home.path().join("sessions/review-dev-a.env").exists());
-        // Unit: the shared predicates, independent of any route.
-        use crate::api::session_verbs::{config_rename_only, lead_team_rename};
-        assert_eq!(lead_team_rename("review-dev-lead", "review-dev-a", "dev-x").map(|t| t.into_iter().collect::<Vec<_>>()),
-            Some(vec!["dev".to_string()]));
-        assert!(lead_team_rename("review-dev-lead", "review-dev-a", "MrPopo").is_none(), "renamed to the owner agent, any case");
-        assert!(lead_team_rename("review-dev-lead", "mrpopo", "dev-x").is_none(), "the owner agent");
-        assert!(lead_team_rename("review-dev-lead", "review-dev-lead2", "dev-x").is_none(), "another lead");
-        assert!(lead_team_rename("review-dev-a", "review-dev-b", "dev-x").is_none(), "non-lead");
-        assert!(lead_team_rename("review-ops-lead", "review-dev-a", "dev-x").is_none(), "other team");
-        assert!(lead_team_rename(crate::api::worker_identity::UNVERIFIED_IDENTITY, "review-dev-a", "dev-x").is_none(), "unverified");
-        assert_eq!(config_rename_only(&json!({"rename": "n"})), Some("n"));
-        for body in [json!({"rename": "n", "desc": "x"}), json!({"rename": 1}), json!({"desc": "x"}), json!({}), json!("n")] {
-            assert_eq!(config_rename_only(&body), None, "{body}");
-        }
+        // The predicate itself: delegation::tests::delegation_lead_renames_non_lead_team_workers_only.
     }
 
     /// ai-config #203 with amux #3: a rule-10 worker renamed BY ITS LEAD keeps
