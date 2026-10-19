@@ -8545,6 +8545,8 @@ pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
             return;
         }
     };
+    #[cfg(test)]
+    capture_gate::at(&cap_session, "after_read").await;
     // Recheck on recovery too: the mode may have changed after acceptance.
     if session_is_isolated(&cap_session) {
         let result = state
@@ -41258,7 +41260,19 @@ mod tests {
         }).await.unwrap();
         let id: i64 = st.store.read().unwrap()
             .query_row("SELECT id FROM cmd_history WHERE session='seo' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
-        tokio::join!(capture_recorded_message(&st, id), capture_recorded_message(&st, id));
+        // Both captures read the row as pending before either claims it: the
+        // race the claim exists for, every run (without the gate, one capture
+        // could finish before the other's read and find nothing to claim).
+        let after_read = capture_gate::hold("seo", "after_read");
+        let both = async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while after_read.reached() < 2 && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            assert_eq!(after_read.reached(), 2, "both captures read the pending row");
+            after_read.open();
+        };
+        tokio::join!(capture_recorded_message(&st, id), capture_recorded_message(&st, id), both);
         let delivery: String = st.store.read().unwrap()
             .query_row("SELECT delivery FROM cmd_history WHERE id=?1", [id], |r| r.get(0)).unwrap();
         assert_eq!(delivery, "queued");
