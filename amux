@@ -1577,6 +1577,12 @@ sys.exit(0 if any(line.startswith("n/") and os.path.realpath(line[1:].strip().sp
   # created was left running and unlocked. See frustrations.md / INIT-2.
   tmux set-option -t "=$tname:" allow-rename off 2>/dev/null
   tmux set-window-option -t "=$tname:" automatic-rename off 2>/dev/null
+  # Show the plain worker name in the status bar, not "amux-<name>" (tmux's
+  # default status-left is the session name). Same values as the server's
+  # backend::tmux::WORKER_STATUS_LEFT; the format survives rename-session.
+  tmux set-option -t "=$tname:" status-left '[#{s/^amux-//:session_name}] ' >/dev/null 2>&1 \
+    && tmux set-option -t "=$tname:" status-left-length 40 >/dev/null 2>&1 \
+    || printf '[amux] WARN verdict=worker_status_name_unset measured=true n_considered=1 worker=%s\n' "$name" >&2
 
   # "started" USED TO MEAN "tmux new-session returned", which it always does:
   # the session is created before the command inside it runs, so a command that

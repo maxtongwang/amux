@@ -211,6 +211,15 @@ pub(crate) fn pane_target(backend_ref: &str) -> String {
     format!("={backend_ref}:")
 }
 
+/// Worker sessions are named `amux-<worker>`, and tmux's default `status-left`
+/// is `[#{session_name}] `, so every worker's status bar read `[amux-…`. Max
+/// sees worker names, never tmux names. The format strips the prefix itself,
+/// so it stays right across `rename-session` with no per-worker state.
+pub(crate) const WORKER_STATUS_LEFT: &str = "[#{s/^amux-//:session_name}] ";
+/// tmux's default is 10, which cut `[amux-dev-` and would still cut most
+/// plain names.
+pub(crate) const WORKER_STATUS_LEFT_LENGTH: &str = "40";
+
 pub struct TmuxBackend {
     bin: String,
 }
@@ -588,6 +597,24 @@ impl SessionBackend for TmuxBackend {
                 OP_TIMEOUT,
             )
             .await?;
+
+            // Display only, so a failure is logged rather than failing the
+            // spawn. set-option takes the pane form: `=<ref>` alone is "no
+            // such session" and sets nothing.
+            for (opt, val) in [
+                ("status-left", WORKER_STATUS_LEFT),
+                ("status-left-length", WORKER_STATUS_LEFT_LENGTH),
+            ] {
+                let out = self.run(&["set-option", "-t", &pt, opt, val], OP_TIMEOUT).await;
+                if !matches!(out, Ok(ref o) if o.status.success()) {
+                    tracing::warn!(
+                        target: "amux::backend",
+                        verdict = "worker_status_name_unset", option = opt, session = %ref_,
+                        measured = true, n_considered = 1,
+                        "could not set the worker status bar option; it shows the tmux session name"
+                    );
+                }
+            }
 
             // `-l` = literal: without it send-keys translates tokens like
             // "Enter"/"Space"/"C-c" inside the command into KEYS — the exact
