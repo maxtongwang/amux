@@ -8100,7 +8100,11 @@ pub(crate) async fn cmd_hist_record_with_id(
         if row_id > 0 {
             if board_delivery {
                 let state = state.clone();
+                #[cfg(test)]
+                let gate_session = cap_session.clone();
                 tokio::spawn(async move {
+                    #[cfg(test)]
+                    capture_gate::at(&gate_session, "spawned").await;
                     capture_recorded_message(&state, row_id).await;
                 });
             } else {
@@ -8462,6 +8466,64 @@ pub(crate) async fn release_held_message(state: &AppState, row_id: i64, session:
 
 /// Resume only explicitly pending message consequences. This does not deliver a
 /// command, insert history, or infer work from arbitrary old cardless messages.
+/// Test-only: hold a capture of one session at a named point until the test
+/// lets it go, so a race between two captures can be replayed in a fixed order.
+/// A point with no gate held costs nothing; production builds have no gates.
+#[cfg(test)]
+pub(crate) mod capture_gate {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::Semaphore;
+
+    type Key = (String, &'static str);
+    type Slot = (Arc<Semaphore>, Arc<AtomicUsize>);
+
+    fn gates() -> &'static Mutex<HashMap<Key, Slot>> {
+        static GATES: OnceLock<Mutex<HashMap<Key, Slot>>> = OnceLock::new();
+        GATES.get_or_init(Default::default)
+    }
+
+    /// A held gate; dropping it lets everything through and removes it.
+    pub(crate) struct Gate { key: Key, slot: Slot }
+
+    impl Gate {
+        /// How many captures have reached this point and are waiting at it.
+        pub(crate) fn reached(&self) -> usize { self.slot.1.load(Ordering::SeqCst) }
+        /// Let every capture waiting here (and any later one) through.
+        pub(crate) fn open(&self) { self.slot.0.add_permits(Semaphore::MAX_PERMITS / 2); }
+    }
+
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            self.open();
+            gates().lock().unwrap().remove(&self.key);
+        }
+    }
+
+    pub(crate) fn hold(session: &str, point: &'static str) -> Gate {
+        let key = (session.to_string(), point);
+        let slot: Slot = (Arc::new(Semaphore::new(0)), Arc::new(AtomicUsize::new(0)));
+        gates().lock().unwrap().insert(key.clone(), slot.clone());
+        Gate { key, slot }
+    }
+
+    pub(crate) async fn at(session: &str, point: &'static str) {
+        let slot = gates().lock().unwrap().get(&(session.to_string(), point)).cloned();
+        if let Some((sem, reached)) = slot {
+            reached.fetch_add(1, Ordering::SeqCst);
+            if let Ok(permit) = sem.acquire().await { permit.forget(); }
+        }
+    }
+}
+
+/// Another capture of the same row took its pending claim first: this one does
+/// nothing, and says so, so two captures never read as two releases in the log.
+fn capture_already_claimed(session: &str, row_id: i64, branch: &str) {
+    tracing::info!(session, message_id = row_id, branch, measured = true, n_considered = 1,
+        verdict = "capture_already_claimed", "ledger: another capture of this message took it first; nothing to do");
+}
+
 pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
     use rusqlite::OptionalExtension;
     let session = (|| -> anyhow::Result<Option<String>> {
@@ -8499,6 +8561,7 @@ pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
             })
             .await;
         match result {
+            Ok(reply) if !reply.applied => capture_already_claimed(&cap_session, row_id, "isolated"),
             Ok(_) => {
                 tracing::info!(session=%cap_session, message_id=row_id, measured=true, n_considered=1,
                 verdict="isolated_capture_suppressed", "isolated input is not board work; pending intake cleared");
@@ -8523,13 +8586,19 @@ pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
     // accumulate and its not an isolated worker"). Raw prompt capture used to
     // ignore that switch and card every prompt anyway.
     if !super::board_lifecycle::enabled(&cap_session) {
+        // The clear is the claim: a held (board) message is captured both by the
+        // task its recording spawns and by recovery or a caller, and only the
+        // one whose UPDATE took the pending row may release it.
         let result = state.store.write_async(move |conn| {
-            conn.execute("UPDATE cmd_history SET capture_pending=0,intake_result=?2 WHERE id=?1 AND card_id IS NULL",
+            let n = conn.execute("UPDATE cmd_history SET capture_pending=0,intake_result=?2 WHERE id=?1 AND card_id IS NULL AND capture_pending!=0",
                 rusqlite::params![row_id, json!({"state":"board_capture_off","reason":"decompose onto board is off for this worker"}).to_string()])?;
-            Ok(crate::db::WriteOutcome { applied:true, events:vec![] })
+            Ok(crate::db::WriteOutcome { applied: n > 0, events:vec![] })
         }).await;
         match result {
+            Ok(reply) if !reply.applied => capture_already_claimed(&cap_session, row_id, "board_capture_off"),
             Ok(_) => {
+                #[cfg(test)]
+                capture_gate::at(&cap_session, "before_release").await;
                 tracing::info!(session=%cap_session, message_id=row_id, measured=true, n_considered=1,
                     verdict="board_capture_off", "ledger: decompose onto board is off; message kept in Messages without a card");
                 release_held_message(state, row_id, &cap_session, "board_capture_off").await;
@@ -41085,17 +41154,46 @@ mod tests {
         }
     }
 
+    /// Logs of everything the test thread emits (the capture its recording
+    /// spawns runs on this current-thread runtime too).
+    fn held_capture_logs() -> (std::sync::Arc<std::sync::Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(CapturedLogs(bytes.clone()))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        // Same registration peer as rename_is_convergent_journaled_and_collision_safe.
+        (bytes, guard, tracing::Dispatch::new(tracing_subscriber::registry()))
+    }
+
+    fn held_capture_count(bytes: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>, verdict: &str) -> usize {
+        String::from_utf8_lossy(&bytes.lock().unwrap()).matches(&format!("verdict=\"{verdict}\"")).count()
+    }
+
     /// MSG-89740 (mixpeek-seo, 2026-10-15): an owner message held for the board
     /// reached intake after "decompose onto board" was switched off. Intake made
     /// no card and cleared the row, so the worker never saw it. It must be handed
     /// to the worker instead, exactly once.
+    ///
+    /// Recording a board-held message already spawns its capture, so the call
+    /// below is a SECOND capture of the same row. CI (1 run in ~10) caught the
+    /// spawned one between clearing capture_pending and releasing the row: this
+    /// call found nothing to do and the test read delivery='board'. The gates
+    /// replay exactly that order every run; the test waits for the row to
+    /// settle instead of reading it while another capture still holds it.
     #[tokio::test]
     async fn a_held_message_with_no_plan_goes_to_its_worker() {
+        let (logs, _guard, _peer) = held_capture_logs();
         let (st, dir) = state();
         let _g = crate::api::settings::test_env::set_home(dir.path());
         let sessions = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         std::fs::write(sessions.join("seo.env"), "AMUX_COMMAND_LIFECYCLE=0\nAMUX_BOARD_FORCE_ADHERENCE=1\n").unwrap();
+        let spawned = capture_gate::hold("seo", "spawned");
+        let before_release = capture_gate::hold("seo", "before_release");
         let id = cmd_hist_record_with_id(&st, "seo", "build the video understanding extension", "user", "", false,
             DeliveryMeta::board(now_i64() * 1000)).await;
         assert!(id > 0);
@@ -41103,19 +41201,69 @@ mod tests {
             c.execute("UPDATE cmd_history SET capture_pending=1 WHERE id=?1", [id])?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         }).await.unwrap();
+        // The spawned capture claims the row and stops just before releasing it.
+        spawned.open();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while before_release.reached() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(before_release.reached(), 1, "the spawned capture claimed the row");
+        // This second capture finds nothing pending: the spawned one owns the row.
         capture_recorded_message(&st, id).await;
+        let delivery = |st: &AppState| -> String {
+            st.store.read().unwrap().query_row("SELECT delivery FROM cmd_history WHERE id=?1", [id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(delivery(&st), "board", "mid-release: the CI flake's read, every run");
+        before_release.open();
+        // Settled means the spawned capture FINISHED: its release log comes after
+        // the row is marked queued, so waiting on the row alone could assert
+        // before that line was written (1 run in 300).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while held_capture_count(&logs, "board_held_message_released") == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         let c = st.store.read().unwrap();
-        let (delivery, cards): (String, i64) = c.query_row(
-            "SELECT delivery, (SELECT COUNT(*) FROM issues) FROM cmd_history WHERE id=?1", [id],
-            |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let cards: i64 = c.query_row("SELECT COUNT(*) FROM issues", [], |r| r.get(0)).unwrap();
         assert_eq!(cards, 0, "capture is off: no card");
-        assert_eq!(delivery, "queued", "the held row is released, not left as board");
+        drop(c);
+        assert_eq!(delivery(&st), "queued", "the held row is released, not left as board");
+        let c = st.store.read().unwrap();
         let queued: i64 = c.query_row(
             "SELECT COUNT(*) FROM steering_queue WHERE session='seo' AND text LIKE '%video understanding%'",
             [], |r| r.get(0)).unwrap();
         assert_eq!(queued, 1, "the owner's words are queued for the worker");
         drop(c);
         assert!(!release_held_message(&st, id, "seo", "again").await, "a released row is not released twice");
+        assert_eq!(held_capture_count(&logs, "board_held_message_released"), 1, "one release, however many captures ran");
+    }
+
+    /// Two captures of one held row at once (the recording's own and recovery's):
+    /// only the one whose clear took the pending row releases it; the other says
+    /// it found the row claimed. Before the claim both released, and the log
+    /// reported one message released twice.
+    #[tokio::test]
+    async fn two_captures_of_one_held_message_release_it_once() {
+        let (logs, _guard, _peer) = held_capture_logs();
+        let (st, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("seo.env"), "AMUX_COMMAND_LIFECYCLE=0\nAMUX_BOARD_FORCE_ADHERENCE=1\n").unwrap();
+        // A held row inserted directly, so no capture is spawned behind the test.
+        st.store.write_async(move |c| {
+            ensure_fleet_tables(c)?;
+            c.execute("INSERT INTO cmd_history (text, type, session, ts, origin, delivery, capture_pending) \
+                       VALUES ('build the video understanding extension','user','seo',?1,'','board',1)", [now_i64() * 1000])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        let id: i64 = st.store.read().unwrap()
+            .query_row("SELECT id FROM cmd_history WHERE session='seo' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+        tokio::join!(capture_recorded_message(&st, id), capture_recorded_message(&st, id));
+        let delivery: String = st.store.read().unwrap()
+            .query_row("SELECT delivery FROM cmd_history WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(delivery, "queued");
+        assert_eq!(held_capture_count(&logs, "board_held_message_released"), 1, "released once");
+        assert_eq!(held_capture_count(&logs, "capture_already_claimed"), 1, "the other capture says it found the row claimed");
     }
 
     #[tokio::test]
