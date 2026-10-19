@@ -59,7 +59,13 @@ _bounded() { # seconds cmd...
   local s="$1"; shift
   if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$s" "$@"
-  else perl -e 'alarm shift; exec @ARGV or exit 127' "$s" "$@"
+  else
+    # Own process group, killed whole on timeout, so a fetch's ssh child cannot
+    # outlive the bound; exits 124 like timeout(1).
+    perl -e 'my $s = shift; my $pid = fork; exit 127 unless defined $pid;
+      if (!$pid) { setpgrp(0, 0); exec @ARGV or exit 127 }
+      $SIG{ALRM} = sub { kill "TERM", -$pid; select(undef, undef, undef, 0.5); kill "KILL", -$pid; exit 124 };
+      alarm $s; waitpid($pid, 0); exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' "$s" "$@"
   fi
 }
 # Which bound ran is logged, so a silent no-op cannot come back unseen. Not to

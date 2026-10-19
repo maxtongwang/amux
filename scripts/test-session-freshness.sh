@@ -19,6 +19,10 @@
 #
 # Exit 0 = all pass, 1 = a failure. Wired into .github/workflows/checks.yml.
 set -euo pipefail
+# Hermetic: the hook writes its bound log under AMUX_HOME and, by default,
+# probes https://localhost:8824/health. Neither may be the real one.
+export AMUX_HOME="$(mktemp -d "${TMPDIR:-/tmp}/freshness-home.XXXXXX")"
+export AMUX_HEALTH_URL="file://$AMUX_HOME/no-such-health.json"
 cd "$(dirname "$0")/.."
 HOOK="$(pwd)/.claude/session-freshness.sh"
 PASS=0; FAIL=0
