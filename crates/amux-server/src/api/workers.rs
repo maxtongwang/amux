@@ -2960,8 +2960,9 @@ mod tests {
         };
         use crate::api::worker_identity::{verified_worker, IdentityRefusal};
         assert_eq!(verified_worker(&h(&[])), Ok(None));
-        assert_eq!(verified_worker(&h(&[("x-amux-worker", "w")])), Ok(Some("w".into())));
-        assert_eq!(verified_worker(&h(&[("x-amux-session", "w"), ("x-amux-worker", "w")])), Ok(Some("w".into())));
+        assert!(matches!(verified_worker(&h(&[("x-amux-worker", "w")])), Err(IdentityRefusal::Unproven { .. })));
+        assert!(matches!(verified_worker(&h(&[("x-amux-session", "w"), ("x-amux-worker", "w")])), Err(IdentityRefusal::Unproven { .. })));
+        assert_eq!(verified_worker(&h(&[("x-amux-session", "w"), (crate::api::process_identity::PROCESS_WORKER_HEADER, "w")])), Ok(Some("w".into())));
         assert!(matches!(verified_worker(&h(&[("x-amux-session", "a"), ("x-amux-worker", "b")])), Err(IdentityRefusal::Mismatch { .. })));
         assert!(matches!(verified_worker(&h(&[("x-amux-session", "../x")])), Err(IdentityRefusal::Invalid { .. })));
     }

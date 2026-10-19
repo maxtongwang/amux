@@ -180,6 +180,12 @@ pub trait SessionBackend: Send + Sync {
     ) -> Result<std::collections::BTreeMap<String, amux_core::protocol::ExitStatus>> {
         Ok(std::collections::BTreeMap::new())
     }
+    /// The pid of the process the backend runs for `proc`, so a stop can signal
+    /// it instead of typing into its terminal (#10, B4). Default: the pid the
+    /// ref recorded at spawn, if any.
+    async fn pid(&self, proc: &ProcessRef) -> Result<Option<u32>> {
+        Ok(proc.pid)
+    }
     /// Type literal text into the session's terminal and submit it.
     ///
     /// This is KEYSTROKE DELIVERY, not the control plane — the same category

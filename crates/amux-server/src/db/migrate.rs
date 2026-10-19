@@ -693,6 +693,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 126,
         name: "0126_vault_write_grant",
         sql: include_str!("../../migrations/0126_vault_write_grant.sql"),
+    },
+    Migration {
+        version: 127,
+        name: "0127_steering_stamp",
+        sql: include_str!("../../migrations/0127_steering_stamp.sql"),
     },];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

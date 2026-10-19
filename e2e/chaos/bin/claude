@@ -12,6 +12,9 @@ plus one launch record per process, written before anything is painted:
   {"event": "launch", "cwd": <os.getcwd()>, "pid": <pid>, "argv": [...], "t": ...}
 The launch cwd is the agent's own report of where it runs, which is what a
 worktree test has to prove (not what amux believes it passed to tmux).
+A SIGTERM is logged as {"event": "signal", "sig": "SIGTERM", "pid": ..., "t": ...}
+and IGNORED, like a provider slow to shut down: amux stops by signal (#10, B4)
+and must escalate to SIGKILL after its grace period.
 With $FAKE_CLAUDE_ENV_KEYS (comma-separated names) the launch record also
 carries "env_sha256": {name: sha256 of its value, or null when unset}, so a
 test can prove a secret arrived without any log holding the secret.
@@ -20,7 +23,7 @@ It ignores every argument amux passes (--model, --resume, ...), because the
 point is to exercise amux's paste, Enter and submission-verification path,
 not the model.
 """
-import hashlib, json, os, select, subprocess, sys, time, termios, tty
+import hashlib, json, os, select, signal, subprocess, sys, time, termios, tty
 
 LOG = os.environ.get("FAKE_CLAUDE_LOG")
 # Optional: every raw input byte, for diagnosing what the harness actually typed.
@@ -119,9 +122,14 @@ def headless():
         print(reply)
     sys.exit(0)
 
+def on_sigterm(_signum, _frame):
+    with open(LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"event": "signal", "sig": "SIGTERM", "pid": os.getpid(), "t": time.time()}) + "\n")
+
 def main():
     if not sys.stdin.isatty():
         headless()
+    signal.signal(signal.SIGTERM, on_sigterm)
     with open(LOG, "a", encoding="utf-8") as f:
         rec = {"event": "launch", "bin": os.path.basename(sys.argv[0]),
                "cwd": os.getcwd(), "pid": os.getpid(),

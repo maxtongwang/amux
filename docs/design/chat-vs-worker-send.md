@@ -47,3 +47,10 @@ From there both go through the same steps:
 The parent request also asked to evaluate the amux-meta-helper chat "having
 issues" in the browser. That needs its own pass against that worker's Chat tab.
 This document covers only the send-handling comparison.
+
+## Connection sender attribution
+
+The historical no-stamp Chat behaviour above is superseded by
+[Message connection provenance](message-provenance.md): Chat-tab input carries
+the same connection-derived Sender as worker input. An absent caller header no
+longer creates an owner turn, and unverified claims stay visible in the stamp.

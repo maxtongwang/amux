@@ -13,36 +13,44 @@
 //! THE RULE. For every request over a real socket the server finds the local
 //! processes holding the client end of THAT connection (both ends matched: the
 //! server listens on 0.0.0.0, so a client end alone can belong to two
-//! connections). A holder is a worker when its controlling tty is a worker
-//! pane's tty, or an ancestor is the shell of a tmux pane in session
+//! connections). A holder is a worker when its ancestry reaches the shell of
+//! a tmux pane in session
 //! `amux-<worker>`. Then the request IS that worker, whatever it sent:
 //!
-//! - a missing worker header is filled with that worker, a different one is
-//!   overridden (logged `worker_identity_overridden`), and a member marker is
+//! - original claims are preserved for message stamps, while authorization's
+//!   missing worker header is filled with the real worker and a different one is overridden (logged `worker_identity_overridden`), and a member marker is
 //!   dropped, so it is never the owner, owner token or not;
 //! - `x-amux-process-worker` carries the proof to `worker_identity::enforce`,
 //!   which accepts it in place of the rule-10 token (process ancestry is the
 //!   stronger evidence, and a sandbox can strip the token's env var too).
 //!
-//! FAIL CLOSED. The owner is allowed only on positive proof: the holders were
-//! found by a full scan, their ancestry reached the root, and none is in a
-//! worker pane (the dashboard browser, the owner's terminal, launchd jobs).
+//! FAIL CLOSED. Outside requires positive proof: the holders were found by a
+//! full scan, their ancestry reached the root, and none is in a worker pane.
 //! "None is in a pane" is proven either by a pane inventory read now, or, for
 //! holders that no pane can contain (no controlling tty, no pty open, no tmux
-//! server ancestor: see `needs_inventory`), without one. A cached inventory or
-//! a remembered holder may confirm a worker, never the owner. Anything unproven is refused for a
+//! server ancestor: see `needs_inventory`), without one. Outside alone is NOT
+//! ownership.
+//!
+//! OWNER CONNECTIONS (#10, B1). Message attribution grants the owner only to the
+//! UI token over one of two connections: [`Origin::Browser`], where every
+//! process from each socket holder up to launchd is an allow-listed GUI browser
+//! whose code signature verifies (`browser_identity`; never a name or path), or
+//! [`Origin::Remote`], a tailnet peer. A token-holding curl, a script, a process
+//! under a worker pane or a launchd job's shell all stay Outside: unverified.
+//! A cached inventory or remembered holder may confirm a worker, never owner. Anything unproven is refused for a
 //! headerless `/api/` request: `worker_origin_unattributed`, or
 //! `worker_identity_unavailable` when the pane inventory cannot be read.
 //!
-//! REMOTE. The owner's phone is remote two ways: a non-loopback peer that no
-//! local process holds (LAN), or `tailscale serve`, a raw TCP forward by root
+//! REMOTE. The owner's phone is remote two ways: a tailnet peer that no local
+//! process holds, or `tailscale serve`, a raw TCP forward by root
 //! `tailscaled` to 127.0.0.1, whose sockets this user cannot list. A loopback
 //! connection with no visible holder is that forward only when a root
 //! tailscaled is among the unlistable processes and no worker (or unprovable
 //! process) is connected to any of this host's own tailnet addresses on any
 //! port (the front door, from the interfaces, never the serve config), the one
 //! way a local worker could ride the forward. A peer on one of this host's own
-//! non-loopback addresses with no visible holder gets the same test.
+//! non-loopback addresses with no visible holder gets the same test. Any other
+//! network peer no local process holds is [`Origin::Lan`], which is never owner.
 //!
 //! On a platform without a resolver the layer does nothing and says so once
 //! (`process_attribution_unavailable`, measured=false): that is today's
@@ -77,9 +85,83 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
+use super::browser_identity::{parse_codesign_display, verify_browser, CodeFacts, Exe, SignatureVerifier, BROWSERS};
+
 /// Internal proof header: set only by [`attribute`], stripped from every
 /// inbound request first, so a client cannot assert it.
 pub(crate) const PROCESS_WORKER_HEADER: &str = "x-amux-process-worker";
+/// Server-only connection evidence and the original (possibly false) claim.
+pub(crate) const PROCESS_ORIGIN_HEADER: &str = "x-amux-process-origin";
+pub(crate) const PROCESS_CLAIM_HEADER: &str = "x-amux-process-claim";
+
+/// The e2e harness's per-run owner secret (DMIW-8). Since #10 B1, no local
+/// process proves the owner, so the harness's own throwaway server accepts this
+/// secret, sent by the harness, as the owner's browser. Stripped from every
+/// request; honored only by [`e2e_owner_accepted`].
+pub(crate) const E2E_OWNER_HEADER: &str = "x-amux-e2e-owner";
+/// The server environment variable naming that secret.
+pub(crate) const E2E_OWNER_ENV: &str = "AMUX_E2E_OWNER_TOKEN";
+/// The installed server's port: never a test server.
+const LIVE_PORT: u16 = 8824;
+/// The owner connection an accepted e2e secret stands in for.
+pub(crate) const E2E_OWNER_FIXTURE: &str = "amux e2e owner fixture";
+
+/// Pure: whether a presented e2e owner secret is accepted. Only a server whose
+/// AMUX_HOME is a throwaway directory and that is not on the live port honors
+/// one, so env alone cannot turn it on for the installed server, and only for
+/// a secret of at least 32 characters that matches exactly. Err names why a
+/// presented secret was refused.
+pub(crate) fn e2e_owner_accepted(
+    secret: Option<&str>,
+    presented: &str,
+    home: &std::path::Path,
+    server_port: Option<u16>,
+) -> Result<(), &'static str> {
+    let secret = secret.map(str::trim).filter(|s| !s.is_empty()).ok_or("no e2e owner secret is configured")?;
+    if secret.len() < 32 {
+        return Err("the configured e2e owner secret is shorter than 32 characters");
+    }
+    if crate::backend::tmux_health::spawn_allowed_from(home, false).is_ok() {
+        return Err("AMUX_HOME is not a throwaway directory");
+    }
+    if server_port.is_none_or(|p| p == LIVE_PORT) {
+        return Err("the connection is not to a test server's port");
+    }
+    let (a, b) = (secret.as_bytes(), presented.as_bytes());
+    if a.len() != b.len() || a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) != 0 {
+        return Err("the presented secret does not match");
+    }
+    Ok(())
+}
+
+/// An Outside connection carrying the accepted e2e owner secret is the owner's
+/// browser on the harness's own server. Anything else keeps its origin, and a
+/// refused secret is logged.
+fn e2e_owner_origin(origin: Origin, presented: Option<HeaderValue>, conn: Conn) -> Origin {
+    let Some(presented) = presented else { return origin };
+    let secret = std::env::var(E2E_OWNER_ENV).ok();
+    let verdict = if origin != Origin::Outside {
+        Err("the connection is not a local process outside every pane")
+    } else {
+        e2e_owner_accepted(secret.as_deref(), presented.to_str().unwrap_or(""), &super::session_verbs::home(),
+            conn.server.map(|s| s.port()))
+    };
+    match verdict {
+        Ok(()) => {
+            static ONCE: OnceLock<()> = OnceLock::new();
+            ONCE.get_or_init(|| {
+                tracing::warn!(verdict = "e2e_owner_fixture_used", measured = true, n_considered = 1,
+                    "the e2e harness's owner secret was accepted on this throwaway test server");
+            });
+            Origin::Browser(E2E_OWNER_FIXTURE)
+        }
+        Err(why) => {
+            tracing::warn!(peer = %conn.peer, why, verdict = "e2e_owner_fixture_refused", measured = true,
+                n_considered = 1, "an e2e owner secret was presented and refused; the connection keeps its origin");
+            origin
+        }
+    }
+}
 
 /// The server's own end of an accepted connection, stamped on every request by
 /// the TLS acceptor (tls.rs). With the peer from ConnectInfo it names the exact
@@ -102,10 +184,19 @@ pub(crate) enum Origin {
     Worker(String),
     /// A local process whose whole ancestry is outside every amux pane.
     Outside,
+    /// A descendant of a pane in the owner's own (non-amux) tmux session.
+    /// Outside every worker, but not owner proof (#10 B1): any same-user
+    /// process can run there.
+    OwnerPane,
+    /// Outside every pane, and every process from each socket holder up to
+    /// launchd is this allow-listed, code-signed GUI browser (B1).
+    Browser(&'static str),
     /// The owner's remote device: no local process owns the client end and the
-    /// peer is not loopback, or the connection was forwarded by this host's root
+    /// peer is on the tailnet, or the connection was forwarded by this host's root
     /// `tailscaled` (tailscale serve) with no worker at the tailnet front door.
     Remote,
+    /// A non-tailnet network peer no local process holds. Never the owner.
+    Lan,
     /// Local, but the owner or its ancestry could not be established.
     Unattributed(String),
     /// The tmux pane inventory could not be read, so whether this process is
@@ -128,10 +219,8 @@ pub(crate) struct Panes {
     pub by_tty: HashMap<u64, String>,
 }
 
-/// The pure classification. A process is a worker when its controlling tty is
-/// a worker pane's tty (it stays so when reparented to launchd: `amux send &`
-/// from a one-shot shell, review N1), or when an ancestor is a worker pane's
-/// shell. A pane of a tmux session NOT named `amux-*` is the owner's own tmux
+/// The pure classification. A worker requires an ancestor that is a worker
+/// pane's shell. A worker tty without that ancestry is unverified. A pane of a tmux session NOT named `amux-*` is the owner's own tmux
 /// and the walk continues past it. A chain that breaks, or runs out of steps,
 /// is unattributed, never outside: outside must be proven.
 pub(crate) fn classify(
@@ -143,35 +232,65 @@ pub(crate) fn classify(
     if owners.is_empty() {
         return Origin::Unattributed("no local process owns the client socket".into());
     }
-    let worker_of = |session: &String| session.strip_prefix("amux-").filter(|w| !w.is_empty()).map(str::to_string);
-    let mut broken = None;
-    for &owner in owners {
-        if let Some(worker) = tty_of(owner).and_then(|t| panes.by_tty.get(&t)).and_then(worker_of) {
-            return Origin::Worker(worker);
+    let mut agreed = None;
+    for &holder in owners {
+        let origin = classify_holder(holder, panes, ppid_of, tty_of);
+        if matches!(origin, Origin::Unattributed(_)) {
+            return origin;
         }
-        let mut cur = owner;
-        let mut proven = false;
-        for _ in 0..4096 {
-            if let Some(worker) = panes.by_pid.get(&cur).and_then(worker_of) {
+        if agreed.as_ref().is_some_and(|previous| previous != &origin) {
+            return Origin::Unattributed("ambiguous client socket holders span different panes or outside processes".into());
+        }
+        agreed = Some(origin);
+    }
+    agreed.expect("nonempty holder set")
+}
+
+fn classify_holder(
+    owner: u32,
+    panes: &Panes,
+    ppid_of: &dyn Fn(u32) -> Option<u32>,
+    tty_of: &dyn Fn(u32) -> Option<u64>,
+) -> Origin {
+    let worker_of = |session: &String| session.strip_prefix("amux-").filter(|w| !w.is_empty()).map(str::to_string);
+    let mut broken = tty_of(owner)
+        .and_then(|t| panes.by_tty.get(&t)).and_then(worker_of)
+        .map(|_| format!("pid {owner} holds a worker tty without proven pane ancestry"));
+    let mut owner_pane = false;
+    let mut cur = owner;
+    for _ in 0..4096 {
+        if let Some(session) = panes.by_pid.get(&cur) {
+            if let Some(worker) = worker_of(session) {
                 return Origin::Worker(worker);
             }
-            if cur <= 1 {
-                proven = true;
-                break;
-            }
-            match ppid_of(cur) {
-                Some(p) if p != cur => cur = p,
-                _ => break,
+            // A nested personal pane still belongs to its enclosing worker.
+            if session.starts_with("amux-") {
+                broken = Some("amux pane has no worker name".into());
+            } else {
+                owner_pane = true;
             }
         }
-        if !proven {
-            broken = Some(format!("ancestry of pid {owner} could not be walked to the root (stopped at pid {cur})"));
+        if cur <= 1 {
+            return match broken {
+                Some(why) => Origin::Unattributed(why),
+                None if owner_pane => Origin::OwnerPane,
+                None => Origin::Outside,
+            };
+        }
+        match ppid_of(cur) {
+            Some(p) if p != cur => cur = p,
+            _ => break,
         }
     }
-    match broken {
-        Some(why) => Origin::Unattributed(why),
-        None => Origin::Outside,
-    }
+    Origin::Unattributed(format!("ancestry of pid {owner} could not be walked to the root (stopped at pid {cur})"))
+}
+
+/// Order-independent equality of the COMPLETE visible holder sets. Merely
+/// confirming old descriptors misses a newly duplicated socket in another pane.
+fn same_holders(remembered: &[u32], current: &[u32]) -> bool {
+    !remembered.is_empty()
+        && remembered.iter().all(|p| current.contains(p))
+        && current.iter().all(|p| remembered.contains(p))
 }
 
 /// What one full scan of the process table found for a connection.
@@ -202,6 +321,10 @@ pub(crate) trait Lookups {
     fn comm_of(&self, pid: u32) -> Option<String>;
     /// Whether the process has any pseudo-terminal open (master or slave).
     fn holds_pty(&self, pid: u32) -> bool;
+    /// The process's executable, or None when it cannot be read.
+    fn exe_of(&self, pid: u32) -> Option<Exe>;
+    /// The code-signature reader (codesign in production, a fake in tests).
+    fn verifier(&self) -> &dyn SignatureVerifier;
 }
 
 /// Whether the holders could be tied to a tmux pane at all, so that proving
@@ -250,7 +373,7 @@ fn needs_inventory(holders: &[u32], l: &dyn Lookups) -> Result<bool, String> {
 
 /// The resolver's decision.
 ///
-/// FAIL CLOSED. Outside (and with it owner authority) is granted only on
+/// FAIL CLOSED. Outside (which alone confers no owner authority) requires
 /// positive proof: the holders of THIS connection (both ends matched) were
 /// found by a full scan, their ancestry and controlling tty were read, a pane
 /// inventory read NOW succeeded, and none of them is in a worker pane. A cached
@@ -266,13 +389,6 @@ fn needs_inventory(holders: &[u32], l: &dyn Lookups) -> Result<bool, String> {
 /// front door, which is the one way a local worker could ride the forward.
 fn decide(conn: Conn, l: &dyn Lookups) -> Origin {
     let peer = SocketAddr::new(conn.peer.ip().to_canonical(), conn.peer.port());
-    let Some(server) = conn.server.map(|s| SocketAddr::new(s.ip().to_canonical(), s.port())) else {
-        return if peer.ip().is_loopback() {
-            Origin::Unattributed("the server end of this connection is unknown".into())
-        } else {
-            Origin::Remote
-        };
-    };
     let own = l.own_addresses();
     // A peer on this host (loopback, or one of its own addresses) can be a
     // local process; only a peer provably elsewhere may be Remote outright.
@@ -282,21 +398,31 @@ fn decide(conn: Conn, l: &dyn Lookups) -> Origin {
             Ok(addrs) => addrs.contains(&peer.ip()),
             Err(_) => true,
         };
+    let Some(server) = conn.server.map(|s| SocketAddr::new(s.ip().to_canonical(), s.port())) else {
+        return if local_peer {
+            Origin::Unattributed("the server end of this connection is unknown".into())
+        } else {
+            network_peer(peer)
+        };
+    };
     let scan = match l.scan(peer, server, &front_door_for(&own)) {
         Ok(s) => s,
         Err(os::LookupError::Unsupported(why)) => return Origin::Unavailable(why),
         Err(os::LookupError::Failed(why)) => {
-            return if local_peer { Origin::Unattributed(why) } else { Origin::Remote };
+            return if local_peer { Origin::Unattributed(why) } else { network_peer(peer) };
         }
     };
     if scan.holders.is_empty() {
         if !local_peer {
-            return Origin::Remote;
+            return network_peer(peer);
         }
         return forwarded(peer, &scan, l);
     }
     match needs_inventory(&scan.holders, l) {
-        Ok(false) => return classify(&scan.holders, &Panes::default(), &|p| l.ppid_of(p), &|p| l.tty_of(p)),
+        Ok(false) => {
+            let origin = classify(&scan.holders, &Panes::default(), &|p| l.ppid_of(p), &|p| l.tty_of(p));
+            return browser_or(origin, &scan.holders, l);
+        }
         Ok(true) => {}
         Err(why) => return Origin::Unattributed(why),
     }
@@ -306,9 +432,63 @@ fn decide(conn: Conn, l: &dyn Lookups) -> Origin {
         }
     }
     match l.panes(true) {
-        Ok(panes) => classify(&scan.holders, &panes, &|p| l.ppid_of(p), &|p| l.tty_of(p)),
+        Ok(panes) => browser_or(classify(&scan.holders, &panes, &|p| l.ppid_of(p), &|p| l.tty_of(p)), &scan.holders, l),
         Err(why) => inventory_failed(peer, scan.holders.len(), &why),
     }
+}
+
+/// A network peer no local process holds. Only a tailnet peer is the owner's
+/// remote device (B1); any other address confers nothing.
+fn network_peer(peer: SocketAddr) -> Origin {
+    if is_tailnet(peer.ip()) {
+        Origin::Remote
+    } else {
+        Origin::Lan
+    }
+}
+
+/// B1: an Outside connection is the owner's GUI browser only when the whole
+/// chain qualifies ([`browser_chain`]); otherwise it stays Outside, never owner.
+fn browser_or(origin: Origin, holders: &[u32], l: &dyn Lookups) -> Origin {
+    if origin != Origin::Outside {
+        return origin;
+    }
+    match browser_chain(holders, l) {
+        Ok(name) => Origin::Browser(name),
+        Err(why) => {
+            tracing::debug!(why = %why, verdict = "browser_connection_unverified", measured = true,
+                n_considered = holders.len(), "an outside connection is not a verified GUI browser; it cannot be owner input");
+            Origin::Outside
+        }
+    }
+}
+
+/// Every process from each holder up to launchd (pid 1) must be one
+/// allow-listed browser vendor whose code signature verifies. Any other process
+/// on the way (a shell, a worker pane, a launchd job's script, curl, an
+/// unsigned or re-signed copy) disqualifies the connection.
+fn browser_chain(holders: &[u32], l: &dyn Lookups) -> Result<&'static str, String> {
+    let mut vendor: Option<&'static str> = None;
+    for &holder in holders {
+        let mut cur = holder;
+        for step in 0.. {
+            if step == 64 {
+                return Err(format!("ancestry of pid {holder} does not reach launchd within 64 steps"));
+            }
+            let exe = l.exe_of(cur).ok_or_else(|| format!("pid {cur}: executable unreadable"))?;
+            let browser = verify_browser(&exe, l.verifier()).map_err(|e| format!("pid {cur}: {e}"))?;
+            if let Some(v) = vendor.filter(|v| *v != browser.name) {
+                return Err(format!("pid {cur} is {}, not {v}", browser.name));
+            }
+            vendor = Some(browser.name);
+            match l.ppid_of(cur) {
+                Some(1) => break,
+                Some(p) if p > 1 && p != cur => cur = p,
+                parent => return Err(format!("pid {cur}'s parent {parent:?} is not launchd")),
+            }
+        }
+    }
+    vendor.ok_or_else(|| "no socket holder".into())
 }
 
 fn inventory_failed(peer: SocketAddr, n: usize, why: &str) -> Origin {
@@ -335,7 +515,7 @@ fn forwarded(peer: SocketAddr, scan: &Scan, l: &dyn Lookups) -> Origin {
         };
         for &pid in &scan.front_door {
             let origin = classify(&[pid], &panes, &|p| l.ppid_of(p), &|p| l.tty_of(p));
-            if origin != Origin::Outside {
+            if !matches!(origin, Origin::Outside | Origin::OwnerPane) {
                 tracing::warn!(%peer, front_door_pid = pid, origin = ?origin, verdict = "tailscale_forward_ambiguous",
                     measured = true, n_considered = scan.front_door.len(),
                     "a forwarded request arrived while a worker (or an unprovable process) is connected to this host's tailnet front door");
@@ -377,11 +557,81 @@ impl Lookups for OsLookups {
     fn holds_pty(&self, pid: u32) -> bool {
         os::holds_pty(pid)
     }
+    fn exe_of(&self, pid: u32) -> Option<Exe> {
+        os::exe_of(pid)
+    }
+    fn verifier(&self) -> &dyn SignatureVerifier {
+        static CODESIGN: OnceLock<Codesign> = OnceLock::new();
+        CODESIGN.get_or_init(Codesign::default)
+    }
+}
+
+/// `/usr/bin/codesign` as a subprocess: no Security-framework binding is in the
+/// dependency tree, and codesign never shows UI. Completed answers, failures
+/// included, are cached per executable path and inode; a codesign that could
+/// not run (or timed out) is not cached, so the next request asks again.
+#[derive(Default)]
+struct Codesign {
+    facts: Mutex<HashMap<Exe, Result<CodeFacts, String>>>,
+    verified: Mutex<HashMap<(Exe, &'static str), bool>>,
+}
+
+const CODESIGN: &str = "/usr/bin/codesign";
+const CODESIGN_CACHE_MAX: usize = 1024;
+
+impl SignatureVerifier for Codesign {
+    fn describe(&self, exe: &Exe) -> Result<CodeFacts, String> {
+        if let Some(hit) = self.facts.lock().ok().and_then(|m| m.get(exe).cloned()) {
+            return hit;
+        }
+        if !cfg!(target_os = "macos") {
+            return Err("code signatures are verified on macOS only".into());
+        }
+        let (ok, out, err) = run_bounded(
+            std::process::Command::new(CODESIGN).args(["-dv", "--verbose=2"]).arg(&exe.path),
+            Duration::from_secs(10),
+        )?;
+        let facts = if ok { parse_codesign_display(&format!("{err}\n{out}")) } else { Err(format!("unsigned: {}", err.trim())) };
+        if let Ok(mut m) = self.facts.lock() {
+            if m.len() >= CODESIGN_CACHE_MAX {
+                m.clear();
+            }
+            m.insert(exe.clone(), facts.clone());
+        }
+        facts
+    }
+
+    fn satisfies(&self, exe: &Exe, requirement: &str) -> Result<bool, String> {
+        let Some(req) = BROWSERS.iter().map(|b| b.requirement).find(|r| *r == requirement) else {
+            return Err("not an allow-listed browser requirement".into());
+        };
+        let key = (exe.clone(), req);
+        if let Some(hit) = self.verified.lock().ok().and_then(|m| m.get(&key).copied()) {
+            return Ok(hit);
+        }
+        if !cfg!(target_os = "macos") {
+            return Err("code signatures are verified on macOS only".into());
+        }
+        let (ok, _, _) = run_bounded(
+            std::process::Command::new(CODESIGN)
+                .args(["--verify", "--strict", "--test-requirement"])
+                .arg(format!("={req}"))
+                .arg(&exe.path),
+            Duration::from_secs(30),
+        )?;
+        if let Ok(mut m) = self.verified.lock() {
+            if m.len() >= CODESIGN_CACHE_MAX {
+                m.clear();
+            }
+            m.insert(key, ok);
+        }
+        Ok(ok)
+    }
 }
 
 /// The OS resolver: a per-connection memo that may only CONFIRM a worker (the
-/// remembered holders must still hold this exact connection, both ends, and a
-/// cached inventory must place one in a worker pane), then the full decision.
+/// complete current holder set must equal the remembered set, and a
+/// cached inventory must place every holder in the same worker pane), then the full decision.
 /// An owner verdict never comes from the memo.
 struct OsResolver;
 
@@ -403,11 +653,16 @@ impl PeerResolver for OsResolver {
             let memo = holder_memo().lock().ok()
                 .and_then(|m| m.get(&conn).filter(|(at, _)| at.elapsed() < MEMO_TTL).map(|(_, h)| h.clone()));
             if let Some(holders) = memo {
-                if !holders.is_empty() && holders.iter().all(|&p| os::holds(p, conn.peer, server)) {
-                    if let Ok(panes) = pane_map(false) {
-                        if let worker @ Origin::Worker(_) = classify(&holders, &panes, &os::ppid_of, &os::tty_of) {
-                            return worker;
+                if let Ok(scan) = os::scan(conn.peer, server, &front_door_for(&own_addresses())) {
+                    if same_holders(&holders, &scan.holders) {
+                        if let Ok(panes) = pane_map(false) {
+                            if let worker @ Origin::Worker(_) = classify(&scan.holders, &panes, &os::ppid_of, &os::tty_of) {
+                                return worker;
+                            }
                         }
+                    } else {
+                        tracing::warn!(%conn.peer, measured = true, n_considered = scan.holders.len(),
+                            verdict = "socket_holder_set_changed", "socket holders changed; resolving complete current ownership");
                     }
                 }
             }
@@ -669,11 +924,43 @@ fn claimed(req: &Request) -> String {
     super::groups::hdr_worker(req.headers())
 }
 
+/// Preserve evidence before authorization normalizes headers to the real pane.
+/// Shared by the HTTP layer and unit tests; inbound proof headers are stripped
+/// by `attribute` before this function is called.
+pub(crate) fn record_connection(headers: &mut axum::http::HeaderMap, origin: &Origin) {
+    let mut claims: Vec<_> = ["x-amux-session", "x-amux-worker"].into_iter()
+        .filter_map(|h| headers.get(h).and_then(|v| v.to_str().ok()))
+        .filter(|s| !s.trim().is_empty()).collect();
+    claims.dedup();
+    let claim = claims.join(" / ");
+    if let Ok(value) = HeaderValue::from_str(&claim) {
+        headers.insert(PROCESS_CLAIM_HEADER, value);
+    }
+    let label = match origin {
+        Origin::Worker(w) => {
+            if let Ok(value) = HeaderValue::from_str(w) {
+                headers.insert(PROCESS_WORKER_HEADER, value);
+            }
+            "worker"
+        }
+        Origin::Outside => "outside",
+        Origin::OwnerPane => "owner-pane",
+        Origin::Browser(_) => "browser",
+        Origin::Remote => "remote",
+        Origin::Lan => "lan",
+        _ => "unknown",
+    };
+    headers.insert(PROCESS_ORIGIN_HEADER, HeaderValue::from_static(label));
+}
+
 /// The middleware. Outermost after member identity, so every later layer and
 /// handler (auth, rule 10, the send gate, membership) sees the attributed
 /// identity.
 pub async fn attribute(mut req: Request, next: Next) -> Response {
-    req.headers_mut().remove(PROCESS_WORKER_HEADER);
+    for name in [PROCESS_WORKER_HEADER, PROCESS_ORIGIN_HEADER, PROCESS_CLAIM_HEADER] {
+        req.headers_mut().remove(name);
+    }
+    let e2e_owner = req.headers_mut().remove(E2E_OWNER_HEADER);
     let Some(peer) = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0) else {
         // In-process calls (the server acting for a lane) have no socket.
         return next.run(req).await;
@@ -691,7 +978,9 @@ pub async fn attribute(mut req: Request, next: Next) -> Response {
         });
         return next.run(req).await;
     }
-    match resolve_cached(conn).await {
+    let origin = e2e_owner_origin(resolve_cached(conn).await, e2e_owner, conn);
+    record_connection(req.headers_mut(), &origin);
+    match origin {
         Origin::Worker(worker) if !super::session_verbs::valid_session_name(&worker) => {
             // A pane in an `amux-*` session whose name is no valid worker name:
             // worker-originated, with no identity the server could act on.
@@ -760,7 +1049,7 @@ pub async fn attribute(mut req: Request, next: Next) -> Response {
             });
             next.run(req).await
         }
-        Origin::Outside | Origin::Remote => next.run(req).await,
+        Origin::Outside | Origin::OwnerPane | Origin::Browser(_) | Origin::Remote | Origin::Lan => next.run(req).await,
     }
 }
 
@@ -817,9 +1106,14 @@ pub(crate) mod os {
     }
 
     #[cfg(target_os = "macos")]
-    pub(super) use super::macos::{comm_of, holds, holds_pty, ppid_of, root_tailscaled, scan, tty_of};
+    pub(super) use super::macos::{comm_of, exe_of, holds_pty, ppid_of, root_tailscaled, scan, tty_of};
     #[cfg(target_os = "linux")]
-    pub(super) use super::linux::{comm_of, holds, holds_pty, ppid_of, root_tailscaled, scan, tty_of};
+    pub(super) use super::linux::{comm_of, exe_of, holds_pty, ppid_of, root_tailscaled, scan, tty_of};
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) use super::macos::holds;
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) use super::linux::holds;
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub(super) fn scan(_client: SocketAddr, _server: SocketAddr, _door: &super::FrontDoor) -> Result<super::Scan, LookupError> {
@@ -834,6 +1128,7 @@ pub(crate) mod os {
         None
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(test)]
     pub(super) fn holds(_pid: u32, _client: SocketAddr, _server: SocketAddr) -> bool {
         false
     }
@@ -848,6 +1143,10 @@ pub(crate) mod os {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub(super) fn root_tailscaled() -> Result<Vec<u32>, String> {
         Err("no process table lookup on this platform".into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(super) fn exe_of(_pid: u32) -> Option<super::Exe> {
+        None
     }
 }
 
@@ -1073,6 +1372,7 @@ mod macos {
     }
 
     /// Whether `pid` still holds this exact connection (both ends).
+    #[cfg(test)]
     pub(crate) fn holds(pid: u32, client: SocketAddr, server: SocketAddr) -> bool {
         socket_fds(pid as i32)
             .unwrap_or_default()
@@ -1103,6 +1403,22 @@ mod macos {
         let info = bsdinfo(pid)?;
         let bytes: Vec<u8> = info.pbi_comm.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
         (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The process's executable path (libproc) and that file's inode.
+    pub(crate) fn exe_of(pid: u32) -> Option<super::Exe> {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::MetadataExt;
+        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: the kernel writes at most `buf.len()` bytes and returns the length.
+        let n = unsafe { libc::proc_pidpath(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        if n <= 0 {
+            return None;
+        }
+        buf.truncate(n as usize);
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(buf));
+        let inode = std::fs::metadata(&path).ok()?.ino();
+        Some(super::Exe { path, inode })
     }
 
     const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
@@ -1244,6 +1560,7 @@ mod linux {
         Ok(out)
     }
 
+    #[cfg(test)]
     pub(crate) fn holds(pid: u32, client: SocketAddr, server: SocketAddr) -> bool {
         let Ok(rows) = sockets() else { return false };
         let target: HashSet<u64> = rows.iter().filter(|(l, r, _)| *l == client && *r == server).map(|(_, _, i)| *i).collect();
@@ -1267,6 +1584,13 @@ mod linux {
 
     pub(crate) fn comm_of(pid: u32) -> Option<String> {
         std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|c| c.trim().to_string()).filter(|c| !c.is_empty())
+    }
+
+    pub(crate) fn exe_of(pid: u32) -> Option<super::Exe> {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        let inode = std::fs::metadata(&path).ok()?.ino();
+        Some(super::Exe { path, inode })
     }
 
     /// Any open fd that is a pseudo-terminal (/dev/pts/*, /dev/ptmx, /dev/tty*).
@@ -1293,6 +1617,38 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::browser_identity::fake::FakeSignatures;
+
+    /// DMIW-8: the e2e owner secret is off by default and honored only by a
+    /// throwaway test server, never the installed one, and only exactly.
+    #[test]
+    fn the_e2e_owner_secret_is_honored_only_by_a_throwaway_test_server() {
+        let secret = "e2e-owner-0123456789abcdef0123456789";
+        let tmp = std::path::Path::new("/tmp/amux-e2e-desktop-x");
+        assert_eq!(e2e_owner_accepted(Some(secret), secret, tmp, Some(18824)), Ok(()));
+        assert!(e2e_owner_accepted(None, secret, tmp, Some(18824)).is_err(), "off by default: no secret configured");
+        assert!(e2e_owner_accepted(Some(" "), " ", tmp, Some(18824)).is_err(), "a blank secret is no secret");
+        assert!(e2e_owner_accepted(Some("short"), "short", tmp, Some(18824)).is_err(), "a short secret");
+        let real = std::path::Path::new("/Users/someone/.amux");
+        assert!(e2e_owner_accepted(Some(secret), secret, real, Some(18824)).is_err(), "the installed home");
+        assert!(e2e_owner_accepted(Some(secret), secret, tmp, Some(LIVE_PORT)).is_err(), "the live port");
+        assert!(e2e_owner_accepted(Some(secret), secret, tmp, None).is_err(), "an unknown server port");
+        assert!(e2e_owner_accepted(Some(secret), &secret[1..], tmp, Some(18824)).is_err(), "a prefix");
+        assert!(e2e_owner_accepted(Some(secret), &format!("{secret}x"), tmp, Some(18824)).is_err(), "a longer value");
+        assert!(e2e_owner_accepted(Some(secret), "", tmp, Some(18824)).is_err(), "an empty value");
+    }
+
+    /// The secret only ever upgrades a local process outside every pane: a
+    /// worker, a LAN peer or an unattributed connection keeps its origin.
+    #[test]
+    fn the_e2e_owner_secret_never_turns_a_worker_or_network_peer_into_the_owner() {
+        let presented = Some(HeaderValue::from_static("anything"));
+        let conn = Conn { peer: SocketAddr::from(([127, 0, 0, 1], 1)), server: Some(SocketAddr::from(([127, 0, 0, 1], 18824))) };
+        for origin in [Origin::Worker("dev-a".into()), Origin::Lan, Origin::OwnerPane, Origin::Unattributed("x".into())] {
+            assert_eq!(e2e_owner_origin(origin.clone(), presented.clone(), conn), origin);
+        }
+        assert_eq!(e2e_owner_origin(Origin::Outside, None, conn), Origin::Outside, "no secret presented");
+    }
 
     // Process table for the pure tests:
     //   101 -> 100 (amux-dev-a pane shell) -> 50 (tmux server) -> 1
@@ -1300,17 +1656,48 @@ mod tests {
     //   301 -> 300 -> 1 (owner terminal);  401 -> unreadable parent
     //   501 -> 1 (reparented to launchd) but its controlling tty is dev-a's pane tty
     //   601 <-> 602 (a ppid cycle: the walk runs out of steps)
+    // B1 browsers (executables in `exe_path`):
+    //   701 Chrome Helper -> 700 Google Chrome -> 1 (the owner's GUI browser)
+    //   711 Chrome Helper -> 710 Google Chrome -> 100 (dev-a's pane shell)
+    //   721 Google Chrome -> 720 /bin/sh (a launchd job's script) -> 1
+    //   301 is /usr/bin/curl, 300 /bin/zsh (a token-holding CLI request)
     fn chain(pid: u32) -> Option<u32> {
         match pid {
             101 => Some(100),
             100 | 200 => Some(50),
-            50 | 300 | 501 => Some(1),
+            50 | 300 | 501 | 700 | 720 => Some(1),
             201 => Some(200),
             301 => Some(300),
             601 => Some(602),
             602 => Some(601),
+            701 => Some(700),
+            711 => Some(710),
+            710 => Some(100),
+            721 => Some(720),
             _ => None,
         }
+    }
+    const CHROME: &str = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    const HELPER: &str = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper";
+    const GOOGLE: &str = "Developer ID Application: Google LLC (EQHXZ8M8AV)";
+    fn exe_path(pid: u32) -> Option<&'static str> {
+        Some(match pid {
+            700 | 710 | 721 => CHROME,
+            701 | 711 => HELPER,
+            720 => "/bin/sh",
+            301 => "/usr/bin/curl",
+            300 => "/bin/zsh",
+            _ => return None,
+        })
+    }
+    /// Genuine signatures for every executable in the table.
+    fn signatures() -> FakeSignatures {
+        FakeSignatures::default()
+            .signed(CHROME, "com.google.Chrome", Some("EQHXZ8M8AV"), GOOGLE)
+            .signed(HELPER, "com.google.Chrome.helper", Some("EQHXZ8M8AV"), GOOGLE)
+            .signed("/bin/sh", "com.apple.sh", None, "Software Signing")
+            .signed("/usr/bin/curl", "com.apple.curl", None, "Software Signing")
+            .signed("/bin/zsh", "com.apple.zsh", None, "Software Signing")
     }
     const DEV_A_TTY: u64 = 0x1000_0007;
     fn tty(pid: u32) -> Option<u64> {
@@ -1328,17 +1715,19 @@ mod tests {
         let p = panes();
         assert_eq!(classify(&[101], &p, &chain, &tty), Origin::Worker("dev-a".into()));
         assert_eq!(classify(&[100], &p, &chain, &tty), Origin::Worker("dev-a".into()), "the pane shell itself");
-        assert_eq!(classify(&[201], &p, &chain, &tty), Origin::Outside, "the owner's own tmux is not a worker");
+        assert_eq!(classify(&[201], &p, &chain, &tty), Origin::OwnerPane, "the owner's own tmux is not a worker");
         assert_eq!(classify(&[301], &p, &chain, &tty), Origin::Outside);
-        assert_eq!(classify(&[301, 101], &p, &chain, &tty), Origin::Worker("dev-a".into()), "any worker holder");
+        for holders in [&[301, 101][..], &[101, 301][..]] {
+            assert!(matches!(classify(holders, &p, &chain, &tty), Origin::Unattributed(_)), "mixed pane/outside holders");
+        }
     }
 
     /// Review N1: `amux send &` from a one-shot shell is reparented to launchd,
     /// so its ancestry reads outside; its controlling tty still names the pane.
     #[test]
-    fn a_worker_process_reparented_to_launchd_is_still_that_worker_by_its_tty() {
+    fn a_worker_tty_without_pane_ancestry_is_unverified() {
         assert_eq!(chain(501), Some(1));
-        assert_eq!(classify(&[501], &panes(), &chain, &tty), Origin::Worker("dev-a".into()));
+        assert!(matches!(classify(&[501], &panes(), &chain, &tty), Origin::Unattributed(_)));
     }
 
     #[test]
@@ -1443,6 +1832,8 @@ mod tests {
         nameless: Vec<u32>,
         /// Pane inventory reads (each is a tmux spawn in production).
         reads: Arc<std::sync::atomic::AtomicU32>,
+        /// The fake codesign.
+        sigs: FakeSignatures,
     }
 
     impl Fake {
@@ -1456,6 +1847,7 @@ mod tests {
                 pty: vec![],
                 nameless: vec![],
                 reads: Arc::default(),
+                sigs: signatures(),
             }
         }
         /// The deployed phone path: nobody visible holds the connection, root
@@ -1470,6 +1862,7 @@ mod tests {
                 pty: vec![],
                 nameless: vec![],
                 reads: Arc::default(),
+                sigs: signatures(),
             }
         }
         fn reads(&self) -> u32 {
@@ -1514,6 +1907,12 @@ mod tests {
         fn holds_pty(&self, pid: u32) -> bool {
             self.pty.contains(&pid)
         }
+        fn exe_of(&self, pid: u32) -> Option<Exe> {
+            exe_path(pid).map(|p| Exe { path: p.into(), inode: u64::from(pid) })
+        }
+        fn verifier(&self) -> &dyn SignatureVerifier {
+            &self.sigs
+        }
     }
 
     fn lo(port: u16) -> Conn {
@@ -1532,9 +1931,12 @@ mod tests {
         assert!(matches!(decide(lo(1), &failed), Origin::IdentityUnavailable(_)), "a tmux-descended holder needs the read");
         // The server end unknown on a loopback connection: never owner.
         assert!(matches!(decide(Conn { server: None, ..lo(1) }, &Fake::holders(&[301])), Origin::Unattributed(_)));
-        // A genuinely remote peer (no local holder, not an own address).
+        // A genuinely remote peer (no local holder, not an own address): only
+        // a tailnet peer is Remote (B1); a LAN peer is Lan, never the owner.
         let remote = Conn { peer: "192.168.1.50:5000".parse().unwrap(), server: Some("192.168.1.207:8824".parse().unwrap()) };
-        assert_eq!(decide(remote, &Fake::holders(&[])), Origin::Remote);
+        assert_eq!(decide(remote, &Fake::holders(&[])), Origin::Lan);
+        let tailnet = Conn { peer: "100.101.102.103:5000".parse().unwrap(), ..remote };
+        assert_eq!(decide(tailnet, &Fake::holders(&[])), Origin::Remote);
         // Review carried note: a peer on one of this host's own non-loopback
         // addresses with no visible holder is not Remote outright; it gets the
         // forward test, so without a root tailscaled it is refused.
@@ -1563,13 +1965,13 @@ mod tests {
         assert!(f.reads() >= 1, "a pty holder reads the inventory");
         let f = Fake { pty: vec![301], fresh: Err("tmux gone".into()), ..Fake::holders(&[301]) };
         assert!(matches!(decide(lo(1), &f), Origin::IdentityUnavailable(_)), "and fails closed when it cannot");
-        // A controlling tty (reparented worker) reads it and is the worker.
+        // A controlling tty reads the inventory but cannot prove ancestry.
         let f = Fake::holders(&[501]);
-        assert_eq!(decide(lo(1), &f), Origin::Worker("dev-a".into()));
+        assert!(matches!(decide(lo(1), &f), Origin::Unattributed(_)));
         assert!(f.reads() >= 1);
         // A tmux-server ancestor reads it (the owner's own tmux: still outside).
         let f = Fake::holders(&[201]);
-        assert_eq!(decide(lo(1), &f), Origin::Outside);
+        assert_eq!(decide(lo(1), &f), Origin::OwnerPane);
         assert!(f.reads() >= 1);
         // An ancestor whose name cannot be read: the inventory decides.
         let f = Fake { nameless: vec![300], ..Fake::holders(&[301]) };
@@ -1582,6 +1984,94 @@ mod tests {
         let f = Fake::holders(&[301, 101]);
         assert_eq!(decide(lo(1), &f), Origin::Worker("dev-a".into()));
         assert!(f.reads() >= 1);
+    }
+
+    /// #10 B1, dev-lead's ruling: owner input needs the UI token AND either a
+    /// code-signed GUI browser outside every pane and launchd job, or a remote
+    /// tailnet peer. Each case runs the shipped decision, the middleware's
+    /// evidence recording and the real header-to-sender resolver.
+    fn sender_with_ui_token(conn: Conn, fake: &Fake) -> (Origin, crate::api::session_verbs::Sender) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::api::AppState {
+            store: Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap()),
+            started: Instant::now(),
+            build_hash: "test".into(),
+            auth_token: Some("owner-secret".into()),
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let origin = decide(conn, fake);
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-amux-ui-token", crate::api::session_verbs::ui_token(&state).parse().unwrap());
+        record_connection(&mut h, &origin);
+        (origin.clone(), crate::api::session_verbs::request_sender_of(&state, &h, ""))
+    }
+
+    #[test]
+    fn b1_a_signed_browser_outside_every_pane_is_the_owner() {
+        use crate::api::session_verbs::Sender;
+        let (origin, sender) = sender_with_ui_token(lo(1), &Fake::holders(&[701]));
+        assert_eq!(origin, Origin::Browser("Google Chrome"));
+        assert_eq!(sender, Sender::Owner);
+    }
+
+    #[test]
+    fn b1_the_same_browser_under_a_worker_pane_is_not_the_owner() {
+        use crate::api::session_verbs::Sender;
+        let (origin, sender) = sender_with_ui_token(lo(1), &Fake::holders(&[711]));
+        assert_eq!(origin, Origin::Worker("dev-a".into()));
+        assert_eq!(sender, Sender::Worker("dev-a".into()), "that worker's input, never the owner's");
+    }
+
+    #[test]
+    fn b1_a_browser_started_by_a_launchd_job_is_not_the_owner() {
+        use crate::api::session_verbs::Sender;
+        let (origin, sender) = sender_with_ui_token(lo(1), &Fake::holders(&[721]));
+        assert_eq!(origin, Origin::Outside);
+        assert_eq!(sender, Sender::Unverified);
+    }
+
+    #[test]
+    fn b1_a_token_bearing_curl_is_not_the_owner() {
+        use crate::api::session_verbs::Sender;
+        let (origin, sender) = sender_with_ui_token(lo(1), &Fake::holders(&[301]));
+        assert_eq!(origin, Origin::Outside);
+        assert_eq!(sender, Sender::Unverified);
+    }
+
+    #[test]
+    fn b1_a_tailnet_peer_is_the_owner_and_a_lan_peer_is_not() {
+        use crate::api::session_verbs::Sender;
+        let server = Some("192.168.1.207:8824".parse().unwrap());
+        let tailnet = Conn { peer: "100.101.102.103:5000".parse().unwrap(), server };
+        assert_eq!(sender_with_ui_token(tailnet, &Fake::holders(&[])), (Origin::Remote, Sender::Owner));
+        let forwarded = sender_with_ui_token(lo(53514), &Fake::forwarded(&[]));
+        assert_eq!(forwarded, (Origin::Remote, Sender::Owner), "tailscale serve's forward");
+        let lan = Conn { peer: "192.168.1.50:5000".parse().unwrap(), server };
+        assert_eq!(sender_with_ui_token(lan, &Fake::holders(&[])), (Origin::Lan, Sender::Unverified));
+    }
+
+    #[test]
+    fn b1_a_bad_or_missing_signature_is_not_the_owner() {
+        use crate::api::session_verbs::Sender;
+        for (label, sigs) in [
+            ("tampered main app", signatures().tampered(CHROME)),
+            ("tampered helper", signatures().tampered(HELPER)),
+            ("unsigned helper", signatures().unsigned(HELPER)),
+        ] {
+            let (origin, sender) = sender_with_ui_token(lo(1), &Fake { sigs, ..Fake::holders(&[701]) });
+            assert_eq!((origin, sender), (Origin::Outside, Sender::Unverified), "{label}");
+        }
+    }
+
+    #[test]
+    fn b1_a_wrong_team_id_is_not_the_owner() {
+        use crate::api::session_verbs::Sender;
+        let resigned = signatures().signed(CHROME, "com.google.Chrome", Some("ABCDE12345"), "Developer ID Application: Someone (ABCDE12345)");
+        let (origin, sender) = sender_with_ui_token(lo(1), &Fake { sigs: resigned, ..Fake::holders(&[701]) });
+        assert_eq!((origin, sender), (Origin::Outside, Sender::Unverified));
+        // One vendor per chain: a genuine Chrome helper under a different signed browser.
+        let mixed = signatures().signed(CHROME, "com.microsoft.edgemac", Some("UBF8T346G9"), "Developer ID Application: Microsoft Corporation (UBF8T346G9)");
+        assert_eq!(decide(lo(1), &Fake { sigs: mixed, ..Fake::holders(&[701]) }), Origin::Outside);
     }
 
     /// The real pty and name lookups this shortcut rests on.

@@ -96,6 +96,8 @@ pub mod pinned;
 pub mod planning;
 pub mod policy;
 pub mod process_identity;
+mod browser_identity;
+mod message_identity;
 pub mod prefs;
 pub mod projects;
 pub mod proxies;

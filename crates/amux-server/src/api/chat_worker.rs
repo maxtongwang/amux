@@ -171,7 +171,7 @@ pub(crate) async fn companion_route(
     action: &str,
     receipt_msg_id: Option<&str>,
     body: &Value,
-    caller: &str,
+    sender: &super::session_verbs::Sender,
 ) -> Response {
     let key = companion_key(worker);
     if !env_path(worker).exists() {
@@ -203,12 +203,14 @@ pub(crate) async fn companion_route(
     if text.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "error": "empty message"}))).into_response();
     }
-    // WHO IS ASKING (AMUX-5432, found 2026-10-01): a send carrying a lane's
-    // session header is that lane, not the owner. Every Chat-tab send used to
-    // be recorded as the owner's, so a helper's test message drew an
-    // "[amux accountability] ... no board card" nudge as if Ethan had asked.
-    // The dashboard sends with no session header and stays the owner's.
-    let from_owner = caller.trim().is_empty();
+    // The same connection-derived Sender as terminal sends. Header absence
+    // alone never starts an owner turn or grants the later owner-relay path.
+    let from_owner = matches!(sender, super::session_verbs::Sender::Owner);
+    let caller = match sender {
+        super::session_verbs::Sender::Worker(w) => w.as_str(),
+        _ => super::worker_identity::UNVERIFIED_IDENTITY,
+    };
+    let text = sender.stamp(&text);
     let origin = if from_owner { SendOrigin::Owner } else { SendOrigin::Automation };
     if !from_owner {
         tracing::info!(session = %key, caller, verdict = "chat_companion_send_from_lane",
@@ -239,7 +241,7 @@ pub(crate) async fn companion_route(
     )
     .await;
     tracing::info!(session = %key, worker, verdict = "chat_companion_send", "Chat tab message accepted");
-    (StatusCode::OK, Json(json!({"ok": true, "msg_id": msg_id, "message": message, "submitted": true, "submission": "confirmed"}))).into_response()
+    (StatusCode::OK, Json(json!({"ok": true, "msg_id": msg_id, "message": message, "submitted": true, "submission": "confirmed", "stamp_label": sender.stamp_line()}))).into_response()
 }
 
 /// Does this chat lane exist? A chat worker has an env file; a Chat tab

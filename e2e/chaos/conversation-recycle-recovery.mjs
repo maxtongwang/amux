@@ -15,7 +15,8 @@ try{
  for(const name of ['recycle-live','recycle-dual']){
   const r=await amux.req('PATCH','/api/sessions/'+name+'/config',{new_conversation:true,restart:true});check('owner recycle accepted '+name,r.status===202,r.body);
   check('accepted recycle has durable intent '+name,meta(name).recycle_in_progress_since>0,meta(name));
-  await waitFor('actual retiring provider receives exit '+name,()=>amux.fakeLog().some(x=>x.pid===originals[name]&&x.text==='/exit'));
+  await waitFor('actual retiring provider receives SIGTERM '+name,()=>amux.fakeLog().some(x=>x.pid===originals[name]&&x.event==='signal'&&x.sig==='SIGTERM'));
+  check('stop typed nothing into the retiring provider '+name,!amux.fakeLog().some(x=>x.pid===originals[name]&&x.text==='/exit'),amux.fakeLog().filter(x=>x.pid===originals[name]));
  }
  await amux.down();check('controller SIGKILL leaves retiring provider alive',alive(originals['recycle-live']),originals);
  // Explicit private phase controls: a crash can leave both lifecycle markers,
