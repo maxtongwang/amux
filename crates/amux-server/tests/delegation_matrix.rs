@@ -433,13 +433,14 @@ async fn lifecycle_verbs_on_a_peer_are_the_owners_or_its_leads() {
         // The lead of T and the owner are not refused by the delegation table
         // (the verb itself may still fail in a home with no tmux). Archive by
         // any agent stays behind the separate human-only archive rule
-        // (AMUX_ALLOW_AGENT_SESSION_DELETE), which the table does not lift.
+        // (AMUX_ALLOW_AGENT_SESSION_DELETE), which the table does not lift;
+        // this harness's owner carries no dashboard UI token, so it too.
         for who in [Who::Worker(DEV_LEAD), Who::Owner] {
             let (st, v) = e.call(who, "POST", &path, Some(json!({}))).await;
-            if verb == "archive" && matches!(who, Who::Worker(_)) {
+            if verb == "archive" {
                 assert_eq!(st.as_u16(), 403, "{v}");
                 assert!(v.get("code").is_none() && v["error"].as_str().unwrap_or("").contains("AMUX_ALLOW_AGENT_SESSION_DELETE"),
-                    "the lead's archive is refused only by the human-only archive rule: {v}");
+                    "{who:?} archive is refused only by the human-only archive rule: {v}");
                 continue;
             }
             assert_ne!(st.as_u16(), 403, "{who:?} {verb} on {DEV_B} was refused: {v}");
