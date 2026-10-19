@@ -293,13 +293,14 @@ async fn patch_worker_row_judges_every_field() {
     }
 }
 
-/// Group config, provider env and the settings guards are owner-only for
-/// leads and workers (mrpopo's max_ref path is in delegation_mrpopo.rs).
+/// Another team's group config, provider env and the settings guards are
+/// owner-only for leads and workers (mrpopo's path is in
+/// delegation_mrpopo.rs); a lead sets its own team's group config.
 #[tokio::test]
 async fn group_config_settings_and_guards_are_owner_only_for_leads_and_workers() {
     let e = setup().await;
     let routes = [
-        ("PATCH", "/api/groups/dev/config", json!({"goal": "lead goal"})),
+        ("PATCH", "/api/groups/ops/config", json!({"goal": "lead goal"})),
         ("PATCH", "/api/settings/env", json!({"OPENAI_API_KEY": "sk-review-lead"})),
         ("PATCH", "/api/settings/commit-guard", json!({"enabled": false})),
         ("PATCH", "/api/settings/task-guard", json!({"enabled": true})),
@@ -313,8 +314,14 @@ async fn group_config_settings_and_guards_are_owner_only_for_leads_and_workers()
             assert_eq!(e.snapshot(), before, "{who} {method} {path}: refused request wrote a file");
         }
     }
-    let (st, v) = e.call(Who::Owner, "GET", "/api/groups/dev/config", None).await;
+    let (st, v) = e.call(Who::Owner, "GET", "/api/groups/ops/config", None).await;
     assert_eq!(v["goal"], json!(""), "no refused write reached group config: {st} {v}");
+    let (st, v) = e.call(Who::Worker(DEV_A), "PATCH", "/api/groups/dev/config", Some(json!({"goal": "worker goal"}))).await;
+    assert_refused(st, &v, "a worker sets its team's group config");
+    let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", "/api/groups/dev/config", Some(json!({"goal": "lead goal"}))).await;
+    assert_allowed(st, &v, "a lead sets its own team's group config");
+    let (_, v) = e.call(Who::Owner, "GET", "/api/groups/dev/config", None).await;
+    assert_eq!(v["goal"], json!("lead goal"), "{v}");
 }
 
 // ---- self ---------------------------------------------------------------------
@@ -423,10 +430,18 @@ async fn lifecycle_verbs_on_a_peer_are_the_owners_or_its_leads() {
             let (st, v) = e.call(Who::Worker(who), "POST", &path, Some(json!({}))).await;
             assert_refused(st, &v, &format!("{who} {verb} on {DEV_B}"));
         }
-        // The lead of T and the owner are not refused by authorization (the
-        // verb itself may still fail in a home with no tmux).
+        // The lead of T and the owner are not refused by the delegation table
+        // (the verb itself may still fail in a home with no tmux). Archive by
+        // any agent stays behind the separate human-only archive rule
+        // (AMUX_ALLOW_AGENT_SESSION_DELETE), which the table does not lift.
         for who in [Who::Worker(DEV_LEAD), Who::Owner] {
             let (st, v) = e.call(who, "POST", &path, Some(json!({}))).await;
+            if verb == "archive" && matches!(who, Who::Worker(_)) {
+                assert_eq!(st.as_u16(), 403, "{v}");
+                assert!(v.get("code").is_none() && v["error"].as_str().unwrap_or("").contains("AMUX_ALLOW_AGENT_SESSION_DELETE"),
+                    "the lead's archive is refused only by the human-only archive rule: {v}");
+                continue;
+            }
             assert_ne!(st.as_u16(), 403, "{who:?} {verb} on {DEV_B} was refused: {v}");
         }
     }

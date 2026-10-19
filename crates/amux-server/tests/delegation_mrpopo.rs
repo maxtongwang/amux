@@ -89,7 +89,8 @@ fn classes() -> Vec<Class> {
         Class {
             name: "group config",
             method: "PATCH",
-            path: "/api/groups/dev/config".into(),
+            // `ops`: a lead's own team's group config is the lead's (decide_lead).
+            path: "/api/groups/ops/config".into(),
             body: json!({"goal": "ship delegation"}),
         },
         Class {
@@ -121,7 +122,7 @@ fn classes() -> Vec<Class> {
         Class {
             name: "alerts config (ai-config #175)",
             method: "PATCH",
-            path: "/api/alerts/config".into(),
+            path: "/api/alert/config".into(),
             body: json!({"phone": "+15550100"}),
         },
     ]
@@ -134,7 +135,7 @@ async fn each_delegable_class_applies_with_a_citation_and_undoes() {
     for i in 0..classes().len() {
         let c = classes().remove(i);
         let e = setup().await;
-        let before = e.snapshot();
+        let before = e.config_snapshot();
         let (st, v) = e.call(Who::Worker(MRPOPO), c.method, &c.path, Some(c.body.clone())).await;
         if (st.as_u16(), v["code"].as_str()) != (403, Some("cite_missing")) {
             failures.push(format!("{}: without a citation expected 403 cite_missing, got {st} {v}", c.name));
@@ -153,7 +154,7 @@ async fn each_delegable_class_applies_with_a_citation_and_undoes() {
         let (st, v) = e.call(Who::Worker(MRPOPO), "POST", &format!("/api/delegation/grants/{code}/undo"), None).await;
         if !st.is_success() {
             failures.push(format!("{}: undo failed: {st} {v}", c.name));
-        } else if e.snapshot() != before {
+        } else if e.config_snapshot() != before {
             failures.push(format!("{}: undo did not restore the files exactly", c.name));
         }
     }

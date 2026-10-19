@@ -58,7 +58,7 @@ const CODE_LEN: usize = 4;
 const CAPTURE_LIMIT: usize = 1 << 20;
 /// The paths whose handlers can make a grant.
 const CAPTURE_PREFIXES: [&str; 8] = [
-    "/api/sessions/", "/api/workers", "/api/scope", "/api/groups/", "/api/settings/", "/api/config/", "/api/env/", "/api/alerts/config",
+    "/api/sessions/", "/api/workers", "/api/scope", "/api/groups/", "/api/settings/", "/api/config/", "/api/env/", "/api/alert/config",
 ];
 /// Request fields that are delegation metadata, never part of the change.
 const META: [&str; 2] = ["cite", "why"];
@@ -216,6 +216,15 @@ pub async fn capture(State(state): State<AppState>, req: Request<Body>, next: Ne
         return next.run(req).await;
     }
     let (parts, body) = req.into_parts();
+    // A body declared larger than any config change (a long prompt to
+    // `/send`, whose routes carry no body limit) passes through uncaptured;
+    // a grant then finds no captured body and is refused (`grant_unavailable`).
+    let declared = parts.headers.get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0).max(axum::body::HttpBody::size_hint(&body).lower());
+    if declared > CAPTURE_LIMIT as u64 {
+        return next.run(Request::from_parts(parts, body)).await;
+    }
     let bytes = match axum::body::to_bytes(body, CAPTURE_LIMIT).await {
         Ok(b) => b,
         Err(e) => return (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({"ok": false, "code": "body_too_large", "error": e.to_string()}))).into_response(),

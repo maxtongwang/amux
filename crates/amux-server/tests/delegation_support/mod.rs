@@ -275,6 +275,31 @@ impl Env {
         out
     }
 
+    /// [`Self::snapshot`] as configuration: each env file read as its
+    /// key/value pairs, without the worker identity amux #3 keeps
+    /// (`CC_INCARNATION`, `.incarnation.lock`), which every env writer
+    /// preserves and undo leaves alone. Undo is exact on this view.
+    pub fn config_snapshot(&self) -> std::collections::BTreeMap<String, String> {
+        self.snapshot()
+            .into_iter()
+            .filter(|(f, _)| !f.rsplit('/').next().unwrap_or("").starts_with('.'))
+            .map(|(f, text)| {
+                if !f.ends_with(".env") {
+                    return (f, text);
+                }
+                let pairs: Vec<String> = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .filter_map(|l| l.split_once('='))
+                    .filter(|(k, _)| *k != "CC_INCARNATION")
+                    .map(|(k, v)| format!("{k}={}", v.trim_matches('"')))
+                    .collect();
+                (f, pairs.join("\n"))
+            })
+            .collect()
+    }
+
     pub fn env_path(&self, name: &str) -> PathBuf {
         self.home().join("sessions").join(format!("{name}.env"))
     }

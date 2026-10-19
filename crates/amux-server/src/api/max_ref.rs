@@ -92,7 +92,9 @@ fn human_source(ctype: &str, origin: &str, delivery: &str, process_origin: &str)
     if delivery == "pane" && origin == "pane" {
         return Some(HumanSource::Pane);
     }
-    if matches!(delivery, "direct" | "queued") && matches!(process_origin, "outside" | "remote" | "remote-forwarded") {
+    // `origin='pane'` is the recorder's alone (the PANE shape); a direct or
+    // queued row carrying it is no owner send.
+    if origin != "pane" && matches!(delivery, "direct" | "queued") && matches!(process_origin, "outside" | "remote" | "remote-forwarded") {
         return Some(HumanSource::OwnerSend);
     }
     None

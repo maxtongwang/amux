@@ -28,7 +28,7 @@ fn yolo_on(e: &Env) -> bool {
 #[tokio::test]
 async fn cite_mode_applies_at_once_logs_feeds_and_undoes_exactly() {
     let e = setup().await;
-    let before = e.snapshot();
+    let before = e.config_snapshot();
     let row = e.seed_pane_prompt(MAX_PANE, &format!("turn on yolo for {DEV_A}"), now_s() - 30.0);
     let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_A), Some(cited(json!({"toggle_yolo": true, "why": "Max asked"}), row))).await;
     assert_allowed(st, &v, "cited change applies");
@@ -52,7 +52,7 @@ async fn cite_mode_applies_at_once_logs_feeds_and_undoes_exactly() {
     let (st, v) = e.call(Who::Owner, "POST", &format!("/api/delegation/grants/{code}/undo"), None).await;
     assert_allowed(st, &v, "owner undoes");
     assert_eq!(e.grant_status(&code), "undone");
-    assert_eq!(before, e.snapshot(), "undo restores exactly");
+    assert_eq!(before, e.config_snapshot(), "undo restores exactly");
     assert!(e.log_entries().iter().any(|m| m["action"] == json!("grant:undone")), "{:?}", e.log_entries());
 }
 
@@ -144,14 +144,14 @@ async fn alerts_config_goes_through_the_table() {
     let e = setup().await;
     let body = json!({"phone": "+15550100"});
     for who in [DEV_LEAD, DEV_A] {
-        let (st, v) = e.call(Who::Worker(who), "PATCH", "/api/alerts/config", Some(body.clone())).await;
+        let (st, v) = e.call(Who::Worker(who), "PATCH", "/api/alert/config", Some(body.clone())).await;
         assert_refused(st, &v, &format!("{who} sets alerts config"));
     }
-    let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", "/api/alerts/config", Some(body.clone())).await;
+    let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", "/api/alert/config", Some(body.clone())).await;
     assert_code(st, &v, "cite_missing", "mrpopo without a citation");
     let row = e.seed_pane_prompt(MAX_PANE, "set my alert phone to +15550100", now_s() - 30.0);
-    let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", "/api/alerts/config", Some(cited(body.clone(), row))).await;
+    let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", "/api/alert/config", Some(cited(body.clone(), row))).await;
     assert_allowed(st, &v, "mrpopo citing Max");
-    let (st, v) = e.call(Who::Owner, "PATCH", "/api/alerts/config", Some(body)).await;
+    let (st, v) = e.call(Who::Owner, "PATCH", "/api/alert/config", Some(body)).await;
     assert_allowed(st, &v, "owner sets alerts config");
 }
