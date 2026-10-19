@@ -12651,7 +12651,7 @@ pub(crate) const WORKER_SCHEDULE_GUARD: &str = "wsched:";
 /// worker-authored schedule (`wsched:`) is NOT one: only text the owner set up
 /// is owner input (ai-config#210).
 pub(crate) fn is_owner_configured_guard(guard: &str) -> bool {
-    guard.starts_with("sched:") || guard.starts_with("goal:")
+    (is_schedule_guard(guard) && !guard.starts_with(WORKER_SCHEDULE_GUARD)) || guard.starts_with("goal:")
 }
 
 pub(crate) async fn deliver_automated(
