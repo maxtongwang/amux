@@ -1,0 +1,8 @@
+-- 0124_steering_stamp.sql: who a queued message is from, beside its text.
+--
+-- Every message amux delivers into a pane carries a server-added sender stamp
+-- (PR #10). The stamp travels BESIDE the text and is rendered once, by the
+-- send layer, at delivery: `stamp` holds the sender as JSON
+-- (`session_verbs::Sender`), and `text` stays the body. NULL on every
+-- existing row: such a row is stamped from what it records (guard, sender).
+-- ADDCOL: steering_queue stamp TEXT

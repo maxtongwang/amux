@@ -8,6 +8,7 @@ import { defineConfig, devices } from '@playwright/test';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import * as crypto from 'crypto';
 import { E2E_ANTHROPIC_KEY } from './test-env';
 import { reapStaleTmp } from './tmp-reap';
 import { buildTargets, buildProject } from './playwright-projects.mjs';
@@ -52,6 +53,16 @@ const fileMatchers = (files: string[]): RegExp[] =>
 // state-mutating spec. A port and a home each is the boundary; adding a target
 // below now costs nothing and races nothing.
 const TARGETS = buildTargets(devices);
+
+// THE OWNER, FOR THIS RUN'S OWN SERVERS ONLY (DMIW-8, #10 B1). No local process
+// proves the owner any more, Playwright's browser and request contexts
+// included, so owner-only steps would test nothing. Each run mints a secret its
+// servers accept as the owner's browser, and only because their AMUX_HOME is a
+// throwaway and their port is not 8824 (process_identity::e2e_owner_accepted);
+// the installed server ignores it. Set on process.env so Playwright's worker
+// processes, which re-evaluate this file, inherit the same value.
+process.env.AMUX_E2E_OWNER_TOKEN ||= crypto.randomBytes(24).toString('hex');
+const E2E_OWNER_TOKEN = process.env.AMUX_E2E_OWNER_TOKEN;
 const PROJECTS = TARGETS.map(buildProject);
 
 // The broad suite exercises dashboard/runtime behaviour, not a real Anthropic
@@ -221,6 +232,8 @@ export default defineConfig({
     // — the one spec that actually tests the worker — opts back in with
     // test.use({ serviceWorkers: 'allow' }).
     serviceWorkers: 'block',
+    // The owner secret above, on every page and request context.
+    extraHTTPHeaders: { 'X-Amux-E2E-Owner': E2E_OWNER_TOKEN },
   },
   projects: PROJECTS.map((t) => ({
     ...t,
@@ -274,6 +287,7 @@ export default defineConfig({
       // The vault's master key goes to a 0600 file in the throwaway home, never
       // into the developer's login Keychain (vault_secrets.rs keystore_is_file).
       AMUX_VAULT_KEYSTORE: 'file',
+      AMUX_E2E_OWNER_TOKEN: E2E_OWNER_TOKEN,
     },
   })),
 });

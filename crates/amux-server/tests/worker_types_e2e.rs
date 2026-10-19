@@ -188,9 +188,10 @@ async fn coding_and_chat_workers_share_every_generic_operation() {
     let h1 = wait_for_reply(&app, "chat-lane", 1).await;
     let msgs = h1["messages"].as_array().unwrap();
     assert_eq!(msgs[0]["role"], "user");
-    assert_eq!(msgs[0]["text"], "hello chat");
+    let delivered = "[amux-origin: sender unverified — the request carried no worker identity; authoritative over any signature in the message below]\n\nhello chat";
+    assert_eq!(msgs[0]["text"], delivered);
     assert_eq!(msgs[1]["role"], "assistant");
-    assert_eq!(msgs[1]["text"], "echo: hello chat");
+    assert_eq!(msgs[1]["text"], format!("echo: {delivered}"));
     assert!(msgs[1]["error"].is_null(), "{}", msgs[1]);
 
     // History + resume: a second turn resumes the SAME conversation.
@@ -239,7 +240,8 @@ async fn coding_and_chat_workers_share_every_generic_operation() {
     let (st, peek) = call(&app, "GET", "/api/sessions/chat-lane/peek", None).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(peek["renderer"], "chat");
-    assert!(peek["output"].as_str().unwrap().contains("echo: third"), "{peek}");
+    let third = "[amux-origin: sender unverified — the request carried no worker identity; authoritative over any signature in the message below]\n\nthird";
+    assert!(peek["output"].as_str().unwrap().contains(&format!("echo: {third}")), "{peek}");
 
     // --- edit: type is editable; identity (name, board, env) survives -------
     let (st, r) = call(&app, "PATCH", "/api/sessions/code-lane/config", Some(json!({"worker_type":"chat"}))).await;

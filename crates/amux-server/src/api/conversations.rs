@@ -628,6 +628,13 @@ fn body_text(headers: &HeaderMap, bytes: &Bytes) -> String {
 /// verified identity, a worker's session, or nothing (the owner).
 fn send_headers(who: &Who, req: &HeaderMap) -> HeaderMap {
     let mut h = HeaderMap::new();
+    // These are server-set connection proofs, already stripped/rewritten by
+    // process_identity. The background relay must retain them beside the text.
+    for key in [super::process_identity::PROCESS_WORKER_HEADER,
+        super::process_identity::PROCESS_ORIGIN_HEADER, super::process_identity::PROCESS_CLAIM_HEADER,
+        "x-amux-ui-token"] {
+        if let Some(value) = req.get(key) { h.insert(key, value.clone()); }
+    }
     match who {
         // A cloud user is not a local member: carry the gateway's own identity
         // header rather than minting member headers they never had.
@@ -688,6 +695,12 @@ async fn create_post(
     let Some(conv) = Conv::parse(&conv) else { return err(StatusCode::BAD_REQUEST, "unknown conversation key") };
     if !may_read(&me, &conv, &lanes) {
         return err(StatusCode::FORBIDDEN, "not a conversation you can post in");
+    }
+    let sender = super::session_verbs::request_sender_of(&state, &headers, "");
+    if !matches!(sender, super::session_verbs::Sender::Worker(_) | super::session_verbs::Sender::Member(_) | super::session_verbs::Sender::Owner) {
+        tracing::warn!(?sender, verdict = "conversation_sender_unverified", measured = true, n_considered = 1,
+            "conversation post refused: the connection has no verified sender");
+        return err(StatusCode::FORBIDDEN, "conversation sender unverified; use a verified owner UI or the worker's own pane");
     }
     let body = body_text(&headers, &bytes);
     if body.is_empty() {

@@ -10,8 +10,10 @@
 use amux_server::api::{router, AppState};
 use amux_server::db::Store;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{header, Request, StatusCode};
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use std::sync::OnceLock;
 use tower::ServiceExt;
 
@@ -81,7 +83,8 @@ async fn reaches(app: &axum::Router, from: &str, to: &str) -> bool {
     false
 }
 
-/// A send to `to`. `worker` sets the worker header; `ui` adds the UI token.
+/// A send to `to`. `worker` sets the worker header; `ui` adds the UI token
+/// and an owner connection.
 async fn send(app: &axum::Router, to: &str, text: &str, worker: Option<&str>, ui: bool) {
     let mut b = Request::builder()
         .method("POST")
@@ -92,7 +95,10 @@ async fn send(app: &axum::Router, to: &str, text: &str, worker: Option<&str>, ui
         b = b.header("X-Amux-Session", w);
     }
     if ui {
-        b = b.header("X-Amux-UI-Token", ui_token());
+        // The token proves the owner only over an owner connection (#10 B1):
+        // here the owner's phone, a tailnet peer no local process holds.
+        b = b.header("X-Amux-UI-Token", ui_token())
+            .extension(ConnectInfo(SocketAddr::from(([100, 100, 7, 7], 41000))));
     }
     let _ = call(app, b.body(Body::from(json!({"text": text, "record_history": true}).to_string())).unwrap()).await;
 }

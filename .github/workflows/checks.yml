@@ -351,6 +351,8 @@ jobs:
         run: python3 scripts/test-cargo-worktree-provenance.py
       - name: connector account health classifier
         run: node scripts/test-connector-account-health.mjs
+      - name: Message provenance policy and socket holder regressions
+        run: python3 scripts/test-message-provenance-unit.py
       - name: no harness is written and then never invoked (AF-346)
         run: |
           set -uo pipefail

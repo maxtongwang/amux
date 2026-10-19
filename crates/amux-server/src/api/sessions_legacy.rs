@@ -4806,10 +4806,14 @@ pub async fn create_session_legacy(
             }
         });
     let prompt = s("prompt");
+    // The create-time prompt is stamped as its creator's, beside its text
+    // (PR #10): a worker creating a worker is a peer of it.
+    let prompt_sender = crate::api::session_verbs::request_sender_of(&_state, &headers, "");
     if autostart {
         let st = _state.clone();
         let n = name.clone();
         let p = prompt.clone();
+        let prompt_sender = prompt_sender.clone();
         tokio::spawn(async move {
             if !p.is_empty() {
                 // The owner's first instruction. Queued durably before the
@@ -4818,6 +4822,7 @@ pub async fn create_session_legacy(
                 let (queued, why) = crate::api::session_verbs::queue_boot_prompt_pub(
                     &st, &n, &p,
                     crate::api::session_verbs::SendOrigin::Owner,
+                    Some(&prompt_sender),
                 ).await;
                 if !queued {
                     tracing::warn!(session = %n, error = %why, measured = true, n_considered = 1,
@@ -4845,7 +4850,7 @@ pub async fn create_session_legacy(
         let p = prompt.clone();
         tokio::spawn(async move {
             let (queued, why) = crate::api::session_verbs::queue_boot_prompt_pub(
-                &st, &n, &p, crate::api::session_verbs::SendOrigin::Owner,
+                &st, &n, &p, crate::api::session_verbs::SendOrigin::Owner, Some(&prompt_sender),
             ).await;
             if queued {
                 tracing::info!(session = %n, measured = true, n_considered = 1,

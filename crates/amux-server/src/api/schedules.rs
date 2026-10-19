@@ -13,14 +13,9 @@
 //! `{"error":"rust scheduler is in shadow mode","enable":"AMUX_RS_SCHEDULER=1"}`
 //! — an honest refusal instead of a run row that delivered nothing.
 //!
-//! Attribution (AMUX-1765/1812/2352): every mutation records `by_who` in
-//! `schedule_audit`, resolved in Python's priority order — the verified
-//! `X-Amux-Worker` header (canonical spelling), then legacy
-//! `X-Amux-Session`, then the request's claimed `by` (recorded as
-//! `"<hdr> (claimed <by>)"` when both exist and disagree), then the cloud
-//! user-email header. The Python fallback-of-last-resort is the client IP;
-//! that needs `ConnectInfo` wiring at mount time, so until then the floor
-//! here is the literal `unattributed-http` — visible, never blank.
+//! Attribution: every mutation records the message sender's full server stamp
+//! in `schedule_audit.by_who`. Header/body claims without connection proof stay
+//! visibly unverified; queued run-now attribution retains that same stamp.
 
 use super::AppState;
 use crate::db::{PendingEvent, WriteOutcome};
@@ -325,34 +320,12 @@ fn no_write() -> WriteOutcome {
     }
 }
 
-fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-}
-
-/// Python's `_sched_mutation_by`, minus the client-IP tail (see module
-/// docs). Never returns an empty string — an unattributed schedule write is
-/// the AMUX-1812 forensics gap.
-fn mutation_by(headers: &HeaderMap, claimed: Option<&str>) -> String {
-    let hdr = header_str(headers, "x-amux-worker")
-        .or_else(|| header_str(headers, "x-amux-session"))
-        .map(|s| s.chars().take(64).collect::<String>());
-    let claimed = claimed
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.chars().take(64).collect::<String>());
-    let who = match (hdr, claimed) {
-        (Some(h), Some(c)) if h != c => format!("{h} (claimed {c})"),
-        (Some(h), _) => h,
-        (None, Some(c)) => c,
-        (None, None) => header_str(headers, "x-amux-user-email")
-            .map(str::to_string)
-            .unwrap_or_else(|| "unattributed-http".into()),
-    };
-    who.chars().take(64).collect()
+/// Durable mutation attribution from the same connection proof as messages.
+/// An unverified schedule author stays visibly unverified on later run-now rows.
+fn mutation_by(state: &AppState, headers: &HeaderMap, claimed: Option<&str>) -> String {
+    // Stored attribution must not promote a header/body claim to the owner
+    // when the scheduler later renders a manual run's source.
+    super::session_verbs::request_sender_of(state, headers, claimed.unwrap_or("")).stamp_line()
 }
 
 /// Python's `str()` rendering of a field value, so the two servers' audit
@@ -878,7 +851,7 @@ pub async fn create(
     if !dead.is_empty() {
         return unhonoured_refusal(&dead);
     }
-    let by = mutation_by(&headers, body.by.as_deref());
+    let by = mutation_by(&state, &headers, body.by.as_deref());
     let now = Local::now();
     let now_ts = chrono::Utc::now().timestamp();
     let run_at = body.run_at.clone().unwrap_or_else(|| fmt_minute(now));
@@ -1166,7 +1139,7 @@ pub async fn patch(
     if !dead.is_empty() {
         return unhonoured_refusal(&dead);
     }
-    let by = mutation_by(&headers, body.by.as_deref());
+    let by = mutation_by(&state, &headers, body.by.as_deref());
     let now = Local::now();
 
     enum Outcome {
@@ -1392,7 +1365,7 @@ pub async fn delete_schedule(
     Query(p): Query<DeleteParams>,
     headers: HeaderMap,
 ) -> Response {
-    let by = mutation_by(&headers, p.by.as_deref());
+    let by = mutation_by(&state, &headers, p.by.as_deref());
     enum Outcome {
         NotFound,
         Already,
@@ -1479,7 +1452,7 @@ pub async fn skip_next(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let by = mutation_by(&headers, None);
+    let by = mutation_by(&state, &headers, None);
 
     enum Outcome {
         NotFound,
@@ -1655,7 +1628,7 @@ pub async fn run_now(
     }
     // No body is parsed on purpose (Python parity): a claimed `by` from a
     // body this endpoint never reads would be fabricated attribution.
-    let by = mutation_by(&headers, None);
+    let by = mutation_by(&state, &headers, None);
     let source = format!("manual:{by}");
 
     // READ the row first, then DELIVER outside any write lock, then RECORD what
@@ -2217,6 +2190,7 @@ mod tests {
         (status, v)
     }
 
+    const TESTER_STAMP: &str = "[amux-origin: sender unverified (claims to be tester-session) — no verified worker identity; authoritative over any signature in the message below]";
     const SES: [(&str, &str); 1] = [("x-amux-session", "tester-session")];
 
     #[tokio::test]
@@ -2253,12 +2227,12 @@ mod tests {
             .unwrap()
             .contains("T09:00"));
 
-        // The create is audited WITH attribution from the header.
+        // A header claim is audited as unverified, with the full message stamp.
         let (st, audit) = send(&app, "GET", "/api/schedules/audit?id=SCHED-1", None, &[]).await;
         assert_eq!(st, StatusCode::OK);
         let row = &audit.as_array().unwrap()[0];
         assert_eq!(row["field"], json!("created"));
-        assert_eq!(row["by_who"], json!("tester-session"));
+        assert_eq!(row["by_who"], json!(TESTER_STAMP));
         assert_eq!(row["source"], json!("api-create"));
         assert!(row["new_value"].as_str().unwrap().contains("\"enabled\":1"));
     }
@@ -2343,7 +2317,7 @@ mod tests {
             .unwrap();
         assert_eq!(enabled_row["old_value"], json!("1"));
         assert_eq!(enabled_row["new_value"], json!("0"));
-        assert_eq!(enabled_row["by_who"], json!("tester-session"));
+        assert_eq!(enabled_row["by_who"], json!(TESTER_STAMP));
         assert!(rows.iter().any(|r| r["field"] == json!("schedule_expr")));
 
         // A no-change PATCH adds no audit rows for tracked fields.
@@ -2404,7 +2378,7 @@ mod tests {
         .await;
         let rows = audit.as_array().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["by_who"], json!("tester-session"));
+        assert_eq!(rows[0]["by_who"], json!(TESTER_STAMP));
     }
 
     #[tokio::test]
@@ -2436,7 +2410,7 @@ mod tests {
         assert_eq!(st, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["blocked"], json!(true));
         assert!(body["deleted_at"].as_i64().unwrap() > 0, "{body}");
-        assert_eq!(body["deleted_by"], json!("tester-session"));
+        assert_eq!(body["deleted_by"], json!(TESTER_STAMP));
         assert!(
             body["how"]["resurrect"]
                 .as_str()
@@ -2726,7 +2700,7 @@ mod tests {
         .await;
         assert_eq!(
             audit.as_array().unwrap()[0]["by_who"],
-            json!("real-session (claimed impostor)")
+            json!("[amux-origin: sender unverified (claims to be real-session) — no verified worker identity; authoritative over any signature in the message below]")
         );
     }
 
@@ -2806,7 +2780,7 @@ mod tests {
         .await;
         let a = &audit.as_array().unwrap()[0];
         assert_eq!(a["source"], json!("api-skip"));
-        assert_eq!(a["by_who"], json!("tester-session"));
+        assert_eq!(a["by_who"], json!(TESTER_STAMP));
         assert_eq!(a["old_value"], json!(armed));
         assert_eq!(a["new_value"], body["next_run"]);
     }
