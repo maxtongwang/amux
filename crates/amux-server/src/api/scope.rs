@@ -1975,7 +1975,8 @@ mod tests {
         assert_eq!(v["error"], "unknown capability 'nope'");
 
         // A session may not write global/group, nor another worker; it may
-        // write itself. Exact policy strings (the SPA shows them verbatim).
+        // write itself. The refusals are the delegation table's (ai-config
+        // #160): AMUX_SCOPE_WRITE_AGENTS no longer opens anything to workers.
         let (s, v) = call(
             &app,
             "PUT",
@@ -1987,10 +1988,7 @@ mod tests {
         assert_eq!(s, StatusCode::FORBIDDEN);
         assert_eq!(
             v["error"],
-            "'probe' may not write the global layer. Everything wearing it inherits the \
-             change, so a session could grant itself and its peers new capability. Do it \
-             from the dashboard, or set AMUX_SCOPE_WRITE_AGENTS=1 if you want sessions to \
-             have this."
+            "configuring another worker is the owner's; no delegation row grants it to this caller"
         );
         let (s, v) = call(
             &app,

@@ -139,20 +139,27 @@ async fn get_delegation_log_is_for_the_owner_and_leads() {
 
 #[tokio::test]
 async fn an_allowed_change_reaches_the_leads_group_stamped_system() {
+    // The feed is queued to the other leads as amux automation (its guard and
+    // empty sender are pinned in delegation_log's unit tests), never as an
+    // owner send; it is posted in the background, so poll.
     let e = setup().await;
-    let mark = e.max_row_id();
     let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &format!("/api/sessions/{DEV_A}/config"), Some(json!({"model": "sonnet"}))).await;
     assert_allowed(st, &v, "lead model");
-    let rows = e.rows_after(mark);
-    let feed: Vec<_> = rows.iter().filter(|(_, _, _, text)| text.contains(DEV_A) && text.contains(DEV_LEAD)).collect();
-    assert!(!feed.is_empty(), "a feed message names the actor and target: {rows:?}");
-    for (session, origin, _, _) in &feed {
-        assert!([DEV_LEAD, OPS_LEAD, LEADS_NO_ORCH, MRPOPO].contains(&session.as_str()),
-            "feed went to a leads member, not {session}: {rows:?}");
-        assert_eq!(origin, "system", "feed is stamped system, never the owner: {rows:?}");
+    let names = |t: &String| t.contains(DEV_A) && t.contains(DEV_LEAD);
+    let mut fed = Vec::new();
+    for _ in 0..40 {
+        fed = e.queued_for(OPS_LEAD).into_iter().filter(names).collect();
+        if !fed.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!fed.is_empty(), "a feed message to another lead names the actor and target: {:?}", e.queued_for(OPS_LEAD));
+    for lane in [DEV_A, DEV_B, OPS_A] {
+        assert!(e.queued_for(lane).is_empty(), "the feed went to non-lead {lane}: {:?}", e.queued_for(lane));
     }
     let (st, v) = e.call(Who::Worker(DEV_A), "PATCH", &format!("/api/sessions/{DEV_B}/config"), Some(json!({"model": "sonnet"}))).await;
     assert_refused(st, &v, "peer");
-    let after_refusal = e.rows_after(mark);
-    assert_eq!(after_refusal.len(), rows.len(), "a refusal sends no feed message: {after_refusal:?}");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!e.queued_for(OPS_LEAD).iter().any(|t| t.contains(DEV_B)), "a refusal sends no feed message: {:?}", e.queued_for(OPS_LEAD));
 }

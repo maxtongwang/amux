@@ -3638,7 +3638,6 @@ mod tests {
             (&lead, "POST", "/api/env/apply".into(), json!({"workers": [{"name": "review-dev-a", "groups": ["dev", "ops"]}]}), "env_apply_existing_owner_only"),
             (&worker, "PUT", "/api/config/apply".into(), json!({"workers": [{"name": "iac-minted"}]}), NEEDS_LEAD),
             (&[("X-Amux-Worker", "review-dev-lead")], "PUT", "/api/config/apply".into(), json!({"workers": [{"name": "iac-leads", "tags": ["leads"]}]}), OUTSIDE_TEAM),
-            (&lead, "PATCH", "/api/sessions/review-dev-a/config".into(), json!({"tags": ["dev"]}), "peer_config_owner_only"),
             (&worker, "PATCH", "/api/sessions/review-dev-a/config".into(), json!({"worker_type": "chat"}), MEMBERSHIP_CODE),
             (&worker, "PUT", "/api/scope".into(), json!({"level": "worker", "name": "review-dev-a", "capability": "env", "value": {"CC_TAGS": "dev,leads"}}), MEMBERSHIP_CODE),
             (&worker, "PUT", "/api/scope".into(), json!({"level": "worker", "name": "review-dev-a", "capability": "env", "value": "CC_TAGS=leads\n"}), "raw_text_owner_only"),
