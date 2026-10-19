@@ -62,6 +62,20 @@ _bounded() { # seconds cmd...
   else perl -e 'alarm shift; exec @ARGV or exit 127' "$s" "$@"
   fi
 }
+# Which bound ran is logged, so a silent no-op cannot come back unseen. Not to
+# stdout/stderr (that is the hook's message to the session); to amux's own log,
+# only where that directory already exists.
+_freshness_bound_tool() {
+  if command -v timeout >/dev/null 2>&1; then echo timeout
+  elif command -v gtimeout >/dev/null 2>&1; then echo gtimeout
+  elif command -v perl >/dev/null 2>&1; then echo perl-alarm
+  else echo none
+  fi
+}
+_fl="${AMUX_HOME:-$HOME/.amux}/logs"
+[ -d "$_fl" ] && printf '%s verdict=freshness_bound tool=%s measured=true n_considered=1\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(_freshness_bound_tool)" >> "$_fl/session-freshness.log" 2>/dev/null
+unset _fl
 
 # ── Axis 1: is the checkout behind its remote? ───────────────────────────────
 # Bounded: a hook that hangs on a slow network is a hook that gets deleted.
