@@ -18,6 +18,18 @@
 # Intentional cross-session push: AMUX_ALLOW_FOREIGN=1 git push ...
 import datetime, json, os, ssl, subprocess, sys, urllib.parse, urllib.request
 
+# Isolated-run endpoint guard: scripts/lib/amux_endpoint.py, installed beside
+# hook copies. Under AMUX_ISOLATED_RUN=1 a live URL becomes a dead port.
+import os, sys  # noqa: E401
+_AE_HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path[:0] = [p for p in (_AE_HERE, os.path.join(_AE_HERE, "lib"),
+                            os.path.join(_AE_HERE, os.pardir, "lib")) if p not in sys.path]
+try:
+    from amux_endpoint import guard as _endpoint_guard
+except ImportError:  # an install without the shared file: refuse only when isolated
+    def _endpoint_guard(url, client):
+        return "http://127.0.0.1:9" if os.environ.get("AMUX_ISOLATED_RUN") == "1" else url
+
 ZERO = "0" * 40
 
 
@@ -115,7 +127,8 @@ def _consent_message(msg_id, expect_origin, sha):
         return False, ("message id %r is not a MSG-<n> id. These are cmd_history "
                        "row ids, the `MSG-27463` form you see and paste" % (msg_id,))
 
-    base = (os.environ.get("AMUX_URL") or "https://localhost:8824").rstrip("/")
+    base = _endpoint_guard(os.environ.get("AMUX_URL") or "https://localhost:8824",
+                           "pre-push").rstrip("/")
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -920,7 +933,8 @@ def main():
                         # alive only by a compatibility bind (CLAUDE.md). A
                         # fallback pointing at it re-teaches the dead port to
                         # every checkout that lacks AMUX_URL.
-                        (os.environ.get("AMUX_URL") or "https://localhost:8824")
+                        _endpoint_guard(os.environ.get("AMUX_URL") or "https://localhost:8824",
+                                        "pre-push")
                         + "/api/sessions", context=_ctx, timeout=_API_TIMEOUT_S).read())
                     _hit = next((r for r in _rows if r.get("name") == _bown), None)
                     _bstat = ("not a session on this machine" if _hit is None

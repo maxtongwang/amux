@@ -164,12 +164,17 @@ sync_worker_bin_guard() {
 # hook enrollment. Read exact elected bytes, validate and verify the rename.
 sync_observed_edits_hooks() {
   local sha="$1" half rel dest tmp mode verdict
-  for half in pre post orchestrate; do
+  for half in pre post orchestrate endpoint; do
     mode=0755; verdict=observed_hook
     if [ "$half" = orchestrate ]; then
       rel=".claude/commands/orchestrate.md"
       dest="${AMUX_CLAUDE_COMMAND_DIR:-$HOME/.claude/commands}/orchestrate.md"
       mode=0644; verdict=orchestration_command
+    elif [ "$half" = endpoint ]; then
+      # The isolated-run endpoint guard the hooks beside it import.
+      rel="scripts/lib/amux_endpoint.py"
+      dest="${AMUX_OBSERVED_HOOK_DIR:-$HOME/.amux/hooks}/amux_endpoint.py"
+      mode=0644; verdict=endpoint_guard
     else
       rel="scripts/claude-hooks/observed-edits-${half}.py"
       dest="${AMUX_OBSERVED_HOOK_DIR:-$HOME/.amux/hooks}/observed-edits-${half}.py"

@@ -41,6 +41,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Isolated-run endpoint guard: scripts/lib/amux_endpoint.py, installed beside
+# hook copies. Under AMUX_ISOLATED_RUN=1 a live URL becomes a dead port.
+import os, sys  # noqa: E401
+_AE_HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path[:0] = [p for p in (_AE_HERE, os.path.join(_AE_HERE, "lib"),
+                            os.path.join(_AE_HERE, os.pardir, "lib")) if p not in sys.path]
+try:
+    from amux_endpoint import guard as _endpoint_guard
+except ImportError:  # an install without the shared file: refuse only when isolated
+    def _endpoint_guard(url, client):
+        return "http://127.0.0.1:9" if os.environ.get("AMUX_ISOLATED_RUN") == "1" else url
+
 ROOT = Path(__file__).resolve().parent.parent
 LEDGER = ROOT / "frustrations.md"
 ARCHIVE = ROOT / "frustrations-archive.md"
@@ -139,6 +151,10 @@ def field(block, key):
 
 
 def _api():
+    return _endpoint_guard(_api_unguarded(), 'frustrations-archive')
+
+
+def _api_unguarded():
     """The server-written endpoint, so a port move cannot point this at a dead
     port (the same guard frustrations_retire.py grew after a silent failure)."""
     try:

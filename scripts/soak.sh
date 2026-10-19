@@ -68,7 +68,16 @@
 
 set -uo pipefail
 
-URL="${AMUX_SOAK_URL:-https://localhost:8824}"
+# Isolated-run endpoint guard (scripts/lib/amux-endpoint.sh, installed beside
+# hook copies). Without the file, refuse everything when isolated.
+_ae_dir=$(dirname "$0")
+for _ae in "$_ae_dir/amux-endpoint.sh" "$_ae_dir/lib/amux-endpoint.sh" "$_ae_dir/../lib/amux-endpoint.sh"; do
+  [ -r "$_ae" ] && . "$_ae" && break
+done
+command -v amux_endpoint_guard >/dev/null 2>&1 || amux_endpoint_guard() {
+  if [ "${AMUX_ISOLATED_RUN:-}" = 1 ]; then echo "http://127.0.0.1:9"; else echo "$1"; fi
+}
+URL=$(amux_endpoint_guard "${AMUX_SOAK_URL:-https://localhost:8824}" soak)
 INTERVAL=60
 OUT="${AMUX_SOAK_OUT:-$HOME/.amux/soak.jsonl}"
 DURATION=0

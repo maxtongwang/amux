@@ -16,6 +16,16 @@
 # internal error handling; it drives the HTTP API directly per lane so a
 # single failure can never truncate the loop.
 LOG_FILE="$HOME/.amux/worker-start.log"
+# Isolated-run endpoint guard (scripts/lib/amux-endpoint.sh, installed beside
+# hook copies). Without the file, refuse everything when isolated.
+_ae_dir=$(dirname "$0")
+for _ae in "$_ae_dir/amux-endpoint.sh" "$_ae_dir/lib/amux-endpoint.sh" "$_ae_dir/../lib/amux-endpoint.sh"; do
+  [ -r "$_ae" ] && . "$_ae" && break
+done
+command -v amux_endpoint_guard >/dev/null 2>&1 || amux_endpoint_guard() {
+  if [ "${AMUX_ISOLATED_RUN:-}" = 1 ]; then echo "http://127.0.0.1:9"; else echo "$1"; fi
+}
+AMUX_START_BASE=$(amux_endpoint_guard "https://localhost:8824" amux-start-worker)
 SESSIONS_DIR="$HOME/.amux/sessions"
 
 echo "$(date): Starting worker startup script" >> "$LOG_FILE"
@@ -34,7 +44,7 @@ while true; do
     sleep "$wait_time"
 
     # Try to reach the health endpoint
-    if /usr/bin/curl -sk --connect-timeout 2 --max-time 5 "https://localhost:8824/health" > /dev/null 2>&1; then
+    if /usr/bin/curl -sk --connect-timeout 2 --max-time 5 "$AMUX_START_BASE/health" > /dev/null 2>&1; then
         echo "$(date): Server is responding, attempting to start workers..." >> "$LOG_FILE"
         break
     fi
@@ -85,7 +95,7 @@ verify_running() {
     local name="$1" tries=0
     while [ $tries -lt 5 ]; do
         sleep 2
-        if /usr/bin/curl -sk --connect-timeout 3 --max-time 5 "https://localhost:8824/api/sessions/$name" 2>/dev/null \
+        if /usr/bin/curl -sk --connect-timeout 3 --max-time 5 "$AMUX_START_BASE/api/sessions/$name" 2>/dev/null \
           | grep -q '"running":true'; then
             return 0
         fi
@@ -97,7 +107,7 @@ verify_running() {
 for f in "${lane_files[@]}"; do
     name=$(basename "$f" .env)
     echo "$(date): Calling amux API to start worker: $name..." >> "$LOG_FILE"
-    RESPONSE=$(/usr/bin/curl -sk --connect-timeout 5 --max-time 10 -X POST "https://localhost:8824/api/sessions/$name/start" \
+    RESPONSE=$(/usr/bin/curl -sk --connect-timeout 5 --max-time 10 -X POST "$AMUX_START_BASE/api/sessions/$name/start" \
       -H "Content-Type: application/json" \
       -d '{"backend": "tmux"}' 2>&1)
     CURL_RC=$?

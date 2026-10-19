@@ -40,6 +40,18 @@ import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
+# Isolated-run endpoint guard: scripts/lib/amux_endpoint.py, installed beside
+# hook copies. Under AMUX_ISOLATED_RUN=1 a live URL becomes a dead port.
+import os, sys  # noqa: E401
+_AE_HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path[:0] = [p for p in (_AE_HERE, os.path.join(_AE_HERE, "lib"),
+                            os.path.join(_AE_HERE, os.pardir, "lib")) if p not in sys.path]
+try:
+    from amux_endpoint import guard as _endpoint_guard
+except ImportError:  # an install without the shared file: refuse only when isolated
+    def _endpoint_guard(url, client):
+        return "http://127.0.0.1:9" if os.environ.get("AMUX_ISOLATED_RUN") == "1" else url
+
 REPO = Path(__file__).resolve().parent.parent
 FRUST = REPO / "frustrations.md"
 REQUIRED = ["AREA", "SEVERITY", "STATUS", "DATE", "SESSION", "CARD", "SYMPTOM", "COST", "FIX"]
@@ -129,6 +141,7 @@ def fetch_board():
     base = os.environ.get("AMUX_URL", "") or "https://localhost:8824"
     if base.rstrip("/").endswith(":8822"):
         base = "https://localhost:8824"
+    base = _endpoint_guard(base, "frustrations_audit")
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -163,6 +176,7 @@ def fetch_sessions():
     base = os.environ.get("AMUX_URL", "") or "https://localhost:8824"
     if base.rstrip("/").endswith(":8822"):
         base = "https://localhost:8824"
+    base = _endpoint_guard(base, "frustrations_audit")
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE

@@ -31,6 +31,18 @@ import subprocess
 import sys
 import urllib.request
 
+# Isolated-run endpoint guard: scripts/lib/amux_endpoint.py, installed beside
+# hook copies. Under AMUX_ISOLATED_RUN=1 a live URL becomes a dead port.
+import os, sys  # noqa: E401
+_AE_HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path[:0] = [p for p in (_AE_HERE, os.path.join(_AE_HERE, "lib"),
+                            os.path.join(_AE_HERE, os.pardir, "lib")) if p not in sys.path]
+try:
+    from amux_endpoint import guard as _endpoint_guard
+except ImportError:  # an install without the shared file: refuse only when isolated
+    def _endpoint_guard(url, client):
+        return "http://127.0.0.1:9" if os.environ.get("AMUX_ISOLATED_RUN") == "1" else url
+
 ROUTE_CAP = 10
 SESSION = os.environ.get("AMUX_SESSION", "amux")
 ROUTE_TO = "amux"
@@ -44,7 +56,8 @@ REARM_MARKER = "detector RE-ARMED"
 def base_url():
     out = subprocess.run(["amux", "url"], capture_output=True, text=True)
     u = out.stdout.strip()
-    return u if u else os.environ.get("AMUX_URL", "https://localhost:8824")
+    return _endpoint_guard(u if u else os.environ.get("AMUX_URL", "https://localhost:8824"),
+                           "autofix-recovery-sweep")
 
 
 CTX = ssl.create_default_context()
