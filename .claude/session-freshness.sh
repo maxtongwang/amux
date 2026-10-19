@@ -50,10 +50,23 @@ fi
 
 out=""
 
+# Bounded runs WITHOUT GNU `timeout`, which macOS does not ship: both bounded
+# calls below used `timeout N ...` and on a Mac that is "command not found", so
+# the fetch never ran (axis 1 read a stale origin) and the health cross-check
+# never ran either, silently, behind 2>/dev/null and `|| true` (2026-10-19,
+# found as 3 cases failing only on macOS). perl's alarm is on every Mac.
+_bounded() { # seconds cmd...
+  local s="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$s" "$@"
+  else perl -e 'alarm shift; exec @ARGV or exit 127' "$s" "$@"
+  fi
+}
+
 # ── Axis 1: is the checkout behind its remote? ───────────────────────────────
 # Bounded: a hook that hangs on a slow network is a hook that gets deleted.
 if git remote get-url origin >/dev/null 2>&1; then
-  timeout 10 git fetch -q origin 2>/dev/null
+  _bounded 10 git fetch -q origin 2>/dev/null
   base="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo origin/main)"
   if git rev-parse --verify -q "$base" >/dev/null 2>&1; then
     behind="$(git rev-list --count "HEAD..$base" 2>/dev/null || echo 0)"
@@ -560,7 +573,7 @@ fi
 # not testing the hook (the mistake test-session-freshness.sh already made once).
 HEALTH_URL="${AMUX_HEALTH_URL:-https://localhost:8824/health}"
 if command -v curl >/dev/null 2>&1; then
-  hs="$(timeout 5 curl -sk "$HEALTH_URL" 2>/dev/null || true)"
+  hs="$(_bounded 5 curl -sk "$HEALTH_URL" 2>/dev/null || true)"
   if [ -n "$hs" ] && ! printf '%s' "$hs" | grep -q '"server":"amux-rust"'; then
     out+="  - ${HEALTH_URL} is answering but not as amux-rust — check com.amux.server-rs"$'\n'
   fi
