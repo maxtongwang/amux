@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
 # scripts/e2e-worker-control.sh, exercised for real (not --dry-run) against a
 # synthetic repo whose only remote is a local bare repo, with a fake `gh` and a
-# fake `sleep` first on PATH. Nothing here reaches GitHub: GH_REPO is unset and
-# the fake gh exits 99 on any call it does not model.
+# fake `sleep` first on PATH. Nothing here reaches GitHub: GH_REPO names a fake
+# repository (cell 7 unsets it) and the fake gh exits 99 on any call it does not
+# model; a GitHub URL on a remote is rewritten to the local bare repo.
 #
 # Cells: a capped real dispatch (4 runs, at most 2 in flight), the run-id
 # parse loop (PR #39 B1), an untraceable dispatch recorded as 'unknown', the
 # piped input check that refused valid SHAs under pipefail (N1), and report
-# exiting nonzero when nothing was measured (N3).
+# exiting nonzero when nothing was measured (N3), and the repository every gh
+# call targets when GH_REPO is unset (7: the 2026-10-18 403 against upstream).
 set -euo pipefail
 
 SRC_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SCRIPT="$SRC_REPO/scripts/e2e-worker-control.sh"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-unset GH_REPO GH_TOKEN GITHUB_TOKEN
+unset GH_TOKEN GITHUB_TOKEN
+export GH_REPO=fake/fork
 PASS=0
 FAIL=0
 check() {  # check <label> <0 = pass>
@@ -37,7 +40,7 @@ case "$1 $2" in
     inflight=$(awk '$2 != "completed"' "$S/runs" | wc -l | tr -d ' ')
     n=$(( $(wc -l < "$S/runs") + 1001 ))
     echo "$n in_progress" >> "$S/runs"
-    echo "workflow-run inflight=$inflight id=$n args=$*" >> "$S/gh.log"
+    echo "workflow-run inflight=$inflight id=$n repo=${GH_REPO:-unset} args=$*" >> "$S/gh.log"
     [ "${FAKE_GH_NO_URL:-0}" = 1 ] || echo "https://github.com/fake/repo/actions/runs/$n"
     ;;
   "run list")
@@ -167,6 +170,40 @@ printf 'workers\trun_id\tsha\tbranch\n1\t1001\t%s\t%s\n2\t1002\t%s\t%s\n' "$sha"
 rc=0; ctl report "$TMP/n3.tsv" --dir "$TMP/n3-report" > /dev/null 2> "$TMP/n3.err" || rc=$?
 check "N3: report with no measured run exits 1 (got $rc)" "$([ "$rc" = 1 ] && echo 0 || echo 1)"
 check "N3: report names why" "$(grep -q 'no run was measured' "$TMP/n3.err" && echo 0 || echo 1)"
+
+# ── 7. GH_REPO unset: the repository comes from REMOTE, never gh's guess ─────
+# The fixture mirrors the failing checkout: origin is the fork (a GitHub URL,
+# rewritten to the local bare repo for git), upstream is mixpeek/amux.
+git -C "$repo" remote set-url origin https://github.com/acme/fork.git
+git -C "$repo" config url."$bare".insteadOf https://github.com/acme/fork.git
+git -C "$repo" config --add url."$bare".insteadOf git@github.com:acme/fork.git
+git -C "$repo" remote add upstream https://github.com/mixpeek/amux
+sha7=$(git -C "$repo" rev-parse "$sha")
+reset_state
+rc=0; (unset GH_REPO; ctl dispatch "$sha7" 1 --workers 1 --max-inflight 2 --out "$TMP/seven.tsv") > /dev/null 2> "$TMP/seven.err" || rc=$?
+check "7: dispatch with GH_REPO unset exits 0 (got $rc)" "$([ "$rc" = 0 ] && echo 0 || echo 1)"
+check "7: every gh dispatch targeted the fork, none upstream or unset" \
+  "$([ "$(grep -c '^workflow-run' "$STATE/gh.log" 2>/dev/null || true)" = 1 ] && ! grep '^workflow-run' "$STATE/gh.log" | grep -qv 'repo=acme/fork ' && echo 0 || echo 1)"
+check "7: the resolved repository is printed" "$(grep -q 'repository acme/fork$' "$TMP/seven.err" && echo 0 || echo 1)"
+git -C "$repo" push -q "$bare" --delete "e2e-control/${sha7:0:12}" 2>/dev/null || true
+git -C "$repo" remote set-url origin git@github.com:acme/fork.git
+rc=0; (unset GH_REPO; ctl dispatch "$sha7" 1 --dry-run) > /dev/null 2> "$TMP/seven-ssh.err" || rc=$?
+check "7: an ssh remote resolves to the same repository" "$([ "$rc" = 0 ] && grep -q 'repository acme/fork$' "$TMP/seven-ssh.err" && echo 0 || echo 1)"
+rc=0; (export GH_REPO=other/explicit; ctl dispatch "$sha7" 1 --dry-run) > /dev/null 2> "$TMP/seven-explicit.err" || rc=$?
+check "7: an explicit GH_REPO wins" "$([ "$rc" = 0 ] && grep -q 'repository other/explicit$' "$TMP/seven-explicit.err" && echo 0 || echo 1)"
+git -C "$repo" remote set-url origin https://github.com/acme/fork.git/
+git -C "$repo" config --add url."$bare".insteadOf https://github.com/acme/fork.git/
+rc=0; (unset GH_REPO; ctl dispatch "$sha7" 1 --dry-run) > /dev/null 2> "$TMP/seven-slash.err" || rc=$?
+check "7: a URL ending .git/ resolves to the repository, not <repo>.git" "$([ "$rc" = 0 ] && grep -q 'repository acme/fork$' "$TMP/seven-slash.err" && echo 0 || echo 1)"
+git -C "$repo" remote set-url origin https://x-token:SECRET-TOKEN@github.com/acme/fork.git
+git -C "$repo" config --add url."$bare".insteadOf https://x-token:SECRET-TOKEN@github.com/acme/fork.git
+rc=0; (unset GH_REPO; ctl dispatch "$sha7" 1 --dry-run) > /dev/null 2> "$TMP/seven-cred.err" || rc=$?
+check "7: a credentialed URL resolves and its token is never printed" \
+  "$([ "$rc" = 0 ] && grep -q 'repository acme/fork$' "$TMP/seven-cred.err" && ! grep -q 'SECRET-TOKEN' "$TMP/seven-cred.err" && echo 0 || echo 1)"
+git -C "$repo" remote set-url origin "$bare"
+rc=0; (unset GH_REPO; ctl dispatch "$sha7" 1 --dry-run) > /dev/null 2> "$TMP/seven-local.err" || rc=$?
+check "7: a non-GitHub remote with GH_REPO unset is refused, not guessed (got $rc)" \
+  "$([ "$rc" = 1 ] && grep -q 'is not a GitHub URL; set GH_REPO' "$TMP/seven-local.err" && echo 0 || echo 1)"
 
 echo "test-e2e-worker-control: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]
