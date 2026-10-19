@@ -20,14 +20,16 @@
 //! | Class | Allowed | Through a grant Max approves |
 //! |---|---|---|
 //! | Owner | everything | - |
-//! | Lead | create workers tagged with a non-empty subset of its teams, writing only SelfOk/LeadOk settings; stop and lifecycle verbs on non-lead workers in its team; remove its team tag from such a worker; rules and group config of its teams; model and effort on such workers | nothing |
+//! | Lead | create workers tagged with a non-empty subset of its teams, writing only SelfOk/LeadOk settings; rename (not to a reserved name), stop and lifecycle verbs on non-lead workers in its team; remove its team tag from such a worker; rules and group config of its teams; model and effort on such workers | nothing |
 //! | Mrpopo | nothing | each setting in [`GRANT_ROWS`] and the action rows in `decide_mrpopo`: stored as a pending grant, applied only on Max's approval (api/delegation_grants.rs) |
 //! | SelfWorker | settings in [`SELF_ENV_KEYS`] / SelfOk config fields, rename (not to a reserved name), stop and lifecycle verbs | nothing |
 //! | Worker | nothing | nothing |
 //!
 //! Never delegated: secret values ([`is_secret_key`]) and everything in
 //! [`HELD_FOR_MAX`] (one line each, so delegating one later is a one-line
-//! change). Lead rename is refused until amux #3 (token moves with a rename).
+//! change). A lead rename keeps the worker's token and old-name alias (amux
+//! #3); the rule matches amux #40 (ai-config #203): non-lead, same team, and
+//! neither the target nor the new name is mrpopo.
 //! Every non-owner change is logged by [`Grant::commit`]; refusals are WARN
 //! lines with `verdict = "delegation_refused"`, never log entries.
 use super::AppState;
@@ -420,13 +422,13 @@ fn decide_lead(team: &str, teams: &[String], action: &Action, t: &TargetFacts) -
                     "a lead may not create a worker with '{k}'; that setting follows the same rule as on an existing worker")),
             }
         }
-        Action::RenameWorker { .. } => deny("lead_rename_pending", "a lead may not rename workers until amux #3 moves the worker token with a rename".into()),
-        Action::StopWorker | Action::Lifecycle { .. } if on_team_worker => Decision::Allow,
+        Action::RenameWorker { to } if reserved_name(to) => reserved_denied(to),
+        Action::RenameWorker { .. } | Action::StopWorker | Action::Lifecycle { .. } if on_team_worker => Decision::Allow,
         Action::SetConfig { keys } if on_team_worker => match keys.iter().find(|k| key_class(k) != KeyClass::LeadOk) {
             None => Decision::Allow,
             Some(k) => deny("peer_config_owner_only", format!("a lead may set only model and effort on workers in its team '{team}', not '{k}'")),
         },
-        Action::StopWorker | Action::Lifecycle { .. } | Action::SetConfig { .. } => not_team(),
+        Action::RenameWorker { .. } | Action::StopWorker | Action::Lifecycle { .. } | Action::SetConfig { .. } => not_team(),
         Action::SetTags { from, to } => {
             let (from, to) = (set(from), set(to));
             let changed: BTreeSet<String> = from.symmetric_difference(&to).cloned().collect();
@@ -944,8 +946,12 @@ mod tests {
     }
 
     #[test]
-    fn delegation_lead_rename_waits_for_token_move() {
-        assert_eq!(code(decide(&lead("dev"), &Action::RenameWorker { to: "dev-b".into() }, &TEAM)), "lead_rename_pending");
+    fn delegation_lead_renames_non_lead_team_workers_only() {
+        let rename = |to: &str| Action::RenameWorker { to: to.into() };
+        assert_eq!(code(decide(&lead("dev"), &rename("dev-b"), &TEAM)), "allow");
+        assert_eq!(code(decide(&lead("dev"), &rename("dev-b"), &PEER_LEAD)), "peer_config_owner_only");
+        assert_eq!(code(decide(&lead("dev"), &rename("dev-b"), &OTHER)), "peer_config_owner_only");
+        assert_eq!(code(decide(&lead("dev"), &rename("mrpopo"), &TEAM)), "reserved_name");
     }
 
     #[test]
