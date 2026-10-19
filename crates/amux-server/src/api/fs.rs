@@ -1612,7 +1612,9 @@ async fn upload(req: Request) -> Response {
                 i += 1;
             }
         }
-        if let Err(e) = std::fs::write(&dest, &part.data) {
+        // Atomic, and never through a name planted at dest: a symlink there
+        // is replaced, not followed (it used to be written through in place).
+        if let Err(e) = crate::atomic_write::atomic_write(&dest, &part.data) {
             return j(500, json!({"error": e.to_string()}));
         }
         let final_name = dest
@@ -3495,7 +3497,7 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["saved"][0], json!({"name": "a_1.txt", "size": 3}));
 
-        // overwrite=1 clobbers in place.
+        // overwrite=1 replaces the file (atomically, never through a planted link).
         let body = mp_body(
             "XX",
             &[
@@ -3518,6 +3520,27 @@ mod tests {
             std::fs::read_to_string(td.path().join("a.txt")).unwrap(),
             "newer"
         );
+    }
+
+    /// PR #48 review B1 class sweep: an overwrite=1 upload wrote in place with
+    /// std::fs::write, so a symlink planted at the destination name took the
+    /// bytes. It is now replaced, not followed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_overwrite_upload_replaces_a_planted_link_instead_of_writing_through_it() {
+        let app = app();
+        let td = tempfile::tempdir().unwrap();
+        let victim = td.path().join("victim.txt");
+        std::fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, td.path().join("a.txt")).unwrap();
+        let dir = td.path().to_string_lossy().into_owned();
+        let body = mp_body("XX", &[("dir", None, dir.as_bytes()), ("overwrite", None, b"1"), ("file", Some("a.txt"), b"newer")]);
+        let (st, v) = call(&app, "POST", "/api/fs/upload", Some("multipart/form-data; boundary=XX"), body).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep", "the planted link was not written through");
+        let a = td.path().join("a.txt");
+        assert!(!std::fs::symlink_metadata(&a).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "newer");
     }
 
     #[tokio::test]

@@ -849,25 +849,11 @@ fn current_etag(p: &std::path::Path) -> Option<String> {
     Some(format!("\"{}-{}\"", mtime_secs(&meta), meta.len()))
 }
 
-static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Write via a sibling temp file and rename, so a reader (or a worker opening
-/// the file) never sees it half-written. The temp name is unique per write, so
-/// two saves of one file never share it; the file keeps its permissions (a
-/// script stays executable) and a symlink keeps pointing where it did: the
-/// rename lands on the file it names (the same resolution the write gates use).
+/// Save through the shared atomic write, landing on the file the write gates
+/// judged: a symlink is saved through to the file it names (resolve_nonstrict),
+/// and the link itself stays a link.
 fn write_atomic(p: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let target = resolve_nonstrict(p);
-    let name = target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let seq = SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = target.with_file_name(format!(".{name}.amux-save-{}-{seq}", std::process::id()));
-    let staged = std::fs::write(&tmp, bytes).and_then(|()| match std::fs::metadata(&target) {
-        Ok(m) => std::fs::set_permissions(&tmp, m.permissions()),
-        Err(_) => Ok(()),
-    });
-    staged.and_then(|()| std::fs::rename(&tmp, &target)).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    crate::atomic_write::atomic_write(&resolve_nonstrict(p), bytes).map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -3158,6 +3144,49 @@ pub(crate) mod tests {
         reader.join().unwrap();
         assert!(std::fs::read_dir(dir.path()).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains("amux-save")),
             "no temp file is left behind");
+    }
+
+    /// PR #48 review B1: the spreadsheet save staged into `.<name>.amux-save-<pid>`
+    /// (and the text save briefly into `-<pid>-<seq>`), opened following symlinks,
+    /// so a link planted at that name took the bytes. A read-only file is refused
+    /// and kept (B2), as an in-place write left it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn put_file_cannot_be_redirected_by_a_planted_temp_link_and_keeps_read_only_files() {
+        use base64::Engine as _;
+        use std::os::unix::fs::PermissionsExt;
+        let app = app();
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join(".bashrc");
+        std::fs::write(&victim, "# rc").unwrap();
+        let book = dir.path().join("book.xlsx");
+        std::fs::write(&book, b"PK-old").unwrap();
+        let notes = dir.path().join("notes.md");
+        std::fs::write(&notes, "old").unwrap();
+        let pid = std::process::id();
+        let mut names = vec![format!(".book.xlsx.amux-save-{pid}"), format!(".notes.md.amux-save-{pid}")];
+        names.extend((0..64).map(|seq| format!(".notes.md.amux-save-{pid}-{seq}")));
+        crate::atomic_write::plant_links(dir.path(), &names, &victim);
+        let put = |body: Value| HttpRequest::builder().method("PUT").uri("/api/file")
+            .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"PK-new");
+        let (status, _, _) = send(&app, put(json!({"path": book.to_str().unwrap(), "content_base64": b64}))).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) = send(&app, put(json!({"path": notes.to_str().unwrap(), "content": "echo pwned"}))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "# rc", "no planted link was written through");
+        assert_eq!(std::fs::read(&book).unwrap(), b"PK-new");
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), "echo pwned");
+        assert!(!std::fs::symlink_metadata(&notes).unwrap().file_type().is_symlink(), "the saved file is not a link");
+
+        if unsafe { libc::geteuid() } != 0 {
+            let ro = dir.path().join("ro.md");
+            std::fs::write(&ro, "protected").unwrap();
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o444)).unwrap();
+            let (status, _, _) = send(&app, put(json!({"path": ro.to_str().unwrap(), "content": "overwritten"}))).await;
+            assert_ne!(status, StatusCode::OK, "a read-only file is refused, not replaced");
+            assert_eq!(std::fs::read_to_string(&ro).unwrap(), "protected");
+        }
     }
 
     #[tokio::test]

@@ -223,7 +223,11 @@ test('realtime draw: live stroke at frame rate, equal scenes, no remote undo, on
     // 85% of what was actually sent (printed, so a low bar is visible).
     const inputHz = moves * 1000 / (t1 - t0);
     const fpsBar = Math.min(budget.fps, Math.floor(inputHz * 0.85));
-    const line = `[rt-perf] ${info.project.name} per-frame stroke: input ${inputHz.toFixed(1)} moves/s; latency p50=${m.p50.toFixed(1)}ms p95=${m.p95.toFixed(1)}ms max=${m.max.toFixed(1)}ms n=${m.n}; transport p95=${m.transportP95.toFixed(1)}ms frame-wait p95=${m.waitP95.toFixed(1)}ms; remote fps=${m.fps.toFixed(1)} over ${t1 - t0}ms (budget ${budget.strict ? 'strict' : 'loose'}: p95<${budget.p95}, fps>=${fpsBar})`;
+    // Decided before the line is printed, so the line says whether the total
+    // was judged: an annotation alone never reaches the CI log (PR #48 review).
+    const judgeTotal = inputHz >= 20;
+    const totalState = judgeTotal ? 'total judged (measured=true)' : `total NOT judged (measured=false): sender ${inputHz.toFixed(1)} moves/s < 20`;
+    const line = `[rt-perf] ${info.project.name} per-frame stroke: input ${inputHz.toFixed(1)} moves/s; latency p50=${m.p50.toFixed(1)}ms p95=${m.p95.toFixed(1)}ms max=${m.max.toFixed(1)}ms n=${m.n}; transport p95=${m.transportP95.toFixed(1)}ms frame-wait p95=${m.waitP95.toFixed(1)}ms; remote fps=${m.fps.toFixed(1)} over ${t1 - t0}ms (budget ${budget.strict ? 'strict' : 'loose'}: p95<${budget.p95}, fps>=${fpsBar}); ${totalState}`;
     console.log(line);
     info.annotations.push({ type: 'rt-perf', description: line });
     // Side by side, for whoever reads the run: A drew, B shows it with A's cursor.
@@ -240,8 +244,17 @@ test('realtime draw: live stroke at frame rate, equal scenes, no remote undo, on
     // same line the fps check draws below, and otherwise said not to be.
     expect(m.nTransport, 'B recorded transport samples for the stroke').toBe(m.n);
     expect(m.transportP95, 'relay latency (sent -> received)').toBeLessThan(budget.p95);
-    if (inputHz >= 20) expect(m.p95, 'total latency (sent -> applied)').toBeLessThan(budget.p95);
-    else info.annotations.push({ type: 'rt-perf', description: `total latency not judged: the sender produced only ${inputHz.toFixed(1)} moves/s, frame-wait p95 ${m.waitP95.toFixed(1)}ms (measured=false)` });
+    // Chromium (desktop, mobile) sends ~60 moves/s in CI, so the cutoff must
+    // never quietly stop judging it: there the total is always judged.
+    if (info.project.name === 'desktop' || info.project.name === 'mobile') {
+      expect(judgeTotal, `${info.project.name} judges total latency (sender ${inputHz.toFixed(1)} moves/s)`).toBe(true);
+    }
+    if (judgeTotal) expect(m.p95, 'total latency (sent -> applied)').toBeLessThan(budget.p95);
+    else {
+      const notJudged = `[rt-perf] ${info.project.name} total latency NOT judged (measured=false): the sender produced only ${inputHz.toFixed(1)} moves/s; total p95 ${m.p95.toFixed(1)}ms, frame-wait p95 ${m.waitP95.toFixed(1)}ms`;
+      console.log(notJudged);
+      info.annotations.push({ type: 'rt-perf', description: notJudged });
+    }
     // Below ~20 moves/s the SENDER is starved (CI WebKit measured 8.3 moves/s
     // on 2026-10-15) and a frame rate over a handful of frames is noise, not
     // a measurement: 6.6 against a bar of 7 failed a run whose scenes matched

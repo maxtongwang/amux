@@ -450,14 +450,7 @@ fn run_bounded(bin: &Path, args: &[String], timeout: Duration) -> Result<(), Str
 // ---- sidecars ----------------------------------------------------------------
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    crate::atomic_write::atomic_write(path, bytes).map(|_| ())
 }
 
 fn is_sidecar_name(name: &str) -> bool {
@@ -1267,6 +1260,22 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use tower::ServiceExt;
+
+    /// PR #48 review B1 class sweep: this site staged into `.<name>.tmp`, opened
+    /// following symlinks, so a link planted at that name took the write.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_temp_link_cannot_take_this_sites_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let target = dir.path().join("meeting.json");
+        std::fs::write(&target, "old").unwrap();
+        crate::atomic_write::plant_links(dir.path(), &[".meeting.json.tmp".to_string()], &victim);
+        write_atomic(&target, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep", "the planted link was not written through");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    }
 
     /// 2026-09-14T22:51:03Z, which is 18:51:03 in New York (EDT, -240).
     const T0: i64 = 1_789_426_263_000;

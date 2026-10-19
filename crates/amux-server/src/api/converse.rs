@@ -166,9 +166,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    crate::atomic_write::atomic_write(path, bytes).map(|_| ())
 }
 
 /// Add the computed fields every reader needs (expiry, audio URL).
@@ -994,6 +992,22 @@ async fn sweep_now(State(_state): State<AppState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PR #48 review B1 class sweep: this site staged into `<stem>.tmp-<pid>`, opened
+    /// following symlinks, so a link planted at that name took the write.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_temp_link_cannot_take_this_sites_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let target = dir.path().join("session.json");
+        std::fs::write(&target, "old").unwrap();
+        crate::atomic_write::plant_links(dir.path(), &[format!("session.tmp-{}", std::process::id())], &victim);
+        write_atomic(&target, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep", "the planted link was not written through");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    }
 
     fn rec(dir: &Path, worker: &str, id: &str, started: i64, audio: bool) {
         let wdir = dir.join(worker);
