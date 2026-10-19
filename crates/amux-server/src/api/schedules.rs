@@ -2363,6 +2363,20 @@ mod tests {
         (home, guard)
     }
 
+    /// The older tests write as worker `tester-session` (SES) for lanes alpha
+    /// and beta. Since ai-config#210 a worker may only schedule a lane it
+    /// shares a group with, so they run in a home where all three share one.
+    fn team_home() -> (tempfile::TempDir, crate::api::settings::test_env::HomeGuard) {
+        let home = tempfile::tempdir().unwrap();
+        let guard = crate::api::settings::test_env::set_home(home.path());
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        for w in ["tester-session", "alpha", "beta"] {
+            std::fs::write(sessions.join(format!("{w}.env")), "CC_TAGS=team\n").unwrap();
+        }
+        (home, guard)
+    }
+
     fn sched_body(target: &str) -> Value {
         json!({"title": "t", "session": target, "command": "hi", "schedule_expr": "every 1h"})
     }
@@ -2449,6 +2463,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_lists_and_audits_with_attribution() {
+        let (_team, _team_guard) = team_home();
         let (app, _dir) = app();
         let (st, created) = send(
             &app,
@@ -2509,6 +2524,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_scope_only_surfaces_bound_schedules() {
+        let (_team, _team_guard) = team_home();
         let (app, _dir) = app();
         for (title, session) in [("a-task", "alpha"), ("b-task", "beta")] {
             let (st, _) = send(
@@ -2532,6 +2548,7 @@ mod tests {
 
     #[tokio::test]
     async fn patch_updates_recomputes_and_audits() {
+        let (_team, _team_guard) = team_home();
         let (app, _dir) = app();
         let (_, created) = send(
             &app,
@@ -3241,6 +3258,7 @@ mod tests {
 
     #[tokio::test]
     async fn inert_values_for_those_fields_still_save() {
+        let (_team, _team_guard) = team_home();
         let (app, _dir) = app();
         let (st, body) = send(
             &app,
@@ -3313,6 +3331,7 @@ mod tests {
     /// with the denominator published beside them.
     #[tokio::test]
     async fn list_counts_runs_and_failures_from_run_history() {
+        let (_team, _team_guard) = team_home();
         let (app, dir) = app();
         let (st, created) = send(
             &app,
