@@ -113,6 +113,14 @@ fn rel(home: &std::path::Path, p: &std::path::Path) -> String {
     p.strip_prefix(home).unwrap_or(p).to_string_lossy().into_owned()
 }
 
+/// An env file's configuration pairs. `CC_INCARNATION` is the worker's
+/// identity (amux #3), which every env writer preserves: a grant never changes
+/// it and undo never restores it, so it is not part of a change.
+fn config_pairs(p: &std::path::Path) -> BTreeMap<String, String> {
+    super::session_verbs::EnvFile::load(p).pairs().iter()
+        .filter(|(k, _)| k != super::rename_identity::INCARNATION_KEY).cloned().collect()
+}
+
 fn snapshot(state: &AppState) -> Snapshot {
     let home = crate::config::amux_home();
     let mut snap = Snapshot::default();
@@ -120,8 +128,7 @@ fn snapshot(state: &AppState) -> Snapshot {
         for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             let p = e.path();
             if p.extension().and_then(|x| x.to_str()) == Some("env") && p.is_file() {
-                let pairs = super::session_verbs::EnvFile::load(&p).pairs().iter().cloned().collect();
-                snap.env.insert(rel(&home, &p), pairs);
+                snap.env.insert(rel(&home, &p), config_pairs(&p));
             }
         }
     }
@@ -640,7 +647,7 @@ fn restore(state: &AppState, changes: &Value) -> Result<usize, String> {
     }
     for f in changes["created"].as_array().into_iter().flatten().filter_map(Value::as_str) {
         let p = home.join(f);
-        if super::session_verbs::EnvFile::load(&p).pairs().is_empty() {
+        if config_pairs(&p).is_empty() {
             let _ = std::fs::remove_file(&p);
         }
     }
@@ -847,7 +854,7 @@ mod tests {
         let _home = crate::api::settings::test_env::set_home(tmp.path());
         let state = test_state(tmp.path());
         let app = super::super::router(state.clone());
-        let before = env_of(tmp.path());
+        let before = config_pairs(&tmp.path().join("sessions/test-dev-a.env"));
         let row = pane(&state, "test-desk", "turn on yolo for test-dev-a");
         let (st, v, h) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("mrpopo"),
             json!({"toggle_yolo": true, "cite": {"row_id": row}, "why": "Max asked"}), None).await;
@@ -865,7 +872,7 @@ mod tests {
         assert_eq!(st, StatusCode::FORBIDDEN);
         let (st, v, _) = call(&app, "POST", &format!("/api/delegation/grants/{code}/undo"), Some("mrpopo"), Value::Null, None).await;
         assert!(st.is_success(), "{st} {v}");
-        assert_eq!(env_of(tmp.path()), before, "undo restores the env file exactly");
+        assert_eq!(config_pairs(&tmp.path().join("sessions/test-dev-a.env")), before, "undo restores every configuration key exactly");
         assert_eq!(load(&state, &code).unwrap().status, "undone");
         assert_eq!(logged(tmp.path(), "grant:undone"), 1);
         let (st, _, _) = call(&app, "POST", &format!("/api/delegation/grants/{code}/undo"), None, Value::Null, None).await;
