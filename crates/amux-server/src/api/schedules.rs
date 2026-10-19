@@ -860,16 +860,16 @@ fn attach_isolated_note(o: &mut serde_json::Map<String, Value>, verb: &str) {
 /// (`worker_identity::verified_worker`, the same reader every authorization
 /// check uses), or "" for the owner. A claim that fails verification is a 403,
 /// never the owner.
-fn schedule_author(headers: &HeaderMap) -> Result<String, Response> {
+fn schedule_author(headers: &HeaderMap) -> Result<String, Box<Response>> {
     match crate::api::worker_identity::verified_worker(headers) {
         Ok(w) => Ok(w.unwrap_or_default()),
         Err(_) => {
             tracing::warn!(verdict = "schedule_author_unverified", measured = true, n_considered = 1,
                 "schedule write refused: the worker identity did not verify");
-            Err(err(StatusCode::FORBIDDEN, json!({
+            Err(Box::new(err(StatusCode::FORBIDDEN, json!({
                 "error": "schedule write refused: the worker identity on this request did not verify",
                 "code": "worker_identity_refused",
-            })))
+            }))))
         }
     }
 }
@@ -915,7 +915,7 @@ pub async fn create(
     let by = mutation_by(&headers, body.by.as_deref());
     let author = match schedule_author(&headers) {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Some(r) = schedule_target_gate(&headers, body.session.as_deref().unwrap_or(""), "schedule.create") {
         return r;
@@ -1211,7 +1211,7 @@ pub async fn patch(
     let by = mutation_by(&headers, body.by.as_deref());
     let author = match schedule_author(&headers) {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     // A worker may PATCH only a schedule aimed (before and after the edit) at
     // itself or a same-group worker: retargeting, or rewriting the command of
@@ -1734,7 +1734,7 @@ pub async fn run_now(
     let source = format!("manual:{by}");
     let author = match schedule_author(&headers) {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
 
     // READ the row first, then DELIVER outside any write lock, then RECORD what
