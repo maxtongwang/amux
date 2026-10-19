@@ -134,6 +134,9 @@ scripts/e2e-worker-control.sh dispatch <sha> 20      # 20 runs at workers=1 and 
 scripts/e2e-worker-control.sh report e2e-control-<sha12>.tsv
 ```
 
+Every gh call targets `GH_REPO`, or when it is unset the GitHub repository of
+the push remote (`REMOTE`, default origin); a remote without a GitHub URL is
+refused. Both print `repository <owner>/<repo>` first.
 `dispatch` pushes `e2e-control/<sha12>` at the SHA (a dispatch needs a branch,
 not a bare SHA; the branch triggers nothing by itself) and records each run id.
 At most 4 control runs are in flight at once (`--max-inflight K` changes it):
@@ -153,7 +156,7 @@ contradicts its dispatch, or no measured run at all exit 1.
 
 The script itself: `amux-isolated bash scripts/test-e2e-worker-control.sh`
 (fake `gh` and `sleep`, a local bare remote, no GitHub). Pass:
-`test-e2e-worker-control: 24 passed, 0 failed`.
+`test-e2e-worker-control: 30 passed, 0 failed`.
 
 Change the default to workers=1 only if, at one SHA and full population,
 workers=1 removes failures that reproduce at workers=2 (for example

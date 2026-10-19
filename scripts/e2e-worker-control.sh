@@ -47,7 +47,10 @@ report    For every run in runs.tsv: saves `gh run view --json` metadata and
           is safe: existing downloads are reused. Exits 1 when no run was
           measured (no run had any evidence artifact), with the reason.
 
-Environment: GH_REPO selects the repository (gh's own variable); REMOTE the git
+Environment: GH_REPO selects the repository (gh's own variable); when unset it
+is derived from REMOTE's GitHub URL, so a checkout with an upstream remote still
+dispatches to the fork it pushes to (gh alone picked upstream: HTTP 403). A
+REMOTE without a GitHub URL is refused rather than guessed. REMOTE is the git
 remote to push the control branch to (default origin).
 
 Exit status: 0 success; 1 failure (git/gh error, or an integrity error in the
@@ -65,6 +68,20 @@ ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "run inside the amux ch
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 REMOTE=${REMOTE:-origin}
 WORKFLOW=rust.yml
+
+# Every gh call targets the repository the control branch is pushed to.
+resolve_repo() {
+  if [ -z "${GH_REPO:-}" ]; then
+    local url slug
+    url=$(git -C "$ROOT" config --get "remote.$REMOTE.url") \
+      || die "GH_REPO is unset and remote '$REMOTE' has no URL; set GH_REPO=<owner>/<repo>"
+    slug=$(printf '%s' "$url" | sed -E 's#^(https://|http://|ssh://git@|git@)github\.com[:/]##; s#\.git$##; s#/$##')
+    [[ "$slug" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+      || die "GH_REPO is unset and remote '$REMOTE' ($url) is not a GitHub URL; set GH_REPO=<owner>/<repo>"
+    export GH_REPO=$slug
+  fi
+  echo "e2e-worker-control: repository $GH_REPO" >&2
+}
 
 dispatch() {
   local sha_arg=${1:-} reps=${2:-}; shift 2 || usage_error "dispatch needs <sha> <repetitions>"
@@ -90,6 +107,7 @@ dispatch() {
   workflow_text=$(git -C "$ROOT" show "$sha:.github/workflows/$WORKFLOW") || die "no .github/workflows/$WORKFLOW at ${sha:0:12}"
   grep -qE '^[[:space:]]+e2e_workers:' <<<"$workflow_text" \
     || die "$WORKFLOW at ${sha:0:12} has no e2e_workers input; a dispatch there would ignore the worker setting"
+  resolve_repo
   local branch="e2e-control/${sha:0:12}"
   out=${out:-e2e-control-${sha:0:12}.tsv}
 
@@ -183,6 +201,7 @@ report() {
     esac
   done
   [ -f "$tsv" ] || usage_error "no such file: $tsv"
+  resolve_repo
   mkdir -p "$dir"
   local w id sha branch rd n=0
   while IFS=$'\t' read -r w id sha branch; do
