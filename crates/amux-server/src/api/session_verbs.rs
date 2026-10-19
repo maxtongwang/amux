@@ -34355,11 +34355,13 @@ const CONFIG_PATCH_OPS: &[&[&str]] = &[
 /// The settings a config PATCH body names. Keys handled together by one
 /// branch count as one setting: model with effort and force, toggle_yolo with
 /// toggle_auto_continue, send_allow with spans_groups, branch with create,
-/// new_conversation with restart.
+/// new_conversation with restart. Each setting is named by the keys the body
+/// sent, so a model+effort body is not reported as naming `force`.
 fn config_patch_operations(body: &Value) -> Vec<String> {
     CONFIG_PATCH_OPS.iter()
-        .filter(|keys| keys.iter().any(|k| body.get(*k).is_some()))
-        .map(|keys| keys.join("+"))
+        .map(|keys| keys.iter().copied().filter(|k| body.get(*k).is_some()).collect::<Vec<_>>())
+        .filter(|sent| !sent.is_empty())
+        .map(|sent| sent.join("+"))
         .collect()
 }
 
@@ -54570,7 +54572,10 @@ mod config_patch_operation_tests {
         assert_eq!(super::config_patch_operations(&json!({"model": "m", "effort": "high"})), vec!["model+effort"]);
         assert_eq!(super::config_patch_operations(&json!({"new_conversation": true, "restart": true})).len(), 1);
         assert_eq!(super::config_patch_operations(&json!({"send_allow": "x", "spans_groups": true})).len(), 1);
-        assert_eq!(super::config_patch_operations(&json!({"branch": "b", "create": true})), vec!["branch"]);
+        assert_eq!(super::config_patch_operations(&json!({"model": "m", "effort": "high", "force": true})), vec!["model+effort+force"]);
+        assert_eq!(super::config_patch_operations(&json!({"model": "m"})), vec!["model"]);
+        assert_eq!(super::config_patch_operations(&json!({"branch": "b", "create": true})), vec!["branch+create"]);
+        assert_eq!(super::config_patch_operations(&json!({"toggle_yolo": true, "toggle_auto_continue": true})).len(), 1);
         assert!(super::config_patch_operations(&json!({})).is_empty());
     }
 }
