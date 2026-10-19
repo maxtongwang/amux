@@ -1663,7 +1663,9 @@ mod tests {
     ) -> (StatusCode, Value) {
         let mut b = axum::http::Request::builder().method(method).uri(uri);
         if let Some(s) = session {
-            b = b.header("x-amux-session", s);
+            // This router has no rule-10 layer; stand in for its proof, as a
+            // claim with no proof gets no delegated power (ai-config #160).
+            b = b.header("x-amux-session", s).header(crate::api::worker_identity::PROOF_HEADER, s);
         }
         let body = match body {
             Some(v) => {
@@ -2004,8 +2006,7 @@ mod tests {
         assert_eq!(s, StatusCode::FORBIDDEN);
         assert_eq!(
             v["error"],
-            "'probe' may not configure another worker ('other'). A session reconfiguring \
-             a peer is a human's call."
+            "configuring another worker is the owner's; no delegation row grants it to this caller"
         );
         let (s, v) = call(
             &app,
@@ -2021,7 +2022,7 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!(
             v["why_allowed"],
-            "session writing its own worker layer (probe)"
+            "'probe' through the delegation table (ai-config #160)"
         );
         assert_eq!(v["actor"], "probe");
     }
