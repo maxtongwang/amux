@@ -712,13 +712,8 @@ pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, target: &Target, 
                                 "{} needs a citation of Max's own typed row: cite {{row_id}} or {{session, time}} of a row in a lane other than {origin}'s (own lane: only a send from his phone): {}",
                                 action.label(), r.code()))),
                         };
-                        match super::delegation_grants::begin_cited(state, &origin, &class.label(), &action.label(), &target.name(), why.clone(), &cited) {
-                            Ok(code) => {
-                                grant = Some(code);
-                                Some(cited.row_id)
-                            }
-                            Err(resp) => return Err(resp),
-                        }
+                        grant = Some(super::delegation_grants::begin_cited(state, &origin, &class.label(), &action.label(), &target.name(), why.clone(), &cited)?);
+                        Some(cited.row_id)
                     }
                 },
             }

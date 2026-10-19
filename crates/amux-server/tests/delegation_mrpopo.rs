@@ -21,8 +21,6 @@ struct Class {
     method: &'static str,
     path: String,
     body: Value,
-    /// One typed row naming the target and the setting.
-    /// Names the target only.
 }
 
 fn classes() -> Vec<Class> {

@@ -281,6 +281,7 @@ struct NewGrant<'a> {
 }
 
 /// Insert a grant for the captured request; returns its code and sentence.
+#[allow(clippy::result_large_err)] // the refusal IS the handler's response; it is returned as-is
 fn insert(state: &AppState, g: &NewGrant, c: &Captured) -> Result<(String, String), Response> {
     let created = now();
     for _ in 0..10 {
@@ -317,6 +318,7 @@ fn arm(state: &AppState, code: &str) -> bool {
 
 /// Cite mode: record the grant for the captured request with its citation and
 /// let the handler apply it now. Returns the code.
+#[allow(clippy::result_large_err)] // the refusal IS the handler's response; it is returned as-is
 pub(crate) fn begin_cited(state: &AppState, actor: &str, class: &str, action: &str, target: &str, why: Option<String>, cited: &super::max_ref::Cited) -> Result<String, Response> {
     let Some(c) = captured() else {
         return Err(forbid("grant_unavailable", format!("{action} could not be recorded as a grant (no captured body)")));
@@ -395,6 +397,7 @@ fn set_status(state: &AppState, code: &str, from: &str, to: &str, by: &str, evid
     }).is_ok_and(|o| o.applied)
 }
 
+#[allow(clippy::too_many_arguments)] // one flat record per grant; a context struct would only rename the fields
 fn log_transition(state: &AppState, code: &str, what: &str, actor: &str, class: &str, target: &str, after: Value, why: Option<String>) {
     let change = super::delegation_log::DelegatedChange {
         ts: now(),
@@ -797,6 +800,7 @@ mod tests {
             .lines().filter(|l| l.contains(&format!("\"action\":\"{action}\""))).count()
     }
 
+    #[allow(clippy::too_many_arguments)] // test fixture: one cmd_history row's columns
     fn put_row(state: &AppState, session: &str, text: &str, ty: &str, origin: &str, delivery: &str, po: Option<&str>, ts: f64) -> i64 {
         let (session, text, ty, origin, delivery, po) = (session.to_string(), text.to_string(), ty.to_string(), origin.to_string(), delivery.to_string(), po.map(str::to_string));
         let id = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));

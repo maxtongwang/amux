@@ -1119,6 +1119,7 @@ enum Delegated {
 
 /// Python `_scope_write`: validate → authorize → before-read → storage write
 /// → after-read → audit → respond. Errors carry Python's exact strings.
+#[allow(clippy::too_many_arguments)] // Python `_scope_write`'s signature plus the delegation outcome
 async fn scope_write(
     state: &AppState,
     level: &str,
