@@ -50,10 +50,43 @@ fi
 
 out=""
 
+# Bounded runs WITHOUT GNU `timeout`, which macOS does not ship: both bounded
+# calls below used `timeout N ...` and on a Mac that is "command not found", so
+# the fetch never ran (axis 1 read a stale origin) and the health cross-check
+# never ran either, silently, behind 2>/dev/null and `|| true` (2026-10-19,
+# found as 3 cases failing only on macOS). perl's alarm is on every Mac.
+_bounded() { # seconds cmd...
+  local s="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$s" "$@"
+  else
+    # Own process group, killed whole on timeout, so a fetch's ssh child cannot
+    # outlive the bound; exits 124 like timeout(1).
+    perl -e 'my $s = shift; my $pid = fork; exit 127 unless defined $pid;
+      if (!$pid) { setpgrp(0, 0); exec @ARGV or exit 127 }
+      $SIG{ALRM} = sub { kill "TERM", -$pid; select(undef, undef, undef, 0.5); kill "KILL", -$pid; exit 124 };
+      alarm $s; waitpid($pid, 0); exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' "$s" "$@"
+  fi
+}
+# Which bound ran is logged, so a silent no-op cannot come back unseen. Not to
+# stdout/stderr (that is the hook's message to the session); to amux's own log,
+# only where that directory already exists.
+_freshness_bound_tool() {
+  if command -v timeout >/dev/null 2>&1; then echo timeout
+  elif command -v gtimeout >/dev/null 2>&1; then echo gtimeout
+  elif command -v perl >/dev/null 2>&1; then echo perl-alarm
+  else echo none
+  fi
+}
+_fl="${AMUX_HOME:-$HOME/.amux}/logs"
+[ -d "$_fl" ] && printf '%s verdict=freshness_bound tool=%s measured=true n_considered=1\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(_freshness_bound_tool)" >> "$_fl/session-freshness.log" 2>/dev/null
+unset _fl
+
 # ── Axis 1: is the checkout behind its remote? ───────────────────────────────
 # Bounded: a hook that hangs on a slow network is a hook that gets deleted.
 if git remote get-url origin >/dev/null 2>&1; then
-  timeout 10 git fetch -q origin 2>/dev/null
+  _bounded 10 git fetch -q origin 2>/dev/null
   base="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo origin/main)"
   if git rev-parse --verify -q "$base" >/dev/null 2>&1; then
     behind="$(git rev-list --count "HEAD..$base" 2>/dev/null || echo 0)"
@@ -560,7 +593,7 @@ fi
 # not testing the hook (the mistake test-session-freshness.sh already made once).
 HEALTH_URL="${AMUX_HEALTH_URL:-https://localhost:8824/health}"
 if command -v curl >/dev/null 2>&1; then
-  hs="$(timeout 5 curl -sk "$HEALTH_URL" 2>/dev/null || true)"
+  hs="$(_bounded 5 curl -sk "$HEALTH_URL" 2>/dev/null || true)"
   if [ -n "$hs" ] && ! printf '%s' "$hs" | grep -q '"server":"amux-rust"'; then
     out+="  - ${HEALTH_URL} is answering but not as amux-rust — check com.amux.server-rs"$'\n'
   fi
