@@ -1429,6 +1429,20 @@ async fn tmux(args: &[&str]) -> Option<std::process::Output> {
 /// answers "no such session" on tmux 3.6a and sets nothing, which is how
 /// these three silently never applied on this path (tmux_target_audit now
 /// refuses the session form for set-option). A failure is logged.
+/// Every pane of the worker's window has exited (remain-on-exit keeps them).
+/// False when tmux cannot answer: a probe failure is never a death notice.
+pub(crate) async fn pane_dead(name: &str) -> bool {
+    let ptq = pt(name);
+    match tmux(&["list-panes", "-t", &ptq, "-F", "#{pane_dead}"]).await {
+        Some(o) if o.status.success() => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty()).peekable();
+            lines.peek().is_some() && lines.all(|l| l == "1")
+        }
+        _ => false,
+    }
+}
+
 async fn lock_worker_window(ptq: &str, name: &str) {
     for (verb, opt, val) in [
         ("set-option", "remain-on-exit", "on"),
@@ -10046,6 +10060,11 @@ pub(crate) async fn is_running(name: &str) -> bool {
     if !tmux_sessions_set().await.contains(&tmux_sess) {
         return false;
     }
+    // A corpse is not a worker: with remain-on-exit on, a pane whose process
+    // exited keeps its last screen, which can still look like a running agent.
+    if pane_dead(name).await {
+        return false;
+    }
     let output = tmux_capture(name, 10).await;
     if output.is_empty() {
         return true;
@@ -16653,7 +16672,19 @@ pub(crate) async fn start_session(
             }
         };
     }
-    if tmux_exists {
+    if tmux_exists && pane_dead(name).await {
+        // remain-on-exit keeps a pane whose shell exited (Ctrl-D, `exit`). Its
+        // last screen can be a prompt, so the prompt check below would type
+        // into a corpse and every later Start would time out on its receipt
+        // (#52 review B2). Respawn the shell first, then set it up afresh.
+        let ptq = pt(name);
+        let sh = user_shell();
+        let ok = matches!(tmux(&["respawn-pane", "-k", "-t", &ptq, &sh]).await, Some(ref o) if o.status.success());
+        tracing::warn!(session = %name, respawned = ok, verdict = "dead_pane_respawned",
+            measured = true, n_considered = 1, "worker pane was dead at start; respawned its shell");
+        sleep_ms(1000).await;
+        shell_step!(&shell_rc, false);
+    } else if tmux_exists {
         // Reuse the surviving tmux session (py:24589).
         let output = tmux_capture(name, 10).await;
         if at_shell_prompt(&strip_ansi(&output)) {
@@ -44997,6 +45028,43 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             !any_non_zombie("   \n  \n"),
             "whitespace is not a live child"
         );
+    }
+
+    /// #52 review B2: with remain-on-exit on, a shell that exits at its prompt
+    /// leaves a dead pane. It must read as dead (so is_running says no) and a
+    /// respawn must bring back a live shell. Private test socket.
+    #[tokio::test]
+    async fn a_dead_worker_pane_is_detected_and_respawned() {
+        struct Pane(String);
+        impl Drop for Pane {
+            fn drop(&mut self) {
+                let st = session_target(&self.0);
+                let _ = tmux_command().args(["kill-session", "-t", &st]).output();
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let name = format!("dead-pane-{}", std::process::id());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join(format!("sessions/{name}.env")), "CC_PROVIDER=claude\n").unwrap();
+        let _pane = Pane(tmux_name(&name));
+        let created = tmux(&["new-session", "-d", "-s", &tmux_name(&name), "/bin/sh"]).await.expect("tmux");
+        assert!(created.status.success());
+        lock_worker_window(&pt(&name), &name).await;
+        assert!(!pane_dead(&name).await, "a live shell is not dead");
+        let ptq = pt(&name);
+        tmux(&["send-keys", "-t", &ptq, "exit", "Enter"]).await;
+        let mut dead = false;
+        for _ in 0..50 {
+            if pane_dead(&name).await { dead = true; break; }
+            sleep_ms(100).await;
+        }
+        assert!(dead, "the exited shell's pane must read as dead (remain-on-exit kept it)");
+        assert!(!is_running(&name).await, "a dead pane is not a running worker");
+        let sh = user_shell();
+        let r = tmux(&["respawn-pane", "-k", "-t", &ptq, &sh]).await.unwrap();
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+        assert!(!pane_dead(&name).await, "respawn brings the pane back");
     }
 
     /// The spawn-time window options must actually land: on the session form
