@@ -150,11 +150,14 @@ async fn cc_orchestrator_is_never_a_leads_or_a_workers_to_set() {
 async fn lead_renames_and_stops_in_its_team_only() {
     let e = setup().await;
     let lead = Who::Worker(DEV_LEAD);
-    // Lead rename stays refused until amux #3 moves the worker token with a
-    // rename (settled decision); the env file is untouched.
+    // amux #3 moves the worker's token and alias with a rename, so a lead
+    // renames a non-lead worker in its team (the amux #40 rule).
     let (st, v) = e.call(lead, "POST", &format!("/api/sessions/{DEV_A}/rename"), Some(json!({"name": "review-dev-a2"}))).await;
-    assert_code(st, &v, "lead_rename_pending", "lead rename in T waits for #3");
-    assert!(e.env_path(DEV_A).exists() && !e.env_path("review-dev-a2").exists(), "a refused rename moved nothing");
+    assert_allowed(st, &v, "lead rename in T");
+    assert!(!e.env_path(DEV_A).exists() && e.env_path("review-dev-a2").exists(), "the rename moved the env file");
+    let (st, v) = e.call(lead, "POST", "/api/sessions/review-dev-a2/rename", Some(json!({"name": "mrpopo"}))).await;
+    assert_code(st, &v, "reserved_name", "lead renames a T worker to mrpopo");
+    assert!(e.env_path("review-dev-a2").exists(), "a refused rename moved nothing");
 
     let (st, v) = e.call(lead, "POST", &format!("/api/sessions/{DEV_B}/stop"), Some(json!({}))).await;
     assert_allowed(st, &v, "lead stop in T");
@@ -173,16 +176,17 @@ async fn a_lead_renamed_workers_token_still_validates() {
     let e = setup().await;
     // DEV_A is a rule-10 contract lane with a minted token.
     std::fs::write(e.env_path(DEV_A), "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\nAMUX_CONTRACT_DONE=1\n").unwrap();
-    let token = amux_server::api::worker_identity::mint(e.home(), DEV_A).expect("rule 10 mints for the contract lane");
-    // Until amux #3 lands, a lead rename is refused, so the token-after-rename
-    // hole (#8 review N2) cannot open. When #3 lands this flips to: rename
-    // allowed, the renamed lane validates with its token, and fails without.
+    let token = amux_server::api::worker_identity::mint(e.home(), DEV_A).expect("mint").expect("rule 10 mints for the contract lane");
+    // amux #3 carries the token across a rename, so the token-after-rename
+    // hole (#8 review N2) stays shut: the renamed lane validates with its
+    // token and fails without.
     let (st, v) = e.call(Who::Worker(DEV_LEAD), "POST", &format!("/api/sessions/{DEV_A}/rename"), Some(json!({"name": "review-dev-a2"}))).await;
-    assert_code(st, &v, "lead_rename_pending", "lead rename refused until #3");
-    let (st, v) = e.call_socket(DEV_A, Some(&token), "PATCH", &cfg(DEV_A), json!({"model": "sonnet"})).await;
-    assert_allowed(st, &v, "the unrenamed lane still validates with its token");
-    let (st, v) = e.call_socket(DEV_A, None, "PATCH", &cfg(DEV_A), json!({"model": "haiku"})).await;
-    assert_eq!((st.as_u16(), v["code"].clone()), (403, json!("worker_identity_refused")), "lane without its token: {v}");
+    assert_allowed(st, &v, "lead renames a T contract lane");
+    let renamed = "review-dev-a2";
+    let (st, v) = e.call_socket(renamed, Some(&token), "PATCH", &cfg(renamed), json!({"model": "sonnet"})).await;
+    assert_allowed(st, &v, "the renamed lane validates with its token");
+    let (st, v) = e.call_socket(renamed, None, "PATCH", &cfg(renamed), json!({"model": "haiku"})).await;
+    assert_eq!((st.as_u16(), v["code"].clone()), (403, json!("worker_identity_refused")), "renamed lane without its token: {v}");
 }
 
 #[tokio::test]
