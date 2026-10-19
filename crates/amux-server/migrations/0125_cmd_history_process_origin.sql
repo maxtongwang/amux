@@ -1,0 +1,12 @@
+-- 0125_cmd_history_process_origin.sql: which process sent an owner message
+-- (maxtongwang/ai-config#160).
+--
+-- An owner-delegated change cites the owner's own words (max_ref). A worker
+-- can read the owner token, so a send's author header is client-asserted.
+-- The send path now records the process-attribution verdict of the request:
+-- `outside` (a local process outside every worker pane, the Mac browser) or
+-- `remote` (a non-local owner peer), or `remote-forwarded` (a loopback
+-- forward). NULL on every
+-- existing row and on every non-owner send; nothing is backfilled, so an old
+-- row never qualifies as the owner's words.
+-- ADDCOL: cmd_history process_origin TEXT

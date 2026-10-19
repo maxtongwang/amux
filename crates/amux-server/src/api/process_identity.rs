@@ -80,6 +80,16 @@ use std::time::{Duration, Instant};
 /// Internal proof header: set only by [`attribute`], stripped from every
 /// inbound request first, so a client cannot assert it.
 pub(crate) const PROCESS_WORKER_HEADER: &str = "x-amux-process-worker";
+/// Internal verdict header (ai-config#160): `outside`, `remote` or `worker`,
+/// set only by [`attribute`] and stripped from every inbound request first.
+/// The send path records it on the owner's Messages row so `max_ref::row_qualifies` can tell
+/// a send the owner's own browser or phone made from one a worker made with
+/// the owner token. Absent means unproven, never the owner.
+pub(crate) const PROCESS_ORIGIN_HEADER: &str = "x-amux-process-origin";
+/// `x-amux-process-origin` for a non-local peer: owner proof.
+pub(crate) const REMOTE_DIRECT: &str = "remote";
+/// `x-amux-process-origin` for a tailscale-serve forward over loopback: not owner proof.
+pub(crate) const REMOTE_FORWARDED: &str = "remote-forwarded";
 
 /// The server's own end of an accepted connection, stamped on every request by
 /// the TLS acceptor (tls.rs). With the peer from ConnectInfo it names the exact
@@ -103,9 +113,12 @@ pub(crate) enum Origin {
     /// A local process whose whole ancestry is outside every amux pane.
     Outside,
     /// The owner's remote device: no local process owns the client end and the
-    /// peer is not loopback, or the connection was forwarded by this host's root
-    /// `tailscaled` (tailscale serve) with no worker at the tailnet front door.
-    Remote,
+    /// peer is not loopback (`forwarded: false`, owner proof), or the
+    /// connection was forwarded by this host's root `tailscaled` (tailscale
+    /// serve) with no worker at the tailnet front door (`forwarded: true`: NOT
+    /// owner proof, since a local process outside every pane can ride the same
+    /// forward).
+    Remote { forwarded: bool },
     /// Local, but the owner or its ancestry could not be established.
     Unattributed(String),
     /// The tmux pane inventory could not be read, so whether this process is
@@ -270,7 +283,7 @@ fn decide(conn: Conn, l: &dyn Lookups) -> Origin {
         return if peer.ip().is_loopback() {
             Origin::Unattributed("the server end of this connection is unknown".into())
         } else {
-            Origin::Remote
+            Origin::Remote { forwarded: false }
         };
     };
     let own = l.own_addresses();
@@ -286,12 +299,12 @@ fn decide(conn: Conn, l: &dyn Lookups) -> Origin {
         Ok(s) => s,
         Err(os::LookupError::Unsupported(why)) => return Origin::Unavailable(why),
         Err(os::LookupError::Failed(why)) => {
-            return if local_peer { Origin::Unattributed(why) } else { Origin::Remote };
+            return if local_peer { Origin::Unattributed(why) } else { Origin::Remote { forwarded: false } };
         }
     };
     if scan.holders.is_empty() {
         if !local_peer {
-            return Origin::Remote;
+            return Origin::Remote { forwarded: false };
         }
         return forwarded(peer, &scan, l);
     }
@@ -346,7 +359,7 @@ fn forwarded(peer: SocketAddr, scan: &Scan, l: &dyn Lookups) -> Origin {
     }
     tracing::debug!(%peer, forwarder, front_door = scan.front_door.len(), verdict = "tailscale_forward_remote",
         measured = true, n_considered = 1, "forwarded by tailscale serve with no worker at the front door: the owner's remote device");
-    Origin::Remote
+    Origin::Remote { forwarded: true }
 }
 
 /// The OS lookups.
@@ -674,6 +687,7 @@ fn claimed(req: &Request) -> String {
 /// identity.
 pub async fn attribute(mut req: Request, next: Next) -> Response {
     req.headers_mut().remove(PROCESS_WORKER_HEADER);
+    req.headers_mut().remove(PROCESS_ORIGIN_HEADER);
     let Some(peer) = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0) else {
         // In-process calls (the server acting for a lane) have no socket.
         return next.run(req).await;
@@ -716,6 +730,7 @@ pub async fn attribute(mut req: Request, next: Next) -> Response {
                 h.insert("x-amux-worker", v.clone());
                 h.insert("x-amux-session", v.clone());
                 h.insert(PROCESS_WORKER_HEADER, v);
+                h.insert(PROCESS_ORIGIN_HEADER, HeaderValue::from_static("worker"));
             }
             super::org::strip_member_headers(req.headers_mut());
             next.run(req).await
@@ -760,7 +775,20 @@ pub async fn attribute(mut req: Request, next: Next) -> Response {
             });
             next.run(req).await
         }
-        Origin::Outside | Origin::Remote => next.run(req).await,
+        Origin::Outside => {
+            req.headers_mut().insert(PROCESS_ORIGIN_HEADER, HeaderValue::from_static("outside"));
+            next.run(req).await
+        }
+        // A non-local peer (the phone, another device on the tailnet) is
+        // `remote`; a loopback connection forwarded by tailscale serve is
+        // `remote-forwarded`. A worker can `launchctl submit` a process that
+        // curls the tailnet URL and get the forwarded verdict, so only `remote`
+        // is owner proof (ai-config #160).
+        Origin::Remote { forwarded } => {
+            let v = if forwarded { REMOTE_FORWARDED } else { REMOTE_DIRECT };
+            req.headers_mut().insert(PROCESS_ORIGIN_HEADER, HeaderValue::from_static(v));
+            next.run(req).await
+        }
     }
 }
 
@@ -1534,14 +1562,14 @@ mod tests {
         assert!(matches!(decide(Conn { server: None, ..lo(1) }, &Fake::holders(&[301])), Origin::Unattributed(_)));
         // A genuinely remote peer (no local holder, not an own address).
         let remote = Conn { peer: "192.168.1.50:5000".parse().unwrap(), server: Some("192.168.1.207:8824".parse().unwrap()) };
-        assert_eq!(decide(remote, &Fake::holders(&[])), Origin::Remote);
+        assert_eq!(decide(remote, &Fake::holders(&[])), Origin::Remote { forwarded: false });
         // Review carried note: a peer on one of this host's own non-loopback
         // addresses with no visible holder is not Remote outright; it gets the
         // forward test, so without a root tailscaled it is refused.
         for own in ["192.168.1.207:5000", "100.85.233.44:5000"] {
             let c = Conn { peer: own.parse().unwrap(), server: Some("192.168.1.207:8824".parse().unwrap()) };
             assert!(matches!(decide(c, &Fake::holders(&[])), Origin::Unattributed(_)), "{own}");
-            assert_eq!(decide(c, &Fake::forwarded(&[])), Origin::Remote, "{own} via a proven forward");
+            assert_eq!(decide(c, &Fake::forwarded(&[])), Origin::Remote { forwarded: true }, "{own} via a proven forward");
         }
         // Interfaces unreadable: no peer can be shown to be elsewhere.
         let blind = Fake { own: Err("getifaddrs failed".into()), ..Fake::holders(&[]) };
@@ -1612,10 +1640,10 @@ mod tests {
     #[test]
     fn the_owners_phone_through_tailscale_serve_is_remote_and_only_then() {
         // (1) the forwarded owner phone path.
-        assert_eq!(decide(lo(53514), &Fake::forwarded(&[])), Origin::Remote);
+        assert_eq!(decide(lo(53514), &Fake::forwarded(&[])), Origin::Remote { forwarded: true });
         // An owner process at the front door (this Mac's browser on the ts.net
         // URL) leaves the forward provably free of workers.
-        assert_eq!(decide(lo(53514), &Fake::forwarded(&[301])), Origin::Remote);
+        assert_eq!(decide(lo(53514), &Fake::forwarded(&[301])), Origin::Remote { forwarded: true });
         // (2) a local worker connected to this host's front door: refused.
         assert!(matches!(decide(lo(53514), &Fake::forwarded(&[101])), Origin::IdentityUnavailable(_)));
         assert!(matches!(decide(lo(53514), &Fake::forwarded(&[501])), Origin::IdentityUnavailable(_)), "by tty too");
@@ -1940,6 +1968,39 @@ mod tests {
         let res = router.clone().oneshot(req).await.unwrap();
         let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"", "an owner request cannot claim process proof");
+    }
+
+    /// The verdict header is server-set only, and says what the resolver
+    /// decided: a forged `outside` from a worker pane reads `worker`, and a
+    /// forged one with no socket (an in-process call) reads nothing.
+    #[tokio::test]
+    async fn the_process_verdict_header_is_server_set_and_names_the_verdict() {
+        let (_state, dir, _r) = fixture();
+        let _h = crate::api::settings::test_env::set_home(dir.path());
+        drop(_r);
+        async fn echo(headers: axum::http::HeaderMap) -> String {
+            headers.get(PROCESS_ORIGIN_HEADER).and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
+        }
+        let router = axum::Router::new().route("/api/echo", axum::routing::get(echo)).layer(axum::middleware::from_fn(attribute));
+        let by_port = test_support::ByPort(HashMap::from([
+            (40001, Origin::Outside),
+            (40002, Origin::Remote { forwarded: false }),
+            (40003, Origin::Worker("test-peer".into())),
+            (40004, Origin::Unattributed("x".into())),
+        ]));
+        let _g = test_support::set_resolver(Arc::new(by_port));
+        for (port, want) in [(40001u16, "outside"), (40002, "remote"), (40003, "worker"), (40004, "")] {
+            let mut req = HttpRequest::builder().uri("/api/echo").header(PROCESS_ORIGIN_HEADER, "outside")
+                .header("x-amux-worker", "test-claim").body(Body::empty()).unwrap();
+            req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], port))));
+            let res = router.clone().oneshot(req).await.unwrap();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(String::from_utf8_lossy(&body), want, "port {port}");
+        }
+        let req = HttpRequest::builder().uri("/api/echo").header(PROCESS_ORIGIN_HEADER, "remote").body(Body::empty()).unwrap();
+        let res = router.clone().oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"", "an in-process call carries no verdict");
     }
 
     #[cfg(target_os = "linux")]

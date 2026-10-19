@@ -32,6 +32,13 @@ use std::path::{Path, PathBuf};
 pub const TOKEN_ENV: &str = "AMUX_WORKER_TOKEN";
 pub const TOKEN_HEADER: &str = "x-amux-worker-token";
 pub const RULE: &str = "10";
+/// Server-stamped by [`enforce`]: the worker name whose claim is proven.
+pub const PROOF_HEADER: &str = "x-amux-identity-proof";
+
+/// Whether `enforce` proved this request's claim to be `worker`.
+pub(crate) fn identity_proven(headers: &axum::http::HeaderMap, worker: &str) -> bool {
+    headers.get(PROOF_HEADER).and_then(|v| v.to_str().ok()) == Some(worker)
+}
 
 pub(crate) fn hash_path(home: &Path, incarnation: &str) -> PathBuf {
     home.join("worker-tokens").join(format!("{incarnation}.sha256"))
@@ -331,13 +338,36 @@ fn identity_refusal(req: &Request, refusal: IdentityRefusal) -> Response {
 /// check then applies to mutating requests over a real socket only: the
 /// server's own in-process calls (no ConnectInfo) act for lanes by design and
 /// are not a lane asserting itself.
-pub async fn enforce(req: Request, next: Next) -> Response {
+pub async fn enforce(mut req: Request, next: Next) -> Response {
+    // Server-only: a client copy of the proof stamp is dropped, and so is a
+    // grant-replay marker arriving over a socket (only the server's own
+    // in-process replay of an approved grant carries one).
+    req.headers_mut().remove(PROOF_HEADER);
+    if req.extensions().get::<ConnectInfo<SocketAddr>>().is_some() {
+        req.headers_mut().remove(super::delegation_grants::GRANT_HEADER);
+    }
     let claimed = match verified_worker(req.headers()) {
         Ok(name) => name.unwrap_or_default(),
         Err(refusal) => return identity_refusal(&req, refusal),
     };
     let mutating = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
     let socket = req.extensions().get::<ConnectInfo<SocketAddr>>().is_some();
+    // N13 (ai-config #160): stamp a claim that is PROVEN, for every method:
+    // an in-process call, process attribution naming it (or its Chat tab's
+    // lane), or the lane's valid token. Delegated power reads only this.
+    if !claimed.is_empty() {
+        let attributed = header(&req, super::process_identity::PROCESS_WORKER_HEADER);
+        let proven = !socket
+            || attributed == Some(claimed.as_str())
+            || (attributed.is_some() && attributed == super::chat_worker::companion_parent(&claimed))
+            || (super::session_verbs::valid_session_name(&claimed)
+                && check(&crate::config::amux_home(), &claimed, header(&req, TOKEN_HEADER)) == Check::Valid);
+        if proven {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&claimed) {
+                req.headers_mut().insert(PROOF_HEADER, v);
+            }
+        }
+    }
     if !mutating || !socket {
         return next.run(req).await;
     }

@@ -28,6 +28,7 @@
 //!   flags fail loudly with Python's exact 400 message instead of wiping
 //!   the user's other flags.
 
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -49,6 +50,27 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/task-guard", get(get_task_guard).patch(patch_task_guard))
         .route("/env", get(get_env).patch(patch_env))
+}
+
+/// Instance settings go through the delegation table (ai-config #160): a
+/// worker needs mrpopo and a grant Max approves; `env` writes provider API key
+/// VALUES, which are never delegated. The owner is unaffected.
+async fn gated<F: std::future::Future<Output = Response>>(state: &AppState, headers: &axum::http::HeaderMap, key: &str, body: &Value, run: F) -> Response {
+    use crate::api::delegation::{authorize, Action, Target};
+    let action = if key == "env" {
+        Action::SetSecret { key: "settings:env".into() }
+    } else {
+        Action::SetConfig { keys: vec![format!("settings:{key}")] }
+    };
+    let grant = match authorize(state, headers, &Target::Fleet, &action, Some(body)) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    let resp = run.await;
+    if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(state, Value::Null, body.clone());
+    }
+    resp
 }
 
 fn err(status: StatusCode, body: Value) -> Response {
@@ -436,7 +458,11 @@ async fn get_default_model_h() -> Response {
     Json(json!({ "model": get_default_model(&amux_home()) })).into_response()
 }
 
-async fn patch_default_model(Json(body): Json<Value>) -> Response {
+async fn patch_default_model(State(state): State<AppState>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    gated(&state, &headers, "default-model", &body.clone(), patch_default_model_inner(body)).await
+}
+
+async fn patch_default_model_inner(body: Value) -> Response {
     if !body.is_object() {
         return err(
             StatusCode::BAD_REQUEST,
@@ -483,7 +509,11 @@ async fn get_commit_guard() -> Response {
     Json(json!({ "enabled": commit_guard_enabled(&amux_home()) })).into_response()
 }
 
-async fn patch_commit_guard(Json(body): Json<Value>) -> Response {
+async fn patch_commit_guard(State(state): State<AppState>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    gated(&state, &headers, "commit-guard", &body.clone(), patch_commit_guard_inner(body)).await
+}
+
+async fn patch_commit_guard_inner(body: Value) -> Response {
     // Python: bool(body.get("enabled", True)).
     let enabled = body.get("enabled").map(truthy).unwrap_or(true);
     let val = if enabled { "1" } else { "0" };
@@ -500,7 +530,11 @@ async fn get_task_guard() -> Response {
     Json(json!({ "enabled": task_guard_enabled(&amux_home()) })).into_response()
 }
 
-async fn patch_task_guard(Json(body): Json<Value>) -> Response {
+async fn patch_task_guard(State(state): State<AppState>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    gated(&state, &headers, "task-guard", &body.clone(), patch_task_guard_inner(body)).await
+}
+
+async fn patch_task_guard_inner(body: Value) -> Response {
     // Python: bool(body.get("enabled", False)).
     let enabled = body.get("enabled").map(truthy).unwrap_or(false);
     let val = if enabled { "1" } else { "0" };
@@ -560,7 +594,11 @@ async fn get_env() -> Response {
     Json(Value::Object(out)).into_response()
 }
 
-async fn patch_env(Json(body): Json<Value>) -> Response {
+async fn patch_env(State(state): State<AppState>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    gated(&state, &headers, "env", &body.clone(), patch_env_inner(body)).await
+}
+
+async fn patch_env_inner(body: Value) -> Response {
     let updates: Vec<(String, String)> = body
         .as_object()
         .map(|o| {
