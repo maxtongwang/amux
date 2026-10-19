@@ -2252,7 +2252,8 @@ pub async fn config_worker(
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
-    if let Some(refusal) = crate::api::session_verbs::peer_config_refusal(&headers, &name, "config") { return refusal; }
+    let rename_to = crate::api::session_verbs::config_rename_only(&body);
+    if let Some(refusal) = crate::api::session_verbs::peer_config_refusal_unless_lead_rename(&headers, &name, "config", rename_to) { return refusal; }
     if let Some(refusal) = crate::api::session_verbs::membership_patch_refusal(&headers, crate::api::session_verbs::names_messaging_authority(&body)) { return refusal; }
     crate::api::session_verbs::config_patch(&state, &name, &body).await
 }
@@ -3252,6 +3253,146 @@ mod tests {
         // Owner control.
         let (st, _, v) = send(&app, "PATCH", &path, Some(json!({"environment": {"K": "v"}}))).await;
         assert_eq!(st, StatusCode::OK, "owner sets environment: {v}");
+    }
+
+    /// The ai-config #203 fleet: two teams with a lead each, a second dev lead,
+    /// the owner agent (in `dev` only, so nothing but the owner-agent rule can
+    /// refuse renaming it), and team workers. Fake panes, no auto-start: a
+    /// rename never reaches tmux.
+    fn lead_rename_fleet(home: &std::path::Path) {
+        let s = home.join("sessions");
+        std::fs::create_dir_all(&s).unwrap();
+        for (n, t) in [
+            ("review-dev-lead", "leads,dev"), ("review-dev-lead2", "leads,dev"), ("review-ops-lead", "leads,ops"),
+            ("mrpopo", "dev"), ("review-dev-a", "dev"), ("review-dev-b", "dev"), ("review-ops-a", "ops"),
+        ] {
+            std::fs::write(s.join(format!("{n}.env")),
+                format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{t}\"\nCC_AUTO_START=0\nCC_TEST_FAKE_PANE=1\n")).unwrap();
+        }
+    }
+
+    /// ai-config #203 (Max, 2026-10-17: "Worker name dynamic change with task
+    /// is still not in right?"): a lead renames a worker in its own team, on
+    /// every surface that renames a session. Each rename is journaled.
+    /// Fails on origin/main, where every one was `peer_config_owner_only`.
+    #[tokio::test]
+    async fn a_lead_renames_a_worker_in_its_own_team_on_every_rename_surface() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = isolated(home.path());
+        lead_rename_fleet(home.path());
+        let (app, _db) = app();
+        let lead = [("X-Amux-Session", "review-dev-lead")];
+        for (m, path, body, to) in [
+            ("POST", "/api/sessions/review-dev-a/rename", json!({"name": "dev-assign-one"}), "dev-assign-one"),
+            ("POST", "/api/sessions/dev-assign-one/rename", json!({"rename": "dev-assign-two"}), "dev-assign-two"),
+            ("PATCH", "/api/sessions/dev-assign-two/config", json!({"rename": "dev-assign-three"}), "dev-assign-three"),
+            ("PATCH", "/api/workers/dev-assign-three/config", json!({"rename": "dev-assign-four"}), "dev-assign-four"),
+        ] {
+            let (st, _, v) = send_with(&app, m, path, Some(body), &lead).await;
+            assert_eq!(st, StatusCode::OK, "{m} {path}: {v}");
+            assert!(home.path().join(format!("sessions/{to}.env")).exists(), "{m} {path} -> {to}");
+        }
+        assert!(!home.path().join("sessions/review-dev-a.env").exists());
+        let journal = std::fs::read_to_string(home.path().join("renames.jsonl")).unwrap();
+        assert_eq!(journal.lines().count(), 4, "each lead rename is journaled (undoable): {journal}");
+        assert_eq!(crate::api::rename_identity::current_name(home.path(), "review-dev-a").as_deref(), Some("dev-assign-four"));
+    }
+
+    /// ai-config #203's refusals: the exception is a lead renaming a non-lead
+    /// in a shared non-`leads` group, and nothing else. Nothing a refused
+    /// request names is written.
+    #[tokio::test]
+    async fn the_lead_rename_exception_refuses_everything_else() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = isolated(home.path());
+        lead_rename_fleet(home.path());
+        let (app, _db) = app();
+        let lead: &[(&str, &str)] = &[("X-Amux-Session", "review-dev-lead")];
+        let worker: &[(&str, &str)] = &[("X-Amux-Session", "review-dev-a")];
+        type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str, &'a str, Value);
+        let cases: Vec<Case> = vec![
+            ("another lead, same team", lead, "POST", "/api/sessions/review-dev-lead2/rename", json!({"name": "x-renamed"})),
+            ("another lead, same team (config)", lead, "PATCH", "/api/workers/review-dev-lead2/config", json!({"rename": "x-renamed"})),
+            ("the owner agent", lead, "POST", "/api/sessions/mrpopo/rename", json!({"name": "x-renamed"})),
+            ("the owner agent (config)", lead, "PATCH", "/api/sessions/mrpopo/config", json!({"rename": "x-renamed"})),
+            ("a worker in another team", lead, "POST", "/api/sessions/review-ops-a/rename", json!({"name": "x-renamed"})),
+            ("a worker in another team (config)", lead, "PATCH", "/api/workers/review-ops-a/config", json!({"rename": "x-renamed"})),
+            ("a team worker renamed to the owner agent", lead, "POST", "/api/sessions/review-dev-a/rename", json!({"name": "mrpopo"})),
+            ("a non-rename field", lead, "PATCH", "/api/sessions/review-dev-a/config", json!({"desc": "x"})),
+            ("rename plus another field", lead, "PATCH", "/api/workers/review-dev-a/config", json!({"rename": "x-renamed", "desc": "x"})),
+            ("a non-string rename", lead, "PATCH", "/api/sessions/review-dev-a/config", json!({"rename": ["x-renamed"]})),
+            ("instructions", lead, "POST", "/api/sessions/review-dev-a/instructions", json!({"instructions": "x"})),
+            ("memory", lead, "POST", "/api/workers/review-dev-a/memory", json!({"content": "x"})),
+            ("a non-lead renaming a peer", worker, "POST", "/api/sessions/review-dev-b/rename", json!({"name": "x-renamed"})),
+            ("a non-lead renaming a peer (config)", worker, "PATCH", "/api/sessions/review-dev-b/config", json!({"rename": "x-renamed"})),
+        ];
+        // This in-process router bypasses async_main: run its startup
+        // migration first so only the requests can change files.
+        crate::api::rename_identity::ensure_migrated(home.path()).unwrap();
+        let before = snapshot(home.path());
+        for (label, headers, m, path, body) in &cases {
+            let (st, _, v) = send_with(&app, m, path, Some(body.clone()), headers).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("peer_config_owner_only")), "{label}: {m} {path} {body}: {v}");
+        }
+        let after = snapshot(home.path());
+        let changed: Vec<_> = after.iter().filter(|(p, b)| before.get(*p) != Some(*b)).map(|(p, _)| p.clone())
+            .chain(before.keys().filter(|p| !after.contains_key(*p)).cloned()).collect();
+        assert!(changed.is_empty(), "refused requests changed files: {changed:?}");
+        // An unverified lead claim: a rule-10 lead without its token is refused before any handler.
+        std::fs::write(home.path().join("sessions/review-dev-lead.env"),
+            "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads,dev\"\nCC_AUTO_START=0\nCC_TEST_FAKE_PANE=1\nAMUX_CONTRACT_DONE=1\n").unwrap();
+        crate::api::worker_identity::mint(home.path(), "review-dev-lead").unwrap().expect("rule 10 mints");
+        let (st, v) = status_and_body(&app, socket_request("POST", "/api/sessions/review-dev-a/rename",
+            json!({"name": "x-renamed"}), lead)).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_refused")), "unverified lead: {v}");
+        assert!(home.path().join("sessions/review-dev-a.env").exists());
+        // Unit: the shared predicates, independent of any route.
+        use crate::api::session_verbs::{config_rename_only, lead_team_rename};
+        assert_eq!(lead_team_rename("review-dev-lead", "review-dev-a", "dev-x").map(|t| t.into_iter().collect::<Vec<_>>()),
+            Some(vec!["dev".to_string()]));
+        assert!(lead_team_rename("review-dev-lead", "review-dev-a", "MrPopo").is_none(), "renamed to the owner agent, any case");
+        assert!(lead_team_rename("review-dev-lead", "mrpopo", "dev-x").is_none(), "the owner agent");
+        assert!(lead_team_rename("review-dev-lead", "review-dev-lead2", "dev-x").is_none(), "another lead");
+        assert!(lead_team_rename("review-dev-a", "review-dev-b", "dev-x").is_none(), "non-lead");
+        assert!(lead_team_rename("review-ops-lead", "review-dev-a", "dev-x").is_none(), "other team");
+        assert!(lead_team_rename(crate::api::worker_identity::UNVERIFIED_IDENTITY, "review-dev-a", "dev-x").is_none(), "unverified");
+        assert_eq!(config_rename_only(&json!({"rename": "n"})), Some("n"));
+        for body in [json!({"rename": "n", "desc": "x"}), json!({"rename": 1}), json!({"desc": "x"}), json!({}), json!("n")] {
+            assert_eq!(config_rename_only(&body), None, "{body}");
+        }
+    }
+
+    /// ai-config #203 with amux #3: a rule-10 worker renamed BY ITS LEAD keeps
+    /// its identity. Its launch token still verifies, under its old name (the
+    /// alias resolves) and its new one, and its incarnation is unchanged.
+    #[tokio::test]
+    async fn a_lead_made_rename_keeps_the_renamed_workers_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = isolated(home.path());
+        lead_rename_fleet(home.path());
+        let rule10 = |n: &str, t: &str| std::fs::write(home.path().join(format!("sessions/{n}.env")),
+            format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{t}\"\nCC_AUTO_START=0\nCC_TEST_FAKE_PANE=1\nAMUX_CONTRACT_DONE=1\n")).unwrap();
+        rule10("review-dev-lead", "leads,dev");
+        rule10("review-dev-a", "dev");
+        let lead_token = crate::api::worker_identity::mint(home.path(), "review-dev-lead").unwrap().expect("rule 10 mints");
+        let token = crate::api::worker_identity::mint(home.path(), "review-dev-a").unwrap().expect("rule 10 mints");
+        let inc = crate::api::rename_identity::incarnation(home.path(), "review-dev-a").unwrap();
+        let (app, _db) = app();
+        let tok = crate::api::worker_identity::TOKEN_HEADER;
+        let (st, v) = status_and_body(&app, socket_request("POST", "/api/sessions/review-dev-a/rename",
+            json!({"name": "dev-assigned"}), &[("X-Amux-Session", "review-dev-lead"), (tok, &lead_token)])).await;
+        assert_eq!(st, StatusCode::OK, "verified lead renames its team worker: {v}");
+        assert_eq!(crate::api::rename_identity::incarnation(home.path(), "dev-assigned").as_deref(), Some(inc.as_str()));
+        assert!(crate::api::worker_identity::hash_path(home.path(), &inc).exists(), "the token hash stays with the incarnation");
+        for claim in ["review-dev-a", "dev-assigned"] {
+            let (st, v) = status_and_body(&app, socket_request("PATCH", "/api/sessions/dev-assigned/config",
+                json!({"desc": format!("as {claim}")}), &[("X-Amux-Session", claim), (tok, &token)])).await;
+            assert_eq!(st, StatusCode::OK, "the renamed worker's own token as {claim}: {v}");
+        }
+        // Control: the same claim without the token is refused.
+        let (st, v) = status_and_body(&app, socket_request("PATCH", "/api/sessions/dev-assigned/config",
+            json!({"desc": "no token"}), &[("X-Amux-Session", "review-dev-a")])).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_refused")), "{v}");
     }
 
     /// Round 3 N5: an env apply validates the whole spec before writing: one
