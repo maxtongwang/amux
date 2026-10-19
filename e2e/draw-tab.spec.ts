@@ -883,3 +883,56 @@ test('Draw: a recents save that read before another tab wrote merges it instead 
     await expect.poll(() => beacons, { message: 'the conflict announced itself' }).toContain('recents-save-conflict');
   });
 });
+
+// When every merge loses (three conflicts in a row), the save stops instead of
+// spinning, the user's entry is kept, the library says it is not saved and a
+// beacon reports it; the next change saves it and the note clears.
+test('Draw: recents that cannot be saved stay pending and say so, then save on the next change', async ({ page, request }, info) => {
+  test.setTimeout(90_000);
+  await withDrawPrefs(page, request, info, 'amux-draw-recents-unsaved-', async dir => {
+    const mine = join(dir, 'Mine.excalidraw');
+    const recents = join(dir, 'recents.json');
+    await writeFile(mine, sceneOf([{ id: 'mine-rect', type: 'rectangle', x: 0 }]));
+    await page.reload();
+    await page.waitForFunction(() => typeof (window as any)._drawRecentsPath === 'function');
+    await page.evaluate(p => { (window as any)._drawRecentsPath = () => p; }, recents);
+    await openDraw(page);
+    await page.evaluate(p => (window as any)._drawOpen(p), mine);
+    await expect.poll(() => sceneIds(page)).toEqual(['mine-rect']);
+    await recentsSettled(page);
+    await showDrawings(page);
+    const beacons: string[] = [];
+    page.on('request', r => {
+      if (r.method() === 'POST' && r.url().includes('/api/client-debug')) { try { beacons.push(r.postDataJSON()?.event); } catch {} }
+    });
+    let refused = 0;
+    const refuse = async (route: import('@playwright/test').Route) => {
+      const req = route.request();
+      let path = '';
+      try { path = req.postDataJSON()?.path || ''; } catch {}
+      if (req.method() === 'PUT' && path === recents) {
+        refused++;
+        return route.fulfill({ status: 409, json: { error: 'file changed on disk since it was opened', code: 'file_changed' } });
+      }
+      return route.continue();
+    };
+    await page.route('**/api/file', refuse);
+    await page.evaluate(() => (window as any)._drawRememberRecent(true));
+    await recentsSettled(page);
+    expect(refused, 'the save gave up after its bounded merges, not spinning').toBe(3);
+    const note = page.locator('#draw-recents-unsaved');
+    await expect(note).toHaveText(/not saved/);
+    expect(await page.evaluate(() => (window as unknown as Win)._draw.recentsUnsaved)).toBe(true);
+    expect(await page.evaluate(p => (window as unknown as Win)._draw.recents.some((x: any) => x.path === p), mine),
+      'the entry is kept in memory for the next save').toBe(true);
+    await expect.poll(() => beacons).toContain('recents-save-failed');
+    await page.unroute('**/api/file', refuse);
+    await page.evaluate(() => (window as any)._drawRememberRecent(true));
+    await recentsSettled(page);
+    const want = await page.evaluate(p => (window as unknown as Win)._draw.recents.find((x: any) => x.path === p).ts, mine);
+    const disk = JSON.parse(await readFile(recents, 'utf8')).recents;
+    expect(disk.find((x: any) => x.path === mine)?.ts, 'the next change saved the pending entry').toBe(want);
+    await expect(note).toHaveText('');
+    expect(await page.evaluate(() => (window as unknown as Win)._draw.recentsUnsaved)).toBe(false);
+  });
+});

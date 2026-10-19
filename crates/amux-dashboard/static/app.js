@@ -59287,7 +59287,7 @@ function _drawS() {
       saving: false, saveAgain: false, saveTimer: null, status: 'idle', statusMsg: '',
       pollTimer: null, pollTick: 0, applying: false, conflict: null, opening: false, openSeq: 0, savedCount: 0,
       libItems: [], libHash: null, libEtag: null, libSaveTimer: null, libLoaded: false,
-      recents: [], recentsLoaded: false, recentsTimer: null, recentsSaving: null, recentsAgain: false, thumbAt: 0,
+      recents: [], recentsLoaded: false, recentsTimer: null, recentsSaving: null, recentsAgain: false, recentsUnsaved: false, thumbAt: 0,
       libTab: 'components', settings: { grid: false, align: true, connect: true },
       settingsLoaded: false, live: false, selCount: 0, selLocked: false, svgCache: new Map(),
       themeObs: null, penColor: _DRAW_PEN_COLORS[1], penWidth: 2,
@@ -60536,6 +60536,7 @@ function _drawSaveRecents() {
   return d.recentsSaving;
 }
 const _DRAW_RECENTS_TRIES = 3;
+const _DRAW_RECENTS_UNSAVED = ' · not saved, retrying on your next change';
 async function _drawWriteRecents(d) {
   try {
     for (let attempt = 1; ; attempt++) {
@@ -60572,9 +60573,20 @@ async function _drawWriteRecents(d) {
       // No re-render here: entries merged in from another tab would shift the
       // list under a pointer that is about to click. They show on the next
       // render the user causes.
+      if (d.recentsUnsaved) { d.recentsUnsaved = false; _drawRecentsNote(); }
       return;
     }
-  } catch (e) { _drawBeacon('recents-save-failed', { error: String(e && e.message || e) }); }
+  } catch (e) {
+    // The list stays in memory and the next change saves it again; until then
+    // the library says so instead of reading as saved.
+    d.recentsUnsaved = true;
+    _drawRecentsNote();
+    _drawBeacon('recents-save-failed', { measured: true, unsaved: d.recentsUnsaved, error: String(e && e.message || e) });
+  }
+}
+function _drawRecentsNote() {
+  const el = document.getElementById('draw-recents-unsaved');
+  if (el) el.textContent = _draw && _draw.recentsUnsaved ? _DRAW_RECENTS_UNSAVED : '';
 }
 async function _drawRenderDrawings(body, q) {
   const d = _draw;
@@ -60590,7 +60602,8 @@ async function _drawRenderDrawings(body, q) {
   // straddled that swap fired no click (draw-tab.spec.ts:356 on iOS).
   const keep = d.folderHtml || '<div class="draw-empty">Loading…</div>';
   const top = body.scrollTop;
-  if (_drawSetBody(body, '<div class="draw-lib-sub">Recent drawings</div>'
+  if (_drawSetBody(body, '<div class="draw-lib-sub">Recent drawings<span id="draw-recents-unsaved" class="draw-recents-unsaved">'
+    + (d.recentsUnsaved ? _DRAW_RECENTS_UNSAVED : '') + '</span></div>'
     + (rec.length ? rec.map(row).join('') : '<div class="draw-empty">' + (q ? 'No drawings match.' : 'Drawings you open show up here.') + '</div>')
     + '<div class="draw-lib-sub">In this folder</div><div id="draw-folder-list"></div>')) {
     _drawSetBody(document.getElementById('draw-folder-list'), keep);
