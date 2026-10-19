@@ -56,6 +56,10 @@ const ALLOW: &[(&str, &str)] = &[
         "crates/amux-server/tests/legacy_port_guard.rs",
         "this guard — it must contain the pattern it searches for",
     ),
+    (
+        "scripts/test-endpoint-clients-isolated.py",
+        "the isolated-run endpoint guard's test: its allowlist quotes docstring prose that names the retired address, and it probes that every guard refuses it",
+    ),
     // -- prose ABOUT the retired port, in code that does not USE it --
     //
     // Both of these arrived on main already red (2026-08-10) and made

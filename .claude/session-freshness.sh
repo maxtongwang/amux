@@ -26,6 +26,22 @@
 #     signal rather than another banner to scroll past.
 set -uo pipefail
 
+# >>> amux-endpoint-guard (rule: scripts/lib/amux-endpoint.sh; every copy identical, test-enforced)
+_ae_dir=$(dirname "$0")
+for _ae in "$_ae_dir/amux-endpoint.sh" "$_ae_dir/lib/amux-endpoint.sh" "$_ae_dir/../lib/amux-endpoint.sh"            "$(eval echo "~$(id -un 2>/dev/null)" 2>/dev/null)/.amux/hooks/amux-endpoint.sh"; do
+  [ -r "$_ae" ] && . "$_ae" && break
+done
+command -v amux_endpoint_guard >/dev/null 2>&1 || amux_endpoint_guard() {  # stand-in: fixed live ports
+  _aeg_a=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s|^[a-z][a-z0-9+.-]*://||; s|[/?#].*||; s|.*@||; s|^\[.*\]||')
+  case "$_aeg_a" in *:*) _aeg_p=$(printf '%s' "${_aeg_a##*:}" | sed 's/^0*//') ;; *) _aeg_p="" ;; esac
+  if [ "${AMUX_ISOLATED_RUN:-}" = 1 ] && { [ -z "$(printf '%s' "$1" | tr -d '[:space:]')" ] || [ "$_aeg_p" = 8824 ] || [ "$_aeg_p" = 8822 ]; }; then
+    printf '[amux] verdict=isolated_live_endpoint_refused client=%s from=%s reason=stand_in to=http://127.0.0.1:9 measured=true n_considered=1\n' "$2" "${1:-<unset>}" >&2
+    echo "http://127.0.0.1:9"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+# <<< amux-endpoint-guard
 [ "${AMUX_SKIP_FRESHNESS:-}" = "1" ] && exit 0
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P)" || exit 0
@@ -558,7 +574,7 @@ fi
 # against a `file://` fixture instead of whatever happens to be listening on the
 # machine running the suite. A check whose verdict depends on the host's state is
 # not testing the hook (the mistake test-session-freshness.sh already made once).
-HEALTH_URL="${AMUX_HEALTH_URL:-https://localhost:8824/health}"
+HEALTH_URL=$(amux_endpoint_guard "${AMUX_HEALTH_URL:-https://localhost:8824/health}" session-freshness)
 if command -v curl >/dev/null 2>&1; then
   hs="$(timeout 5 curl -sk "$HEALTH_URL" 2>/dev/null || true)"
   if [ -n "$hs" ] && ! printf '%s' "$hs" | grep -q '"server":"amux-rust"'; then

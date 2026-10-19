@@ -2,6 +2,28 @@ import http from 'node:http';
 import https from 'node:https';
 import type { Plugin } from 'vite';
 import { handleBusiness } from './business';
+
+// >>> amux-endpoint-guard (rule: scripts/lib/amux_endpoint.py; every copy identical, test-enforced)
+function amuxEndpointGuard(url: unknown, client: string): unknown {
+  const u = String(url || '').trim().toLowerCase();
+  const a = u.replace(/^[a-z][a-z0-9+.-]*:\/\//, '').split(/[/?#]/)[0].replace(/^.*@/, '').replace(/^\[.*\]/, '');
+  const p = a.includes(':') ? a.slice(a.lastIndexOf(':') + 1) : '';
+  const live = new Set([8824, 8822]);
+  const mod = (m: string): any => (process as any).getBuiltinModule(m);
+  const e = process.env;
+  for (const h of [mod('path').join(mod('os').userInfo().homedir, '.amux'), e.AMUX_HOME, e.CC_HOME, e.HOME && `${e.HOME}/.amux`]) {
+    try {
+      const ep = JSON.parse(mod('fs').readFileSync(`${h}/endpoint.json`, 'utf8'));
+      for (const n of [ep.canonical_port, ep.legacy_port, ...(ep.retired_ports || [])]) if (Number.isInteger(n)) live.add(n);
+    } catch {}
+  }
+  if (process.env.AMUX_ISOLATED_RUN === '1' && (!u || (/^[0-9]+$/.test(p) && live.has(Number(p))))) {
+    process.stderr.write(`[amux] verdict=isolated_live_endpoint_refused client=${client} from=${url || '<unset>'} reason=live_port to=http://127.0.0.1:9 measured=true n_considered=1\n`);
+    return 'http://127.0.0.1:9';
+  }
+  return url;
+}
+// <<< amux-endpoint-guard
 // Development transport only. Production can reverse-proxy /api/business to the same adapter,
 // or use the Worker route with an authenticated, externally reachable Amux URL.
 export function businessBridge(): Plugin {
@@ -35,7 +57,7 @@ export function businessBridge(): Plugin {
           return;
         }
         const upstream = new URL(
-          process.env.AMUX_SERVER_URL || 'https://localhost:8824',
+          String(amuxEndpointGuard(process.env.AMUX_SERVER_URL || 'https://localhost:8824', 'business-ui-bridge')),
         );
         if (!['http:', 'https:'].includes(upstream.protocol)) {
           res.writeHead(503);

@@ -11,6 +11,22 @@
 # "there is a change to adopt", mirroring how the Python server's file-save
 # reload is bounded by whole-file saves.
 set -euo pipefail
+# >>> amux-endpoint-guard (rule: scripts/lib/amux-endpoint.sh; every copy identical, test-enforced)
+_ae_dir=$(dirname "$0")
+for _ae in "$_ae_dir/amux-endpoint.sh" "$_ae_dir/lib/amux-endpoint.sh" "$_ae_dir/../lib/amux-endpoint.sh"            "$(eval echo "~$(id -un 2>/dev/null)" 2>/dev/null)/.amux/hooks/amux-endpoint.sh"; do
+  [ -r "$_ae" ] && . "$_ae" && break
+done
+command -v amux_endpoint_guard >/dev/null 2>&1 || amux_endpoint_guard() {  # stand-in: fixed live ports
+  _aeg_a=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s|^[a-z][a-z0-9+.-]*://||; s|[/?#].*||; s|.*@||; s|^\[.*\]||')
+  case "$_aeg_a" in *:*) _aeg_p=$(printf '%s' "${_aeg_a##*:}" | sed 's/^0*//') ;; *) _aeg_p="" ;; esac
+  if [ "${AMUX_ISOLATED_RUN:-}" = 1 ] && { [ -z "$(printf '%s' "$1" | tr -d '[:space:]')" ] || [ "$_aeg_p" = 8824 ] || [ "$_aeg_p" = 8822 ]; }; then
+    printf '[amux] verdict=isolated_live_endpoint_refused client=%s from=%s reason=stand_in to=http://127.0.0.1:9 measured=true n_considered=1\n' "$2" "${1:-<unset>}" >&2
+    echo "http://127.0.0.1:9"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+# <<< amux-endpoint-guard
 
 # launchd does NOT inherit the shell PATH (the restic lesson in ~/Dev/CLAUDE.md
 # — same class, same fix): name the toolchain absolutely.
@@ -164,7 +180,7 @@ sync_worker_bin_guard() {
 # hook enrollment. Read exact elected bytes, validate and verify the rename.
 sync_observed_edits_hooks() {
   local sha="$1" half rel dest tmp mode verdict
-  for half in pre post orchestrate endpoint; do
+  for half in pre post orchestrate endpoint endpoint-sh; do
     mode=0755; verdict=observed_hook
     if [ "$half" = orchestrate ]; then
       rel=".claude/commands/orchestrate.md"
@@ -175,6 +191,10 @@ sync_observed_edits_hooks() {
       rel="scripts/lib/amux_endpoint.py"
       dest="${AMUX_OBSERVED_HOOK_DIR:-$HOME/.amux/hooks}/amux_endpoint.py"
       mode=0644; verdict=endpoint_guard
+    elif [ "$half" = endpoint-sh ]; then
+      rel="scripts/lib/amux-endpoint.sh"
+      dest="${AMUX_OBSERVED_HOOK_DIR:-$HOME/.amux/hooks}/amux-endpoint.sh"
+      mode=0644; verdict=endpoint_guard_sh
     else
       rel="scripts/claude-hooks/observed-edits-${half}.py"
       dest="${AMUX_OBSERVED_HOOK_DIR:-$HOME/.amux/hooks}/observed-edits-${half}.py"
@@ -182,7 +202,8 @@ sync_observed_edits_hooks() {
     [ -f "$dest" ] && [ ! -L "$dest" ] && [ -w "$(dirname "$dest")" ] || continue
     tmp="$(mktemp "$(dirname "$dest")/.observed-hook.XXXXXX")" || continue
     if ! git -C "$REPO" show "${sha}:${rel}" > "$tmp" 2>/dev/null \
-       || { [ "$half" != orchestrate ] && ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$tmp" 2>/dev/null; }; then
+       || { [ "${rel##*.}" = py ] && ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$tmp" 2>/dev/null; } \
+       || { [ "${rel##*.}" = sh ] && ! sh -n "$tmp" 2>/dev/null; }; then
       echo "== WORKER HELPER SYNC FAILED sha=$sha half=$half verdict=${verdict}_source_invalid" >> "$LOG"
       rm -f "$tmp"; continue
     fi
@@ -248,7 +269,7 @@ except Exception:
 PY
 )
   fi
-  printf '%s\n' "${api:-https://localhost:${AMUX_RS_PORT:-8824}}"
+  amux_endpoint_guard "${api:-https://localhost:${AMUX_RS_PORT:-8824}}" rust-auto-build
 }
 
 # One measurement owns both the decision and its receipt. A later successful

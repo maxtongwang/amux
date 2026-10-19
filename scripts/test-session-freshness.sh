@@ -82,11 +82,14 @@ mk() { # $1 name  $2 n_ahead  $3 n_behind  [$4 local snippet]  [$5 upstream snip
     # heard of — and case (a) fails on this machine while passing in CI, where
     # no such file exists. A test whose verdict depends on the host's state is
     # not testing the hook.
+    # The health probe gets a dead file:// URL for the same reason: by default
+    # the hook asks https://localhost:8824/health, which is the live server on
+    # a developer box (and a refused, logged URL under amux-isolated).
     # After the self-check, so a dirty tree can never be mistaken for a setup
     # failure, and before the hook, which is the whole point.
     eval "${4:-:}"
     AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
-      bash .claude/session-freshness.sh 2>&1
+      AMUX_HEALTH_URL="${AMUX_HEALTH_URL:-file:///nonexistent/amux-health.json}" bash .claude/session-freshness.sh 2>&1
   )
 }
 
@@ -152,7 +155,7 @@ prov_run() { # $1 = file contents, or "" for no file
   ( cd "$d"; git init -q -b main .; echo x > f; git add -A; git commit -qm x ) >/dev/null 2>&1
   local pf="$d/prov.json"
   if [ -n "$1" ]; then printf '%s\n' "$1" > "$pf"; else rm -f "$pf"; fi
-  ( cd "$d"; AMUX_RS_BUILD_PROVENANCE="$pf" bash .claude/session-freshness.sh 2>&1 )
+  ( cd "$d"; AMUX_RS_BUILD_PROVENANCE="$pf" AMUX_HEALTH_URL="${AMUX_HEALTH_URL:-file:///nonexistent/amux-health.json}" bash .claude/session-freshness.sh 2>&1 )
 }
 
 out=$(prov_run '{"sha":"deadbeef1234","ref":"fix/my-thing","on_main":"no","built_at":"x"}')
@@ -220,7 +223,7 @@ lag_run() { # $1 = how many commits the BUILT sha is behind origin/main
     git fetch -q origin 2>/dev/null
     got=$(git rev-list --count "${built}..origin/main" -- crates/ Cargo.toml Cargo.lock 2>/dev/null || echo x)
     if [ "$got" != "$1" ]; then echo "SETUP BROKEN for lag$1: wanted build-relevant behind=$1, got $got"; exit 0; fi
-    AMUX_RS_BUILD_PROVENANCE="$pf" bash .claude/session-freshness.sh 2>&1 )
+    AMUX_RS_BUILD_PROVENANCE="$pf" AMUX_HEALTH_URL="${AMUX_HEALTH_URL:-file:///nonexistent/amux-health.json}" bash .claude/session-freshness.sh 2>&1 )
 }
 
 # (f) the running build is 3 commits stale — must say so, with the count.
@@ -273,7 +276,7 @@ lag_nonbuild_run() {
     if [ "$plain" != "2" ] || [ "$build" != "0" ]; then
       echo "SETUP BROKEN for lagnb: wanted plain=2 build-relevant=0, got plain=$plain build=$build"; exit 0
     fi
-    AMUX_RS_BUILD_PROVENANCE="$pf" bash .claude/session-freshness.sh 2>&1 )
+    AMUX_RS_BUILD_PROVENANCE="$pf" AMUX_HEALTH_URL="${AMUX_HEALTH_URL:-file:///nonexistent/amux-health.json}" bash .claude/session-freshness.sh 2>&1 )
 }
 out=$(lag_nonbuild_run)
 if setup_ok "lagnb" "$out"; then
@@ -315,7 +318,7 @@ lag_age_run() {
     git fetch -q origin 2>/dev/null
     n=$(git rev-list --count "${built}..origin/main" -- crates/ Cargo.toml Cargo.lock 2>/dev/null || echo x)
     [ "$n" = "2" ] || { echo "SETUP BROKEN for lagage: wanted 2 build-relevant behind, got $n"; exit 0; }
-    AMUX_RS_BUILD_PROVENANCE="$pf" bash .claude/session-freshness.sh 2>&1 )
+    AMUX_RS_BUILD_PROVENANCE="$pf" AMUX_HEALTH_URL="${AMUX_HEALTH_URL:-file:///nonexistent/amux-health.json}" bash .claude/session-freshness.sh 2>&1 )
 }
 out=$(lag_age_run)
 if setup_ok "lagage" "$out"; then
@@ -344,7 +347,7 @@ unknown_run() {
   local pf="$d/prov.json"
   printf '{"sha":"%s","ref":"main","on_main":"yes","built_at":"x"}\n' \
     "0123456789abcdef0123456789abcdef01234567" > "$pf"
-  ( cd "$d/work"; AMUX_RS_BUILD_PROVENANCE="$pf" bash .claude/session-freshness.sh 2>&1 )
+  ( cd "$d/work"; AMUX_RS_BUILD_PROVENANCE="$pf" AMUX_HEALTH_URL="${AMUX_HEALTH_URL:-file:///nonexistent/amux-health.json}" bash .claude/session-freshness.sh 2>&1 )
 }
 out=$(unknown_run)
 says "$NEVERMARK" "$out"
@@ -386,7 +389,7 @@ hooks_repo() { # $1 name
 # provenance; the AF-375 cross-reference needs it for the same reason.
 hooks_run() { ( cd "$1"; AMUX_SESSION="${2-}" AMUX_OBSERVED_EDITS_LOG="${3-}" \
                         AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
-                        bash .claude/session-freshness.sh 2>&1 ); }
+                        AMUX_HEALTH_URL="${AMUX_HEALTH_URL:-file:///nonexistent/amux-health.json}" bash .claude/session-freshness.sh 2>&1 ); }
 
 # (i) CONTROL — installed hooks identical to the checkout: say NOTHING.
 w=$(hooks_repo hk_same)
@@ -431,7 +434,7 @@ printf 'running version\n' > "$TMP/pg_drift/dest/git-shared-guard.py"
 out=$(cd "$w"; AMUX_SESSION="" AMUX_OBSERVED_EDITS_LOG="" \
       AMUX_SHARED_GUARD_DEST="$TMP/pg_drift/dest/git-shared-guard.py" \
       AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
-      bash .claude/session-freshness.sh 2>&1)
+      AMUX_HEALTH_URL="${AMUX_HEALTH_URL:-file:///nonexistent/amux-health.json}" bash .claude/session-freshness.sh 2>&1)
 says "$PGMARK" "$out"
 says "install-hooks.sh" "$out"
 
@@ -444,7 +447,7 @@ printf 'same bytes\n' > "$TMP/pg_same/dest/git-shared-guard.py"
 out=$(cd "$w"; AMUX_SESSION="" AMUX_OBSERVED_EDITS_LOG="" \
       AMUX_SHARED_GUARD_DEST="$TMP/pg_same/dest/git-shared-guard.py" \
       AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
-      bash .claude/session-freshness.sh 2>&1)
+      AMUX_HEALTH_URL="${AMUX_HEALTH_URL:-file:///nonexistent/amux-health.json}" bash .claude/session-freshness.sh 2>&1)
 lacks "$PGMARK" "$out"
 
 # (p3) DESTINATION ABSENT: not an amux host, not drift. This is the arm that keeps
@@ -455,7 +458,7 @@ printf 'repo version\n' > "$w/scripts/git-hooks/git-shared-guard.py"
 out=$(cd "$w"; AMUX_SESSION="" AMUX_OBSERVED_EDITS_LOG="" \
       AMUX_SHARED_GUARD_DEST="$TMP/pg_nodest/definitely/not/here.py" \
       AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
-      bash .claude/session-freshness.sh 2>&1)
+      AMUX_HEALTH_URL="${AMUX_HEALTH_URL:-file:///nonexistent/amux-health.json}" bash .claude/session-freshness.sh 2>&1)
 lacks "$PGMARK" "$out"
 
 # ── AMUX-4544: the large-read router, same blind spot, same three states ─────
@@ -471,7 +474,7 @@ printf 'running version\n' > "$TMP/rr_drift/dest/large-read-guard.py"
 out=$(cd "$w"; AMUX_SESSION="" AMUX_OBSERVED_EDITS_LOG="" \
       AMUX_READ_ROUTER_DEST="$TMP/rr_drift/dest/large-read-guard.py" \
       AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
-      bash .claude/session-freshness.sh 2>&1)
+      AMUX_HEALTH_URL="${AMUX_HEALTH_URL:-file:///nonexistent/amux-health.json}" bash .claude/session-freshness.sh 2>&1)
 says "$RRMARK" "$out"
 says "install-hooks.sh" "$out"
 
@@ -483,7 +486,7 @@ printf 'same bytes\n' > "$TMP/rr_same/dest/large-read-guard.py"
 out=$(cd "$w"; AMUX_SESSION="" AMUX_OBSERVED_EDITS_LOG="" \
       AMUX_READ_ROUTER_DEST="$TMP/rr_same/dest/large-read-guard.py" \
       AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
-      bash .claude/session-freshness.sh 2>&1)
+      AMUX_HEALTH_URL="${AMUX_HEALTH_URL:-file:///nonexistent/amux-health.json}" bash .claude/session-freshness.sh 2>&1)
 lacks "$RRMARK" "$out"
 
 # (r3) DESTINATION ABSENT: not an amux host, not drift.
@@ -493,7 +496,7 @@ printf 'repo version\n' > "$w/scripts/hooks/large-read-guard.py"
 out=$(cd "$w"; AMUX_SESSION="" AMUX_OBSERVED_EDITS_LOG="" \
       AMUX_READ_ROUTER_DEST="$TMP/rr_nodest/definitely/not/here.py" \
       AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
-      bash .claude/session-freshness.sh 2>&1)
+      AMUX_HEALTH_URL="${AMUX_HEALTH_URL:-file:///nonexistent/amux-health.json}" bash .claude/session-freshness.sh 2>&1)
 lacks "$RRMARK" "$out"
 
 # ── AF-375: is one of the drifting hooks a file THIS session edited? ─────────

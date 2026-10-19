@@ -43,6 +43,7 @@ repo="$TMP/origin"
 mkdir -p "$repo/scripts"
 cp -p "$SRC_REPO/scripts/install-hooks.sh" "$repo/scripts/"
 cp -pr "$SRC_REPO/scripts/git-hooks" "$repo/scripts/"
+cp -pr "$SRC_REPO/scripts/lib" "$repo/scripts/"
 git -C "$repo" init -q -b main
 git -C "$repo" config user.email t@example.com
 git -C "$repo" config user.name  t

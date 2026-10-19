@@ -254,6 +254,22 @@ if [ "$DERIVED" = "1" ]; then
     exit 0
   fi
 fi
+# >>> amux-endpoint-guard (rule: scripts/lib/amux-endpoint.sh; every copy identical, test-enforced)
+_ae_dir=$(dirname "$0")
+for _ae in "$_ae_dir/amux-endpoint.sh" "$_ae_dir/lib/amux-endpoint.sh" "$_ae_dir/../lib/amux-endpoint.sh"            "$(eval echo "~$(id -un 2>/dev/null)" 2>/dev/null)/.amux/hooks/amux-endpoint.sh"; do
+  [ -r "$_ae" ] && . "$_ae" && break
+done
+command -v amux_endpoint_guard >/dev/null 2>&1 || amux_endpoint_guard() {  # stand-in: fixed live ports
+  _aeg_a=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s|^[a-z][a-z0-9+.-]*://||; s|[/?#].*||; s|.*@||; s|^\[.*\]||')
+  case "$_aeg_a" in *:*) _aeg_p=$(printf '%s' "${_aeg_a##*:}" | sed 's/^0*//') ;; *) _aeg_p="" ;; esac
+  if [ "${AMUX_ISOLATED_RUN:-}" = 1 ] && { [ -z "$(printf '%s' "$1" | tr -d '[:space:]')" ] || [ "$_aeg_p" = 8824 ] || [ "$_aeg_p" = 8822 ]; }; then
+    printf '[amux] verdict=isolated_live_endpoint_refused client=%s from=%s reason=stand_in to=http://127.0.0.1:9 measured=true n_considered=1\n' "$2" "${1:-<unset>}" >&2
+    echo "http://127.0.0.1:9"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+# <<< amux-endpoint-guard
 IN=$(cat 2>/dev/null)
 E="$HOME/.amux/endpoint.json"
 C=$(sed -n 's/.*"canonical_url":"\([^"]*\)".*/\1/p' "$E" 2>/dev/null)
@@ -263,7 +279,7 @@ case "$U" in *localhost:$L|*127.0.0.1:$L) U="${C:-$U}";; esac
 # Any other localhost port endpoint.json does not name is stale too (a reboot
 # race left every lane on 8823, 2026-10-05); the CLI heals and logs the same.
 case "$U" in *://localhost:*|*://127.0.0.1:*) [ -n "$C" ] && U="$C";; esac
-U="${U%/}"
+U=$(amux_endpoint_guard "${U%/}" hook-report)
 REPORT_URL="$U/api/sessions/$AMUX_SESSION/report"
 # AMUX-4024: THE SUBAGENT LIFECYCLE PRODUCER.
 #

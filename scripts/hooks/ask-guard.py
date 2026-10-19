@@ -21,6 +21,30 @@ worse than the stall it replaces. Every run appends one line to
 
 from __future__ import annotations
 
+# >>> amux-endpoint-guard (rule: scripts/lib/amux_endpoint.py; every copy identical, test-enforced)
+import os, sys  # noqa: E401
+_AE_HERE = os.path.dirname(os.path.realpath(__file__))
+for _ae_dir in (_AE_HERE, os.path.join(_AE_HERE, "lib"), os.path.join(_AE_HERE, os.pardir, "lib"),
+                os.path.join(__import__("pwd").getpwuid(os.getuid()).pw_dir, ".amux", "hooks")):
+    if _ae_dir not in sys.path:
+        sys.path.append(_ae_dir)
+try:
+    from amux_endpoint import guard as _endpoint_guard
+except ImportError:  # no shared file anywhere: the parsed-port rule on the fixed live ports
+    def _endpoint_guard(url, client):
+        import re
+        u = (url or "").strip().lower()
+        a = re.split(r"[/?#]", u.split("://", 1)[-1], 1)[0].rsplit("@", 1)[-1]
+        p = a.partition("]")[2] if a.startswith("[") else a
+        p = p.rpartition(":")[2] if ":" in p else ""
+        if os.environ.get("AMUX_ISOLATED_RUN") == "1" and (not u or (p.isdigit() and int(p) in (8824, 8822))):
+            print("[amux] verdict=isolated_live_endpoint_refused client=%s from=%s reason=stand_in "
+                  "to=http://127.0.0.1:9 measured=true n_considered=1" % (client, url or "<unset>"),
+                  file=sys.stderr)
+            return "http://127.0.0.1:9"
+        return url
+# <<< amux-endpoint-guard
+
 import json
 import os
 from pathlib import Path
@@ -57,7 +81,7 @@ def base_url() -> str:
             url = endpoint.get("canonical_url", "")
         except Exception:
             url = ""
-    return url.rstrip("/")
+    return _endpoint_guard(url.rstrip("/"), "ask-guard")
 
 
 def main() -> int:

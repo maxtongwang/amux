@@ -40,17 +40,29 @@ import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
-# Isolated-run endpoint guard: scripts/lib/amux_endpoint.py, installed beside
-# hook copies. Under AMUX_ISOLATED_RUN=1 a live URL becomes a dead port.
+# >>> amux-endpoint-guard (rule: scripts/lib/amux_endpoint.py; every copy identical, test-enforced)
 import os, sys  # noqa: E401
 _AE_HERE = os.path.dirname(os.path.realpath(__file__))
-sys.path[:0] = [p for p in (_AE_HERE, os.path.join(_AE_HERE, "lib"),
-                            os.path.join(_AE_HERE, os.pardir, "lib")) if p not in sys.path]
+for _ae_dir in (_AE_HERE, os.path.join(_AE_HERE, "lib"), os.path.join(_AE_HERE, os.pardir, "lib"),
+                os.path.join(__import__("pwd").getpwuid(os.getuid()).pw_dir, ".amux", "hooks")):
+    if _ae_dir not in sys.path:
+        sys.path.append(_ae_dir)
 try:
     from amux_endpoint import guard as _endpoint_guard
-except ImportError:  # an install without the shared file: refuse only when isolated
+except ImportError:  # no shared file anywhere: the parsed-port rule on the fixed live ports
     def _endpoint_guard(url, client):
-        return "http://127.0.0.1:9" if os.environ.get("AMUX_ISOLATED_RUN") == "1" else url
+        import re
+        u = (url or "").strip().lower()
+        a = re.split(r"[/?#]", u.split("://", 1)[-1], 1)[0].rsplit("@", 1)[-1]
+        p = a.partition("]")[2] if a.startswith("[") else a
+        p = p.rpartition(":")[2] if ":" in p else ""
+        if os.environ.get("AMUX_ISOLATED_RUN") == "1" and (not u or (p.isdigit() and int(p) in (8824, 8822))):
+            print("[amux] verdict=isolated_live_endpoint_refused client=%s from=%s reason=stand_in "
+                  "to=http://127.0.0.1:9 measured=true n_considered=1" % (client, url or "<unset>"),
+                  file=sys.stderr)
+            return "http://127.0.0.1:9"
+        return url
+# <<< amux-endpoint-guard
 
 REPO = Path(__file__).resolve().parent.parent
 FRUST = REPO / "frustrations.md"
@@ -138,9 +150,9 @@ def fetch_board():
     # This fails SILENTLY otherwise: fetch_board() raises, main() prints "Structural
     # checks only" and exits 2, which reads like a deliberate offline mode rather
     # than a broken probe. It ran that way for a full sweep before anyone noticed.
-    base = os.environ.get("AMUX_URL", "") or "https://localhost:8824"
+    base = os.environ.get("AMUX_URL", "") or _endpoint_guard("https://localhost:8824", "frustrations_audit")
     if base.rstrip("/").endswith(":8822"):
-        base = "https://localhost:8824"
+        base = _endpoint_guard("https://localhost:8824", "frustrations_audit")
     base = _endpoint_guard(base, "frustrations_audit")
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -173,9 +185,9 @@ def fetch_sessions():
     confident answer produced by a broken instrument. Callers must treat None as
     "unknown" and claim neither state.
     """
-    base = os.environ.get("AMUX_URL", "") or "https://localhost:8824"
+    base = os.environ.get("AMUX_URL", "") or _endpoint_guard("https://localhost:8824", "frustrations_audit")
     if base.rstrip("/").endswith(":8822"):
-        base = "https://localhost:8824"
+        base = _endpoint_guard("https://localhost:8824", "frustrations_audit")
     base = _endpoint_guard(base, "frustrations_audit")
     ctx = ssl.create_default_context()
     ctx.check_hostname = False

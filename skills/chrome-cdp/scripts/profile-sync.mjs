@@ -22,6 +22,28 @@ import { appendFileSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
 
+// >>> amux-endpoint-guard (rule: scripts/lib/amux_endpoint.py; every copy identical, test-enforced)
+function amuxEndpointGuard(url, client) {
+  const u = String(url || '').trim().toLowerCase();
+  const a = u.replace(/^[a-z][a-z0-9+.-]*:\/\//, '').split(/[/?#]/)[0].replace(/^.*@/, '').replace(/^\[.*\]/, '');
+  const p = a.includes(':') ? a.slice(a.lastIndexOf(':') + 1) : '';
+  const live = new Set([8824, 8822]);
+  const mod = (m) => process.getBuiltinModule(m);
+  const e = process.env;
+  for (const h of [mod('path').join(mod('os').userInfo().homedir, '.amux'), e.AMUX_HOME, e.CC_HOME, e.HOME && `${e.HOME}/.amux`]) {
+    try {
+      const ep = JSON.parse(mod('fs').readFileSync(`${h}/endpoint.json`, 'utf8'));
+      for (const n of [ep.canonical_port, ep.legacy_port, ...(ep.retired_ports || [])]) if (Number.isInteger(n)) live.add(n);
+    } catch {}
+  }
+  if (process.env.AMUX_ISOLATED_RUN === '1' && (!u || (/^[0-9]+$/.test(p) && live.has(Number(p))))) {
+    process.stderr.write(`[amux] verdict=isolated_live_endpoint_refused client=${client} from=${url || '<unset>'} reason=live_port to=http://127.0.0.1:9 measured=true n_considered=1\n`);
+    return 'http://127.0.0.1:9';
+  }
+  return url;
+}
+// <<< amux-endpoint-guard
+
 const LOG_DIR = resolve(homedir(), '.cache', 'cdp');
 const LOG = resolve(LOG_DIR, 'profile-sync.log');
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -72,7 +94,7 @@ export function fingerprint(cookies, site) {
 
 function amuxBase() {
   try { return execFileSync('amux', ['url'], { encoding: 'utf8', timeout: 5000 }).trim(); }
-  catch { return (process.env.AMUX_URL || 'https://localhost:8824').trim(); }
+  catch { return amuxEndpointGuard((process.env.AMUX_URL || 'https://localhost:8824').trim(), 'profile-sync'); }
 }
 
 function api(method, path, body) {

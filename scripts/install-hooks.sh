@@ -53,6 +53,22 @@
 # script already made once, in the other direction, by overwriting amux's
 # pre-commit and silently deleting the shim. It reports instead.
 set -e
+# >>> amux-endpoint-guard (rule: scripts/lib/amux-endpoint.sh; every copy identical, test-enforced)
+_ae_dir=$(dirname "$0")
+for _ae in "$_ae_dir/amux-endpoint.sh" "$_ae_dir/lib/amux-endpoint.sh" "$_ae_dir/../lib/amux-endpoint.sh"            "$(eval echo "~$(id -un 2>/dev/null)" 2>/dev/null)/.amux/hooks/amux-endpoint.sh"; do
+  [ -r "$_ae" ] && . "$_ae" && break
+done
+command -v amux_endpoint_guard >/dev/null 2>&1 || amux_endpoint_guard() {  # stand-in: fixed live ports
+  _aeg_a=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s|^[a-z][a-z0-9+.-]*://||; s|[/?#].*||; s|.*@||; s|^\[.*\]||')
+  case "$_aeg_a" in *:*) _aeg_p=$(printf '%s' "${_aeg_a##*:}" | sed 's/^0*//') ;; *) _aeg_p="" ;; esac
+  if [ "${AMUX_ISOLATED_RUN:-}" = 1 ] && { [ -z "$(printf '%s' "$1" | tr -d '[:space:]')" ] || [ "$_aeg_p" = 8824 ] || [ "$_aeg_p" = 8822 ]; }; then
+    printf '[amux] verdict=isolated_live_endpoint_refused client=%s from=%s reason=stand_in to=http://127.0.0.1:9 measured=true n_considered=1\n' "$2" "${1:-<unset>}" >&2
+    echo "http://127.0.0.1:9"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+# <<< amux-endpoint-guard
 # Sources always come from the amux checkout this script lives in, never from
 # the target — that is the whole bug the foreign mode fixes.
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -327,8 +343,15 @@ install -m 0755 "$ROOT/scripts/git-hooks/pre-push" "$HOOKS/pre-push"
 install -m 0755 "$ROOT/scripts/git-hooks/append-only-push-guard" "$HOOKS/append-only-push-guard"
 install -m 0755 "$ROOT/scripts/git-hooks/post-commit" "$HOOKS/post-commit"
 # The isolated-run endpoint guard the hooks above load from their own directory.
-install -m 0644 "$ROOT/scripts/lib/amux_endpoint.py" "$HOOKS/amux_endpoint.py"
-install -m 0644 "$ROOT/scripts/lib/amux-endpoint.sh" "$HOOKS/amux-endpoint.sh"
+# A source tree without scripts/lib must not abort this installer halfway: the
+# hooks above are already in place and carry a stand-in for the guard.
+for _ae_lib in amux_endpoint.py amux-endpoint.sh; do
+  if [ -f "$ROOT/scripts/lib/$_ae_lib" ]; then
+    install -m 0644 "$ROOT/scripts/lib/$_ae_lib" "$HOOKS/$_ae_lib"
+  else
+    echo "  WARN scripts/lib/$_ae_lib missing in $ROOT: hooks use their built-in stand-in guard" >&2
+  fi
+done
 
 # THE FIFTH GUARD, which is not a git hook and had no installer at all (AF-409).
 #
@@ -351,7 +374,8 @@ install -m 0644 "$ROOT/scripts/lib/amux-endpoint.sh" "$HOOKS/amux-endpoint.sh"
 SHARED_GUARD_DEST="${AMUX_SHARED_GUARD_DEST:-$HOME/.amux/hooks/git-shared-guard.py}"
 if [ -d "$(dirname "$SHARED_GUARD_DEST")" ]; then
   install -m 0755 "$ROOT/scripts/git-hooks/git-shared-guard.py" "$SHARED_GUARD_DEST"
-  install -m 0644 "$ROOT/scripts/lib/amux_endpoint.py" "$(dirname "$SHARED_GUARD_DEST")/amux_endpoint.py"
+  [ -f "$ROOT/scripts/lib/amux_endpoint.py" ] \
+    && install -m 0644 "$ROOT/scripts/lib/amux_endpoint.py" "$(dirname "$SHARED_GUARD_DEST")/amux_endpoint.py"
 fi
 
 # THE READ ROUTER, the same shape as the guard above (AMUX-4544). settings.json
@@ -398,6 +422,7 @@ for h in pre-commit amux-staged-guard prepare-commit-msg pre-push post-commit ap
   fi
 done
 for h in amux_endpoint.py amux-endpoint.sh; do
+  [ -f "$ROOT/scripts/lib/$h" ] || continue
   if cmp -s "$ROOT/scripts/lib/$h" "$HOOKS/$h"; then
     echo "  ok   $HOOKS/$h matches scripts/lib/$h"
   else
@@ -466,9 +491,7 @@ BASE="$(python3 -c "
 import importlib.machinery, sys
 m = importlib.machinery.SourceFileLoader('amux_guard', '$ROOT/scripts/git-hooks/amux-staged-guard').load_module()
 print(m.amux_base_url())" 2>/dev/null)" || BASE=""
-[ -n "$BASE" ] || BASE="${AMUX_URL:-https://localhost:8824}"
-. "$ROOT/scripts/lib/amux-endpoint.sh"
-BASE=$(amux_endpoint_guard "$BASE" install-hooks)
+BASE=$(amux_endpoint_guard "${BASE:-${AMUX_URL:-https://localhost:8824}}" install-hooks)
 URL="$BASE/api/git/staged-guard"
 code=$(curl -sk -o /dev/null -w '%{http_code}' -m 3 -X POST \
         -H 'Content-Type: application/json' -d '{}' "$URL" 2>/dev/null || echo 000)

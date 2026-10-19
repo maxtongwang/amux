@@ -14,13 +14,29 @@
 # Run by com.amux.amuxhelper-poll every 5 minutes (see amuxhelper-poll.plist).
 set -euo pipefail
 
+# >>> amux-endpoint-guard (rule: scripts/lib/amux-endpoint.sh; every copy identical, test-enforced)
+_ae_dir=$(dirname "$0")
+for _ae in "$_ae_dir/amux-endpoint.sh" "$_ae_dir/lib/amux-endpoint.sh" "$_ae_dir/../lib/amux-endpoint.sh"            "$(eval echo "~$(id -un 2>/dev/null)" 2>/dev/null)/.amux/hooks/amux-endpoint.sh"; do
+  [ -r "$_ae" ] && . "$_ae" && break
+done
+command -v amux_endpoint_guard >/dev/null 2>&1 || amux_endpoint_guard() {  # stand-in: fixed live ports
+  _aeg_a=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s|^[a-z][a-z0-9+.-]*://||; s|[/?#].*||; s|.*@||; s|^\[.*\]||')
+  case "$_aeg_a" in *:*) _aeg_p=$(printf '%s' "${_aeg_a##*:}" | sed 's/^0*//') ;; *) _aeg_p="" ;; esac
+  if [ "${AMUX_ISOLATED_RUN:-}" = 1 ] && { [ -z "$(printf '%s' "$1" | tr -d '[:space:]')" ] || [ "$_aeg_p" = 8824 ] || [ "$_aeg_p" = 8822 ]; }; then
+    printf '[amux] verdict=isolated_live_endpoint_refused client=%s from=%s reason=stand_in to=http://127.0.0.1:9 measured=true n_considered=1\n' "$2" "${1:-<unset>}" >&2
+    echo "http://127.0.0.1:9"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+# <<< amux-endpoint-guard
 export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 
 REPO="${AMUX_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 RUNBOOK_DIR="${AMUXHELPER_RUNBOOK_DIR:-$REPO/scripts/amuxhelper-runbooks}"
 LOG="${AMUXHELPER_LOG:-$HOME/.amux/logs/amuxhelper.log}"
 LOCK="${AMUXHELPER_LOCK:-$HOME/.amux/amuxhelper.lock}"
-AMUX_URL="${AMUX_URL:-$(amux url 2>/dev/null || echo https://localhost:8824)}"
+AMUX_URL=$(amux_endpoint_guard "${AMUX_URL:-$(amux url 2>/dev/null || echo https://localhost:8824)}" amuxhelper-poll)
 SESSION="${AMUXHELPER_SESSION_NAME:-amuxhelper}"
 MAX_PER_TICK="${AMUXHELPER_MAX_PER_TICK:-5}"
 CMD_TIMEOUT_S="${AMUXHELPER_TIMEOUT_S:-60}"

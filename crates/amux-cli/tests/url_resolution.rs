@@ -11,12 +11,13 @@
 //! only via a countdown bind for pre-cutover processes, so defaulting there was
 //! the same bug with a later expiry date. 8824 is what install.sh configures.
 //!
-//! HONEST LIMIT of the two `err.is_empty() ||` assertions below: on a machine
-//! where the server is up, `health` succeeds and stderr is empty, so they pass
-//! without testing the port. That is deliberate (they must not fail in CI, where
-//! nothing is listening) but it means they are not the guard against the default
-//! regressing. `crates/amux-server/tests/legacy_port_guard.rs` is — it reads the
-//! constant out of the source and fails on the literal, listening or not.
+//! No test here may contact the live server (2026-10-19). The two default-URL
+//! cases used to run a bare `amux-rs health`, which reaches 8824 whenever a
+//! server is up. They now run with AMUX_ISOLATED_RUN=1 set explicitly, so the
+//! default is observed as the isolated refusal ("unset_would_use_builtin")
+//! aimed at the dead port; the default's VALUE is pinned by the
+//! `resolve_url_from` unit tests and by legacy_port_guard.rs. Every other case
+//! names its own dead loopback port, so the flag never decides its result.
 //!
 //! End-to-end rather than unit, because the bug was in the wiring — `resolve_url`
 //! could be perfect and the arg still bound to the wrong default.
@@ -30,7 +31,7 @@ fn health_stderr(env: &[(&str, Option<&str>)]) -> String {
     c.arg("health");
     // Start from a clean slate: the test process inherits a real AMUX_URL when
     // run inside amux, which would silently decide the result.
-    c.env_remove("AMUX_URL").env_remove("AMUX_RS_URL");
+    c.env_remove("AMUX_URL").env_remove("AMUX_RS_URL").env_remove("AMUX_ISOLATED_RUN");
     for (k, v) in env {
         match v {
             Some(val) => {
@@ -45,26 +46,32 @@ fn health_stderr(env: &[(&str, Option<&str>)]) -> String {
     String::from_utf8_lossy(&out.stderr).to_string()
 }
 
+/// A bare invocation uses the built-in default, and under isolation that
+/// default is refused before any request: this is also the test of the
+/// AMUX_ISOLATED_RUN wiring (with it ignored, the child would try the live
+/// default and print no refusal).
 #[test]
-fn bare_invocation_targets_neither_retired_port() {
-    let err = health_stderr(&[]);
+fn bare_invocation_is_refused_under_isolation_and_targets_no_live_port() {
+    let err = health_stderr(&[("AMUX_ISOLATED_RUN", Some("1"))]);
     assert!(
-        !err.contains(":8823"),
-        "bare invocation must not target the dead dev port; stderr: {err}"
+        err.contains("verdict=isolated_live_endpoint_refused reason=unset_would_use_builtin"),
+        "the built-in default must be refused under isolation; stderr: {err}"
     );
-    // 8822 is the retired legacy address. Defaulting there works today and
-    // stops working the day the countdown bind is dropped, which is precisely
-    // the class of failure this test exists to prevent.
+    assert!(err.contains("127.0.0.1:9"), "the dead port must be the target; stderr: {err}");
+    for port in [":8822", ":8823", ":8824"] {
+        assert!(!err.contains(&format!("localhost{port}")), "targeted {port}; stderr: {err}");
+    }
+}
+
+#[test]
+fn a_live_port_in_any_spelling_is_refused_under_isolation() {
+    let err = health_stderr(&[
+        ("AMUX_ISOLATED_RUN", Some("1")),
+        ("AMUX_URL", Some("HTTPS://user@LOCALHOST:08824/")),
+    ]);
     assert!(
-        !err.contains(":8822"),
-        "bare invocation must not target the RETIRED legacy port; stderr: {err}"
-    );
-    // It should be TRYING 8824. Asserting on the attempted URL keeps this
-    // meaningful whether or not a server happens to be up on this machine —
-    // otherwise the test would pass for the wrong reason in CI.
-    assert!(
-        err.is_empty() || err.contains(":8824"),
-        "expected the default to be :8824; stderr: {err}"
+        err.contains("reason=live_port") && err.contains("127.0.0.1:9"),
+        "a leading-zero, uppercase, userinfo spelling of the live port must be refused; stderr: {err}"
     );
 }
 
@@ -95,9 +102,9 @@ fn amux_rs_url_outranks_amux_url() {
 fn an_empty_env_value_falls_through_instead_of_targeting_nothing() {
     // An exported-but-empty AMUX_URL is ordinary shell breakage; it must not
     // produce a request to "" (which fails with a useless parse error).
-    let err = health_stderr(&[("AMUX_URL", Some(""))]);
+    let err = health_stderr(&[("AMUX_URL", Some("")), ("AMUX_ISOLATED_RUN", Some("1"))]);
     assert!(
-        err.is_empty() || err.contains(":8824"),
-        "empty AMUX_URL must fall through to the default; stderr: {err}"
+        err.contains("reason=unset_would_use_builtin") && err.contains("127.0.0.1:9"),
+        "empty AMUX_URL must fall through to the (refused) default; stderr: {err}"
     );
 }

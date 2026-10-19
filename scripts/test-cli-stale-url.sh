@@ -16,14 +16,26 @@ trap 'kill $SRV 2>/dev/null; cd /; rm -rf -- "${H:?}"' EXIT
 for _ in $(seq 1 50); do curl -s "http://127.0.0.1:$PORT/api/board" >/dev/null 2>&1 && break; sleep 0.1; done
 printf '{"canonical_port":%s,"canonical_url":"http://127.0.0.1:%s","legacy_port":8822,"retired_ports":[8822]}\n' "$PORT" "$PORT" > "$H/.amux/endpoint.json"
 fail=0
+count() { local n; n=$(grep -c "$1" "$2" 2>/dev/null) || true; echo "${n:-0}"; }
 : > "$H/srv.log"
+if [ "${AMUX_ISOLATED_RUN:-}" = 1 ]; then
+  # Under amux-isolated the heal must never run: endpoint.json is not followed,
+  # so a stale URL stays stale, the canonical server is never asked, and the
+  # skip is logged.
+  HOME="$H" CC_HOME="$H/.amux" AMUX_SESSION=csu AMUX_API="http://127.0.0.1:$DEAD" AMUX_URL="http://127.0.0.1:$DEAD" \
+    bash "$AM" board ls >/dev/null 2>"$H/err.txt"
+  ! grep -q 'GET /api/board' "$H/srv.log" && echo "ok   isolated: the canonical server is not reached" || { echo "FAIL isolated: the heal reached endpoint.json's server"; fail=1; }
+  grep -q 'verdict=isolated_endpoint_json_not_followed use=heal' "$H/err.txt" && echo "ok   isolated: the skipped heal is logged" || { echo "FAIL isolated: no not_followed line"; fail=1; }
+  [ "$(count stale_env_url_healed "$H/.amux/cli-transport.jsonl")" = 0 ] && echo "ok   isolated: nothing is recorded as healed" || { echo "FAIL isolated: a heal was recorded"; fail=1; }
+  exit $fail
+fi
 HOME="$H" CC_HOME="$H/.amux" AMUX_SESSION=csu AMUX_API="http://127.0.0.1:$DEAD" AMUX_URL="http://127.0.0.1:$DEAD" \
   bash "$AM" board ls >/dev/null 2>&1
 grep -q 'GET /api/board' "$H/srv.log" && echo "ok   a stale localhost AMUX_API reaches endpoint.json's server" || { echo "FAIL the CLI did not reach the canonical server"; fail=1; }
-n=$(grep -c 'stale_env_url_healed' "$H/.amux/cli-transport.jsonl" 2>/dev/null || echo 0)
+n=$(count stale_env_url_healed "$H/.amux/cli-transport.jsonl")
 [ "$n" -ge 1 ] && echo "ok   the heal is logged ($n line(s))" || { echo "FAIL no stale_env_url_healed line"; fail=1; }
 HOME="$H" CC_HOME="$H/.amux" AMUX_SESSION=csu AMUX_API="http://127.0.0.1:$DEAD" bash "$AM" board ls >/dev/null 2>&1
-n2=$(grep -c "\"var\":\"AMUX_API\"" "$H/.amux/cli-transport.jsonl" 2>/dev/null || echo 0)
+n2=$(count '"var":"AMUX_API"' "$H/.amux/cli-transport.jsonl")
 [ "$n2" = 1 ] && echo "ok   logged once per lane and port, not per call" || { echo "FAIL AMUX_API heal logged $n2 times"; fail=1; }
 out=$(grep -n '_amux_heal_url()' -A12 "$AM" | grep -c 'https://localhost:\*|http://localhost:\*|https://127.0.0.1:\*|http://127.0.0.1:\*) ;; \*) continue')
 [ "$out" = 1 ] && echo "ok   only localhost URLs are healed; a remote override is left alone" || { echo "FAIL the localhost guard is missing"; fail=1; }

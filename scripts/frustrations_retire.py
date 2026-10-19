@@ -27,18 +27,6 @@ runbook, a note or a habit is TOLD where to go, instead of getting
 """
 import sys
 
-# Isolated-run endpoint guard: scripts/lib/amux_endpoint.py, installed beside
-# hook copies. Under AMUX_ISOLATED_RUN=1 a live URL becomes a dead port.
-import os, sys  # noqa: E401
-_AE_HERE = os.path.dirname(os.path.realpath(__file__))
-sys.path[:0] = [p for p in (_AE_HERE, os.path.join(_AE_HERE, "lib"),
-                            os.path.join(_AE_HERE, os.pardir, "lib")) if p not in sys.path]
-try:
-    from amux_endpoint import guard as _endpoint_guard
-except ImportError:  # an install without the shared file: refuse only when isolated
-    def _endpoint_guard(url, client):
-        return "http://127.0.0.1:9" if os.environ.get("AMUX_ISOLATED_RUN") == "1" else url
-
 print(__doc__, file=sys.stderr)
 print("REFUSING: use scripts/frustrations-archive.py <line> <validated-by> "
       "--evidence-stdin  (`--list` shows the heading lines).", file=sys.stderr)
@@ -49,10 +37,6 @@ import json, re, subprocess, sys, urllib.parse
 
 FILE = 'frustrations.md'
 def _api():
-    return _endpoint_guard(_api_unguarded(), 'frustrations_retire')
-
-
-def _api_unguarded():
     # Read the server-written endpoint so a port move cannot silently point this at a
     # dead port — where the pre-2026-08-23 failure mode was a SILENT DELETE.
     try:
