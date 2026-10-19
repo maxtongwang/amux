@@ -1,3 +1,5 @@
+// chat-markdown-file-links.spec — file anchors in Chat replies; each reply is the stubbed /chat snapshot loaded
+// through the app, so a poller reload of the absent fixture session cannot replace it with a 404 (as in chat-read-aloud).
 import {test,expect} from './fixtures';
 import {cleanup} from './teardown';
 import {mkdtemp,writeFile,rm} from 'node:fs/promises';
@@ -15,18 +17,27 @@ test('Markdown file anchors open complete real files in finished, interrupted an
  await writeFile(md,Array.from({length:150},(_,i)=>`${i+1}. Complete artifact evidence`).join('\n\n')+'\n\n'+end);
  await writeFile(txt,'plain text\n'+end);
  await page.route(/\/api\/sessions(?:\?.*)?$/,r=>r.fulfill({json:[{name:'chat-file-fixture',provider:'codex',chat_companion:true,running:false,dir}]}));
+ // The chat is what the stubbed endpoint answers; the app's own reloads get the same reply.
+ let snapshot:any={messages:[],cursor:'e2e:1',busy:false,queued:0},chatLoads=0,releaseStream=()=>{};
+ const streamHeld=new Promise<void>(r=>{releaseStream=r;});
+ await page.route(/\/api\/sessions\/[^/?]+\/chat(?:\?.*)?$/,r=>{chatLoads++;return r.fulfill({json:snapshot});});
+ await page.route(/\/api\/sessions\/[^/?]+\/chat\/stream/,async r=>{await streamHeld;await r.abort().catch(()=>{});});
  try{
   await page.goto('/?peekEmbed=chat-file-fixture&peekTab=chat');
   await expect(page.locator('#peek-overlay')).toBeVisible();
   await expect.poll(()=>page.evaluate(()=>typeof (window as any).renderMarkdown)).toBe('function');
-  const render=async(kind:string,text:string)=>page.evaluate(({kind,text,dir})=>{
-   const w=window as any;w._chatUnmount();peekSessionDir=dir;_chat.name='chat-file-fixture@chat';_chat.messages=[];_chat.streaming=null;
-   const body=document.getElementById('peek-body')!;body.classList.add('peek-chat');
-   if(kind==='finished')_chat.messages=[{role:'assistant',text,ts:Date.now()/1000}];
-   if(kind==='interrupted')_chat.messages=[{role:'assistant',text,interrupted:true,ts:Date.now()/1000}];
-   if(kind==='streaming'){_chat.streaming=w._chatNewTurn({turn_id:'file-link-stream'});w._chatApply(_chat.streaming,{type:'delta',text});}
-   w._chatRender(); if(kind==='streaming'){w._chatApply(_chat.streaming,{type:'delta',text:'\n\nIncremental tail'});w._chatPaintLive();}
-  },{kind,text,dir});
+  await expect.poll(()=>page.evaluate(()=>_chat.name)).toBe('chat-file-fixture@chat');
+  const render=async(kind:string,text:string)=>{
+   const ts=Date.now()/1000;
+   snapshot={cursor:'e2e:1',busy:false,queued:0,
+    messages:kind==='finished'?[{role:'assistant',text,ts}]:kind==='interrupted'?[{role:'assistant',text,interrupted:true,ts}]:[],
+    streaming:kind==='streaming'?{turn_id:'file-link-stream',text}:null};
+   await page.evaluate(async({kind,dir})=>{
+    const w=window as any;peekSessionDir=dir;await w._chatLoad(_chat.name);
+    // The incremental tail arrives the way a live delta does.
+    if(kind==='streaming'){w._chatApply(_chat.streaming,{type:'delta',text:'\n\nIncremental tail'});w._chatPaintLive();}
+   },{kind,dir});
+  };
   const replies=[['finished',`[absolute artifact](<${md}>)`],['finished','[relative artifact](<./proof file.md>)'],['interrupted',`[interrupted artifact](<${txt}>)`],['streaming',`[streamed artifact](<${md}>)`]];
   for(const[kind,text]of replies){
    await render(kind,text);
@@ -43,5 +54,7 @@ test('Markdown file anchors open complete real files in finished, interrupted an
   await expect.poll(()=>beacons.length).toBe(4);expect(beacons.every(x=>x.measured===true&&x.n===1)).toBe(true);
   await render('finished','[external](https://example.com/docs/proof.md) [heading](#evidence) [bad](javascript:alert(1))');
   await expect(page.locator('.chat-bubble a.md-file-link')).toHaveCount(0);await expect(page.locator('.chat-bubble a[href="https://example.com/docs/proof.md"]')).toHaveAttribute('target','_blank');await expect(page.locator('.chat-bubble a[href^="javascript:"]')).toHaveCount(0);
- }finally{await cleanup('remove temp folder',()=>rm(dir,{recursive:true,force:true}),info);}
+ await expect(page.locator('#peek-body .chat-empty',{hasText:'Could not load the chat'})).toHaveCount(0);
+ console.log('[CHAT-RELOADS] '+chatLoads);
+ }finally{releaseStream();await cleanup('remove temp folder',()=>rm(dir,{recursive:true,force:true}),info);}
 });

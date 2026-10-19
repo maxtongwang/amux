@@ -1,3 +1,5 @@
+// chat-read-aloud.spec — Read aloud beside Copy; the fixture conversation is served through the app's own chat
+// endpoints, so the peek poller's reloads re-render the same replies instead of a 404 (refs e2e control 7ca1c0d3).
 import {test,expect} from './fixtures';
 import {cleanup} from './teardown';
 
@@ -13,6 +15,11 @@ function silentWav(seconds:number){
  return 'data:audio/wav;base64,'+b.toString('base64');
 }
 const LONG=silentWav(30),SHORT=silentWav(1.2);
+// Served by the stubbed /api/sessions/<name>/chat, never written into _chat
+// by hand: the peek poller and the chat watchdog reload that endpoint on their
+// own schedule, and a reload of the real (absent) session replaced the injected
+// replies with "Could not load the chat: HTTP 404" mid-test, detaching the
+// buttons being measured (3 of 40 control runs; offsetHeight 0, 0 metas).
 const MSGS=[
  {role:'user',text:'Read me something',turn_id:'t1',ts:1760000000},
  {role:'assistant',text:'First **bold** reply.\n\n```js\nconst secret = 1;\n```\n\nAfter the code.',turn_id:'t1',ts:1760000001,duration_ms:2300,usage:{output_tokens:12}},
@@ -25,6 +32,11 @@ test(`Read aloud sits beside Copy and speaks one reply at a time (${variant.name
  const beacons:any[]=[];
  page.on('request',r=>{if(r.url().endsWith('/api/client-debug')&&r.method()==='POST'){try{const x=r.postDataJSON();if(x.kind==='chat-read-aloud')beacons.push(x);}catch{}}});
  await page.route(/\/api\/sessions(?:\?.*)?$/,r=>r.fulfill({json:[{name:'chat-ra-fixture',provider:'claude',chat_companion:true,running:false,dir:'/tmp'}]}));
+ let chat=[...MSGS],chatLoads=0,releaseStream=()=>{};
+ const streamHeld=new Promise<void>(r=>{releaseStream=r;});
+ await page.route(/\/api\/sessions\/[^/?]+\/chat(?:\?.*)?$/,r=>{chatLoads++;return r.fulfill({json:{messages:chat,cursor:'e2e:1',busy:false,queued:0}});});
+ // An open, silent stream: the chat counts as connected (no "Stream disconnected").
+ await page.route(/\/api\/sessions\/[^/?]+\/chat\/stream/,async r=>{await streamHeld;await r.abort().catch(()=>{});});
  await page.route(/\/api\/tts$/,async r=>{
   tts.push(r.request().postDataJSON());
   if(mode==='fail')return r.fulfill({status:503,json:{error:'No TTS engine: install piper or enable say'}});
@@ -39,20 +51,21 @@ test(`Read aloud sits beside Copy and speaks one reply at a time (${variant.name
   }else await page.goto('/?peekEmbed=chat-ra-fixture&peekTab=chat'+variant.q);
   await expect(page.locator('#peek-overlay')).toBeVisible();
   await expect.poll(()=>page.evaluate(()=>typeof (window as any)._chatReadAloud)).toBe('function');
-  const render=(extra:any[]=[])=>page.evaluate(({msgs})=>{
-   const w=window as any;w._chatUnmount();_chat.name=(typeof w._peekChatTarget==='function'&&w._peekChatTarget())||'chat-ra-fixture@chat';_chat.messages=msgs;_chat.streaming=null;
-   document.getElementById('peek-body')!.classList.add('peek-chat');w._chatRender();
-  },{msgs:[...MSGS,...extra]});
-  await render();
+  // The app mounts the chat itself and loads the fixture from the stub; a new
+  // turn is the same endpoint answering with one more reply, loaded the way
+  // the app loads it.
+  const render=async(extra:any[]=[])=>{chat=[...MSGS,...extra];await page.evaluate(()=>(window as any)._chatLoad(_chat.name));};
 
   const metas=page.locator('.chat-msg.chat-assistant .chat-meta');
   await expect(metas).toHaveCount(2);
   const read=page.locator('.chat-read-btn');
   await expect(read).toHaveCount(2);
   // Directly after Copy, on every reply.
-  for(let i=0;i<2;i++){
-   expect(await metas.nth(i).evaluate(m=>{const b=m.querySelector('.chat-read-btn');return b?.previousElementSibling?.classList.contains('chat-copy-btn')&&b.previousElementSibling.textContent;})).toBe('Copy');
-  }
+  // Read in one in-page pass: a reload between resolving a node and reading
+  // it would measure a detached copy.
+  await expect.poll(()=>page.evaluate(()=>Array.from(document.querySelectorAll('.chat-msg.chat-assistant .chat-meta')).map(m=>{
+   const b=m.querySelector('.chat-read-btn');return b?.previousElementSibling?.classList.contains('chat-copy-btn')?b.previousElementSibling.textContent:null;
+  }))).toEqual(['Copy','Copy']);
   await expect(read.nth(0)).toHaveText('Read aloud');
 
   // Click: the existing /api/tts path gets the reply's plain text (code skipped).
@@ -116,15 +129,22 @@ test(`Read aloud sits beside Copy and speaks one reply at a time (${variant.name
   // because the embedded peek (body.peek-embed) scales its whole page by 0.8
   // on purpose; that zoom is the host layout's, not this button's.
   if(vw<=600){
-   for(const b of [read.nth(0),page.locator('.chat-copy-btn:not(.chat-read-btn)').first()]){
-    const sz=await b.evaluate(el=>({h:(el as HTMLElement).offsetHeight,w:(el as HTMLElement).offsetWidth}));
-    expect(sz.h).toBeGreaterThanOrEqual(44);expect(sz.w).toBeGreaterThanOrEqual(44);
-   }
+   // The smallest side of Read aloud and of Copy; 0 when either is missing.
+   await expect.poll(()=>page.evaluate(()=>Math.min(...[document.querySelector('.chat-read-btn'),document.querySelector('.chat-copy-btn:not(.chat-read-btn)')]
+    .map(el=>el?Math.min((el as HTMLElement).offsetHeight,(el as HTMLElement).offsetWidth):0))),{message:'Read aloud and Copy are 44 CSS px touch targets'})
+    .toBeGreaterThanOrEqual(44);
   }
   expect(await page.locator('#peek-body').evaluate(el=>el.scrollWidth-el.clientWidth)).toBeLessThanOrEqual(1);
-  for(let i=0;i<3;i++){await expect(read.nth(i)).toBeVisible();const right=await read.nth(i).evaluate(el=>{const r=el.getBoundingClientRect();return r.x+r.width;});expect(right).toBeLessThanOrEqual(vw+1);}
+  // Three laid-out buttons, the rightmost edge inside the viewport.
+  await expect.poll(()=>page.evaluate(vw=>{const r=Array.from(document.querySelectorAll('.chat-read-btn')).map(el=>el.getBoundingClientRect()).filter(b=>b.width>0&&b.height>0);
+   return {shown:r.length,inside:r.every(b=>b.x+b.width<=vw+1)};},vw),{message:'every Read aloud is visible inside the viewport'}).toEqual({shown:3,inside:true});
+  // Signal: the stubbed endpoint answered every reload, so the chat never fell
+  // back to the load-failure banner; the reload count shows how often the app
+  // re-fetched under the test.
+  await expect(page.locator('#peek-body .chat-empty',{hasText:'Could not load the chat'})).toHaveCount(0);
+  console.log('[CHAT-RELOADS] '+chatLoads);
   // Evidence only. A page shot: the chat log can re-render between frames, and an element shot then fails as detached.
   await page.screenshot({path:info.outputPath('chat-read-aloud.png')});
- }finally{await cleanup('stop playback',()=>page.evaluate(()=>{try{eval('_ttsCancel()');}catch{}}),info);}
+ }finally{releaseStream();await cleanup('stop playback',()=>page.evaluate(()=>{try{eval('_ttsCancel()');}catch{}}),info);}
 });
 }
