@@ -84,6 +84,40 @@ CC_HOME="${CC_HOME:-$HOME/.amux}"
 CC_SESSIONS="$CC_HOME/sessions"
 CC_DEFAULTS="$CC_HOME/defaults.env"
 
+# Under amux-isolated (AMUX_ISOLATED_RUN=1) this CLI never talks to the live
+# server. The wrapper points AMUX_API/AMUX_URL at a dead port, but a test that
+# unsets them fell back to the built-in https://localhost:8824, and the stale-URL
+# heal below rewrote the dead port to endpoint.json's canonical (live) URL. On
+# 2026-10-19 that sent a real `start` request to the live server from a test.
+# So: an unset or live endpoint becomes the dead one, endpoint.json is never
+# allowed to name a live one, and each refusal is logged.
+AMUX_ISOLATED_DEAD_URL="http://127.0.0.1:9"
+_amux_is_live_endpoint() { # url -> 0 when it names this host's live amux ports
+  case "${1%/}" in
+    http://localhost:8824*|https://localhost:8824*|http://127.0.0.1:8824*|https://127.0.0.1:8824*|\
+    http://\[::1\]:8824*|https://\[::1\]:8824*|\
+    http://localhost:8822*|https://localhost:8822*|http://127.0.0.1:8822*|https://127.0.0.1:8822*) return 0 ;;
+  esac
+  return 1
+}
+_amux_isolated_refused() { # var from reason
+  printf '[amux] verdict=isolated_live_endpoint_refused var=%s from=%s reason=%s to=%s measured=true n_considered=1\n' \
+    "$1" "${2:-<unset>}" "$3" "$AMUX_ISOLATED_DEAD_URL" >&2
+}
+_amux_isolated_guard() {
+  [ "${AMUX_ISOLATED_RUN:-}" = 1 ] || return 0
+  local name v
+  for name in AMUX_API AMUX_URL; do
+    v="${!name:-}"
+    if [ -z "$v" ]; then _amux_isolated_refused "$name" "" unset_would_use_builtin
+    elif _amux_is_live_endpoint "$v"; then _amux_isolated_refused "$name" "$v" live_endpoint
+    else continue
+    fi
+    printf -v "$name" '%s' "$AMUX_ISOLATED_DEAD_URL"; export "${name?}"
+  done
+}
+_amux_isolated_guard
+
 # A localhost AMUX_API or AMUX_URL on a port that endpoint.json does not name is
 # stale: the server rewrites endpoint.json on every boot, while a lane's env is
 # fixed for its life. On 2026-10-05 a reboot raced two servers; the one on the
@@ -98,6 +132,10 @@ _amux_heal_url() {
   [ -r "$ep" ] || return 0
   c=$(sed -n 's/.*"canonical_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ep" | head -1)
   [ -n "$c" ] || return 0
+  if [ "${AMUX_ISOLATED_RUN:-}" = 1 ] && _amux_is_live_endpoint "$c"; then
+    _amux_isolated_refused endpoint.json "$c" heal_to_live_endpoint
+    return 0
+  fi
   for name in AMUX_API AMUX_URL; do
     v="${!name:-}"
     [ -n "$v" ] || continue
@@ -7112,6 +7150,11 @@ cmd_url() {
   # 3. Unconditional literal — a conditional fallback is not a fallback: it would
   #    remove the only working candidate exactly when file+env both fail.
   [ -z "$resolved" ] && { resolved="$literal"; src="literal"; }
+
+  if [ "${AMUX_ISOLATED_RUN:-}" = 1 ] && _amux_is_live_endpoint "$resolved"; then
+    _amux_isolated_refused "url:$src" "$resolved" live_endpoint
+    resolved="$AMUX_ISOLATED_DEAD_URL"; src="isolated"
+  fi
 
   printf '%s\n' "$resolved"
 

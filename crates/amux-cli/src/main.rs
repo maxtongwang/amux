@@ -294,12 +294,55 @@ fn restore_default_sigpipe() {}
 const DEFAULT_CLIENT_URL: &str = "https://localhost:8824";
 
 fn resolve_url(explicit: Option<String>) -> String {
-    [explicit, std::env::var("AMUX_URL").ok()]
+    let isolated = std::env::var("AMUX_ISOLATED_RUN").is_ok_and(|v| v == "1");
+    let (url, refusal) = resolve_url_from(explicit, std::env::var("AMUX_URL").ok(), isolated);
+    if let Some(reason) = refusal {
+        eprintln!(
+            "[amux-rs] verdict=isolated_live_endpoint_refused reason={reason} \
+             to={ISOLATED_DEAD_URL} measured=true n_considered=1"
+        );
+    }
+    url
+}
+
+/// Under amux-isolated (`AMUX_ISOLATED_RUN=1`) a test must never reach the
+/// live server: the built-in default and any URL naming this host's live
+/// ports resolve to a dead loopback port instead, with the reason returned
+/// for logging. Same rule as the Bash CLI's `_amux_isolated_guard`.
+const ISOLATED_DEAD_URL: &str = "http://127.0.0.1:9";
+
+fn resolve_url_from(
+    explicit: Option<String>,
+    env_url: Option<String>,
+    isolated: bool,
+) -> (String, Option<&'static str>) {
+    let chosen = [explicit, env_url]
         .into_iter()
         .flatten()
         .map(|u| u.trim().trim_end_matches('/').to_string())
-        .find(|u| !u.is_empty())
-        .unwrap_or_else(|| DEFAULT_CLIENT_URL.to_string())
+        .find(|u| !u.is_empty());
+    match chosen {
+        None if isolated => (ISOLATED_DEAD_URL.to_string(), Some("unset_would_use_builtin")),
+        Some(u) if isolated && is_live_endpoint(&u) => {
+            (ISOLATED_DEAD_URL.to_string(), Some("live_endpoint"))
+        }
+        Some(u) => (u, None),
+        None => (DEFAULT_CLIENT_URL.to_string(), None),
+    }
+}
+
+/// Loopback URL on the live (8824) or retired (8822) amux port.
+fn is_live_endpoint(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let authority = rest.split('/').next().unwrap_or("");
+    ["localhost", "127.0.0.1", "[::1]"].iter().any(|host| {
+        ["8824", "8822"]
+            .iter()
+            .any(|port| authority == format!("{host}:{port}"))
+    })
 }
 
 fn main() {
@@ -905,4 +948,42 @@ fn why(
         "partial" => 5,
         _ => 6,
     })
+}
+
+#[cfg(test)]
+mod isolated_endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn isolated_run_refuses_the_builtin_default() {
+        let (url, why) = resolve_url_from(None, None, true);
+        assert_eq!(url, ISOLATED_DEAD_URL);
+        assert_eq!(why, Some("unset_would_use_builtin"));
+    }
+
+    #[test]
+    fn isolated_run_refuses_live_and_retired_loopback_ports() {
+        for live in [
+            "https://localhost:8824",
+            "http://127.0.0.1:8824/",
+            "https://[::1]:8824",
+            "https://localhost:8822",
+        ] {
+            let (url, why) = resolve_url_from(None, Some(live.into()), true);
+            assert_eq!((url.as_str(), why), (ISOLATED_DEAD_URL, Some("live_endpoint")), "{live}");
+            let (url, _) = resolve_url_from(Some(live.into()), None, true);
+            assert_eq!(url, ISOLATED_DEAD_URL, "explicit {live}");
+        }
+    }
+
+    #[test]
+    fn isolated_run_keeps_a_test_server_and_normal_runs_are_unchanged() {
+        let test_srv = "http://127.0.0.1:41234";
+        assert_eq!(resolve_url_from(None, Some(test_srv.into()), true), (test_srv.to_string(), None));
+        assert_eq!(resolve_url_from(None, None, false), (DEFAULT_CLIENT_URL.to_string(), None));
+        assert_eq!(
+            resolve_url_from(None, Some("https://localhost:8824".into()), false),
+            ("https://localhost:8824".to_string(), None)
+        );
+    }
 }

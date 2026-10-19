@@ -26,7 +26,10 @@ check() { # label expected actual
 TMP=$(mktemp -d); mkdir -p "$TMP/.amux"
 # Quiet + isolate the stale-URL warning (it probes a dead port for 2s otherwise).
 export AMUX_SESSION="urltest"; export TMPDIR="$TMP"; touch "$TMP/amux-url-warn-urltest"
-run() { CC_HOME="$TMP/.amux" HOME="$TMP" AMUX_URL="$1" "$AMUX_BIN" url 2>/dev/null; }
+# These cases pin the NORMAL resolver and send no request (`url` without
+# --verify), so drop amux-isolated's flag; test-cli-isolated-endpoint.sh owns
+# the isolated rule.
+run() { env -u AMUX_ISOLATED_RUN CC_HOME="$TMP/.amux" HOME="$TMP" AMUX_URL="$1" "$AMUX_BIN" url 2>/dev/null; }
 write_ep() { printf '{"canonical_port":%s,"canonical_url":"%s","retired_ports":[8822]}\n' "$2" "$1" > "$TMP/.amux/endpoint.json"; }
 
 # (a) file MISSING + env=retired  -> the :8824 literal (unconditional fallback).
