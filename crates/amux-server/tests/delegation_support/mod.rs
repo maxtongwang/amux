@@ -55,7 +55,7 @@ pub const LOG_REL: &str = "audit/delegated-changes.jsonl";
 pub const ATTRIBUTION_COLUMN: &str = "process_origin";
 
 /// Every max_ref refusal code the spec defines.
-pub const MAX_REF_CODES: [&str; 9] = [
+pub const MAX_REF_CODES: [&str; 17] = [
     "max_ref_missing",
     "max_ref_no_such_row",
     "max_ref_not_human_typed",
@@ -65,6 +65,14 @@ pub const MAX_REF_CODES: [&str; 9] = [
     "max_ref_does_not_name_target",
     "max_ref_does_not_name_setting",
     "max_ref_own_lane",
+    "cite_missing",
+    "cite_pair_required",
+    "cite_ask_not_found",
+    "cite_ask_not_from_actor",
+    "cite_ask_missing_target",
+    "cite_ask_missing_setting",
+    "cite_reply_not_first",
+    "cite_reply_outside_window",
 ];
 
 /// Who a request speaks for.
@@ -202,9 +210,9 @@ pub fn assert_grant_pending(st: StatusCode, v: &Value, ctx: &str) -> String {
     code
 }
 
-/// `body` plus a citation of Messages row `row` (cite mode, the default).
-pub fn cited(mut body: Value, row: i64) -> Value {
-    body["cite"] = json!({"row_id": row});
+/// `body` plus a citation pair from [`Env::cite`] (cite mode, the default).
+pub fn cited(mut body: Value, cite: Value) -> Value {
+    body["cite"] = cite;
     body
 }
 
@@ -336,6 +344,15 @@ impl Env {
             })
             .unwrap();
         id.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A citation pair (review B4 ruling): mrpopo's `ask` sent into Max's
+    /// pane lane (a peer send's row: type 'session', origin mrpopo), then Max's
+    /// own typed reply there. The ask must name the target and the setting.
+    pub fn cite(&self, ask: &str) -> Value {
+        let ask = self.seed_row(MAX_PANE, ask, "session", MRPOPO, Some("direct"), now_s() - 60.0);
+        let reply = self.seed_pane_prompt(MAX_PANE, "yes, go ahead", now_s() - 30.0);
+        json!({"ask_row_id": ask, "reply_row_id": reply})
     }
 
     /// A prompt typed into `session`'s pane, in exactly the shape

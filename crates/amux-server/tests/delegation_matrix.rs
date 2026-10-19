@@ -480,3 +480,49 @@ async fn secrets_are_never_delegable() {
     let snap = e.snapshot();
     assert!(snap.values().all(|text| !text.contains("review-secret-value")), "a secret value was written: {snap:?}");
 }
+
+/// Review B1: `tags` beside another key is no longer a tag change that lets
+/// the other key through. On BOTH config routes a lead's mixed body is
+/// refused with nothing written, each board-automation field alone is
+/// refused, mrpopo's cited mixed body is judged key by key, and the owner's
+/// mixed body is two settings.
+#[tokio::test]
+async fn a_mixed_config_body_is_judged_key_by_key_on_both_routes() {
+    let e = setup().await;
+    let board = ["auto_drain_backlog", "board_auto_pickup", "board_auto_continue", "board_standing_orders", "board_decompose", "board_force_adherence"];
+    let mut extras: Vec<&str> = vec!["toggle_auto_continue", "toggle_yolo"];
+    extras.extend(board);
+    let mut tried = 0;
+    for route in [format!("/api/sessions/{DEV_A}/config"), format!("/api/workers/{DEV_A}/config")] {
+        for k in &extras {
+            for body in [json!({"tags": "dev", *k: true}), json!({"rename": "review-dev-a2", *k: true})] {
+                let before = e.snapshot();
+                let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &route, Some(body.clone())).await;
+                assert_code(st, &v, "peer_config_owner_only", &format!("lead {route} {body}"));
+                assert_eq!(before, e.snapshot(), "{route} {body}: nothing written");
+                tried += 1;
+            }
+        }
+        for k in board {
+            let before = e.snapshot();
+            let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &route, Some(json!({k: true}))).await;
+            assert_code(st, &v, "peer_config_owner_only", &format!("lead {route} {k} alone"));
+            assert_eq!(before, e.snapshot(), "{route} {k}: nothing written");
+        }
+    }
+    assert_eq!(tried, 32, "every mixed body was sent on both routes");
+    assert!(!e.env_text(DEV_A).contains("dangerously"), "no YOLO: {}", e.env_text(DEV_A));
+    // mrpopo with a valid citation for the tag change: the bundled key is
+    // judged too, so the membership row cannot carry auto-continue.
+    let before = e.snapshot();
+    let row = e.cite(&format!("Max, may I add {DEV_A} to ops?"));
+    let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &format!("/api/sessions/{DEV_A}/config"),
+        Some(json!({"tags": "dev,ops", "toggle_auto_continue": true, "cite": row}))).await;
+    assert_code(st, &v, "worker_group_membership_refused", "mrpopo's cited mixed body");
+    assert_eq!(before, e.snapshot(), "nothing written");
+    assert_eq!(e.latest_grant(), "", "no grant");
+    // The owner: a mixed body is two settings, refused as malformed.
+    let (st, v) = e.call(Who::Owner, "PATCH", &format!("/api/sessions/{DEV_A}/config"), Some(json!({"tags": "dev", "toggle_auto_continue": true}))).await;
+    assert_eq!((st.as_u16(), v["code"].clone()), (400, json!("one_setting_per_patch")), "{v}");
+    assert_eq!(before, e.snapshot(), "nothing written");
+}

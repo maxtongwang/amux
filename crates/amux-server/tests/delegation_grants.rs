@@ -1,9 +1,10 @@
 //! Structured grants (maxtongwang/ai-config#160), HTTP level.
 //!
-//! CITE MODE (default): mrpopo's widening change cites one of Max's typed
-//! rows in another lane and applies at once, recorded as a grant: logged, fed
-//! to the leads, undoable in one step. Own-lane, delivered, stale or missing
-//! citations are refused.
+//! CITE MODE (default): mrpopo's widening change cites a PAIR (review B4):
+//! its own ask into a lane, naming the target and the setting, and Max's
+//! first typed reply there within 2 hours. It applies at once, recorded as a
+//! grant: logged, fed to the leads, undoable in one step. Own-lane, delivered,
+//! stale, unrelated or single-row citations are refused.
 //! PASSKEY MODE (`AMUX_DELEGATION_APPROVAL=passkey`, owner-only): the change is
 //! a pending grant; only the approval proof (a non-local Remote owner) applies
 //! it. In-process requests carry no Remote verdict, so the approving path is
@@ -29,7 +30,7 @@ fn yolo_on(e: &Env) -> bool {
 async fn cite_mode_applies_at_once_logs_feeds_and_undoes_exactly() {
     let e = setup().await;
     let before = e.config_snapshot();
-    let row = e.seed_pane_prompt(MAX_PANE, &format!("turn on yolo for {DEV_A}"), now_s() - 30.0);
+    let row = e.cite(&format!("Max, may I turn on yolo for {DEV_A}?"));
     let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_A), Some(cited(json!({"toggle_yolo": true, "why": "Max asked"}), row))).await;
     assert_allowed(st, &v, "cited change applies");
     let code = e.latest_grant();
@@ -45,7 +46,8 @@ async fn cite_mode_applies_at_once_logs_feeds_and_undoes_exactly() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    assert!(fed, "the leads feed carries the sentence and the cited excerpt: {:?}", e.queued_for(DEV_LEAD));
+    assert!(fed, "the leads feed carries the sentence and the ask: {:?}", e.queued_for(DEV_LEAD));
+    assert!(e.queued_for(DEV_LEAD).iter().any(|t| t.contains("Max replied: \"yes, go ahead\"")), "and Max's reply: {:?}", e.queued_for(DEV_LEAD));
     // Undo: a plain worker may not; the owner may; the state is restored exactly.
     let (st, v) = e.call(Who::Worker(DEV_A), "POST", &format!("/api/delegation/grants/{code}/undo"), None).await;
     assert_refused(st, &v, "a worker undoing");
@@ -60,12 +62,22 @@ async fn cite_mode_applies_at_once_logs_feeds_and_undoes_exactly() {
 async fn cite_mode_refuses_own_lane_delivered_stale_and_missing_citations() {
     let e = setup().await;
     let now = now_s();
-    let own = e.seed_pane_prompt(MRPOPO, &format!("turn on yolo for {DEV_A}"), now - 30.0);
-    let delivered = e.seed_pane_prompt(MAX_PANE, &format!("[amux-origin: {DEV_LEAD}] turn on yolo for {DEV_A}"), now - 30.0);
-    let stale = e.seed_pane_prompt(MAX_PANE, &format!("turn on yolo for {DEV_A}"), now - 90_000.0);
+    let ask = format!("Max, may I turn on yolo for {DEV_A}?");
+    let pair = |lane: &str, reply: &str, at: f64| {
+        let a = e.seed_row(lane, &ask, "session", MRPOPO, Some("direct"), at - 30.0);
+        json!({"ask_row_id": a, "reply_row_id": e.seed_pane_prompt(lane, reply, at)})
+    };
+    let own = pair(MRPOPO, "yes", now - 30.0);
+    let delivered = pair(DEV_B, &format!("[amux-origin: {DEV_LEAD}] yes"), now - 30.0);
+    let stale = pair(OPS_A, "yes", now - 90_000.0);
+    let lunch = e.seed_pane_prompt(MAX_PANE, "what time is lunch?", now - 20.0);
+    let a = e.seed_row(MAX_PANE, "lunch at noon?", "session", MRPOPO, Some("direct"), now - 15.0);
+    let unrelated = json!({"ask_row_id": a, "reply_row_id": e.seed_pane_prompt(MAX_PANE, "ok", now - 10.0)});
     let before = e.snapshot();
     for (body, code) in [
         (json!({"toggle_yolo": true}), "cite_missing"),
+        (json!({"toggle_yolo": true, "cite": {"row_id": lunch}}), "cite_pair_required"),
+        (cited(json!({"toggle_yolo": true}), unrelated), "cite_ask_missing_target"),
         (cited(json!({"toggle_yolo": true}), own), "max_ref_own_lane"),
         (cited(json!({"toggle_yolo": true}), delivered), "max_ref_not_human_typed"),
         (cited(json!({"toggle_yolo": true}), stale), "max_ref_stale"),
@@ -80,9 +92,9 @@ async fn cite_mode_refuses_own_lane_delivered_stale_and_missing_citations() {
 #[tokio::test]
 async fn a_lead_or_worker_citing_max_gets_nothing() {
     let e = setup().await;
-    let row = e.seed_pane_prompt(MAX_PANE, &format!("turn on yolo for {DEV_A}"), now_s() - 30.0);
+    let row = e.cite(&format!("Max, may I turn on yolo for {DEV_A}?"));
     for who in [DEV_LEAD, DEV_A, OPS_A] {
-        let (st, v) = e.call(Who::Worker(who), "PATCH", &cfg(DEV_A), Some(cited(json!({"toggle_yolo": true}), row))).await;
+        let (st, v) = e.call(Who::Worker(who), "PATCH", &cfg(DEV_A), Some(cited(json!({"toggle_yolo": true}), row.clone()))).await;
         assert_refused(st, &v, &format!("{who} citing Max"));
     }
     assert!(!yolo_on(&e));
@@ -92,7 +104,7 @@ async fn a_lead_or_worker_citing_max_gets_nothing() {
 async fn passkey_mode_creates_pending_grants_that_local_requests_cannot_approve() {
     let e = setup().await;
     e.set_mode("passkey");
-    let row = e.seed_pane_prompt(MAX_PANE, &format!("turn on yolo for {DEV_A}"), now_s() - 30.0);
+    let row = e.cite(&format!("Max, may I turn on yolo for {DEV_A}?"));
     let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_A), Some(cited(json!({"toggle_yolo": true}), row))).await;
     let code = assert_grant_pending(st, &v, "passkey mode: pending even with a citation");
     assert!(!yolo_on(&e));
@@ -116,10 +128,10 @@ async fn passkey_mode_creates_pending_grants_that_local_requests_cannot_approve(
 #[tokio::test]
 async fn the_mode_setting_is_owner_only() {
     let e = setup().await;
-    let row = e.seed_pane_prompt(MAX_PANE, "switch delegation to cite mode", now_s() - 30.0);
+    let row = e.cite("Max, may I switch the delegation approval mode to cite globally?");
     for who in [MRPOPO, DEV_LEAD, DEV_A] {
         for (level, name) in [("global", ""), ("worker", DEV_A)] {
-            let body = cited(scope_body(level, name, "env", json!({"AMUX_DELEGATION_APPROVAL": "cite"})), row);
+            let body = cited(scope_body(level, name, "env", json!({"AMUX_DELEGATION_APPROVAL": "cite"})), row.clone());
             let (st, v) = e.call(Who::Worker(who), "PUT", "/api/scope", Some(body)).await;
             assert_refused(st, &v, &format!("{who} switching the mode at {level}"));
         }
@@ -137,8 +149,9 @@ async fn whoami_answers_in_process() {
     assert_eq!(v["mode"], json!("cite"));
 }
 
-/// ai-config #175: the owner's alert channels are owner-only, or mrpopo
-/// citing Max; a lead or a worker is refused.
+/// ai-config #175: the owner's alert channels are owner-only. A lead or a
+/// worker is refused, and so is mrpopo since review B3: an instance-wide
+/// setting is the global layer, which includes mrpopo itself.
 #[tokio::test]
 async fn alerts_config_goes_through_the_table() {
     let e = setup().await;
@@ -147,11 +160,13 @@ async fn alerts_config_goes_through_the_table() {
         let (st, v) = e.call(Who::Worker(who), "PATCH", "/api/alert/config", Some(body.clone())).await;
         assert_refused(st, &v, &format!("{who} sets alerts config"));
     }
-    let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", "/api/alert/config", Some(body.clone())).await;
-    assert_code(st, &v, "cite_missing", "mrpopo without a citation");
-    let row = e.seed_pane_prompt(MAX_PANE, "set my alert phone to +15550100", now_s() - 30.0);
-    let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", "/api/alert/config", Some(cited(body.clone(), row))).await;
-    assert_allowed(st, &v, "mrpopo citing Max");
+    let row = e.cite("Max, may I set your alert phone for the fleet to +15550100?");
+    let before = e.snapshot();
+    for b in [body.clone(), cited(body.clone(), row)] {
+        let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", "/api/alert/config", Some(b)).await;
+        assert_code(st, &v, "held_for_max", "mrpopo, an instance-wide setting");
+    }
+    assert_eq!(before, e.snapshot(), "nothing written");
     let (st, v) = e.call(Who::Owner, "PATCH", "/api/alert/config", Some(body)).await;
     assert_allowed(st, &v, "owner sets alerts config");
 }

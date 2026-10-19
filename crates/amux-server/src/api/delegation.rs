@@ -56,11 +56,15 @@ pub const HELD_FOR_MAX: &[(&str, &str)] = &[
     ("env:AMUX_DELEGATION_APPROVAL", "the delegation approval mode (cite or passkey): who may approve a widening change is the owner's call"),
     ("name:mrpopo", "the owner agent's identity: a worker given this name would act as mrpopo"),
     ("name:owner", "reads as the owner in every log and message"),
-    ("mrpopo:own-config", "mrpopo widening itself would need no one else's act"),
+    ("mrpopo:own-config", "a worker widening itself, directly or through a group or global layer it reads, would need no one else's act"),
 ];
 
 fn held_items(prefix: &str) -> impl Iterator<Item = &'static str> + '_ {
     HELD_FOR_MAX.iter().filter_map(move |(h, _)| h.strip_prefix(prefix))
+}
+
+fn held_reason(item: &str) -> &'static str {
+    HELD_FOR_MAX.iter().find(|(h, _)| *h == item).map(|(_, r)| *r).unwrap_or("")
 }
 
 fn held_env(key: &str) -> bool {
@@ -207,6 +211,88 @@ pub const GRANT_ROWS: &[&str] = &[
     "settings:alerts",
 ];
 
+/// The plain words that name each grant row in an ask (review B4 ruling: the
+/// ask names the setting "in plain words"). An ask names a setting when it
+/// contains any one of its words, or the key itself (`CC_FLAGS`,
+/// `toggle_yolo`). `every_grant_row_has_plain_words` keeps this exhaustive.
+pub const SETTING_WORDS: &[(&str, &[&str])] = &[
+    ("toggle_yolo", &["yolo", "skip permissions"]),
+    ("env:CC_FLAGS", &["yolo", "flags", "skip permissions"]),
+    ("create:yolo", &["yolo"]),
+    ("create:flags", &["flags", "yolo"]),
+    ("external_email_allowed", &["external email"]),
+    ("env:AMUX_EMAIL_EXTERNAL_ALLOW", &["external email"]),
+    ("isolated", &["isolated", "isolation", "isolate"]),
+    ("env:CC_ISOLATED", &["isolated", "isolation", "isolate"]),
+    ("create:isolated", &["isolated", "isolation"]),
+    ("toggle_auto_continue", &["auto continue", "autocontinue"]),
+    ("env:CC_AUTO_CONTINUE", &["auto continue", "autocontinue"]),
+    ("env:AMUX_NEEDS_INPUT_AUTO*", &["auto approve", "auto approval"]),
+    ("env:AMUX_BROWSER_PROFILES_*", &["browser profile"]),
+    ("env:AMUX_APPROVAL_TYPES", &["approval type"]),
+    ("scope:gates", &["gate"]),
+    ("scope:connectors", &["connector"]),
+    ("row:permissions", &["permission"]),
+    ("env:CC_ORCHESTRATOR", &["lead", "orchestrator"]),
+    ("send_allow", &["routing", "send allow", "messaging"]),
+    ("spans_groups", &["routing", "spans groups", "cross group"]),
+    ("env:CC_SEND_ALLOW", &["routing", "send allow", "messaging"]),
+    ("settings:commit-guard", &["commit guard"]),
+    ("settings:task-guard", &["task guard"]),
+    ("settings:default-model", &["default model"]),
+    ("instance:apply", &["config apply", "apply config", "instance config", "column", "skin"]),
+    ("worktree_verify", &["verify command", "verify"]),
+    ("env:CC_WORKTREE_VERIFY", &["verify command", "verify"]),
+    ("env:CC_VERIFY", &["verify command", "verify"]),
+    ("env:CC_DEPLOY_CHECK", &["deploy check"]),
+    ("env:CC_WORKTREE_AUTO_MERGE", &["auto merge"]),
+    ("env:AMUX_YOLO_AUTO_YES", &["auto yes"]),
+    ("env:CC_PROJECT_LEAD", &["project lead"]),
+    ("env:CC_RECEIVE_DENY", &["receive deny", "block messages"]),
+    ("create:creator", &["creator"]),
+    ("settings:alerts", &["alert"]),
+];
+
+/// The spellings that name the global layer or the whole instance.
+const GLOBAL_WORDS: &[&str] = &["global", "fleet", "every worker", "all workers", "everyone", "instance"];
+
+/// The words naming one setting key: its row's plain words and the key
+/// itself without its layer and kind prefixes.
+fn setting_words(key: &str) -> Vec<String> {
+    let mut k = key;
+    while let Some(rest) = k.strip_prefix("group:").or_else(|| k.strip_prefix("global:")) {
+        k = rest;
+    }
+    let mut words: Vec<String> = SETTING_WORDS.iter()
+        .filter(|(row, _)| match row.strip_suffix('*') { Some(p) => k.starts_with(p), None => *row == k })
+        .flat_map(|(_, w)| w.iter().map(|x| x.to_string())).collect();
+    let bare = ["env:", "scope:", "settings:", "row:", "create:", "instance:"].iter().find_map(|p| k.strip_prefix(p)).unwrap_or(k);
+    words.push(if k == "instance:apply" { "instance apply".into() } else { bare.to_string() });
+    words
+}
+
+/// What a citation's ask must name for this change (review B4): the target
+/// and every setting, each in any one of its spellings.
+pub(crate) fn cite_terms(target: &Target, action: &Action) -> super::max_ref::CiteTerms {
+    let target_words = match target {
+        Target::Worker(w) => vec![w.clone()],
+        Target::Group(g) => vec![g.clone()],
+        Target::NewWorker => vec!["new worker".into()],
+        Target::Fleet | Target::Settings(_) => GLOBAL_WORDS.iter().map(|w| w.to_string()).collect(),
+    };
+    let settings: Vec<Vec<String>> = match action {
+        Action::SetConfig { keys } => keys.iter().map(|k| setting_words(k)).collect(),
+        Action::SetTags { from, to } => set(from).symmetric_difference(&set(to)).map(|g| vec![g.clone()]).collect(),
+        Action::MakeLead => vec![vec!["lead".into()]],
+        Action::SetGroupRules { .. } => vec![vec!["rule".into()]],
+        Action::SetGroupConfig { .. } => vec![["config", "configuration", "department", "goal", "kpi"].iter().map(|w| w.to_string()).collect()],
+        Action::CreateGroup { .. } => vec![vec!["group".into()]],
+        Action::SetRouting => vec![["routing", "inbound", "cross group"].iter().map(|w| w.to_string()).collect()],
+        other => vec![vec![other.label()]],
+    };
+    super::max_ref::CiteTerms { target: target_words, settings }
+}
+
 /// Env keys a worker may set on itself (H4: an explicit list, not "anything
 /// not privileged"). Display and runtime-choice keys only.
 pub const SELF_ENV_KEYS: &[&str] = &[
@@ -240,6 +326,14 @@ const FIELDS: &[(&str, KeyClass)] = &[
     ("keys", KeyClass::SelfOk),
     ("worker_type", KeyClass::Membership),
     ("tags", KeyClass::Membership),
+    // The board-automation switches (review B1): the owner's, listed so the
+    // config PATCH sweep names them rather than leaving them unclassified.
+    ("auto_drain_backlog", KeyClass::OwnerOnly),
+    ("board_auto_pickup", KeyClass::OwnerOnly),
+    ("board_auto_continue", KeyClass::OwnerOnly),
+    ("board_standing_orders", KeyClass::OwnerOnly),
+    ("board_decompose", KeyClass::OwnerOnly),
+    ("board_force_adherence", KeyClass::OwnerOnly),
     ("scope:memory", KeyClass::SelfOk),
     ("scope:skin", KeyClass::SelfOk),
     ("scope:status_mode", KeyClass::SelfOk),
@@ -338,6 +432,34 @@ pub(crate) struct TargetFacts {
     pub privileged: bool,
     /// The target is the actor itself.
     pub is_actor: bool,
+    /// The change reaches the actor: it targets the actor, or a layer the
+    /// actor reads (a group it is in, the global layer, an instance-wide
+    /// setting). Review B3: a layer write is a write to every worker it
+    /// affects.
+    pub covers_actor: bool,
+}
+
+/// THE self-privilege rule, for a change that reaches its own actor through a
+/// layer (review B3): a worker may change on itself only the SelfOk/LeadOk
+/// settings, so any other setting, a membership change or routing on a layer
+/// that covers the actor is refused as hands-only. Group rules and group
+/// config are the team's text, not authority, and stay with the table.
+fn widens_self(action: &Action) -> Option<String> {
+    let inner = |k: &str| -> String {
+        let mut k = k;
+        while let Some(rest) = k.strip_prefix("group:").or_else(|| k.strip_prefix("global:")) {
+            k = rest;
+        }
+        k.to_string()
+    };
+    match action {
+        Action::SetConfig { keys } => keys.iter().find(|k| !matches!(key_class(&inner(k)), KeyClass::SelfOk | KeyClass::LeadOk)).cloned(),
+        Action::SetTags { .. } => Some("tags".into()),
+        Action::MakeLead => Some("make lead".into()),
+        Action::SetRouting => Some("routing".into()),
+        Action::SetSecret { key } => Some(format!("env:{key}")),
+        _ => None,
+    }
 }
 
 fn membership_denied(what: &str) -> Decision {
@@ -367,6 +489,17 @@ pub(crate) fn decide(class: &Class, action: &Action, t: &TargetFacts) -> Decisio
     if let Action::SetConfig { keys } = action {
         if keys.is_empty() {
             return deny("delegation_not_allowed", "a change that names no setting is not delegable".into());
+        }
+    }
+    // A layer that covers the actor (review B3): its own group, the global
+    // layer, an instance-wide setting. Widening yourself through a layer is
+    // the same act as widening yourself directly. SelfWorker already decides
+    // by this rule, and a plain Worker is refused below.
+    if t.covers_actor && matches!(class, Class::Mrpopo | Class::Lead { .. }) {
+        if let Some(k) = widens_self(action) {
+            return deny("held_for_max", format!(
+                "'{k}' on a layer that includes the caller widens the caller itself (HELD_FOR_MAX: {}); only the owner may change it",
+                held_reason("mrpopo:own-config")));
         }
     }
     match class {
@@ -569,7 +702,14 @@ pub(crate) fn facts(origin: &str, class: &Class, target: &Target, action: &Actio
         _ => (false, false),
     };
     let is_actor = matches!(target, Target::Worker(w) if w == origin);
-    TargetFacts { in_team, privileged, is_actor }
+    let global_key = matches!(action, Action::SetConfig { keys } if keys.iter().any(|k| k.starts_with("global:")));
+    let covers_actor = !origin.is_empty() && (is_actor || global_key || match target {
+        Target::Group(g) => super::session_verbs::lane_groups(origin).contains(&super::session_verbs::norm_label(g)),
+        // The global layer and instance-wide settings reach every worker.
+        Target::Fleet | Target::Settings(_) => true,
+        Target::Worker(_) | Target::NewWorker => false,
+    });
+    TargetFacts { in_team, privileged, is_actor, covers_actor }
 }
 
 /// The request's verified worker identity, with M12 applied: a Chat-tab
@@ -716,11 +856,12 @@ pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, target: &Target, 
                     super::delegation_grants::Mode::Cite => {
                         let cite: Option<super::max_ref::Cite> = body.and_then(|b| b.get("cite")).filter(|c| !c.is_null())
                             .and_then(|c| serde_json::from_value(c.clone()).ok());
-                        let cited = match super::max_ref::cite_row(state, cite.as_ref(), &origin) {
+                        let terms = cite_terms(target, action);
+                        let cited = match super::max_ref::cite_pair(state, cite.as_ref(), &origin, &terms) {
                             Ok(c) => c,
                             Err(r) => return Err(forbid(r.code(), &format!(
-                                "{} needs a citation of Max's own typed row: cite {{row_id}} or {{session, time}} of a row in a lane other than {origin}'s (own lane: only a send from his phone): {}",
-                                action.label(), r.code()))),
+                                "{} needs a citation pair: cite {{ask_row_id, reply_row_id}}. The ask is your message into a session that names the target (one of {:?}) and the setting (one of {:?} for each); the reply is Max's own first typed message in that session after it, within 2 hours: {}",
+                                action.label(), terms.target, terms.settings, r.code()))),
                         };
                         grant = Some(super::delegation_grants::begin_cited(state, &origin, &class.label(), &action.label(), &target.name(), why.clone(), &cited)?);
                         Some(cited.row_id)
@@ -779,18 +920,25 @@ pub(crate) fn changed_only(before: &Value, after: &Value) -> (Value, Value) {
     (Value::Object(ob), Value::Object(oa))
 }
 
-/// The action a config PATCH body asks for. Every named field is classified;
-/// the handler still enforces one setting per PATCH.
+/// The action a config PATCH body asks for. EVERY key is classified (review
+/// B1): `tags` or `rename` is its own action only when the body names nothing
+/// else. Beside any other key the body is a `SetConfig` over all of its keys,
+/// so `decide` judges each one and an unclassified key refuses it. Before
+/// this, `{"tags":"dev","toggle_auto_continue":true}` was judged as a no-op
+/// tag change and the handler then applied the YOLO toggle.
 pub(crate) fn config_action(target: &str, body: &Value) -> Action {
-    if let Some(v) = body.get("tags") {
-        let to = super::session_verbs::tags_of(Some(v)).unwrap_or_else(|_| vec!["!invalid".into()]);
+    let keys: Vec<String> = body.as_object().map(|o| o.keys().filter(|k| !META_FIELDS.contains(&k.as_str())).cloned().collect()).unwrap_or_default();
+    let only = |k: &str| keys.len() == 1 && keys[0] == k;
+    if only("tags") {
+        let to = super::session_verbs::tags_of(body.get("tags")).unwrap_or_else(|_| vec!["!invalid".into()]);
         let from: Vec<String> = super::session_verbs::lane_groups(target).into_iter().collect();
         return Action::SetTags { from, to };
     }
-    if let Some(to) = body.get("rename").and_then(Value::as_str) {
-        return Action::RenameWorker { to: to.trim().to_string() };
+    if only("rename") {
+        if let Some(to) = body.get("rename").and_then(Value::as_str) {
+            return Action::RenameWorker { to: to.trim().to_string() };
+        }
     }
-    let keys: Vec<String> = body.as_object().map(|o| o.keys().filter(|k| !META_FIELDS.contains(&k.as_str())).cloned().collect()).unwrap_or_default();
     Action::SetConfig { keys }
 }
 
@@ -894,10 +1042,12 @@ mod tests {
     fn create(tags: &[&str], settings: &[&str]) -> Action {
         Action::CreateWorker { tags: tags.iter().map(|s| s.to_string()).collect(), settings: settings.iter().map(|s| s.to_string()).collect(), owner_only: None }
     }
-    const TEAM: TargetFacts = TargetFacts { in_team: true, privileged: false, is_actor: false };
-    const PEER_LEAD: TargetFacts = TargetFacts { in_team: true, privileged: true, is_actor: false };
-    const OTHER: TargetFacts = TargetFacts { in_team: false, privileged: false, is_actor: false };
-    const ME: TargetFacts = TargetFacts { in_team: false, privileged: false, is_actor: true };
+    const TEAM: TargetFacts = TargetFacts { in_team: true, privileged: false, is_actor: false, covers_actor: false };
+    const PEER_LEAD: TargetFacts = TargetFacts { in_team: true, privileged: true, is_actor: false, covers_actor: false };
+    const OTHER: TargetFacts = TargetFacts { in_team: false, privileged: false, is_actor: false, covers_actor: false };
+    const ME: TargetFacts = TargetFacts { in_team: false, privileged: false, is_actor: true, covers_actor: true };
+    /// A group or global layer the actor reads.
+    const MY_LAYER: TargetFacts = TargetFacts { in_team: false, privileged: false, is_actor: false, covers_actor: true };
     fn code(d: Decision) -> String {
         match d {
             Decision::Deny { code, .. } => code.into(),
@@ -1093,6 +1243,109 @@ mod tests {
             assert!(FIELDS.iter().any(|(f, _)| *f == k) || GRANT_ROWS.contains(&k),
                 "config PATCH field '{k}' has no delegation row");
         }
+    }
+
+    /// Review B1's sweep, by construction: every key the config PATCH handler
+    /// reads (each `.get("<key>")` in its body and each board-automation
+    /// field) is in the one-setting guard and has a delegation class. Reads
+    /// the shipped handler's source, so a new branch without a row fails.
+    #[test]
+    fn config_patch_ops_cover_every_key_the_handler_reads() {
+        let src = include_str!("session_verbs.rs");
+        let start = src.find("async fn config_patch_with_liveness(").expect("handler");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("handler end")];
+        let get = regex::Regex::new(r#"\.get\(\s*"([a-z][a-z_]*)"\s*\)"#).unwrap();
+        let mut read: BTreeSet<String> = get.captures_iter(body).map(|c| c[1].to_string()).collect();
+        let auto = &body[body.find("let automation = [").expect("automation table")..];
+        let auto = &auto[..auto.find("];").unwrap()];
+        let field = regex::Regex::new(r#"\(\s*"([a-z][a-z_]*)",\s"#).unwrap();
+        let fields: Vec<String> = field.captures_iter(auto).map(|c| c[1].to_string()).collect();
+        assert_eq!(fields.len(), 6, "the six board-automation fields: {fields:?}");
+        read.extend(fields);
+        // Read inside a branch from something other than the body.
+        read.remove("expires_hours");
+        assert!(read.len() >= 30, "the scan found the handler's keys: {read:?}");
+        let ops: BTreeSet<String> = super::super::session_verbs::config_patch_fields_for_delegation().into_iter().map(String::from).collect();
+        let missing: Vec<&String> = read.iter().filter(|k| !ops.contains(*k)).collect();
+        assert!(missing.is_empty(), "keys the handler reads with no one-setting row: {missing:?}");
+        for k in &read {
+            assert!(FIELDS.iter().any(|(f, _)| f == k) || GRANT_ROWS.contains(&k.as_str()), "'{k}' has no delegation class");
+        }
+    }
+
+    /// Review B4: every grant row has plain words an ask can name it by.
+    #[test]
+    fn every_grant_row_has_plain_words() {
+        for row in GRANT_ROWS {
+            assert!(SETTING_WORDS.iter().any(|(r, w)| r == row && !w.is_empty()), "grant row '{row}' has no plain words");
+        }
+        let t = cite_terms(&Target::Group("leads".into()), &cfg(&["group:env:CC_FLAGS"]));
+        assert_eq!(t.target, vec!["leads".to_string()]);
+        assert!(t.settings[0].contains(&"yolo".to_string()) && t.settings[0].contains(&"CC_FLAGS".to_string()));
+        let t = cite_terms(&Target::Worker("review-dev-a".into()), &tags(&["dev"], &["dev", "ops"]));
+        assert_eq!(t.settings, vec![vec!["ops".to_string()]], "a tag change names each changed group");
+    }
+
+    /// Review B1: `tags` (or `rename`) beside any other key is no longer a tag
+    /// change; every key is judged, so the bundled key cannot ride on it.
+    #[test]
+    fn delegation_a_mixed_config_body_is_judged_key_by_key() {
+        let board = ["auto_drain_backlog", "board_auto_pickup", "board_auto_continue", "board_standing_orders", "board_decompose", "board_force_adherence"];
+        let mut extras: Vec<&str> = vec!["toggle_auto_continue", "toggle_yolo", "external_email_allowed", "an_unclassified_key"];
+        extras.extend(board);
+        for extra in extras {
+            for lead_key in ["tags", "rename"] {
+                let body = json!({lead_key: "dev", extra: true});
+                let a = config_action("review-nobody", &body);
+                let Action::SetConfig { keys } = &a else { panic!("{body}: judged as {a:?}, not key by key") };
+                assert_eq!(keys.iter().map(String::as_str).collect::<BTreeSet<_>>(), [lead_key, extra].into_iter().collect(), "{body}");
+                assert_ne!(code(decide(&lead("dev"), &a, &TEAM)), "allow", "lead: {body}");
+                assert!(matches!(code(decide(&Class::Mrpopo, &a, &OTHER)).as_str(), "worker_group_membership_refused" | "delegation_not_allowed"), "mrpopo: {body}");
+            }
+        }
+        // Each board field alone is the owner's: a lead is refused on its team.
+        for k in board {
+            assert_eq!(code(decide(&lead("dev"), &config_action("review-nobody", &json!({k: true})), &TEAM)), "peer_config_owner_only", "{k}");
+            assert_eq!(code(decide(&Class::Mrpopo, &cfg(&[k]), &OTHER)), "delegation_not_allowed", "{k}");
+        }
+        // A lone tags/rename (with metadata) keeps its own row.
+        assert!(matches!(config_action("review-nobody", &json!({"tags": "dev", "why": "x", "cite": null})), Action::SetTags { .. }));
+        assert!(matches!(config_action("review-nobody", &json!({"rename": "dev-b"})), Action::RenameWorker { .. }));
+    }
+
+    /// Review B3: a write to a layer that covers the actor (its own group, the
+    /// global layer, an instance-wide setting) is a write to the actor itself.
+    #[test]
+    fn delegation_a_layer_that_covers_the_actor_is_held() {
+        let m = Class::Mrpopo;
+        for k in ["group:env:CC_FLAGS", "global:env:CC_SEND_ALLOW", "global:env:AMUX_EMAIL_EXTERNAL_ALLOW", "settings:default-model", "group:scope:connectors"] {
+            assert_eq!(code(decide(&m, &cfg(&[k]), &MY_LAYER)), "held_for_max", "mrpopo, own layer: {k}");
+        }
+        assert_eq!(code(decide(&m, &cfg(&["group:env:CC_FLAGS"]), &OTHER)), "grant", "a layer without mrpopo stays a grant row");
+        assert_eq!(code(decide(&m, &Action::SetRouting, &MY_LAYER)), "held_for_max");
+        // Non-privileged on its own layer: the table still decides.
+        assert_eq!(code(decide(&m, &Action::SetGroupRules { group: "leads".into() }, &MY_LAYER)), "grant");
+        assert_eq!(code(decide(&m, &Action::SetGroupConfig { group: "leads".into() }, &MY_LAYER)), "grant");
+        // A lead on a layer it reads.
+        let l = lead("dev");
+        assert_eq!(code(decide(&l, &cfg(&["group:env:CC_FLAGS"]), &MY_LAYER)), "held_for_max");
+        assert_eq!(code(decide(&l, &cfg(&["global:env:CC_SEND_ALLOW"]), &MY_LAYER)), "held_for_max");
+        assert_eq!(code(decide(&l, &Action::SetGroupRules { group: "dev".into() }, &MY_LAYER)), "allow", "its team's rules are not authority");
+    }
+
+    #[test]
+    fn delegation_facts_say_which_layers_cover_the_actor() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(dir.path().join("sessions/mrpopo.env"), "CC_TAGS=\"leads\"\n").unwrap();
+        let a = cfg(&["group:env:CC_FLAGS"]);
+        let f = |t: Target| facts(MRPOPO, &Class::Mrpopo, &t, &a).covers_actor;
+        assert!(f(Target::Group("leads".into())), "its own group");
+        assert!(f(Target::Group(" Leads ".into())), "normalized");
+        assert!(!f(Target::Group("dev".into())), "a group it is not in");
+        assert!(f(Target::Fleet) && f(Target::Settings(vec![])), "global and instance-wide");
+        assert!(f(Target::Worker(MRPOPO.into())) && !f(Target::Worker("review-dev-a".into())));
     }
 
     /// An unproven claim acting on ITSELF is not configuring another worker

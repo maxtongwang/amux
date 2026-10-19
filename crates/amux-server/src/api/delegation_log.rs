@@ -137,8 +137,11 @@ pub(crate) fn feed_text(c: &DelegatedChange) -> String {
     // A grant request carries its exact sentence, so Max sees what he approves.
     if let Some(sentence) = c.after.get("sentence").and_then(Value::as_str) {
         let what = c.action.strip_prefix("grant:").unwrap_or(&c.action);
+        // The citation pair (review B4): what was asked, and Max's reply.
+        let asked = c.after.get("ask_text").and_then(Value::as_str)
+            .map(|x| format!(" (asked: \"{}\")", flat(x, 200))).unwrap_or_default();
         let cited = c.after.get("cited_excerpt").and_then(Value::as_str)
-            .map(|x| format!(" (cited Max: \"{}\")", flat(x, 200))).unwrap_or_default();
+            .map(|x| format!("{asked} (Max replied: \"{}\")", flat(x, 200))).unwrap_or(asked);
         return format!("delegated grant {what}: {}{cited}", flat(sentence, 600));
     }
     let why = c.why.as_deref().map(|w| format!(" ({})", flat(w, 200))).unwrap_or_default();
