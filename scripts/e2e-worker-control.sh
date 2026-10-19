@@ -73,11 +73,13 @@ WORKFLOW=rust.yml
 resolve_repo() {
   if [ -z "${GH_REPO:-}" ]; then
     local url slug
-    url=$(git -C "$ROOT" config --get "remote.$REMOTE.url") \
+    # The push URL is where the control branch goes; the URL itself is never
+    # printed, since a credentialed one carries a token.
+    url=$(git -C "$ROOT" config --get "remote.$REMOTE.pushurl" || git -C "$ROOT" config --get "remote.$REMOTE.url") \
       || die "GH_REPO is unset and remote '$REMOTE' has no URL; set GH_REPO=<owner>/<repo>"
-    slug=$(printf '%s' "$url" | sed -E 's#^(https://|http://|ssh://git@|git@)github\.com[:/]##; s#\.git$##; s#/$##')
+    slug=$(printf '%s' "$url" | sed -E 's#^(https://([^@/]*@)?|http://([^@/]*@)?|ssh://git@|git@)github\.com[:/]##; s#/$##; s#\.git$##')
     [[ "$slug" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
-      || die "GH_REPO is unset and remote '$REMOTE' ($url) is not a GitHub URL; set GH_REPO=<owner>/<repo>"
+      || die "GH_REPO is unset and remote '$REMOTE' is not a GitHub URL; set GH_REPO=<owner>/<repo>"
     export GH_REPO=$slug
   fi
   echo "e2e-worker-control: repository $GH_REPO" >&2

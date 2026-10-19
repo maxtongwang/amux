@@ -191,6 +191,15 @@ rc=0; (unset GH_REPO; ctl dispatch "$sha7" 1 --dry-run) > /dev/null 2> "$TMP/sev
 check "7: an ssh remote resolves to the same repository" "$([ "$rc" = 0 ] && grep -q 'repository acme/fork$' "$TMP/seven-ssh.err" && echo 0 || echo 1)"
 rc=0; (export GH_REPO=other/explicit; ctl dispatch "$sha7" 1 --dry-run) > /dev/null 2> "$TMP/seven-explicit.err" || rc=$?
 check "7: an explicit GH_REPO wins" "$([ "$rc" = 0 ] && grep -q 'repository other/explicit$' "$TMP/seven-explicit.err" && echo 0 || echo 1)"
+git -C "$repo" remote set-url origin https://github.com/acme/fork.git/
+git -C "$repo" config --add url."$bare".insteadOf https://github.com/acme/fork.git/
+rc=0; (unset GH_REPO; ctl dispatch "$sha7" 1 --dry-run) > /dev/null 2> "$TMP/seven-slash.err" || rc=$?
+check "7: a URL ending .git/ resolves to the repository, not <repo>.git" "$([ "$rc" = 0 ] && grep -q 'repository acme/fork$' "$TMP/seven-slash.err" && echo 0 || echo 1)"
+git -C "$repo" remote set-url origin https://x-token:SECRET-TOKEN@github.com/acme/fork.git
+git -C "$repo" config --add url."$bare".insteadOf https://x-token:SECRET-TOKEN@github.com/acme/fork.git
+rc=0; (unset GH_REPO; ctl dispatch "$sha7" 1 --dry-run) > /dev/null 2> "$TMP/seven-cred.err" || rc=$?
+check "7: a credentialed URL resolves and its token is never printed" \
+  "$([ "$rc" = 0 ] && grep -q 'repository acme/fork$' "$TMP/seven-cred.err" && ! grep -q 'SECRET-TOKEN' "$TMP/seven-cred.err" && echo 0 || echo 1)"
 git -C "$repo" remote set-url origin "$bare"
 rc=0; (unset GH_REPO; ctl dispatch "$sha7" 1 --dry-run) > /dev/null 2> "$TMP/seven-local.err" || rc=$?
 check "7: a non-GitHub remote with GH_REPO unset is refused, not guessed (got $rc)" \

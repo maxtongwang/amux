@@ -23,12 +23,12 @@ async function setTool(page: Page, type: string) {
   await page.waitForFunction((t) => (window as unknown as Win)._draw.api.getAppState().activeTool.type === t, type);
 }
 
-// The recents write is done when no save is pending AND none is in flight.
-// recentsTimer alone clears when a save STARTS, so a test that wrote the file
-// "after the save" raced that save's own read and write (draw-tab control,
-// 7ca1c0d3: 4 of 40 runs lost OtherTab this way).
+// The recents write is done when no remember is on its way to a save, no
+// save is scheduled, and none is in flight. recentsTimer alone clears when a
+// save STARTS (draw-tab control, 7ca1c0d3: 4 of 40 runs lost OtherTab), and
+// is not yet set while a remember builds its thumbnail (PR #46 review).
 async function recentsSettled(page: Page) {
-  await page.waitForFunction(() => { const d = (window as unknown as Win)._draw; return !d.recentsTimer && !d.recentsSaving; }, null, { timeout: 10_000 });
+  await page.waitForFunction(() => { const d = (window as unknown as Win)._draw; return !d.recentsRemembering && !d.recentsTimer && !d.recentsSaving; }, null, { timeout: 10_000 });
 }
 
 async function openDraw(page: Page) {
@@ -905,18 +905,19 @@ test('Draw: recents that cannot be saved stay pending and say so, then save on t
     page.on('request', r => {
       if (r.method() === 'POST' && r.url().includes('/api/client-debug')) { try { beacons.push(r.postDataJSON()?.event); } catch {} }
     });
-    let refused = 0;
-    const refuse = async (route: import('@playwright/test').Route) => {
+    // One route for the whole test, switched by a flag: the refusals are on
+    // for the first save and off for the next.
+    let refused = 0, refusing = true;
+    await page.route('**/api/file', async route => {
       const req = route.request();
       let path = '';
       try { path = req.postDataJSON()?.path || ''; } catch {}
-      if (req.method() === 'PUT' && path === recents) {
+      if (refusing && req.method() === 'PUT' && path === recents) {
         refused++;
         return route.fulfill({ status: 409, json: { error: 'file changed on disk since it was opened', code: 'file_changed' } });
       }
       return route.continue();
-    };
-    await page.route('**/api/file', refuse);
+    });
     await page.evaluate(() => (window as any)._drawRememberRecent(true));
     await recentsSettled(page);
     expect(refused, 'the save gave up after its bounded merges, not spinning').toBe(3);
@@ -926,7 +927,7 @@ test('Draw: recents that cannot be saved stay pending and say so, then save on t
     expect(await page.evaluate(p => (window as unknown as Win)._draw.recents.some((x: any) => x.path === p), mine),
       'the entry is kept in memory for the next save').toBe(true);
     await expect.poll(() => beacons).toContain('recents-save-failed');
-    await page.unroute('**/api/file', refuse);
+    refusing = false;
     await page.evaluate(() => (window as any)._drawRememberRecent(true));
     await recentsSettled(page);
     const want = await page.evaluate(p => (window as unknown as Win)._draw.recents.find((x: any) => x.path === p).ts, mine);

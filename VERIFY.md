@@ -156,7 +156,7 @@ contradicts its dispatch, or no measured run at all exit 1.
 
 The script itself: `amux-isolated bash scripts/test-e2e-worker-control.sh`
 (fake `gh` and `sleep`, a local bare remote, no GitHub). Pass:
-`test-e2e-worker-control: 30 passed, 0 failed`.
+`test-e2e-worker-control: 32 passed, 0 failed`.
 
 Change the default to workers=1 only if, at one SHA and full population,
 workers=1 removes failures that reproduce at workers=2 (for example

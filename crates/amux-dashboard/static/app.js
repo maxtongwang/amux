@@ -59287,7 +59287,7 @@ function _drawS() {
       saving: false, saveAgain: false, saveTimer: null, status: 'idle', statusMsg: '',
       pollTimer: null, pollTick: 0, applying: false, conflict: null, opening: false, openSeq: 0, savedCount: 0,
       libItems: [], libHash: null, libEtag: null, libSaveTimer: null, libLoaded: false,
-      recents: [], recentsLoaded: false, recentsTimer: null, recentsSaving: null, recentsAgain: false, recentsUnsaved: false, thumbAt: 0,
+      recents: [], recentsLoaded: false, recentsTimer: null, recentsSaving: null, recentsAgain: false, recentsUnsaved: false, recentsRemembering: 0, thumbAt: 0,
       libTab: 'components', settings: { grid: false, align: true, connect: true },
       settingsLoaded: false, live: false, selCount: 0, selLocked: false, svgCache: new Map(),
       themeObs: null, penColor: _DRAW_PEN_COLORS[1], penWidth: 2,
@@ -60480,45 +60480,51 @@ async function _drawLoadRecents() {
 async function _drawRememberRecent(force) {
   const d = _draw;
   if (!d || !d.path || !d.api) return;
-  const now = Date.now();
-  let entry = d.recents.find(x => x.path === d.path);
-  // Already first in the list: a save only changes its picture and time, so
-  // the row is patched in place below. A full re-render on every autosave
-  // replaced the library under a pointer about to click a row (and reset its
-  // scroll), so a click on "In this folder" during autosave did nothing.
-  const wasFirst = !!entry && d.recents[0] === entry && entry.title === _drawTitleOf(d.path);
-  if (!entry) { entry = { path: d.path }; d.recents.unshift(entry); }
-  entry.title = _drawTitleOf(d.path);
-  entry.ts = now;
-  d.recents = [entry].concat(d.recents.filter(x => x !== entry)).slice(0, _DRAW_RECENTS_MAX);
-  // A thumbnail at most every 10s while drawing; always on open/rename and
-  // whenever the entry has none yet.
-  if (force || !entry.thumb || now - d.thumbAt > 10000) {
-    try {
-      const els = d.api.getSceneElements();
-      // An empty drawing gets no picture: a thumbnail kept from earlier
-      // content showed strokes on a file that had none (Ethan, 2026-10-13).
-      if (!els.length) entry.thumb = '';
-      else {
-        d.thumbAt = now;
-        const blob = await d.lib.X.exportToBlob({ elements: els, files: d.api.getFiles(), mimeType: 'image/png',
-          appState: { exportBackground: true, viewBackgroundColor: '#ffffff', exportWithDarkMode: false },
-          exportPadding: 8, maxWidthOrHeight: 240 });
-        entry.thumb = await new Promise(res => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => res(''); fr.readAsDataURL(blob); });
-      }
-    } catch (e) {}
-  }
-  if (d.libTab === 'drawings') {
-    const row = wasFirst && document.querySelector('#draw-lib-body .draw-recent[data-path="' + CSS.escape(entry.path) + '"]');
-    if (row) {
-      const thumb = row.querySelector('.draw-recent-thumb');
-      if (thumb) thumb.innerHTML = entry.thumb ? '<img alt="" src="' + esc(entry.thumb) + '">' : '';
-      const when = row.querySelector('.draw-recent-when');
-      if (when) when.textContent = timeAgo(entry.ts / 1000);
-    } else _drawLibRender();
-  }
-  if (d.recentsTimer) clearTimeout(d.recentsTimer);
-  d.recentsTimer = setTimeout(_drawSaveRecents, 1500);
+  // Counted until the save is scheduled: the thumbnail below is awaited before
+  // recentsTimer is set, so "no timer, no save" alone read as settled while a
+  // remember was still on its way to one.
+  d.recentsRemembering++;
+  try {
+    const now = Date.now();
+    let entry = d.recents.find(x => x.path === d.path);
+    // Already first in the list: a save only changes its picture and time, so
+    // the row is patched in place below. A full re-render on every autosave
+    // replaced the library under a pointer about to click a row (and reset its
+    // scroll), so a click on "In this folder" during autosave did nothing.
+    const wasFirst = !!entry && d.recents[0] === entry && entry.title === _drawTitleOf(d.path);
+    if (!entry) { entry = { path: d.path }; d.recents.unshift(entry); }
+    entry.title = _drawTitleOf(d.path);
+    entry.ts = now;
+    d.recents = [entry].concat(d.recents.filter(x => x !== entry)).slice(0, _DRAW_RECENTS_MAX);
+    // A thumbnail at most every 10s while drawing; always on open/rename and
+    // whenever the entry has none yet.
+    if (force || !entry.thumb || now - d.thumbAt > 10000) {
+      try {
+        const els = d.api.getSceneElements();
+        // An empty drawing gets no picture: a thumbnail kept from earlier
+        // content showed strokes on a file that had none (Ethan, 2026-10-13).
+        if (!els.length) entry.thumb = '';
+        else {
+          d.thumbAt = now;
+          const blob = await d.lib.X.exportToBlob({ elements: els, files: d.api.getFiles(), mimeType: 'image/png',
+            appState: { exportBackground: true, viewBackgroundColor: '#ffffff', exportWithDarkMode: false },
+            exportPadding: 8, maxWidthOrHeight: 240 });
+          entry.thumb = await new Promise(res => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => res(''); fr.readAsDataURL(blob); });
+        }
+      } catch (e) {}
+    }
+    if (d.libTab === 'drawings') {
+      const row = wasFirst && document.querySelector('#draw-lib-body .draw-recent[data-path="' + CSS.escape(entry.path) + '"]');
+      if (row) {
+        const thumb = row.querySelector('.draw-recent-thumb');
+        if (thumb) thumb.innerHTML = entry.thumb ? '<img alt="" src="' + esc(entry.thumb) + '">' : '';
+        const when = row.querySelector('.draw-recent-when');
+        if (when) when.textContent = timeAgo(entry.ts / 1000);
+      } else _drawLibRender();
+    }
+    if (d.recentsTimer) clearTimeout(d.recentsTimer);
+    d.recentsTimer = setTimeout(_drawSaveRecents, 1500);
+  } finally { d.recentsRemembering--; }
 }
 // One save at a time per tab, and `recentsSaving` stays set until the write
 // has landed, so "no timer" never reads as "saved". A save asked for while one
@@ -60547,6 +60553,10 @@ async function _drawWriteRecents(d) {
       try {
         const g = await fetch(API + '/api/file/raw?path=' + encodeURIComponent(_drawRecentsPath()), { cache: 'no-store' });
         if (g.ok) { etag = g.headers.get('etag'); const data = await g.json(); if (Array.isArray(data.recents)) disk = data.recents; }
+        // No file yet: the write still must not land over one another tab
+        // creates meanwhile. Any real ETag differs from this, so a file that
+        // appeared since the read is a 409 like any other change.
+        else if (g.status === 404) etag = '"absent"';
       } catch (e) {}
       const dropped = d.recentsDropped || new Set();
       const byPath = new Map();
@@ -60581,7 +60591,7 @@ async function _drawWriteRecents(d) {
     // the library says so instead of reading as saved.
     d.recentsUnsaved = true;
     _drawRecentsNote();
-    _drawBeacon('recents-save-failed', { measured: true, unsaved: d.recentsUnsaved, error: String(e && e.message || e) });
+    _drawBeacon('recents-save-failed', { measured: true, error: String(e && e.message || e) });
   }
 }
 function _drawRecentsNote() {
