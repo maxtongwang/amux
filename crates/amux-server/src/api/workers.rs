@@ -3491,7 +3491,7 @@ mod tests {
             ("a worker in another team (config)", lead, "PATCH", "/api/workers/review-ops-a/config", json!({"rename": "x-renamed"}), PEER),
             ("a team worker renamed to the owner agent", lead, "POST", "/api/sessions/review-dev-a/rename", json!({"name": "mrpopo"}), "reserved_name"),
             ("a non-rename field", lead, "PATCH", "/api/sessions/review-dev-a/config", json!({"desc": "x"}), PEER),
-            ("rename plus another field", lead, "PATCH", "/api/workers/review-dev-a/config", json!({"rename": "x-renamed", "desc": "x"}), "one_setting_per_patch"),
+            ("rename plus another field", lead, "PATCH", "/api/workers/review-dev-a/config", json!({"rename": "x-renamed", "desc": "x"}), PEER),
             ("a non-string rename", lead, "PATCH", "/api/sessions/review-dev-a/config", json!({"rename": ["x-renamed"]}), PEER),
             ("instructions", lead, "POST", "/api/sessions/review-dev-a/instructions", json!({"instructions": "x"}), PEER),
             ("memory", lead, "POST", "/api/workers/review-dev-a/memory", json!({"content": "x"}), PEER),
@@ -3504,9 +3504,9 @@ mod tests {
         let before = snapshot(home.path());
         for (label, headers, m, path, body, code) in &cases {
             let (st, _, v) = send_with(&app, m, path, Some(body.clone()), headers).await;
-            // A two-setting PATCH is refused as malformed before authorization.
-            let want = if *code == "one_setting_per_patch" { StatusCode::BAD_REQUEST } else { StatusCode::FORBIDDEN };
-            assert_eq!((st, v["code"].clone()), (want, json!(code)), "{label}: {m} {path} {body}: {v}");
+            // Review B1: a rename beside another field is judged key by key, so
+            // the lead is refused on `desc` before the handler's one-setting check.
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(code)), "{label}: {m} {path} {body}: {v}");
         }
         let after = snapshot(home.path());
         let changed: Vec<_> = after.iter().filter(|(p, b)| before.get(*p) != Some(*b)).map(|(p, _)| p.clone())
@@ -3565,8 +3565,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let _guard = isolated(home.path());
         lead_rename_fleet(home.path());
+        // #18 defines a lead as CC_ORCHESTRATOR=1 plus `leads` (as lead_rename_fleet does).
         let rule10 = |n: &str, t: &str| std::fs::write(home.path().join(format!("sessions/{n}.env")),
-            format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{t}\"\nCC_AUTO_START=0\nCC_TEST_FAKE_PANE=1\nAMUX_CONTRACT_DONE=1\n")).unwrap();
+            format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{t}\"\nCC_AUTO_START=0\nCC_TEST_FAKE_PANE=1\nAMUX_CONTRACT_DONE=1\n{}",
+                if t.starts_with("leads") { "CC_ORCHESTRATOR=1\n" } else { "" })).unwrap();
         rule10("review-dev-lead", "leads,dev");
         rule10("review-dev-a", "dev");
         let lead_token = crate::api::worker_identity::mint(home.path(), "review-dev-lead").unwrap().expect("rule 10 mints");
