@@ -44986,9 +44986,8 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         struct Pane(String);
         impl Drop for Pane {
             fn drop(&mut self) {
-                let _ = tmux_command()
-                    .args(["kill-session", "-t", &session_target(&self.0)])
-                    .output();
+                let st = session_target(&self.0);
+                let _ = tmux_command().args(["kill-session", "-t", &st]).output();
             }
         }
         let name = format!("status-name-{}", std::process::id());
@@ -44997,8 +44996,8 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             .await
             .expect("tmux required for status-name proof");
         assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
-        let shown = |target: String| async move {
-            let o = tmux(&["display-message", "-p", "-t", &target, "#{T:status-left}|#{status-left-length}"])
+        let shown = |ptq: String| async move {
+            let o = tmux(&["display-message", "-p", "-t", &ptq, "#{T:status-left}|#{status-left-length}"])
                 .await
                 .expect("display-message");
             String::from_utf8_lossy(&o.stdout).trim_end().to_string()
@@ -45007,7 +45006,8 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         assert_eq!(shown(pt(&name)).await, format!("[{name}] |40"));
 
         let renamed = format!("{name}-renamed");
-        let r = tmux(&["rename-session", "-t", &st(&name), &tmux_name(&renamed)]).await.unwrap();
+        let stq = st(&name);
+        let r = tmux(&["rename-session", "-t", &stq, &tmux_name(&renamed)]).await.unwrap();
         assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
         pane.0 = tmux_name(&renamed);
         assert_eq!(shown(pt(&renamed)).await, format!("[{renamed}] |40"));
