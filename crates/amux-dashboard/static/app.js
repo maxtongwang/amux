@@ -61012,7 +61012,9 @@ var _drawRt = {
   h: null, path: '', sent: new Map(), sentPts: new Map(), sentFiles: new Set(), dirty: false,
   inbox: [], raf: 0, peers: new Map(), pointer: null, pointerDirty: false, presenceAt: 0,
   wasSaver: false, seenMembers: false, collabSig: '',
-  stats: { applied: 0, frames: 0, lat: [], frameTimes: [] },
+  // lat = sent -> applied; transport = sent -> received here; wait = received
+  // -> applied on the next frame (the host's frame scheduling, not the relay).
+  stats: { applied: 0, frames: 0, lat: [], frameTimes: [], transport: [], wait: [] },
 };
 function _drawRtFollower() {
   const h = _drawRt.h;
@@ -61049,11 +61051,11 @@ function _drawRtJoin(path) {
       }
       _drawRtKick();
     },
-    onOp: m => { _drawRt.inbox.push(m); _drawRtKick(); },
+    onOp: m => { m.recvAt = _rtNow(); _drawRt.inbox.push(m); _drawRtKick(); },
     onSnapshot: m => {
       if (m.source !== 'peer' || !m.data) return;
       _drawRt.stats.snapshots = (_drawRt.stats.snapshots || 0) + 1;
-      _drawRt.inbox.push({ data: Object.assign({}, m.data, { kind: 'els' }), from: m.from });
+      _drawRt.inbox.push({ data: Object.assign({}, m.data, { kind: 'els' }), from: m.from, recvAt: _rtNow() });
       _drawRtKick();
     },
     onSnapshotRequest: m => {
@@ -61165,11 +61167,11 @@ function _drawRtApply(frameAt) {
   const d = _draw, X = d.lib.X, api = d.api, h = _drawRt.h;
   const batch = _drawRt.inbox.splice(0);
   const remote = new Map();
-  let files = [], reload = null, saved = null, sentAt = 0;
+  let files = [], reload = null, saved = null, sentAt = 0, recvAt = 0;
   const local = new Map(api.getSceneElementsIncludingDeleted().map(e => [e.id, e]));
   for (const m of batch) {
     const p = m.data || {};
-    if (p.t) sentAt = Math.max(sentAt, p.t);
+    if (p.t && p.t >= sentAt) { sentAt = p.t; recvAt = m.recvAt || frameAt; }
     if (p.kind === 'reload') { reload = p; remote.clear(); continue; }
     if (p.kind === 'saved') { saved = p; continue; }
     if (p.kind !== 'els') continue;
@@ -61210,8 +61212,12 @@ function _drawRtApply(frameAt) {
     }
     const s = _drawRt.stats;
     s.applied++; s.frameTimes.push(frameAt);
-    if (sentAt) s.lat.push(frameAt - sentAt);
+    if (sentAt) {
+      s.lat.push(frameAt - sentAt);
+      if (s.transport) { s.transport.push(recvAt - sentAt); s.wait.push(frameAt - recvAt); }
+    }
     if (s.lat.length > 5000) s.lat.splice(0, 1000);
+    if (s.transport && s.transport.length > 5000) { s.transport.splice(0, 1000); s.wait.splice(0, 1000); }
     if (s.frameTimes.length > 5000) s.frameTimes.splice(0, 1000);
     _rtRecordApply(sentAt, frameAt);
     const v = _drawSceneVersion();
