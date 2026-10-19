@@ -160,3 +160,9 @@ SANDBOX host. No card is issued and no money moves until the owner sets these.
 - `AMUX_BREX_WEBHOOK_SECRET`: Brex webhook signing secret (verification TODO).
 - `AMUX_BREX_LIMIT_PER_TXN_CENTS` / `_DAILY_CENTS` / `_WEEKLY_CENTS` / `_MONTHLY_CENTS`
   the four budgets amux enforces via the transaction webhook + auto-freeze.
+
+## Server network config
+
+| Env key | Purpose |
+|---|---|
+| `AMUX_BIND` | Server listener IP address (IPv4 or IPv6, without a port). Unset preserves the production wildcard interface; invalid input aborts startup. Test harnesses explicitly select IPv4 loopback. |

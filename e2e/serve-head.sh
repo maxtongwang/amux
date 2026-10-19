@@ -52,7 +52,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}"
 _scrubbed=""
 for _k in ${!AMUX_@}; do
   case "$_k" in
-    AMUX_HOME|AMUX_RS_PORT|AMUX_RS_NO_LOOPBACK_BYPASS|AMUX_NO_SELF_ADOPT|AMUX_VAULT_KEYSTORE|AMUX_DASHBOARD_DIR|AMUX_E2E_*) ;;
+    AMUX_HOME|AMUX_BIND|AMUX_RS_PORT|AMUX_RS_NO_LOOPBACK_BYPASS|AMUX_NO_SELF_ADOPT|AMUX_VAULT_KEYSTORE|AMUX_DASHBOARD_DIR|AMUX_E2E_*) ;;
     *) unset "$_k"; _scrubbed="$_scrubbed $_k" ;;
   esac
 done
@@ -102,6 +102,8 @@ fi
 # have taken effect even if the two disagreed. If you are here because a run
 # shows `binary changed on disk`, check the run's created_at against this line's
 # commit before patching anything.
+# Unsigned fixture servers must never request incoming LAN connections on macOS.
+export AMUX_BIND=127.0.0.1
 export AMUX_NO_SELF_ADOPT=1
 
 # A throwaway home is not enough isolation: tmux, process tables, hook files and

@@ -37,10 +37,10 @@ SEED_DB="$WORK/seed.db"
 # The server owns schema creation: boot it once against an empty file so the
 # migrations (including 0013's search index + triggers) run, then seed through
 # the real tables so the triggers do the indexing exactly as they will in prod.
-AMUX_HOME="$WORK" AMUX_DB="$SEED_DB" AMUX_RS_PORT=$((PORT + 1)) "$BIN" >"$WORK/seed-server.log" 2>&1 &
+AMUX_HOME="$WORK" AMUX_DB="$SEED_DB" AMUX_BIND=127.0.0.1 AMUX_RS_PORT=$((PORT + 1)) "$BIN" >"$WORK/seed-server.log" 2>&1 &
 SEED_PID=$!
 for _ in $(seq 1 60); do
-  curl -sk --max-time 2 "https://localhost:$((PORT + 1))/health" >/dev/null 2>&1 && break
+  curl -sk --max-time 2 "https://127.0.0.1:$((PORT + 1))/health" >/dev/null 2>&1 && break
   sleep 0.5
 done
 kill "$SEED_PID" 2>/dev/null || true
@@ -116,16 +116,16 @@ BASE_JSON="$(grep -E '^\{' "$WORK/base-out.txt" | tail -1 || true)"
 }
 
 echo "== measuring /api/search (RR-0110 target: < 50ms over 10k entities)" >&2
-AMUX_HOME="$WORK" AMUX_DB="$SEED_DB" AMUX_RS_PORT=$PORT "$BIN" >"$WORK/server.log" 2>&1 &
+AMUX_HOME="$WORK" AMUX_DB="$SEED_DB" AMUX_BIND=127.0.0.1 AMUX_RS_PORT=$PORT "$BIN" >"$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 60); do
-  curl -sk --max-time 2 "https://localhost:$PORT/health" >/dev/null 2>&1 && break
+  curl -sk --max-time 2 "https://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
   sleep 0.5
 done
 TOKEN=$(cat "$WORK/auth-token" 2>/dev/null || echo "")
 # Assert the index is actually populated BEFORE timing it. Benchmarking an
 # empty index returns a fast, meaningless number that looks like a pass.
-STATUS_JSON=$(curl -sk -H "Authorization: Bearer $TOKEN" "https://localhost:$PORT/api/search/status")
+STATUS_JSON=$(curl -sk -H "Authorization: Bearer $TOKEN" "https://127.0.0.1:$PORT/api/search/status")
 DOCS=$(printf '%s' "$STATUS_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("docs_total",0))')
 [ "$DOCS" -ge "$SEED_CARDS" ] || { echo "FATAL: search index holds $DOCS docs, expected >= $SEED_CARDS — the benchmark would have measured an empty index" >&2; exit 2; }
 echo "   index holds $DOCS docs" >&2
@@ -142,7 +142,7 @@ SEARCH_BODY="$WORK/search-body.json"
 search_samples=""; n_search=0
 for term in deploy migration quokka "index gateway" regression deploy migration quokka "index gateway" regression; do
   t=$(curl -sk -o "$SEARCH_BODY" -w '%{time_appconnect} %{time_total}' -H "Authorization: Bearer $TOKEN" \
-      --get --data-urlencode "q=$term" "https://localhost:$PORT/api/search")
+      --get --data-urlencode "q=$term" "https://127.0.0.1:$PORT/api/search")
   read -r t_tls t_total <<<"$t"
   ms=$(python3 -c "print(int(float('$t_total')*1000))")
   took=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('took_ms','?'))" "$SEARCH_BODY" 2>/dev/null || echo '?')

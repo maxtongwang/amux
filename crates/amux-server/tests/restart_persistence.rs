@@ -171,6 +171,7 @@ impl Rig {
             .env("HOME", self.home.join("fixture-home"))
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("AMUX_HOME", &self.home)
+            .env("AMUX_BIND", "127.0.0.1")
             .env("AMUX_DB", &self.db)
             .env("TMUX_TMPDIR", self._tmp.path())
             .env("AMUX_NO_SELF_ADOPT", "1")

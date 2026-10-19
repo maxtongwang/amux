@@ -6,16 +6,16 @@
 // Run it against an ISOLATED server, never the live one: it creates workers
 // and spends real model turns.
 //
-//   AMUX_HOME=$tmp/home TMUX_TMPDIR=$(mktemp -d /tmp/amuxt.XXXX) AMUX_RS_PORT=18824 //     env -u TMUX -u TMUX_PANE -u AMUX_SESSION -u AMUX_URL amux-server
+//   AMUX_HOME=$tmp/home TMUX_TMPDIR=$(mktemp -d /tmp/amuxt.XXXX) AMUX_BIND=127.0.0.1 AMUX_RS_PORT=18824 //     env -u TMUX -u TMUX_PANE -u AMUX_SESSION -u AMUX_URL amux-server
 //
 // Unset TMUX: with it set, tmux ignores TMUX_TMPDIR and the test server
 // reaches the real fleet's panes (2026-09-24, see frustrations.md).
 //
-//   AMUX_E2E_URL=https://localhost:18824 AMUX_E2E_TOKEN=$(cat $tmp/home/auth_token) //     AMUX_E2E_OUT=/tmp/wt-e2e node e2e/worker-types-click.cjs
+//   AMUX_E2E_URL=https://127.0.0.1:18824 AMUX_E2E_TOKEN=$(cat $tmp/home/auth_token) //     AMUX_E2E_OUT=/tmp/wt-e2e node e2e/worker-types-click.cjs
 const { chromium, devices } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const fs = require('fs');
 const OUT = process.env.AMUX_E2E_OUT || '/tmp/worker-types-e2e';
-const URL = (process.env.AMUX_E2E_URL || 'https://localhost:18824') + '/?_token=' + (process.env.AMUX_E2E_TOKEN || '');
+const URL = (process.env.AMUX_E2E_URL || 'https://127.0.0.1:18824') + '/?_token=' + (process.env.AMUX_E2E_TOKEN || '');
 const results = [];
 const CHAT = 'e2e-chat-' + Date.now().toString(36);
 const ok = (step, pass, detail) => { results.push({ step, pass, detail }); console.log((pass ? 'PASS ' : 'FAIL ') + step + (detail ? ' :: ' + detail : '')); };

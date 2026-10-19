@@ -242,7 +242,7 @@ export default defineConfig({
     // Uncommitted rust changes are announced by name every run;
     // AMUX_E2E_WORKING_TREE=1 opts back in to testing the tree.
     command: `bash ${path.join(__dirname, 'serve-head.sh')}`,
-    url: `https://localhost:${t.port}/health`,
+    url: `https://127.0.0.1:${t.port}/health`,
     ignoreHTTPSErrors: true,
     reuseExistingServer: false,
     // PIPE, not the default 'ignore'. serve-head.sh prints which uncommitted
@@ -260,6 +260,7 @@ export default defineConfig({
     timeout: 600_000,
     env: {
       AMUX_HOME: homes[t.name],
+      AMUX_BIND: '127.0.0.1',
       AMUX_RS_PORT: String(t.port),
       // A browser test necessarily connects over loopback, which the server
       // deliberately auth-bypasses (Python parity). Without this, every

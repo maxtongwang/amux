@@ -26,7 +26,7 @@ registry=(root/'crates/amux-server/src/runtime_jobs/registry.rs').read_text()
 for name in re.findall(r'pub const \w+: &str = "([a-z_-]+)"',registry):env['AMUX_'+name.upper().replace('-','_')+'_SECS']='0'
 for file in (root/'crates/amux-server/src/runtime_jobs').glob('*.rs'):
     for name in re.findall(r'(?:const JOB: &str = |spawn_periodic\()"([a-z_-]+)"',file.read_text()):env['AMUX_'+name.upper().replace('-','_')+'_SECS']='0'
-env.update(TMUX_TMPDIR=str(home),AMUX_HOME=str(home),AMUX_RS_PORT=str(a.port),AMUX_URL=f'https://localhost:{a.port}',AMUX_NO_SELF_ADOPT='1',AMUX_BACKEND='tmux',AMUX_BOARD_DRIVE_SECS='1',AMUX_PROJECT_EXECUTION_SECS='1',AMUX_SCHEDULER_SECS='1',AMUX_STEER_DELIVER_SECS='1',AMUX_CLAUDE_CMD=str(bin_dir/'claude'),AMUX_HELPER_CLI=str(bin_dir/'fake-intake'),AMUX_WARM_HELPER='0',AMUX_ALLOW_TMUX_SPAWN_FROM_TEST_HOME='1',PATH=str(bin_dir)+':'+env['PATH'])
+env.update(TMUX_TMPDIR=str(home),AMUX_HOME=str(home),AMUX_BIND='127.0.0.1',AMUX_RS_PORT=str(a.port),AMUX_URL=f'https://127.0.0.1:{a.port}',AMUX_NO_SELF_ADOPT='1',AMUX_BACKEND='tmux',AMUX_BOARD_DRIVE_SECS='1',AMUX_PROJECT_EXECUTION_SECS='1',AMUX_SCHEDULER_SECS='1',AMUX_STEER_DELIVER_SECS='1',AMUX_CLAUDE_CMD=str(bin_dir/'claude'),AMUX_HELPER_CLI=str(bin_dir/'fake-intake'),AMUX_WARM_HELPER='0',AMUX_ALLOW_TMUX_SPAWN_FROM_TEST_HOME='1',PATH=str(bin_dir)+':'+env['PATH'])
 if a.live_codex:
     assert shutil.which('codex'), 'Installed Codex CLI is required'
     env.pop('AMUX_CLAUDE_CMD',None);env.pop('AMUX_HELPER_CLI',None)
