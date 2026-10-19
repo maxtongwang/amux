@@ -27326,8 +27326,7 @@ async fn post_dispatch(
         use super::delegation::{authorize, reserved_name_refusal, Action, Target};
         let act = match action {
             "rename" => {
-                let to = body_str(body, "name");
-                let to = if to.is_empty() { body_str(body, "rename") } else { to };
+                let to = rename_verb_target(body).to_string();
                 if let Some(r) = reserved_name_refusal(headers, &to) { return r; }
                 Action::RenameWorker { to }
             }
@@ -33951,6 +33950,14 @@ pub(crate) fn worker_origin(headers: &HeaderMap) -> String {
 /// (ai-config #205 N2; a lead may not give one, see `delegation::decide_lead`).
 pub(crate) fn is_lead_suffixed(to: &str) -> bool {
     sanitize_session_name(to).to_ascii_lowercase().ends_with("-lead")
+}
+
+/// The new name `POST .../rename` reads: `name`, else `rename`; empty if neither.
+fn rename_verb_target(body: &Value) -> &str {
+    ["name", "rename"]
+        .iter()
+        .find_map(|k| body.get(*k).and_then(Value::as_str).filter(|s| !s.is_empty()))
+        .unwrap_or("")
 }
 
 /// The group whose members may create workers (Max, 2026-10-16: "Only leads
