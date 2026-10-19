@@ -36,6 +36,19 @@ on:
     paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'amux', 'scripts/**', 'cloud/**', 'eslint.config.mjs', '.github/workflows/rust.yml']
   pull_request:
     paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'amux', 'scripts/**', 'cloud/**', 'eslint.config.mjs', '.github/workflows/rust.yml']
+  # Hosted worker-concurrency control (scripts/e2e-worker-control.sh, VERIFY.md
+  # "e2e worker control"). A dispatch runs the FULL suite exactly as a push to
+  # main does (ci-affected.mjs treats every non-PR event as full), with only
+  # the per-shard Playwright worker count chosen. push and pull_request runs
+  # keep workers=2. Retries are not an input: e2e/playwright.config.ts fixes
+  # `retries: 0` and reads no override, so every run here is already retry-free.
+  workflow_dispatch:
+    inputs:
+      e2e_workers:
+        description: 'Playwright workers per e2e shard (push/PR runs use 2)'
+        type: choice
+        options: ['2', '1', '3', '4']
+        default: '2'
 
 # No group ran the full ~20min check+e2e once per push with nothing
 # superseding anything, so a burst of pushes to main paid full price for
@@ -50,8 +63,12 @@ on:
 # could never clear. For pushes to main GitHub now lets the running run finish
 # and keeps ONE pending run, which a newer push replaces, so every completed
 # run judges a recent head. Pull requests still cancel their own stale runs.
+#
+# A workflow_dispatch run gets a group of its own. A control dispatches many
+# runs on one ref, and sharing the ref's group would let each new dispatch
+# replace the previous pending one, so most repetitions would never run.
 concurrency:
-  group: rust-${{ github.event.pull_request.number || github.ref }}
+  group: rust-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id)) || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -708,9 +725,22 @@ jobs:
           PLAYWRIGHT_JSON_OUTPUT_NAME="$RUNNER_TEMP/e2e-list.json" npx playwright test --config e2e/playwright.config.ts --list --reporter=json > /dev/null
           node scripts/e2e-plan.mjs ${{ matrix.shard }} ${{ strategy.job-total }} "$RUNNER_TEMP/e2e-list.json" > "$RUNNER_TEMP/e2e-plan.json"
           echo "AMUX_E2E_PLAN=$RUNNER_TEMP/e2e-plan.json" >> "$GITHUB_ENV"
+      # control.json records the worker setting and run identity INSIDE the
+      # evidence, before any test starts, so a control report reads each run's
+      # operand from its own artifact instead of trusting a dispatch log.
       - name: Golden scenarios (desktop + mobile + ios-safari)
-        run: npx playwright test --config e2e/playwright.config.ts --workers=2 --global-timeout=1200000
+        run: |
+          set -euo pipefail
+          case "$E2E_WORKERS" in
+            1|2|3|4) ;;
+            *) echo "::error title=Invalid e2e_workers::'$E2E_WORKERS' is not one of 1, 2, 3, 4"; exit 2 ;;
+          esac
+          mkdir -p "$AMUX_E2E_EVIDENCE_DIR"
+          node -e 'const e = process.env; console.log(JSON.stringify({schema: 1, workers: Number(e.E2E_WORKERS), event: e.GITHUB_EVENT_NAME, sha: e.GITHUB_SHA, run_id: e.GITHUB_RUN_ID, run_attempt: Number(e.GITHUB_RUN_ATTEMPT), shard: e.AMUX_E2E_SHARD, started_at: new Date().toISOString()}))' > "$AMUX_E2E_EVIDENCE_DIR/control.json"
+          echo "e2e: workers=$E2E_WORKERS per shard (event=$GITHUB_EVENT_NAME)"
+          npx playwright test --config e2e/playwright.config.ts --workers="$E2E_WORKERS" --global-timeout=1200000
         env:
+          E2E_WORKERS: ${{ github.event_name == 'workflow_dispatch' && inputs.e2e_workers || '2' }}
           AMUX_E2E_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
           AMUX_E2E_EVIDENCE_DIR: ci-results/shard-${{ matrix.shard }}
           AMUX_E2E_WORKING_TREE: '1'

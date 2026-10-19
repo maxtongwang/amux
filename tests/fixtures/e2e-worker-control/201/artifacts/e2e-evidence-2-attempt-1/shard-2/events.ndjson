@@ -1,0 +1,4 @@
+{"event":"started","id":"t3","retry":0}
+{"event":"finished","id":"t3","retry":0,"status":"passed","expected":"passed","outcome":"expected","duration_ms":1000,"errors":[]}
+{"event":"started","id":"t4","retry":0}
+{"event":"finished","id":"t4","retry":0,"status":"skipped","expected":"skipped","outcome":"skipped","duration_ms":1000,"errors":[]}

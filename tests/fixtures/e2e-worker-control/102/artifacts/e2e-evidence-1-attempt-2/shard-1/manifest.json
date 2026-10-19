@@ -1,0 +1,1 @@
+{"schema":1,"shard":{"current":1,"total":2},"tests":[{"id":"t1","title":["","desktop","golden.spec.ts","loads"],"project":"desktop"},{"id":"t2","title":["","mobile","golden.spec.ts","loads"],"project":"mobile"}]}
