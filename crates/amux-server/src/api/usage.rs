@@ -155,6 +155,14 @@ static LAST_RESERVE_PROBE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex:
 /// Fails OPEN at every step: no reading, a failed probe, a probe we declined to
 /// make because one was recent — all of them mean "do not pause".
 pub async fn background_should_pause_now() -> bool {
+    // A TEST BUILD NEVER READS THE REAL PLAN WINDOW. This reads the live
+    // machine's usage (and may probe the provider), so every LiveDeliverer
+    // test paused or passed with the owner's real quota: #210's e2e failed only
+    // because the window happened to be 100% used. The decision itself is
+    // `background_should_pause`, a pure function tested on its own.
+    if cfg!(test) {
+        return false;
+    }
     let reserve = background_reserve_pct();
     if reserve <= 0 {
         return false;
