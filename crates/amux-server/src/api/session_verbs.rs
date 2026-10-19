@@ -32609,7 +32609,22 @@ async fn deliver_rename_title(state: &AppState, name: &str) -> String {
     }
 }
 
+/// Every rename's OUTCOME, logged after it ran (ai-config #205 N6); the
+/// authorization log only says it was allowed.
 async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response {
+    let resp = rename_session_inner(state, name, raw_new).await;
+    let status = resp.status().as_u16();
+    if resp.status().is_success() {
+        tracing::info!(from = name, to = raw_new, status, verdict = "session_rename_done", measured = true,
+            n_considered = 1, "a session rename ran");
+    } else {
+        tracing::warn!(from = name, to = raw_new, status, verdict = "session_rename_failed", measured = true,
+            n_considered = 1, "a session rename was attempted and did not complete");
+    }
+    resp
+}
+
+async fn rename_session_inner(state: &AppState, name: &str, raw_new: &str) -> Response {
     let new_name = sanitize_session_name(raw_new);
     if new_name.is_empty() {
         return jresp(StatusCode::BAD_REQUEST, json!({"error": "invalid name"}));
@@ -33691,8 +33706,18 @@ pub(crate) fn peer_config_refusal_unless_lead_rename(
         let origin = worker_origin(headers);
         if origin != target {
             if let Some(team) = lead_team_rename(&origin, target, to) {
-                tracing::info!(origin = %origin, target, to, ?team, verdict = "lead_team_rename_allowed",
-                    measured = true, n_considered = 1, "a lead renamed a worker in its own team");
+                // A "-lead" name grants nothing (lead status comes from
+                // groups) but would mislead peers (ai-config #205 N2).
+                if is_lead_suffixed(to) {
+                    tracing::warn!(origin = %origin, target, to, verdict = "lead_rename_reserved_suffix",
+                        measured = true, n_considered = 1, "a lead tried to give a team worker a '-lead' name");
+                    return Some(jresp(StatusCode::FORBIDDEN, json!({"ok": false, "code": "lead_rename_reserved_suffix",
+                        "error": format!("a lead may not give '{target}' a name ending in '-lead' ('{to}'); only the owner may")})));
+                }
+                // Authorization only: the rename runs after this, and
+                // rename_session logs its outcome (ai-config #205 N6).
+                tracing::info!(origin = %origin, target, to, ?team, verdict = "lead_team_rename_authorized",
+                    measured = true, n_considered = 1, "a lead was authorized to rename a worker in its own team");
                 return None;
             }
         }
@@ -33717,6 +33742,11 @@ pub(crate) fn lead_team_rename(origin: &str, target: &str, to: &str) -> Option<s
     let shared: std::collections::BTreeSet<String> =
         caller.intersection(&theirs).filter(|g| *g != LEADS_GROUP).cloned().collect();
     (!shared.is_empty()).then_some(shared)
+}
+
+/// Whether `to` (sanitized) ends in `-lead`: a lead-looking name.
+pub(crate) fn is_lead_suffixed(to: &str) -> bool {
+    sanitize_session_name(to).to_ascii_lowercase().ends_with("-lead")
 }
 
 /// The new name a config PATCH body asks for when renaming is ALL it does:

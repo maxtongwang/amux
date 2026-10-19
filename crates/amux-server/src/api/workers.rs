@@ -3395,6 +3395,39 @@ mod tests {
         assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_refused")), "{v}");
     }
 
+    /// ai-config #205 N2: a lead may not give a team worker a name ending in
+    /// "-lead" (it grants nothing but misleads peers), on either rename path.
+    /// The owner still may.
+    #[tokio::test]
+    async fn a_lead_may_not_give_a_team_worker_a_lead_looking_name() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = isolated(home.path());
+        lead_rename_fleet(home.path());
+        let rule10 = |n: &str, t: &str| std::fs::write(home.path().join(format!("sessions/{n}.env")),
+            format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{t}\"\nCC_AUTO_START=0\nCC_TEST_FAKE_PANE=1\nAMUX_CONTRACT_DONE=1\n")).unwrap();
+        rule10("review-dev-lead", "leads,dev");
+        rule10("review-dev-a", "dev");
+        let lead_token = crate::api::worker_identity::mint(home.path(), "review-dev-lead").unwrap().expect("rule 10 mints");
+        let (app, _db) = app();
+        let lead = [("X-Amux-Session", "review-dev-lead"), (crate::api::worker_identity::TOKEN_HEADER, lead_token.as_str())];
+        for (m, path, body) in [
+            ("POST", "/api/sessions/review-dev-a/rename", json!({"name": "dev-a-lead"})),
+            ("PATCH", "/api/sessions/review-dev-a/config", json!({"rename": "Dev-A-LEAD"})),
+        ] {
+            let (st, v) = status_and_body(&app, socket_request(m, path, body.clone(), &lead)).await;
+            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("lead_rename_reserved_suffix")), "{m} {path} {body}: {v}");
+            assert!(home.path().join("sessions/review-dev-a.env").exists(), "refused rename changed nothing");
+        }
+        let (st, v) = status_and_body(&app, socket_request("POST", "/api/sessions/review-dev-a/rename",
+            json!({"name": "dev-a2"}), &lead)).await;
+        assert_eq!(st, StatusCode::OK, "control: an ordinary name still works: {v}");
+        // The owner (an in-process request with no worker identity) may.
+        let (st, _, v) = send_with(&app, "POST", "/api/sessions/dev-a2/rename", Some(json!({"name": "dev-a-lead"})), &[]).await;
+        assert_eq!(st, StatusCode::OK, "the owner may: {v}");
+        use crate::api::session_verbs::is_lead_suffixed;
+        assert!(is_lead_suffixed("x-lead") && is_lead_suffixed("X-LEAD") && !is_lead_suffixed("leader") && !is_lead_suffixed("lead-x"));
+    }
+
     /// Round 3 N5: an env apply validates the whole spec before writing: one
     /// refused value means no worker in the spec is written.
     #[tokio::test]
