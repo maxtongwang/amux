@@ -1428,6 +1428,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_drawWriteRecents": {
+      "kind": "command._drawWriteRecents",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_editSelectChanged": {
       "kind": "command._editSelectChanged",
       "feedback_required": true,
