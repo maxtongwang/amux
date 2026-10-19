@@ -307,11 +307,11 @@ fn resolve_url(explicit: Option<String>) -> String {
 }
 
 /// Under amux-isolated (`AMUX_ISOLATED_RUN=1`) a test must never reach the
-/// live server. The rule matches the PARSED port, never a host spelling: the
-/// built-in default, and any URL whose port is live (8824, 8822, or a port in
-/// an endpoint.json the server wrote), resolve to a dead loopback port, with
-/// the reason returned for logging. The server binds 0.0.0.0, so any host on
-/// a live port is the live server. Same rule as scripts/lib/amux_endpoint.py
+/// live server. FAIL CLOSED: only a test URL of one strict shape
+/// (`test_url_port`) whose port is not live (8824, 8822, or a port in an
+/// endpoint.json the server wrote) is used; the built-in default and
+/// everything else resolve to a dead loopback port, with the reason returned
+/// for logging. Same rule as scripts/lib/amux_endpoint.py
 /// and scripts/lib/amux-endpoint.sh (the Bash CLI's copy); this CLI reads no
 /// endpoint.json for its URL, so there is nothing to stop following.
 const ISOLATED_DEAD_URL: &str = "http://127.0.0.1:9";
@@ -334,11 +334,48 @@ fn resolve_url_from(
         .find(|u| !u.is_empty());
     match chosen {
         None if isolated => (ISOLATED_DEAD_URL.to_string(), Some("unset_would_use_builtin")),
-        Some(u) if isolated && url_port(&u).is_some_and(|p| live_ports.contains(&p)) => {
-            (ISOLATED_DEAD_URL.to_string(), Some("live_port"))
-        }
+        Some(u) if isolated => match test_url_port(&u) {
+            TestUrl::Bad => (ISOLATED_DEAD_URL.to_string(), Some("not_test_shape")),
+            TestUrl::Http(p) if live_ports.contains(&p) => (ISOLATED_DEAD_URL.to_string(), Some("live_port")),
+            TestUrl::Http(_) | TestUrl::File => (u, None),
+        },
         Some(u) => (u, None),
         None => (DEFAULT_CLIENT_URL.to_string(), None),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum TestUrl {
+    Http(u16),
+    File,
+    Bad,
+}
+
+/// THE ALLOWED SHAPE under isolation (fail closed; scripts/lib/amux_endpoint.py
+/// TEST_URL_RE): `http(s)://127.0.0.1|localhost|[::1]:<port>[/<path>]` with the
+/// port 1-65535 written plainly (no sign, no padding), or `file:///<path>`;
+/// no whitespace, control character, backslash or '@' anywhere. Anything else
+/// is Bad, so a spelling a URL parser could still read as a live port never
+/// reaches it.
+fn test_url_port(url: &str) -> TestUrl {
+    let clean = |t: &str| !t.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\' || c == '@');
+    if let Some(path) = url.strip_prefix("file:///") {
+        return if clean(path) { TestUrl::File } else { TestUrl::Bad };
+    }
+    let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) else {
+        return TestUrl::Bad;
+    };
+    let Some(after_host) = ["127.0.0.1:", "localhost:", "[::1]:"].iter().find_map(|h| rest.strip_prefix(h)) else {
+        return TestUrl::Bad;
+    };
+    let (port, path) = after_host.split_at(after_host.find('/').unwrap_or(after_host.len()));
+    let plain = (1..=5).contains(&port.len()) && port.bytes().all(|b| b.is_ascii_digit()) && !port.starts_with('0');
+    if !plain || !clean(path) {
+        return TestUrl::Bad;
+    }
+    match port.parse::<u32>() {
+        Ok(p @ 1..=65535) => TestUrl::Http(p as u16),
+        _ => TestUrl::Bad,
     }
 }
 
@@ -1057,10 +1094,11 @@ mod isolated_endpoint_tests {
         assert_eq!((url.as_str(), why), (ISOLATED_DEAD_URL, Some("unset_would_use_builtin")));
     }
 
-    /// Every spelling two reviews used to escape the old host lists.
+    /// Every spelling three reviews used to escape earlier designs, plus the
+    /// final round's six; fail closed refuses each.
     #[test]
-    fn isolated_run_refuses_any_host_on_a_live_port() {
-        let mut probes = Vec::new();
+    fn isolated_run_refuses_everything_but_a_clean_test_url() {
+        let mut probes: Vec<String> = Vec::new();
         for port in [8824u16, 8822, 9824] {
             for host in ["localhost", "LOCALHOST", "0.0.0.0", "127.1", "127.0.0.2", "[::1]",
                          "[0:0:0:0:0:0:0:1]", "[::ffff:127.0.0.1]", "localhost.", "user@localhost", "some-host"] {
@@ -1070,22 +1108,32 @@ mod isolated_endpoint_tests {
             probes.push(format!(" https://localhost:{port}?x"));
             probes.push(format!("localhost:{port}"));
         }
+        for esc in ["http://127.0.0.1:+8824", "http://127.0.0.1: 8824", "http://127.0.0.1:88_24",
+                    "http://127.0.0.1:8824\\x", "http://127.0.0.1:8824\\@localhost:9999", "http://127.0.0.1:88\t24",
+                    "HTTP://127.0.0.1:41234", "http://127.0.0.1:041234", "http://127.0.0.1:88240",
+                    "https://cloud.example", "http://127.0.0.1:41234/a b",
+                    "http://127.0.0.1:41234/\u{7}", "ftp://127.0.0.1:41234"] {
+            probes.push(esc.to_string());
+        }
         for live in probes {
             let (url, why) = resolve_url_from(None, Some(live.clone()), true, LIVE);
-            assert_eq!((url.as_str(), why), (ISOLATED_DEAD_URL, Some("live_port")), "{live}");
+            assert_eq!(url, ISOLATED_DEAD_URL, "{live:?}");
+            assert!(matches!(why, Some("live_port" | "not_test_shape" | "unset_would_use_builtin")), "{live:?}");
             let (url, _) = resolve_url_from(Some(live.clone()), None, true, LIVE);
-            assert_eq!(url, ISOLATED_DEAD_URL, "explicit {live}");
+            assert_eq!(url, ISOLATED_DEAD_URL, "explicit {live:?}");
         }
     }
 
     #[test]
     fn isolated_run_keeps_a_test_server_and_normal_runs_are_unchanged() {
-        for kept in ["http://127.0.0.1:41234", "https://localhost:88240", "https://cloud.example"] {
-            assert_eq!(resolve_url_from(None, Some(kept.into()), true, LIVE), (kept.to_string(), None));
+        for kept in ["http://127.0.0.1:41234", "https://localhost:65535/x?y=1", "http://[::1]:9", "file:///tmp/h.json"] {
+            assert_eq!(resolve_url_from(None, Some(kept.into()), true, LIVE), (kept.to_string(), None), "{kept}");
         }
         assert_eq!(resolve_url_from(None, None, false, LIVE), (DEFAULT_CLIENT_URL.to_string(), None));
         let live = format!("https://localhost:{}", FIXED_LIVE_PORTS[0]);
         assert_eq!(resolve_url_from(None, Some(live.clone()), false, LIVE), (live, None));
+        assert_eq!(resolve_url_from(None, Some("https://cloud.example".into()), false, LIVE),
+                   ("https://cloud.example".to_string(), None));
     }
 
     #[test]

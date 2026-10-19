@@ -70,7 +70,7 @@ fn a_live_port_in_any_spelling_is_refused_under_isolation() {
         ("AMUX_URL", Some("HTTPS://user@LOCALHOST:08824/")),
     ]);
     assert!(
-        err.contains("reason=live_port") && err.contains("127.0.0.1:9"),
+        err.contains("verdict=isolated_live_endpoint_refused") && err.contains("127.0.0.1:9"),
         "a leading-zero, uppercase, userinfo spelling of the live port must be refused; stderr: {err}"
     );
 }

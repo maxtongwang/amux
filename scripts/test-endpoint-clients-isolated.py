@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Under amux-isolated, a variable-unsetting run reaches no live amux endpoint.
 
-The rule (scripts/lib/amux_endpoint.py): with AMUX_ISOLATED_RUN=1, an empty URL
-or one whose PARSED port is live (8824, 8822, any endpoint.json port) becomes the
-dead port, with a logged refusal; the host is never consulted. This test:
+The rule (scripts/lib/amux_endpoint.py): with AMUX_ISOLATED_RUN=1, FAIL CLOSED.
+Only a test URL of one strict shape (TEST_URL_RE) whose port is not live (8824,
+8822, any endpoint.json port) is used; anything else becomes the dead port, with
+a logged refusal. KNOWN LIMIT: a stand-in (a copy with no shared file anywhere)
+knows only 8824/8822, so it misses a live server on a non-default port; it still
+refuses every non-test shape. This test:
 
 1. drives every implementation over one probe table: the Python and shell
    libraries, the Bash CLI (`amux url`), and the inline stand-ins (Python,
@@ -104,7 +107,17 @@ ESCAPES = ["", "  ", "https://LOCALHOST:8824", "HTTPS://localhost:8824", "http:/
            "https://[::ffff:127.0.0.1]:8824", "https://localhost.:8824", "https://user@localhost:8824",
            "https://localhost:08824", "https://%s:8824" % socket.gethostname(), " https://localhost:8824",
            "https://localhost:8824?x", "localhost:8824", "https://[::1]:8822"]
-KEPT = ["http://127.0.0.1:41234", "https://localhost:88240", "https://cloud.example", "file:///tmp/health.json"]
+# The final review round's six: spellings a real client (urllib's int(), the
+# WHATWG parser) still reads as the live port. Fail closed refuses them as
+# "not a test URL", without parsing a port at all.
+SIX = ["http://127.0.0.1:+8824", "http://127.0.0.1: 8824", "http://127.0.0.1:88_24",
+       "http://127.0.0.1:8824\\x", "http://127.0.0.1:8824\\@localhost:9999", "http://127.0.0.1:88\t24"]
+# Shapes the allow-list refuses even with a harmless port.
+NOT_SHAPE = ["HTTP://127.0.0.1:41234", "http://127.0.0.1:041234", "http://127.0.0.1:88240",
+             "https://cloud.example", "http://127.0.0.1:41234/a b", "ftp://127.0.0.1:41234",
+             "http://127.0.0.1:41234\nhttps://localhost:8824", "http://127.0.0.1:41234/\x07"]
+ESCAPES = ESCAPES + SIX + NOT_SHAPE
+KEPT = ["http://127.0.0.1:41234", "https://localhost:65535/x?y=1", "http://[::1]:9", "file:///tmp/health.json"]
 ENDPOINT_PORT = ["https://localhost:%d" % FIXTURE_PORT, "http://0.0.0.0:0%d/x" % FIXTURE_PORT]
 
 
@@ -184,13 +197,15 @@ def run_table():
             got = fn(u)
             if got is None:
                 break
-            want = u.strip() if name == "bash-cli" else u
+            want = u
             if got != want:
                 bad.append("kept %r -> %r" % (u, got))
         if fn(KEPT[0]) is None:
             print("  skip %s: node not installed" % name)
             continue
-        check("%s refuses every live-port spelling and keeps other URLs" % name, not bad, "; ".join(bad))
+        n = len(ESCAPES) + (len(ENDPOINT_PORT) if knows_ep else 0)
+        check("%s refuses all %d non-test or live URLs and keeps the %d clean test URLs" % (name, n, len(KEPT)),
+              not bad, "; ".join(bad))
 
 
 # ── 2. every copy of a block is identical ────────────────────────────────────

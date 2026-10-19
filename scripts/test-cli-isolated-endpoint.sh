@@ -61,11 +61,14 @@ run 1 - - board ls
   || bad "unset vars: board ls requests" "$(cat "$CURL_LOG")"
 
 # 2. Every spelling two reviews used to escape the old host lists, as AMUX_API and AMUX_URL.
+# Fail closed: anything but a clean test URL is refused, live port or not.
 for u in https://LOCALHOST:8824 HTTPS://localhost:8824 http://0.0.0.0:8824 https://127.1:8824 \
          'https://[::ffff:127.0.0.1]:8824' https://localhost.:8824 https://user@localhost:8824 \
-         https://localhost:08824 "https://$(hostname):8824" https://localhost:9824 'https://[::1]:8822'; do
+         https://localhost:08824 "https://$(hostname):8824" https://localhost:9824 'https://[::1]:8822' \
+         'http://127.0.0.1:+8824' 'http://127.0.0.1: 8824' 'http://127.0.0.1:88_24' 'http://127.0.0.1:8824\x' \
+         'http://127.0.0.1:8824\@localhost:9999' "$(printf 'http://127.0.0.1:88\t24')" https://cloud.example; do
   run 1 "$u" "$u" board ls
-  if [ -s "$CURL_LOG" ] && [ "$(live_hits)" = 0 ] && [ "$(refused live_port)" -ge 2 ]; then
+  if [ -s "$CURL_LOG" ] && [ "$(live_hits)" = 0 ] && [ "$(refused '')" -ge 2 ]; then
     ok "refused and logged: $u"
   else
     bad "not refused: $u" "$(cat "$CURL_LOG") | $(cat "$W/err")"

@@ -2,9 +2,10 @@
 
 Under amux-isolated (AMUX_ISOLATED_RUN=1) a client must never address the live
 server. Each client computes its URL as it always has and passes the result
-through guard(). The rule matches the PARSED PORT, never a host spelling: an
-empty URL, or one whose port (scheme default if absent, leading zeros dropped)
-is a live port, becomes a dead port and the refusal is logged. Live ports are
+through guard(). FAIL CLOSED: an isolated run may use only a test URL of one
+strict shape (TEST_URL_RE) whose port is not live; anything else, including any
+spelling a client might still parse into a live port, becomes a dead port and
+the refusal is logged. Live ports are
 8824, 8822, and every port named by an endpoint.json the server wrote (the
 real user's ~/.amux, $AMUX_HOME, $CC_HOME, $HOME/.amux). The server binds
 0.0.0.0, so any host on a live port is the live server, which is why the host
@@ -83,17 +84,37 @@ def isolated():
     return os.environ.get("AMUX_ISOLATED_RUN") == "1"
 
 
+# THE ALLOWED SHAPE under isolation (dev-lead, 2026-10-19, after three escape
+# rounds in the parse-then-deny design): fail closed. A URL passes only if it is
+# exactly one of these, with nothing to normalize:
+#   http(s)://127.0.0.1|localhost|[::1]:<port>[/<path>]   port 1-65535 as written,
+#       no sign, no padding; no whitespace, control character, backslash or '@'
+#       anywhere
+#   file:///<path>  (a fixture; cannot reach a server)
+# and its port is not live (live_ports()). Everything else is refused and
+# logged. Same pattern in scripts/lib/amux-endpoint.sh (ERE), the Rust CLI, the
+# JS block and every client's inline stand-in.
+TEST_URL_RE = re.compile(
+    r"(?:https?://(?:127\.0\.0\.1|localhost|\[::1\]):([1-9][0-9]{0,4})(?:/[^\s\\@\x00-\x1f\x7f]*)?"
+    r"|file:///[^\s\\@\x00-\x1f\x7f]*)")
+
+
 def guard(url, client):
-    """url unchanged, unless an isolated run would reach the live server."""
+    """url unchanged, unless an isolated run would use something other than a test URL."""
     if not isolated():
         return url
+    m = TEST_URL_RE.fullmatch(url or "")
     if not (url or "").strip():
         reason = "unset_would_use_builtin"
-    elif url_port(url) in live_ports():
+    elif m is None:
+        reason = "not_test_shape"
+    elif m.group(1) and int(m.group(1)) > 65535:
+        reason = "not_test_shape"
+    elif m.group(1) and int(m.group(1)) in live_ports():
         reason = "live_port"
     else:
         return url
-    print("[amux] verdict=isolated_live_endpoint_refused client=%s from=%s reason=%s "
+    print("[amux] verdict=isolated_live_endpoint_refused client=%s from=%r reason=%s "
           "to=%s measured=true n_considered=1" % (client, url or "<unset>", reason, DEAD_URL),
           file=sys.stderr)
     return DEAD_URL

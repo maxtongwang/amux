@@ -5,9 +5,9 @@ import { handleBusiness } from './business';
 
 // >>> amux-endpoint-guard (rule: scripts/lib/amux_endpoint.py; every copy identical, test-enforced)
 function amuxEndpointGuard(url: unknown, client: string): unknown {
-  const u = String(url || '').trim().toLowerCase();
-  const a = u.replace(/^[a-z][a-z0-9+.-]*:\/\//, '').split(/[/?#]/)[0].replace(/^.*@/, '').replace(/^\[.*\]/, '');
-  const p = a.includes(':') ? a.slice(a.lastIndexOf(':') + 1) : '';
+  const u = String(url || '');
+  const m = /^(?:https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):([1-9][0-9]{0,4})(?:\/[^\s\\@\x00-\x1f\x7f]*)?|file:\/\/\/[^\s\\@\x00-\x1f\x7f]*)$/.exec(u);
+  const port = m && m[1] ? Number(m[1]) : 0;
   const live = new Set([8824, 8822]);
   const mod = (m: string): any => (process as any).getBuiltinModule(m);
   const e = process.env;
@@ -17,8 +17,8 @@ function amuxEndpointGuard(url: unknown, client: string): unknown {
       for (const n of [ep.canonical_port, ep.legacy_port, ...(ep.retired_ports || [])]) if (Number.isInteger(n)) live.add(n);
     } catch {}
   }
-  if (process.env.AMUX_ISOLATED_RUN === '1' && (!u || (/^[0-9]+$/.test(p) && live.has(Number(p))))) {
-    process.stderr.write(`[amux] verdict=isolated_live_endpoint_refused client=${client} from=${url || '<unset>'} reason=live_port to=http://127.0.0.1:9 measured=true n_considered=1\n`);
+  if (e.AMUX_ISOLATED_RUN === '1' && (!m || port > 65535 || live.has(port))) {
+    process.stderr.write(`[amux] verdict=isolated_live_endpoint_refused client=${client} from=${JSON.stringify(u)} reason=not_test_shape_or_live_port to=http://127.0.0.1:9 measured=true n_considered=1\n`);
     return 'http://127.0.0.1:9';
   }
   return url;

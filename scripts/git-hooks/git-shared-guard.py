@@ -34,15 +34,14 @@ for _ae_dir in (_AE_HERE, os.path.join(_AE_HERE, "lib"), os.path.join(_AE_HERE, 
         sys.path.append(_ae_dir)
 try:
     from amux_endpoint import guard as _endpoint_guard
-except ImportError:  # no shared file anywhere: the parsed-port rule on the fixed live ports
+except ImportError:  # no shared file anywhere: the same allowed shape, fixed live ports
     def _endpoint_guard(url, client):
         import re
-        u = (url or "").strip().lower()
-        a = re.split(r"[/?#]", u.split("://", 1)[-1], 1)[0].rsplit("@", 1)[-1]
-        p = a.partition("]")[2] if a.startswith("[") else a
-        p = p.rpartition(":")[2] if ":" in p else ""
-        if os.environ.get("AMUX_ISOLATED_RUN") == "1" and (not u or (p.isdigit() and int(p) in (8824, 8822))):
-            print("[amux] verdict=isolated_live_endpoint_refused client=%s from=%s reason=stand_in "
+        m = re.fullmatch(r"(?:https?://(?:127\.0\.0\.1|localhost|\[::1\]):([1-9][0-9]{0,4})"
+                         r"(?:/[^\s\\@\x00-\x1f\x7f]*)?|file:///[^\s\\@\x00-\x1f\x7f]*)", url or "")
+        port = int(m.group(1)) if m and m.group(1) else 0
+        if os.environ.get("AMUX_ISOLATED_RUN") == "1" and (m is None or port > 65535 or port in (8824, 8822)):
+            print("[amux] verdict=isolated_live_endpoint_refused client=%s from=%r reason=stand_in "
                   "to=http://127.0.0.1:9 measured=true n_considered=1" % (client, url or "<unset>"),
                   file=sys.stderr)
             return "http://127.0.0.1:9"

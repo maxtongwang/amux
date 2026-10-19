@@ -1,6 +1,7 @@
 # amux-endpoint.sh — isolated-run endpoint guard for amux's shell clients (sourced, POSIX sh).
 # amux_endpoint_guard <url> <client> prints <url>, unless AMUX_ISOLATED_RUN=1 and <url>
-# is empty or its PARSED port is live: then it prints the dead port and logs the refusal.
+# is not a test URL of the one allowed shape, or its port is live: then it prints the
+# dead port and logs the refusal (fail closed).
 # Live ports: 8824, 8822 and every port in an endpoint.json the server wrote. The host
 # is never consulted (the server binds 0.0.0.0). Same rule as scripts/lib/amux_endpoint.py;
 # the Bash CLI carries a byte-identical copy of the block below, and
@@ -42,17 +43,35 @@ amux_endpoint_live_ports() { # 8824, 8822 and every endpoint.json port, one per 
   done
   return 0
 }
+# THE ALLOWED SHAPE under isolation (fail closed; see scripts/lib/amux_endpoint.py
+# TEST_URL_RE): http(s)://127.0.0.1|localhost|[::1]:<1-65535 as written>[/<path>]
+# or file:///<path>, with no whitespace, control character, backslash or '@'.
+AMUX_TEST_URL_ERE='^(https?://(127\.0\.0\.1|localhost|\[::1\]):[1-9][0-9]{0,4}(/[^[:space:][:cntrl:]\\@]*)?|file:///[^[:space:][:cntrl:]\\@]*)$'
 amux_endpoint_guard() { # url client -> url, or the dead port under isolation
   _aeg_reason=""
   if [ "${AMUX_ISOLATED_RUN:-}" = 1 ]; then
     if [ -z "$(printf '%s' "$1" | tr -d '[:space:]')" ]; then
       _aeg_reason=unset_would_use_builtin
+    # One line only: grep matches per line, so an embedded newline must never
+    # let a clean second line vouch for the whole value.
+    elif [ "$(printf '%s' "$1" | wc -l | tr -d ' ')" != 0 ] \
+         || ! printf '%s\n' "$1" | LC_ALL=C grep -Eq "$AMUX_TEST_URL_ERE"; then
+      _aeg_reason=not_test_shape
     else
-      _aeg_port=$(amux_endpoint_port "$1")
-      # A word match, not `| grep -q`: under pipefail grep's early exit
-      # SIGPIPEs the writer and the pipeline reads as false.
-      _aeg_ports=" $(amux_endpoint_live_ports | tr '\n' ' ') "
-      case "$_aeg_ports" in *" $_aeg_port "*) [ -n "$_aeg_port" ] && _aeg_reason=live_port ;; esac
+      case "$1" in
+        file:*) ;;
+        *)
+          _aeg_port=${1#*://}; _aeg_port=${_aeg_port%%/*}; _aeg_port=${_aeg_port##*:}
+          if [ "$_aeg_port" -gt 65535 ]; then
+            _aeg_reason=not_test_shape
+          else
+            # A word match, not `| grep -q`: under pipefail grep's early exit
+            # SIGPIPEs the writer and the pipeline reads as false.
+            _aeg_ports=" $(amux_endpoint_live_ports | tr '\n' ' ') "
+            case "$_aeg_ports" in *" $_aeg_port "*) _aeg_reason=live_port ;; esac
+          fi
+          ;;
+      esac
     fi
   fi
   if [ -n "$_aeg_reason" ]; then
