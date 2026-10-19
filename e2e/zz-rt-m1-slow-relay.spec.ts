@@ -14,6 +14,7 @@ import { join } from 'node:path';
 import type { Browser, BrowserContext, Page, TestInfo } from '@playwright/test';
 import { test, expect } from './fixtures';
 import { cleanup } from './teardown';
+test.afterEach(() => { delete (globalThis as any).__mut; });
 
 type Win = Window & { _draw: any; _drawRt: any; _rt: any; switchView: (v: string) => void; _drawOpenPath: (p: string) => void };
 const W = () => window as unknown as Win;
