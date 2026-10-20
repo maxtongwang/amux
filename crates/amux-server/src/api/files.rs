@@ -1,5 +1,6 @@
 //! Files API (RR-0093): browse / download / upload rooted at `$HOME`
 //! (override: `AMUX_FILES_ROOT`, which is also how tests pin a temp root).
+//! Uploads refuse dotfiles, sensitive paths, code-execution targets and existing executables (refs maxtongwang/ai-config#218).
 //!
 //! Routes (nested at `/api/files`):
 //! - `GET  /api/files?path=<rel>`            — directory listing
@@ -259,14 +260,59 @@ async fn download(Query(q): Query<PathParam>) -> Response {
     }
 }
 
-async fn upload(Query(q): Query<PathParam>, body: Bytes) -> Response {
+fn upload_refusal(rel: &Path, target: &Path) -> Option<(&'static str, &'static str)> {
+    if rel.components().any(|component| {
+        matches!(component, Component::Normal(name) if name.as_encoded_bytes().starts_with(b"."))
+    }) {
+        return Some((
+            "upload_dotfile_refused",
+            "Uploads may not write dotfiles or files inside hidden directories.",
+        ));
+    }
+    if !crate::api::fs::is_path_allowed(target) {
+        return Some((
+            "upload_path_not_allowed",
+            "Uploads may not write sensitive home or system paths.",
+        ));
+    }
+    if crate::api::fs::is_dangerous_write(target) {
+        return Some((
+            "upload_dangerous_write_refused",
+            "Uploads may not write files that could execute code.",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Ok(metadata) = std::fs::symlink_metadata(target) {
+            if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+                return Some((
+                    "upload_executable_refused",
+                    "Uploads may not overwrite existing executable files.",
+                ));
+            }
+        }
+    }
+    None
+}
+
+async fn upload(
+    headers: axum::http::HeaderMap,
+    Query(q): Query<PathParam>,
+    body: Bytes,
+) -> Response {
+    upload_into(files_root(), &headers, &q, body).await
+}
+
+/// The upload itself, with the root passed in so tests never touch `$HOME`.
+async fn upload_into(root: PathBuf, headers: &axum::http::HeaderMap, q: &PathParam, body: Bytes) -> Response {
     if body.len() > MAX_BYTES {
         return err(
             StatusCode::PAYLOAD_TOO_LARGE,
             json!({ "error": format!("body is {} bytes; upload cap is {} bytes", body.len(), MAX_BYTES), "limit": MAX_BYTES }),
         );
     }
-    let root = files_root();
     let rel = match validate_upload_rel(&q.path) {
         Ok(r) => r,
         Err(e) => return err(StatusCode::BAD_REQUEST, json!({ "error": e })),
@@ -281,6 +327,16 @@ async fn upload(Query(q): Query<PathParam>, body: Bytes) -> Response {
         }
     };
     let target = canon_root.join(&rel);
+    if let Some((code, error)) = upload_refusal(&rel, &target) {
+        let origin = crate::api::session_verbs::worker_origin(headers);
+        tracing::warn!(target: "amux::files", path = %rel.display(), worker = %origin,
+            verdict = code, measured = true, n_considered = 1,
+            "file upload refused: {error}");
+        return err(
+            StatusCode::FORBIDDEN,
+            json!({ "ok": false, "code": code, "error": error }),
+        );
+    }
     if let Some(parent) = target.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
             return err(
@@ -366,6 +422,96 @@ mod tests {
         assert!(validate_upload_rel("../x").is_err());
         assert!(validate_upload_rel("a/../../x").is_err());
         assert!(validate_upload_rel("/abs/path").is_err());
+    }
+
+    #[test]
+    fn upload_refuses_dotfiles_and_dot_directories() {
+        let dir = root();
+        for rel in [
+            ".bashrc",
+            ".zshrc",
+            ".gitconfig",
+            ".ssh/authorized_keys",
+            ".git/hooks/pre-commit",
+            "notes/.envrc",
+        ] {
+            assert_eq!(
+                upload_refusal(Path::new(rel), &dir.path().join(rel)).map(|(code, _)| code),
+                Some("upload_dotfile_refused"),
+                "{rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_refuses_sensitive_paths() {
+        // Pure path only: never create or write anything under the real HOME.
+        let target = PathBuf::from(std::env::var("HOME").unwrap()).join(".ssh/x");
+        assert!(!crate::api::fs::is_path_allowed(&target));
+        assert_eq!(
+            upload_refusal(Path::new("x"), &target).map(|(code, _)| code),
+            Some("upload_path_not_allowed")
+        );
+    }
+
+    #[test]
+    fn upload_refuses_dangerous_write_targets() {
+        let dir = root();
+        for rel in ["Library/LaunchAgents/evil.plist", "bin/run", "x/evil.command"] {
+            assert_eq!(
+                upload_refusal(Path::new(rel), &dir.path().join(rel)).map(|(code, _)| code),
+                Some("upload_dangerous_write_refused"),
+                "{rel}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_refuses_existing_executables() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = root();
+        let target = dir.path().join("tool.sh");
+        std::fs::write(&target, "echo test").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            upload_refusal(Path::new("tool.sh"), &target).map(|(code, _)| code),
+            Some("upload_executable_refused")
+        );
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(upload_refusal(Path::new("tool.sh"), &target), None);
+    }
+
+    #[tokio::test]
+    async fn the_endpoint_refuses_a_dotfile_without_creating_it_and_still_uploads_files() {
+        let dir = root();
+        let up = |path: &str| PathParam { path: path.into() };
+        let h = axum::http::HeaderMap::new();
+        let r = upload_into(dir.path().into(), &h, &up(".bashrc"), Bytes::from_static(b"evil")).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], "upload_dotfile_refused", "{v}");
+        assert!(!dir.path().join(".bashrc").exists());
+        let r = upload_into(dir.path().into(), &h, &up(".ssh/authorized_keys"), Bytes::from_static(b"k")).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert!(!dir.path().join(".ssh").exists(), "a refused upload must not create its dot-directory");
+        let r = upload_into(dir.path().into(), &h, &up("notes/a.txt"), Bytes::from_static(b"ok")).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(dir.path().join("notes/a.txt")).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn upload_allows_ordinary_files() {
+        let dir = root();
+        for rel in ["notes/a.txt", "Documents/report.pdf"] {
+            assert_eq!(
+                upload_refusal(Path::new(rel), &dir.path().join(rel)),
+                None,
+                "{rel}"
+            );
+        }
     }
 
     #[test]
