@@ -229,10 +229,15 @@ class CargoReclaimTests(unittest.TestCase):
         def denied(_):
             raise PermissionError('hardened procfs')
 
+        # A real file of our own, not the host's /usr/bin/sleep: process_executable
+        # resolves symlinks, and runner images now link sleep into Rust coreutils.
+        known = self.base / 'bin' / 'sleep'
+        known.parent.mkdir()
+        known.write_text('')
         resolved = guard.process_executable(
             '1177', 'sleep', linux=True, proc_root=self.base / 'proc',
-            readlink=denied, which=lambda name: '/usr/bin/sleep' if name == 'sleep' else None)
-        self.assertEqual(resolved, Path('/usr/bin/sleep'))
+            readlink=denied, which=lambda name: str(known) if name == 'sleep' else None)
+        self.assertEqual(resolved, known.resolve())
 
     def test_hardened_linux_proc_still_fails_closed_for_unknown_binary(self):
         proc = self.base / 'proc' / '1178'
