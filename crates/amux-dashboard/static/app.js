@@ -5373,6 +5373,7 @@ const _ALERT_LABELS = {
   auto_restart:   (a) => ({ icon: '\u{1f504}', title: 'Agent restarted', body: a.session + ' — ' + a.message }),
   thinking_reset: (a) => ({ icon: '\u{1f504}', title: 'Thinking reset', body: a.session }),
   auto_continue:  (a) => ({ icon: '▶️', title: 'Agent continued', body: a.session }),
+  steering_stuck: (a) => ({ icon: '⚠️', title: 'Message still queued', body: a.message }),
   steering_delivered: (a) => ({ icon: '\u{1f4e8}', title: 'Steering delivered', body: a.session }),
   task_pickup:      (a) => ({ icon: '\u{1f4cb}', title: 'Task assigned', body: a.session + (a.message ? ' — ' + a.message : '') }),
 };

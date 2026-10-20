@@ -189,6 +189,20 @@ pub(crate) mod fake_pane {
             .collect()
     }
 
+    static FRAMES: Mutex<Vec<(std::path::PathBuf, String, String)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn set_frame(name: &str, raw: &str) {
+        let home = crate::config::amux_home();
+        let mut frames = FRAMES.lock().unwrap();
+        frames.retain(|(h, n, _)| h != &home || n != name);
+        frames.push((home, name.into(), raw.into()));
+    }
+
+    pub(crate) fn frame(name: &str) -> Option<String> {
+        let home = crate::config::amux_home();
+        FRAMES.lock().unwrap().iter().find(|(h,n,_)| h == &home && n == name).map(|(_,_,raw)| raw.clone())
+    }
+
     #[async_trait::async_trait]
     impl ExecutionAdapter for FakePane {
         fn worker_type(&self) -> &'static str {
@@ -201,6 +215,9 @@ pub(crate) mod fake_pane {
             Dispatch::Handled((true, "fake pane".into()))
         }
         async fn deliver(&self, _: &AppState, name: &str, text: &str, origin: SendOrigin) -> Dispatch<(bool, String)> {
+            if frame(name).is_some_and(|raw| super::super::session_verbs::composer_state(&raw).typed().is_some()) {
+                return Dispatch::Handled((false, "composer contains a draft; durable message remains queued".into()));
+            }
             let origin = match origin {
                 SendOrigin::Owner => "owner",
                 SendOrigin::Automation => "amux",

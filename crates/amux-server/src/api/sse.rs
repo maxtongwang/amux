@@ -93,6 +93,7 @@ pub async fn events(
     // Ephemeral composer presence (api/typing.rs): never stored, so it has its
     // own channel beside the revisioned store events.
     let mut typing_rx = super::typing::channel().subscribe();
+    let mut alerts_rx = super::alerts::dashboard_alerts().subscribe();
     let viewer = super::typing::actor(&headers);
     let current = state.store.current_rev().map(|r| r.0).unwrap_or(0);
     let scoped_member =
@@ -112,6 +113,15 @@ pub async fn events(
                         // their grant, so presence is not sent to them at all.
                         if let (Ok(payload), false) = (t, scoped_member) {
                             let payload = super::typing::without_viewer(&payload, &viewer).unwrap_or(payload);
+                            if yielder.send(Event::default().data(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    alert = alerts_rx.recv() => {
+                        // Match presence's scope boundary: no cross-grant data.
+                        if let (Ok(payload), false) = (alert, scoped_member) {
                             if yielder.send(Event::default().data(payload)).await.is_err() {
                                 break;
                             }

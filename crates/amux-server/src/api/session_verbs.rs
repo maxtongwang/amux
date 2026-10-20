@@ -20968,6 +20968,7 @@ pub(crate) fn hdr_worker(headers: &HeaderMap) -> String {
 // rather than a copy of it — a displayed interval that can disagree with the
 // sleep is how a healthy job reads as stalled (or worse, the reverse).
 pub const STEER_TICK_SECS: u64 = 5;
+const STEERING_STUCK_SECS: f64 = 60.0;
 
 /// Is this lane at a turn boundary — i.e. may a queued message be delivered NOW?
 ///
@@ -21679,6 +21680,16 @@ pub(crate) async fn boundary_signals(
     state: &AppState,
     lane: Option<&str>,
 ) -> Option<crate::api::sessions_legacy::FleetSignals> {
+    #[cfg(test)]
+    if let Some((name, raw)) = lane.and_then(|name| super::worker_exec::fake_pane::frame(name).map(|raw| (name,raw))) {
+        let mut signals = super::sessions_legacy::tests::signals();
+        signals.now = now_f64();
+        signals.running.insert(format!("amux-{name}"));
+        signals.hookless_workers.insert(name.into());
+        signals.activity.insert(format!("amux-{name}"), now_i64());
+        signals.panes.insert(name.into(), raw);
+        return Some(signals);
+    }
     let store = state.store.clone();
     let lane = lane.map(str::to_string);
     crate::db::interactions::spawn_blocking(move || {
@@ -22618,6 +22629,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
             .await;
     }
     if queued.is_empty() {
+        warn_steering_stuck(state).await;
         return 0;
     }
     // ONE DELIVERY per lane per tick, oldest first. Delivering a whole backlog
@@ -23234,7 +23246,69 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
     // trace anywhere, so finding it took a hand-written DB read. The age comes
     // from `queued_at`, so this needs no new state to be true after a restart.
     warn_on_stalled_lanes(state).await;
+    warn_steering_stuck(state).await;
     delivered
+}
+
+/// The event idem is the durable once-per-row receipt, including after restart.
+/// A row already claimed for delivery is in flight, not stuck: skipping it keeps an
+/// empty or claimed-only queue from waiting on the store writer.
+/// Persist both audiences together before publishing the dashboard alert; never
+/// type a warning into a blocked composer or recursively enqueue warnings.
+async fn warn_steering_stuck(state: &AppState) -> usize {
+    let now = now_f64();
+    let due = state.store.read().and_then(|conn| {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM steering_queue WHERE delivering_since IS NULL AND MAX(queued_at,COALESCE(deliver_at,0))<=?1 \
+             AND NOT EXISTS(SELECT 1 FROM session_events WHERE idem='steering-stuck:'||steering_queue.id))",
+            rusqlite::params![now-STEERING_STUCK_SECS], |r| r.get::<_,bool>(0),
+        )?)
+    });
+    if matches!(due, Ok(false)) { return 0; }
+    let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let written = notices.clone();
+    let result = state.store.write_async(move |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id,session,COALESCE(sender,''),?1-MAX(queued_at,COALESCE(deliver_at,0)) \
+             FROM steering_queue WHERE delivering_since IS NULL AND MAX(queued_at,COALESCE(deliver_at,0))<=?2 \
+             AND NOT EXISTS(SELECT 1 FROM session_events WHERE idem='steering-stuck:'||steering_queue.id)",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![now, now-STEERING_STUCK_SECS], |r| {
+            Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,f64>(3)?))
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for (id, session, sender, age) in rows {
+            let detail = format!("Message {id} to '{session}' is still undelivered after {}s; amux will retry without clearing or submitting someone else's draft.", age as i64);
+            let payload = json!({"id":id,"lane":session,"sender":sender,"age_s":age as i64,
+                "detail":detail,"verdict":"steering_stuck","measured":true,"n_considered":1});
+            let n = conn.execute(
+                "INSERT OR IGNORE INTO session_events(ts,session,type,data,idem,source) VALUES(?1,?2,'steering.stalled',?3,?4,'steering')",
+                rusqlite::params![now,session,payload.to_string(),format!("steering-stuck:{id}")],
+            )?;
+            if n == 0 { continue; }
+            if !sender.is_empty() && sender != session {
+                conn.execute(
+                    "INSERT OR IGNORE INTO session_events(ts,session,type,data,idem,source) VALUES(?1,?2,'steering.undelivered',?3,?4,'steering')",
+                    rusqlite::params![now,sender,payload.to_string(),format!("steering-stuck-sender:{id}")],
+                )?;
+            }
+            written.lock().unwrap().push((id,session,age,detail));
+        }
+        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+    }).await;
+    if let Err(error) = result {
+        tracing::warn!(%error, measured=false, n_considered=0, verdict="steering_stuck_unmeasured",
+            "could not persist undelivered steering notices; next tick retries");
+        return 0;
+    }
+    let notices = std::mem::take(&mut *notices.lock().unwrap());
+    let count = notices.len();
+    for (id, session, age, detail) in notices {
+        tracing::warn!(session, queue_id=%id, age_s=age as i64, measured=true, n_considered=1,
+            verdict="steering_stuck", "steering message remains undelivered after 60 seconds");
+        super::alerts::publish_dashboard_alert(json!({"type":"steering_stuck","session":session,"message":detail,"id":id}));
+    }
+    count
 }
 
 /// Why each lane's last skipped row was skipped. In-memory and therefore
@@ -38936,6 +39010,69 @@ mod tests {
             },
             dir,
         )
+    }
+
+    const AI194_EMPTY: &str = "Claude Code\n❯ \n────────────────────\n⏵⏵ bypass permissions on (shift+tab to cycle)";
+    const AI194_GHOST: &str = "Claude Code\n❯ \x1b[2mTry sending a summary\x1b[0m\n────────────────────\n⏵⏵ bypass permissions on (shift+tab to cycle)";
+
+    fn ai194_lane(name: &str, raw: &str) {
+        rename_fixture_env(name, "CC_TEST_FAKE_PANE=1\nCC_TAGS=dev\nCC_AUTO_START=0\nAMUX_COMMAND_LIFECYCLE=0\n");
+        super::super::worker_exec::fake_pane::set_frame(name, raw);
+    }
+
+    async fn ai194_queue(st: &AppState, id: &str, lane: &str, age: f64) {
+        let (id,lane) = (id.to_string(),lane.to_string());
+        st.store.write_async(move |conn| {
+            ensure_fleet_tables(conn)?;
+            conn.execute("INSERT INTO steering_queue(id,session,text,queued_at,guard,sender) VALUES(?1,?2,'hello from the sender',?3,'test-steering','draft-source')",
+                rusqlite::params![id,lane,now_f64()-age])?;
+            Ok(crate::db::WriteOutcome { applied:true, events:vec![] })
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ai194_raw_dim_suggestion_is_not_a_draft_and_periodic_delivery_proceeds() {
+        let (st,dir) = state();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        let _fleet = super::super::sessions_legacy::suppress_fleet_for_test();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        ai194_lane("draft-source", AI194_EMPTY);
+        ai194_lane("ghost-target", AI194_GHOST);
+        assert!(matches!(composer_state(AI194_GHOST), ComposerState::Placeholder(_)));
+        assert!(composer_state(&strip_ansi(AI194_GHOST)).typed().is_some(), "control: stripping SGR destroys the evidence");
+        ai194_queue(&st,"ghost-row","ghost-target",1.0).await;
+        assert_eq!(steer_deliver_tick(&st).await,1);
+        assert_eq!(super::super::worker_exec::fake_pane::typed("ghost-target").len(),1);
+    }
+
+    #[tokio::test]
+    async fn ai194_stuck_row_warns_and_notifies_both_audiences_once_across_ticks() {
+        let (logs,_guard,_peer) = held_capture_logs();
+        let (st,dir) = state();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        let _fleet = super::super::sessions_legacy::suppress_fleet_for_test();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        ai194_lane("draft-source", AI194_EMPTY);
+        ai194_lane("stuck-target", "Claude Code\n❯ owner draft\n────────────────────");
+        ai194_queue(&st,"stuck-row","stuck-target",61.0).await;
+        let mut dashboard = super::super::alerts::dashboard_alerts().subscribe();
+        assert_eq!(steer_deliver_tick(&st).await,0);
+        assert_eq!(held_capture_count(&logs,"steering_stuck"),1);
+        let alert: Value = serde_json::from_str(&dashboard.try_recv().unwrap()).unwrap();
+        assert_eq!(alert["type"],"alerts");
+        assert_eq!(alert["payload"][0]["session"],"stuck-target");
+        assert_eq!(alert["payload"][0]["id"],"stuck-row");
+        // Reopen the store to prove dedupe is durable, not a process-local set.
+        let mut restarted = st.clone();
+        restarted.store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        assert_eq!(steer_deliver_tick(&restarted).await,0);
+        assert_eq!(held_capture_count(&logs,"steering_stuck"),1);
+        assert!(dashboard.try_recv().is_err());
+        let conn = st.store.read().unwrap();
+        for (session,kind) in [("stuck-target","steering.stalled"),("draft-source","steering.undelivered")] {
+            let n:i64=conn.query_row("SELECT COUNT(*) FROM session_events WHERE session=?1 AND type=?2 AND json_extract(data,'$.id')='stuck-row' AND json_extract(data,'$.measured')=1 AND json_extract(data,'$.n_considered')=1",rusqlite::params![session,kind],|r|r.get(0)).unwrap();
+            assert_eq!(n,1,"{session}: {kind}");
+        }
     }
 
     #[tokio::test]
