@@ -45067,6 +45067,85 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         assert!(!pane_dead(&name).await, "respawn brings the pane back");
     }
 
+    /// #52: Start must respawn a worker that exited at its shell prompt and
+    /// launch its provider, not type startup scripts into a retained dead pane.
+    /// Exercises the real start_session with a stub on the private test socket.
+    #[tokio::test]
+    async fn a_worker_that_exited_at_its_prompt_starts_again_through_start_session() {
+        struct Pane(String);
+        impl Drop for Pane {
+            fn drop(&mut self) {
+                let st = session_target(&self.0);
+                let _ = tmux_command().args(["kill-session", "-t", &st]).output();
+            }
+        }
+        struct Env(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Env {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let _env = Env(["AMUX_CLAUDE_CMD", "AMUX_ALLOW_TMUX_SPAWN_FROM_TEST_HOME", "HOME", "SHELL"]
+            .into_iter().map(|key| (key, std::env::var_os(key))).collect());
+        let stub = home.path().join("stub-provider.sh");
+        std::fs::write(&stub, "#!/bin/sh\nprintf 'STUB-PROVIDER-RAN\\n'\nexec /bin/sleep 120\n").unwrap();
+        // Use the supported Claude command override; no real provider or user
+        // shell profiles should run. All process env changes restore on panic.
+        std::env::set_var("AMUX_CLAUDE_CMD", format!("/bin/sh {}", sh_quote(&stub.to_string_lossy())));
+        std::env::set_var("AMUX_ALLOW_TMUX_SPAWN_FROM_TEST_HOME", "1");
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("SHELL", "/bin/bash --noprofile --norc");
+        let name = format!("start-dead-pane-{}", std::process::id());
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        std::fs::write(env_path(&name), format!(
+            "CC_PROVIDER=claude\nCC_ISOLATED=1\nCC_DIR={}\n", home.path().display()
+        )).unwrap();
+        let _pane = Pane(tmux_name(&name));
+        let ptq = pt(&name);
+        let created = tmux(&["new-session", "-d", "-s", &tmux_name(&name), "PS1='$ ' /bin/sh -i"])
+            .await.expect("tmux required for start-after-exit proof");
+        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+        lock_worker_window(&ptq, &name).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if at_shell_prompt(&strip_ansi(&tmux_capture(&name, 10).await)) { break; }
+            assert!(std::time::Instant::now() < deadline, "fixture shell never reached its prompt");
+            sleep_ms(50).await;
+        }
+        // Leave a bare prompt in scrollback: main mistakes that stale frame
+        // for a shell that can still acknowledge startup commands.
+        let exited = tmux(&["send-keys", "-t", &ptq, "Enter", "exit", "Enter"]).await.unwrap();
+        assert!(exited.status.success(), "{}", String::from_utf8_lossy(&exited.stderr));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if pane_dead(&name).await { break; }
+            assert!(std::time::Instant::now() < deadline, "remain-on-exit did not retain a dead pane");
+            sleep_ms(50).await;
+        }
+        assert!(at_shell_prompt(&strip_ansi(&tmux_capture(&name, 10).await)),
+            "the retained dead pane must reproduce the stale-prompt reuse path");
+        let (state, _dir) = state();
+        let (ok, detail) = start_session(&state, &name, "", false).await;
+        assert!(ok, "start_session must restart the exited worker: {detail}");
+        assert!(!pane_dead(&name).await, "dead_pane_respawned must leave a live pane");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let captured = tmux(&["capture-pane", "-p", "-t", &ptq]).await.unwrap();
+            assert!(captured.status.success(), "{}", String::from_utf8_lossy(&captured.stderr));
+            let output = String::from_utf8_lossy(&captured.stdout);
+            if output.lines().any(|line| line.trim() == "STUB-PROVIDER-RAN") { break; }
+            assert!(std::time::Instant::now() < deadline, "provider stub never ran:\n{output}");
+            sleep_ms(50).await;
+        }
+    }
+
     /// The spawn-time window options must actually land: on the session form
     /// they never did. Read back with show-options on a private socket.
     #[tokio::test]
