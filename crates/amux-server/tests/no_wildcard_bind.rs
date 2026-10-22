@@ -10,8 +10,15 @@ use std::path::{Path, PathBuf};
 /// (repo-relative path, text on the finding's line, reason). Each entry must
 /// match at least one finding, so a stale entry fails like a new finding does.
 const ALLOW: &[(&str, &str, &str)] = &[
-    ("crates/amux-server/src/lib.rs", "([0, 0, 0, 0], cfg.port)",
-     "the production listener: reachable over Tailscale; AMUX_BIND (PR #30) makes it configurable"),
+    // #30: the production listener's wildcard default lives in parse_bind_ip.
+    ("crates/amux-server/src/config.rs", "None => Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),",
+     "production listener default (AMUX_BIND unset); tests pin loopback via AMUX_BIND"),
+    ("crates/amux-server/src/config.rs", "assert_eq!(parse_bind_ip(None).unwrap(), std::net::Ipv4Addr::UNSPECIFIED);",
+     "test assertion of that default, not a bind"),
+    ("crates/amux-server/src/config.rs", "assert_eq!(cfg.bind_ip().unwrap(), std::net::Ipv4Addr::UNSPECIFIED);",
+     "test assertion of that default, not a bind"),
+    ("crates/amux-server/tests/server_launch_bind_audit.rs", "good.replace(\"127.0.0.1\", \"0.0.0.0\")",
+     "#30's own audit feeding itself a wildcard to prove it is detected"),
     ("crates/amux-server/src/api/process_identity.rs", "server listens on 0.0.0.0",
      "doc comment describing the production listener"),
     ("crates/amux-server/src/tls.rs", "on a 0.0.0.0 listener",
