@@ -1469,6 +1469,10 @@ async fn tmux_sessions_set() -> std::collections::BTreeSet<String> {
 
 /// tmux capture-pane -e; lines<=0 → visible screen only (py:4406).
 pub(crate) async fn tmux_capture(name: &str, lines: i64) -> String {
+    #[cfg(test)]
+    if let Some(frame) = super::worker_exec::fake_pane::capture(name) {
+        return frame;
+    }
     if session_backend(name) == "herdr" {
         return herdr_capture(name, lines.max(1)).await;
     }
@@ -1501,10 +1505,18 @@ async fn tmux_alt_screen(name: &str) -> bool {
 }
 
 pub(crate) async fn send_key(name: &str, key: &str) {
+    #[cfg(test)]
+    if super::worker_exec::fake_pane::key(name, key) {
+        return;
+    }
     let pt = pt(name);
     let _ = tmux(&["send-keys", "-t", &pt, key]).await;
 }
 async fn send_literal(name: &str, text: &str) -> bool {
+    #[cfg(test)]
+    if super::worker_exec::fake_pane::literal(name, text) {
+        return true;
+    }
     let pt = pt(name);
     matches!(tmux(&["send-keys", "-t", &pt, "-l", text]).await, Some(o) if o.status.success())
 }
@@ -10659,7 +10671,7 @@ async fn draft_in_the_way(
 ) -> (bool, String) {
     tracing::warn!(session = %name, from_steering, measured = true, n_considered = 1,
         verdict = "draft_in_the_way",
-        "the composer holds unsent text amux did not type; the message waits instead of clearing it");
+        "the composer holds unsent text; the message waits without clearing or appending to it");
     if from_steering {
         return (false, "composer contains a draft; durable message remains queued".into());
     }
@@ -10675,6 +10687,8 @@ async fn draft_in_the_way(
         Err(reason) => (false, block_reason_refused(reason, name)),
     }
 }
+
+const QUEUED_IN_BOX: &str = "queued in box: typed but not submitted — the input box also holds text amux did not type; Enter was not pressed";
 
 /// The text of amux's OWN not-yet-submitted message to this lane that the
 /// composer `draft` (as `composer_state` reports it) is, or `None` when the
@@ -10734,7 +10748,13 @@ pub(crate) fn held_delivery_matching(draft: &str, name: &str, rows: &[(String, S
         let stamped = origin_stamped(origin, name, text);
         std::iter::once(text.clone())
             .chain(stamped)
-            .find(|t| composer_holds_this_delivery(draft, t))
+            .find(|t| {
+                // Receipt recognition includes short sends such as `/status`.
+                // The retry-Enter helper's eight-character safety floor must
+                // not hide recorded text; still require the entire composer.
+                let want: String = t.split_whitespace().collect();
+                !want.is_empty() && draft == want
+            })
     });
     // A COLLAPSED PASTE HIDES ITS TEXT (AMUX-5463: 5 of 8 stuck messages read
     // as a chip). The chip still carries its size: Claude's `+M lines` (the
@@ -11858,7 +11878,7 @@ pub(crate) fn submit_verdict_of(msg: &str) -> Option<&'static str> {
     if matches!(m, "sent (waiting for in-flight boot)" | "sent (auto-woke)") {
         return None;
     }
-    if m.starts_with("not submitted") {
+    if m.starts_with("not submitted") || m == QUEUED_IN_BOX {
         return Some("stuck");
     }
     // Order matters: a retry that SUCCEEDED is still a success, but it must not
@@ -12572,6 +12592,8 @@ pub(crate) fn submission_verdict(ok: bool, msg: &str) -> (Option<bool>, &'static
         // zero-character `message.sent` event and `submission=confirmed`, then
         // the dashboard silently tried a best-effort Enter fallback.
         (Some(false), "no_effect")
+    } else if msg == QUEUED_IN_BOX {
+        (Some(false), "not_submitted")
     } else if msg.starts_with("queued")
         || matches!(
             msg,
@@ -13999,10 +14021,7 @@ async fn send_text_inner_bound(
             {
                 return rescued;
             }
-            return (
-                false,
-                "composer draft appeared before paste; retained without modification".into(),
-            );
+            return draft_in_the_way(state, name, &text, from_steering, origin, queue_id).await;
         }
     } else {
         // A DIRECT SEND NEVER CLEARS SOMEONE ELSE'S DRAFT (2026-10-17: the
@@ -14028,13 +14047,17 @@ async fn send_text_inner_bound(
     // adds 40ms to every send but prevents silent message corruption.
     {
         let post_clear = tmux_capture(name, 15).await;
-        if composer_state(&post_clear).typed().is_some() {
+        if let Some(draft) = composer_state(&post_clear).typed() {
+            if held_amux_delivery(state, name, draft).is_none() {
+                return draft_in_the_way(state, name, &text, from_steering, origin, queue_id).await;
+            }
             send_key(name, "C-u").await;
             sleep_ms(60).await;
             let retry_clear = tmux_capture(name, 15).await;
             if composer_state(&retry_clear).typed().is_some() {
                 tracing::warn!(
                     session = %name,
+                    measured = true, n_considered = 1,
                     verdict = "composer_not_cleared_after_ctrl_u",
                     "C-u failed to clear the composer twice; aborting to prevent concatenation"
                 );
@@ -14086,12 +14109,22 @@ async fn send_text_inner_bound(
         },
         other => (other, staged),
     };
+    // The provider can restore a draft after the post-clear read (ai-config#194).
+    // Re-read at the write boundary, including for busy and waiting lanes. Even
+    // our own restored delivery must not have a second message appended to it.
+    if composer_state(&tmux_capture(name, 15).await).typed().is_some() {
+        return draft_in_the_way(state, name, &text, from_steering, origin, queue_id).await;
+    }
     if let Some(prefix) = typed_prefix.as_deref() {
         if !send_literal(name, prefix).await {
             return (false, "send-keys failed".into());
         }
         sleep_ms(60).await;
     }
+    // Test-only: a fake pane has no tmux buffer, so its paste is recorded through
+    // the same fake typing hook (the bytes land in its composer either way).
+    #[cfg(test)]
+    let use_paste = use_paste && super::worker_exec::fake_pane::capture(name).is_none();
     if use_paste {
         // Named tmux buffer + paste-buffer -p (py:25630). Also the picker-safe
         // path — see `use_paste` above.
@@ -14191,8 +14224,8 @@ async fn send_text_inner_bound(
             verdict = "pre_enter_foreign_composer_text",
             "the composer holds text this send did not type; Enter not pressed");
         return (
-            false,
-            "not submitted: the input box held text amux did not type, so Enter was not pressed".into(),
+            true,
+            QUEUED_IN_BOX.into(),
         );
     }
     send_key(name, "Enter").await;
@@ -29109,7 +29142,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
         // type='user'/'session' either way, so the downstream inference
         // (type=='steering') reported every QUEUED message as direct. That is
         // precisely the mislabelling this metadata exists to end.
-        let deliv = if msg.starts_with("queued") {
+        let deliv = if msg.starts_with("queued") && msg != QUEUED_IN_BOX {
             Delivery::Queued
         } else {
             Delivery::Direct
@@ -29188,6 +29221,13 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             if let Some(id) = queue_id.as_deref() {
                 link_queued_message(state, name, row_id, id).await;
             }
+        } else if msg == QUEUED_IN_BOX {
+            // Even callers opting out of owner history need the amux-typed
+            // receipt: later sends must distinguish our held text from a draft.
+            let row_id = cmd_hist_record_with_id(
+                state, name, &orig_text, "amux", "amux", skip_board, meta,
+            ).await;
+            note_history_msg_id(state, row_id, &msg_id).await;
         }
     } else {
         // A FAILED DELIVERY IS A DELIVERY EVENT (AMUX-3903).
@@ -39480,10 +39520,13 @@ mod tests {
         // test it was written to satisfy went red on main and stayed red.
         // Counted again here rather than adjusted by hand: both new sites pass
         // the computed `skip_board`, which is the property below.
+        // 11 -> 12 (ai-config#194): a post-type race that leaves amux's text in
+        // the box records an amux-typed, unsubmitted receipt ("queued in box"),
+        // passing the computed skip_board like every other site.
         assert_eq!(
             sites.len(),
-            11,
-            "the scan must see all 11 production call sites. A LOWER number means the detector \
+            12,
+            "the scan must see all 12 production call sites. A LOWER number means the detector \
              stopped matching rather than that the call sites went away, which is exactly how \
              the first two versions of this test passed a broken tree: one scanned a window \
              that excluded the send handlers, the other missed the multi-line spelling and left \
@@ -56993,6 +57036,89 @@ mod codex_launch_model_tests {
 #[cfg(test)]
 mod composer_guard_tests {
     use super::*;
+
+    const AI194B_COMMAND: &str = "/status";
+    const AI194B_OWNER_DRAFT: &str = "Max's unsent Katella draft ";
+
+    fn ai194b_lane(name: &str, pane: super::super::worker_exec::fake_pane::Composer) {
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        std::fs::write(env_path(name), "CC_AUTO_START=0\nCC_TEST_FAKE_PANE=1\nCC_DIR=\nCC_PROVIDER=claude\n").unwrap();
+        super::super::worker_exec::fake_pane::composer(name, pane);
+    }
+
+    #[tokio::test]
+    async fn ai194b_direct_send_queues_owner_draft_without_typing() {
+        use super::super::worker_exec::fake_pane::{self, Composer};
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _db) = super::tests::state();
+        // The second case restores the owner's draft after the post-C-u read:
+        // on the old path it is first seen AFTER the payload was typed.
+        for (lane, pane) in [
+            ("ai194b-draft", Composer { text: AI194B_OWNER_DRAFT.into(), ..Default::default() }),
+            ("ai194b-restored", Composer { restore_before_type: Some(AI194B_OWNER_DRAFT.into()), ..Default::default() }),
+        ] {
+            ai194b_lane(lane, pane);
+            let ((ok, reply), queue_id) = send_text_with_queue_id(&state, lane, AI194B_COMMAND, false, SendOrigin::Owner).await;
+            assert!(ok && reply.starts_with("queued (steering)"), "{reply}");
+            assert!(fake_pane::typed(lane).is_empty(), "refused send wrote payload keys");
+            assert!(!fake_pane::keys(lane).iter().any(|k| k == "Enter"));
+            let queued: String = state.store.read().unwrap().query_row(
+                "SELECT text FROM steering_queue WHERE id=?1 AND session=?2",
+                rusqlite::params![queue_id.unwrap(), lane], |r| r.get(0)).unwrap();
+            assert_eq!(queued, AI194B_COMMAND);
+            assert_eq!(composer_state(&fake_pane::capture(lane).unwrap()).typed(), Some("Max'sunsentKatelladraft"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ai194b_dim_placeholder_still_types_and_submits() {
+        use super::super::worker_exec::fake_pane::{self, Composer};
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _db) = super::tests::state();
+        const LANE: &str = "ai194b-placeholder";
+        ai194b_lane(LANE, Composer::default());
+        assert!(matches!(composer_state(&fake_pane::capture(LANE).unwrap()), ComposerState::Placeholder(_)));
+        let response = send_post(&state, LANE, &HeaderMap::new(), &json!({"text":AI194B_COMMAND,"deliver_now":true})).await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        let reply: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(reply["submitted"], true, "{reply}");
+        assert_eq!(fake_pane::typed(LANE), vec![(AI194B_COMMAND.into(), "terminal")]);
+        assert_eq!(fake_pane::keys(LANE).iter().filter(|k| *k == "Enter").count(), 1);
+        assert!(composer_state(&fake_pane::capture(LANE).unwrap()).typed().is_none());
+    }
+
+    #[tokio::test]
+    async fn ai194b_post_type_race_keeps_unsubmitted_amux_receipt() {
+        use super::super::worker_exec::fake_pane::{self, Composer};
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _db) = super::tests::state();
+        const LANE: &str = "ai194b-race";
+        ai194b_lane(LANE, Composer { race_during_type: Some(AI194B_OWNER_DRAFT.into()), ..Default::default() });
+        let response = send_post(&state, LANE, &HeaderMap::new(), &json!({
+            "text":AI194B_COMMAND, "record_history":false, "no_board":true
+        })).await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["message"].as_str().unwrap().starts_with("queued in box:"), "{body}");
+        assert_eq!(body["submitted"], false);
+        assert_eq!(body["submission"], "not_submitted");
+        assert!(!fake_pane::keys(LANE).iter().any(|k| k == "Enter"));
+        let row: (String, String, String) = state.store.read().unwrap().query_row(
+            "SELECT delivery,submit_verdict,type FROM cmd_history WHERE session=?1", [LANE],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(row, ("direct".into(), "stuck".into(), "amux".into()));
+        assert_eq!(held_amux_delivery(&state, LANE, AI194B_COMMAND).as_deref(), Some(AI194B_COMMAND));
+        let mixed = composer_state(&fake_pane::capture(LANE).unwrap()).typed().unwrap().to_string();
+        assert!(mixed.contains("Katelladraft/status"));
+        assert_eq!(held_amux_delivery(&state, LANE, &mixed), None, "never claim the combined owner draft");
+    }
 
     fn claude(text: &str) -> String {
         format!(

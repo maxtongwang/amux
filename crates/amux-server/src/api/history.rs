@@ -153,6 +153,96 @@ fn attach_linked_cards(conn: &rusqlite::Connection, rows: &mut [Value]) -> rusql
     Ok(())
 }
 
+const PROVENANCE_WINDOW_MS: i64 = 6 * 3600 * 1000;
+const PROVENANCE_DELIVERIES: usize = 64;
+const PROVENANCE_MIN_MATCH_CHARS: usize = 16;
+const PROVENANCE_STAMP_PATTERN: &str = r"\[(?:quoted )?amux-origin:\s*([^\]\r\n]+)\]";
+
+/// Owner attribution describes the input channel, not every word in a turn.
+/// Keep the original text and expose embedded relay evidence separately.
+fn attach_owner_provenance(conn: &rusqlite::Connection, rows: &mut [Value]) -> rusqlite::Result<()> {
+    let ids: Vec<i64> = rows.iter().filter(|r| r["sender"] == "owner")
+        .filter_map(|r| r["id"].as_i64()).collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    // One query for the page; never match a pane capture against itself or a
+    // queued message that has no delivery evidence. Bound candidates per entry.
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!(
+        "SELECT owner_id,text,origin FROM (SELECT o.id AS owner_id,d.text,d.origin, \
+         row_number() OVER (PARTITION BY o.id ORDER BY d.id DESC) AS recent \
+         FROM cmd_history o JOIN cmd_history d ON d.session=o.session AND d.id<>o.id \
+         AND d.ts BETWEEN o.ts-{PROVENANCE_WINDOW_MS} AND o.ts \
+         WHERE o.id IN ({placeholders}) AND COALESCE(d.delivery,'')<>'pane' \
+         AND (d.delivery='direct' OR d.delivered_at IS NOT NULL)) \
+         WHERE recent<={PROVENANCE_DELIVERIES}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut deliveries: HashMap<i64, Vec<(String, String)>> = HashMap::new();
+    for entry in stmt.query_map(rusqlite::params_from_iter(ids), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?.unwrap_or_default()))
+    })? {
+        let (id, text, origin) = entry?;
+        deliveries.entry(id).or_default().push((text, origin));
+    }
+    static STAMP: OnceLock<Regex> = OnceLock::new();
+    let stamp = STAMP.get_or_init(|| Regex::new(PROVENANCE_STAMP_PATTERN).expect("relay stamp regex"));
+    for row in rows.iter_mut().filter(|r| r["sender"] == "owner") {
+        let text = row["text"].as_str().unwrap_or_default();
+        let session = row["session"].as_str().unwrap_or_default();
+        let mut spans: Vec<(usize, usize, String)> = stamp.captures_iter(text).map(|c| {
+            let m = c.get(0).expect("stamp match");
+            let sender = c[1].split('—').next().unwrap_or_default().trim().to_string();
+            (m.start(), m.end(), sender)
+        }).collect();
+        let stamp_boundary = spans.first().map(|s| s.0);
+        let stamp_senders: BTreeSet<_> = spans.iter().map(|(_, _, s)| s.clone()).collect();
+        if let Some(candidates) = row["id"].as_i64().and_then(|id| deliveries.get(&id)) {
+            for (delivered, origin) in candidates {
+                if let Some(start) = text.find(delivered).filter(|_| delivered.chars().count() >= PROVENANCE_MIN_MATCH_CHARS) {
+                    spans.push((start, start + delivered.len(), origin.clone()));
+                } else if super::session_verbs::held_delivery_matching(text, session, &[(delivered.clone(), origin.clone())]).is_some() {
+                    spans.push((0, text.len(), origin.clone()));
+                }
+            }
+        }
+        spans.sort_by_key(|s| s.0);
+        let mixed = !spans.is_empty();
+        let mut segments = Vec::new();
+        if mixed {
+            // A stamp starts the relay segment; the preceding bytes remain
+            // owner input. Preserve exact bytes so a consumer can reconstruct it.
+            let mut cursor = 0;
+            for (start, end, _) in &spans {
+                let end = if Some(*start) == stamp_boundary { text.len() } else { *end };
+                if end <= cursor {
+                    continue;
+                }
+                if *start > cursor {
+                    segments.push(json!({"provenance":"owner","start":cursor,"end":start,"text":&text[cursor..*start]}));
+                }
+                let start = (*start).max(cursor);
+                segments.push(json!({"provenance":"relayed","start":start,"end":end,"text":&text[start..end]}));
+                cursor = end;
+            }
+            if cursor < text.len() {
+                segments.push(json!({"provenance":"owner","start":cursor,"end":text.len(),"text":&text[cursor..]}));
+            }
+            tracing::warn!(session, message_id = ?row["id"], measured = true, n_considered = spans.len(),
+                verdict = "owner_entry_mixed_provenance", "owner input contains relay evidence; attribution covers mixed text");
+        }
+        row["mixed_provenance"] = json!(mixed);
+        if mixed {
+            row["stamp_senders"] = json!(stamp_senders);
+            row["provenance_matches"] = json!(spans.iter().map(|(start, end, sender)|
+                json!({"start":start,"end":end,"sender":sender})).collect::<Vec<_>>());
+            row["provenance_segments"] = json!(segments);
+        }
+    }
+    Ok(())
+}
+
 /// GET /api/history/{id} — look up ONE message by its id, accepting either a
 /// bare integer or the `MSG-<id>` form the UI shows and people paste.
 ///
@@ -264,6 +354,7 @@ async fn get_history_item(
             }
             }
         }
+        attach_owner_provenance(&conn, &mut rows)?;
         attach_linked_cards(&conn, &mut rows)?;
         Ok(rows.into_iter().next())
     })
@@ -1090,6 +1181,7 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
                     }
                 }
             }
+            attach_owner_provenance(&conn, &mut rows)?;
             attach_linked_cards(&conn, &mut rows)?;
             Ok((Value::Array(rows), Some(total)))
         })
@@ -1393,6 +1485,66 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn ai194b_owner_history_flags_relay_stamps_and_plain_control() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, state, _db) = app_with_state();
+        const PREFIX: &str = "Max text about Katella ... ";
+        const STAMP: &str = "[amux-origin: re-ops-lead — server-verified] relayed text";
+        const QUOTED: &str = "[quoted amux-origin: business-lead — quoted] more relayed text";
+        let mixed = format!("{PREFIX}{STAMP}");
+        let m = mixed.clone();
+        state.store.write(move |c| {
+            for (id, text) in [(1, m.as_str()), (2, "plain owner input"), (3, QUOTED)] {
+                c.execute("INSERT INTO cmd_history(id,text,type,session,ts,origin,delivery) VALUES (?1,?2,'user','mrpopo',1000,'','pane')",
+                    rusqlite::params![id, text])?;
+            }
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let (status, row) = send(&app, "GET", "/api/history/1", None).await;
+        assert_eq!(status, StatusCode::OK, "{row}");
+        assert_eq!(row["mixed_provenance"], true);
+        assert_eq!(row["stamp_senders"], json!(["re-ops-lead"]));
+        assert_eq!(row["provenance_segments"][0]["text"], PREFIX);
+        assert_eq!(row["provenance_segments"][0]["provenance"], "owner");
+        assert_eq!(row["provenance_segments"][1]["text"], STAMP);
+        assert_eq!(row["provenance_segments"][1]["provenance"], "relayed");
+        assert_eq!(row["text"], mixed);
+        let (_, rows) = send(&app, "GET", "/api/history?session=mrpopo", None).await;
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.iter().find(|r| r["id"] == 1).unwrap()["mixed_provenance"], true);
+        assert_eq!(rows.iter().find(|r| r["id"] == 3).unwrap()["stamp_senders"], json!(["business-lead"]));
+        let plain = rows.iter().find(|r| r["id"] == 2).unwrap();
+        assert_eq!(plain["mixed_provenance"], false);
+        assert!(plain.get("provenance_segments").is_none());
+    }
+
+    #[tokio::test]
+    async fn ai194b_owner_history_matches_recent_delivery_without_stamp() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, state, _db) = app_with_state();
+        const RELAY: &str = "the recent unstamped relay report";
+        let mixed = format!("Owner draft {RELAY}");
+        let m = mixed.clone();
+        state.store.write(move |c| {
+            c.execute("INSERT INTO cmd_history(id,text,type,session,ts,origin,delivery,submit_verdict) VALUES (1,?1,'session','mrpopo',1000,'re-ops-lead','direct','stuck')", [RELAY])?;
+            for (id, session, ts) in [(2, "mrpopo", 2000), (3, "other-lane", 2000), (4, "mrpopo", PROVENANCE_WINDOW_MS + 2000)] {
+                c.execute("INSERT INTO cmd_history(id,text,type,session,ts,origin,delivery) VALUES (?1,?2,'user',?3,?4,'','pane')",
+                    rusqlite::params![id, m, session, ts])?;
+            }
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let (_, row) = send(&app, "GET", "/api/history/2", None).await;
+        assert_eq!(row["mixed_provenance"], true, "{row}");
+        assert_eq!(row["provenance_matches"][0]["sender"], "re-ops-lead");
+        for id in [3, 4] {
+            let (_, row) = send(&app, "GET", &format!("/api/history/{id}"), None).await;
+            assert_eq!(row["mixed_provenance"], false, "lane and delivery age must match: {row}");
+        }
+    }
 
     fn app() -> (axum::Router, tempfile::TempDir) {
         let (router, _, dir) = app_with_state();

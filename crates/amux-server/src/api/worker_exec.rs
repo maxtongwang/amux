@@ -178,6 +178,67 @@ pub(crate) mod fake_pane {
     pub(crate) static FAKE: FakePane = FakePane;
     static TYPED: Mutex<Vec<(String, String, &'static str)>> = Mutex::new(Vec::new());
 
+    /// Opt-in terminal transport: exercise the real send choreography without
+    /// a process, provider HOME or socket. Other fake workers keep the adapter.
+    #[derive(Default)]
+    pub(crate) struct Composer {
+        pub text: String,
+        pub restore_before_type: Option<String>,
+        pub race_during_type: Option<String>,
+        pub keys: Vec<String>,
+        pub(crate) reads_after_clear: Option<usize>,
+    }
+    static COMPOSERS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, Composer>>> =
+        std::sync::LazyLock::new(Default::default);
+    const PLACEHOLDER: &str = "\x1b[2mTry a suggestion\x1b[0m";
+
+    pub(crate) fn composer(name: &str, pane: Composer) {
+        COMPOSERS.lock().unwrap().insert(name.into(), pane);
+    }
+
+    pub(crate) fn keys(name: &str) -> Vec<String> {
+        COMPOSERS.lock().unwrap().get(name).unwrap().keys.clone()
+    }
+
+    pub(crate) fn capture(name: &str) -> Option<String> {
+        let mut panes = COMPOSERS.lock().unwrap();
+        let pane = panes.get_mut(name)?;
+        if let Some(reads) = &mut pane.reads_after_clear {
+            *reads += 1;
+            if *reads == 2 {
+                if let Some(draft) = pane.restore_before_type.take() {
+                    pane.text.insert_str(0, &draft);
+                }
+            }
+        }
+        let text = if pane.text.is_empty() { PLACEHOLDER } else { &pane.text };
+        Some(format!("──── lane ────\n❯ {text}\n──────\n⏵⏵ bypass permissions on\n"))
+    }
+
+    pub(crate) fn key(name: &str, key: &str) -> bool {
+        let mut panes = COMPOSERS.lock().unwrap();
+        let Some(pane) = panes.get_mut(name) else { return false };
+        pane.keys.push(key.into());
+        if key == "C-u" {
+            pane.text.clear();
+            pane.reads_after_clear = Some(0);
+        } else if key == "Enter" {
+            pane.text.clear();
+        }
+        true
+    }
+
+    pub(crate) fn literal(name: &str, text: &str) -> bool {
+        let mut panes = COMPOSERS.lock().unwrap();
+        let Some(pane) = panes.get_mut(name) else { return false };
+        if let Some(draft) = pane.race_during_type.take() {
+            pane.text.push_str(&draft);
+        }
+        pane.text.push_str(text);
+        TYPED.lock().unwrap().push((name.into(), text.into(), "terminal"));
+        true
+    }
+
     /// Every `(text, origin)` delivered to `name` so far.
     pub(crate) fn typed(name: &str) -> Vec<(String, &'static str)> {
         TYPED
@@ -201,6 +262,9 @@ pub(crate) mod fake_pane {
             Dispatch::Handled((true, "fake pane".into()))
         }
         async fn deliver(&self, _: &AppState, name: &str, text: &str, origin: SendOrigin) -> Dispatch<(bool, String)> {
+            if COMPOSERS.lock().unwrap().contains_key(name) {
+                return Dispatch::Terminal;
+            }
             let origin = match origin {
                 SendOrigin::Owner => "owner",
                 SendOrigin::Automation => "amux",
