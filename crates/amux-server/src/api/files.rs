@@ -21,7 +21,9 @@
 //! (symlinks resolved), and prefix-checked against the canonicalized root.
 //! `../` escapes and symlinks pointing outside the root both fail the same
 //! check. Uploads additionally reject `..`/absolute components lexically
-//! BEFORE any filesystem work, because the target may not exist yet.
+//! BEFORE any filesystem work, because the target may not exist yet, check
+//! the created parent the same way, and replace (never follow) a symlink at
+//! the target itself.
 
 use super::AppState;
 use axum::body::Bytes;
@@ -297,6 +299,40 @@ fn upload_refusal(rel: &Path, target: &Path) -> Option<(&'static str, &'static s
     None
 }
 
+/// A refusal decided at the write itself, carried out of `atomic_write_checked`.
+#[derive(Debug)]
+struct UploadRefused(&'static str, &'static str);
+
+impl std::fmt::Display for UploadRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.1)
+    }
+}
+
+impl std::error::Error for UploadRefused {}
+
+/// What may sit at an upload's target when it is written: nothing, or a
+/// regular file with no execute bit. Never a symlink, which would be followed
+/// or replaced on the caller's say-so (ai-config #227).
+fn upload_target_check(at: Option<&std::fs::Metadata>) -> std::io::Result<()> {
+    let refused = |code, error| Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, UploadRefused(code, error)));
+    let Some(m) = at else { return Ok(()) };
+    if m.file_type().is_symlink() {
+        return refused("upload_symlink_refused", "Uploads may not write through or replace a symbolic link.");
+    }
+    if !m.file_type().is_file() {
+        return refused("upload_not_a_file_refused", "Uploads may only replace regular files.");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if m.permissions().mode() & 0o111 != 0 {
+            return refused("upload_executable_refused", "Uploads may not overwrite existing executable files.");
+        }
+    }
+    Ok(())
+}
+
 async fn upload(
     headers: axum::http::HeaderMap,
     Query(q): Query<PathParam>,
@@ -327,16 +363,37 @@ async fn upload_into(root: PathBuf, headers: &axum::http::HeaderMap, q: &PathPar
         }
     };
     let target = canon_root.join(&rel);
-    if let Some((code, error)) = upload_refusal(&rel, &target) {
+    let refuse = |code: &'static str, error: &'static str| {
         let origin = crate::api::session_verbs::worker_origin(headers);
         tracing::warn!(target: "amux::files", path = %rel.display(), worker = %origin,
             verdict = code, measured = true, n_considered = 1,
             "file upload refused: {error}");
-        return err(
+        err(
             StatusCode::FORBIDDEN,
             json!({ "ok": false, "code": code, "error": error }),
+        )
+    };
+    // Judge the path the write will really land on as well as the one asked
+    // for: a symlinked directory in the existing prefix (`cfg` -> `.config`)
+    // moves it where the lexical checks cannot see (ai-config #227). Resolved
+    // before anything is created, so a refused upload creates nothing.
+    let Some(name) = target.file_name().map(|n| n.to_os_string()) else {
+        return err(StatusCode::BAD_REQUEST, json!({ "error": "upload path names no file" }));
+    };
+    let real_parent = crate::api::fs::resolve_nonstrict(target.parent().unwrap_or(&canon_root));
+    let real_target = real_parent.join(&name);
+    let Ok(real_rel) = real_target.strip_prefix(&canon_root).map(Path::to_path_buf) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "upload path resolves outside the files root (symlink)" }),
         );
+    };
+    for (r, t) in [(&rel, &target), (&real_rel, &real_target)] {
+        if let Some((code, error)) = upload_refusal(r, t) {
+            return refuse(code, error);
+        }
     }
+    let target = real_target;
     if let Some(parent) = target.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
             return err(
@@ -364,8 +421,21 @@ async fn upload_into(root: PathBuf, headers: &axum::http::HeaderMap, q: &PathPar
         }
     }
     let size = body.len();
-    match tokio::fs::write(&target, body).await {
-        Ok(()) => Json(json!({ "ok": true, "path": rel.display().to_string(), "size": size }))
+    // Not `fs::write`: that followed a symlink AT the target, which the parent
+    // check above never sees, and wrote outside the root (PR #48 round-2 B2,
+    // ai-config #211). And the link and executable rules are judged on what
+    // is really there at the write, not on the earlier path check, which a
+    // swap in between would pass (ai-config #227).
+    let wrote = tokio::task::spawn_blocking(move || {
+        crate::atomic_write::atomic_write_checked(&target, &body, &upload_target_check)
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+    if let Some(r) = wrote.as_ref().err().and_then(|e| e.get_ref()).and_then(|e| e.downcast_ref::<UploadRefused>()) {
+        return refuse(r.0, r.1);
+    }
+    match wrote {
+        Ok(_) => Json(json!({ "ok": true, "path": rel.display().to_string(), "size": size }))
             .into_response(),
         Err(e) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -382,6 +452,101 @@ mod tests {
 
     fn root() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    /// Upload `body` to `rel` under `root`; the status and the JSON `code`.
+    async fn put(root: &Path, rel: &str, body: &'static [u8]) -> (StatusCode, Value) {
+        let r = upload_into(root.into(), &axum::http::HeaderMap::new(), &PathParam { path: rel.into() }, Bytes::from_static(body)).await;
+        let status = r.status();
+        let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    /// PR #48 round-2 B2 and ai-config #227 case 4: only the parent was checked
+    /// against the root, and the write followed a symlink at the target, so an
+    /// upload to `a.txt` -> `<outside>/victim` wrote outside the root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_upload_never_writes_through_a_final_symlink_pointing_outside_the_root() {
+        let dir = root();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("a.txt")).unwrap();
+        let (status, v) = put(dir.path(), "a.txt", b"pwned").await;
+        assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("upload_symlink_refused")), "{v}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep", "nothing outside the root was written");
+        assert!(std::fs::symlink_metadata(dir.path().join("a.txt")).unwrap().file_type().is_symlink());
+    }
+
+    /// ai-config #227 case 1: a link inside the root to a dotfile got 200 and
+    /// overwrote the dotfile.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_upload_never_writes_through_a_link_to_a_dotfile() {
+        let dir = root();
+        let gc = dir.path().join(".gitconfig");
+        std::fs::write(&gc, "[user]").unwrap();
+        std::os::unix::fs::symlink(&gc, dir.path().join("gc")).unwrap();
+        let (status, v) = put(dir.path(), "gc", b"[core]\nhooksPath=/tmp/x").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(std::fs::read_to_string(&gc).unwrap(), "[user]");
+    }
+
+    /// ai-config #227 case 2: a link to an executable got 200, overwrote it and
+    /// left it executable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_upload_never_writes_through_a_link_to_an_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = root();
+        std::fs::create_dir(dir.path().join("tools")).unwrap();
+        let exe = dir.path().join("tools/run.sh");
+        std::fs::write(&exe, "#!/bin/sh\necho ok").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&exe, dir.path().join("run")).unwrap();
+        let (status, v) = put(dir.path(), "run", b"#!/bin/sh\necho pwned").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "#!/bin/sh\necho ok");
+    }
+
+    /// ai-config #227 case 3: a directory link into `.config` passed the
+    /// lexical dotfile rule and the parent containment check (still inside
+    /// the root) and wrote into the hidden directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_upload_through_a_directory_link_is_judged_where_it_lands() {
+        let dir = root();
+        std::fs::create_dir(dir.path().join(".config")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join(".config"), dir.path().join("cfg")).unwrap();
+        let (status, v) = put(dir.path(), "cfg/tool.toml", b"cmd = 'pwned'").await;
+        assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("upload_dotfile_refused")), "{v}");
+        assert!(!dir.path().join(".config/tool.toml").exists());
+        let (status, v) = put(dir.path(), "cfg/new/tool.toml", b"x").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+        assert!(!dir.path().join(".config/new").exists(), "a refused upload creates no directory");
+    }
+
+    /// The same rules, judged at the write: an executable that a path check
+    /// would have seen is refused by the check on the opened file too.
+    #[cfg(unix)]
+    #[test]
+    fn the_write_time_check_refuses_links_executables_and_non_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = root();
+        let code = |p: &Path| {
+            let e = crate::atomic_write::atomic_write_checked(p, b"x", &upload_target_check).unwrap_err();
+            e.get_ref().and_then(|e| e.downcast_ref::<UploadRefused>()).map(|r| r.0)
+        };
+        let exe = dir.path().join("x.sh");
+        std::fs::write(&exe, "#!/bin/sh").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(code(&exe), Some("upload_executable_refused"));
+        std::os::unix::fs::symlink(&exe, dir.path().join("l")).unwrap();
+        assert_eq!(code(&dir.path().join("l")), Some("upload_symlink_refused"));
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        assert_eq!(code(&dir.path().join("d")), Some("upload_not_a_file_refused"));
+        crate::atomic_write::atomic_write_checked(&dir.path().join("ok.txt"), b"x", &upload_target_check).unwrap();
     }
 
     #[test]

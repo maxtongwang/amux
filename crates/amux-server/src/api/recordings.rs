@@ -547,11 +547,17 @@ pub(crate) fn store_upload(
     }
     let base = base_name(meta);
     let audio = dir.join(format!("{base}.{}", meta.ext));
-    let upload_tmp = dir.join(format!(".{base}.upload.{}", meta.ext));
+    // Both temps live in a fresh directory (random name, made by mkdir, so
+    // only this user can create names in it), never at a predictable name in `dir` where a planted link
+    // would redirect the write (ai-config #211). Dropping it removes leftovers.
+    let staging = tempfile::Builder::new()
+        .prefix(".amux-upload-")
+        .tempdir_in(dir)?;
+    let upload_tmp = staging.path().join(format!("upload.{}", meta.ext));
     std::fs::write(&upload_tmp, bytes)?;
     let (embedded, metadata_error): (bool, Option<String>) = match ffmpeg {
         Some(ff) if embeddable(meta.ext) => {
-            let out_tmp = dir.join(format!(".{base}.meta.{}", meta.ext));
+            let out_tmp = staging.path().join(format!("meta.{}", meta.ext));
             let budget = Duration::from_secs(60 + (bytes.len() as u64 >> 20) * 2);
             let ran = run_bounded(ff, &metadata_args(meta, &upload_tmp, &out_tmp), budget);
             let wrote = std::fs::metadata(&out_tmp)
@@ -1275,6 +1281,61 @@ mod tests {
         write_atomic(&target, b"new").unwrap();
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep", "the planted link was not written through");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    }
+
+    /// PR #48 round-2 review B1: `store_upload` staged the upload at
+    /// `.<base>.upload.<ext>` and ffmpeg's output at `.<base>.meta.<ext>`, both
+    /// predictable names in the recordings folder, written following links.
+    #[cfg(unix)]
+    fn plant_upload_temps(dir: &Path, m: &RecordingMeta) -> PathBuf {
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let base = base_name(m);
+        crate::atomic_write::plant_links(
+            dir,
+            &[format!(".{base}.upload.{}", m.ext), format!(".{base}.meta.{}", m.ext)],
+            &victim,
+        );
+        victim
+    }
+
+    #[cfg(unix)]
+    fn assert_upload_kept_victim(dir: &Path, victim: &Path, sc: &Value, stored: &[u8]) {
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "keep", "the planted link was not written through");
+        let audio = dir.join(sc["file"].as_str().unwrap());
+        assert!(!std::fs::symlink_metadata(&audio).unwrap().file_type().is_symlink(), "the audio is a regular file");
+        assert_eq!(std::fs::read(&audio).unwrap(), stored);
+        let staged: Vec<_> = std::fs::read_dir(dir).unwrap().flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".amux-upload-")).collect();
+        assert!(staged.is_empty(), "the private staging directory is removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_upload_temp_link_cannot_take_the_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = meta("rPlant1");
+        let victim = plant_upload_temps(dir.path(), &m);
+        let (sc, _) = store_upload(dir.path(), &m, b"echo pwned", None).unwrap();
+        assert_upload_kept_victim(dir.path(), &victim, &sc, b"echo pwned");
+    }
+
+    /// The ffmpeg branch, with a fake ffmpeg that writes its last argument the
+    /// way the real one does (opening the output path, following a link).
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_ffmpeg_output_link_cannot_take_the_tagged_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tempfile::tempdir().unwrap();
+        let ff = bin.path().join("ffmpeg");
+        std::fs::write(&ff, "#!/bin/sh\nfor a; do last=$a; done\nprintf tagged > \"$last\"\n").unwrap();
+        std::fs::set_permissions(&ff, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let m = meta("rPlant2");
+        let victim = plant_upload_temps(dir.path(), &m);
+        let (sc, _) = store_upload(dir.path(), &m, b"raw", Some(&ff)).unwrap();
+        assert_eq!(sc["metadata_embedded"], true, "{sc}");
+        assert_upload_kept_victim(dir.path(), &victim, &sc, b"tagged");
     }
 
     /// 2026-09-14T22:51:03Z, which is 18:51:03 in New York (EDT, -240).

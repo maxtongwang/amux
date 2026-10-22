@@ -41,6 +41,26 @@ pub enum Landed {
 /// it first, with the same resolution its write gates judged (`file_viewer`
 /// passes `resolve_nonstrict(path)`). The parent directory must exist.
 pub fn atomic_write(target: &Path, bytes: &[u8]) -> std::io::Result<Landed> {
+    write_judged(target, bytes, None)
+}
+
+/// What sits at a write target, as [`atomic_write_checked`] hands it to its
+/// check: the opened file's own metadata, or the entry's when it is not a
+/// regular file, or `None` when nothing is there.
+pub type TargetCheck<'a> = &'a dyn Fn(Option<&std::fs::Metadata>) -> std::io::Result<()>;
+
+/// [`atomic_write`], with `check` judging what is ACTUALLY at the target when
+/// the write happens rather than what a path check saw earlier (ai-config
+/// #227): a regular file is judged by `fstat` on its O_NOFOLLOW handle, any
+/// other entry (a symlink, a directory) by its own `lstat`, and an empty name
+/// by `None`. An `Err` from `check` refuses the write untouched. A new file is
+/// created without clobbering, so an entry that appears after the check fails
+/// the write (`AlreadyExists`) instead of being replaced unjudged.
+pub fn atomic_write_checked(target: &Path, bytes: &[u8], check: TargetCheck) -> std::io::Result<Landed> {
+    write_judged(target, bytes, Some(check))
+}
+
+fn write_judged(target: &Path, bytes: &[u8], check: Option<TargetCheck>) -> std::io::Result<Landed> {
     #[cfg(test)]
     if failing::matches(target) {
         return Err(std::io::Error::other(format!("injected write failure: {}", target.display())));
@@ -50,11 +70,23 @@ pub fn atomic_write(target: &Path, bytes: &[u8]) -> std::io::Result<Landed> {
         _ => Path::new("."),
     };
     let existing = std::fs::symlink_metadata(target).ok();
+    if existing.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
+        // Seen when a link was planted at an upload or save name (PR #48
+        // round 3); the old in-place writes followed it.
+        tracing::warn!(target: "amux::file", path = %target.display(), measured = true, n_considered = 1,
+            verdict = "atomic_write_replaced_symlink",
+            "a symlink sat at the write target: replaced by a regular file, not followed");
+    }
     let mut keep_mode = None;
-    if let Some(meta) = existing.as_ref().filter(|m| m.file_type().is_file()) {
+    if existing.as_ref().is_some_and(|m| m.file_type().is_file()) {
         // Opening for write (no truncate, no follow) is the permission check:
         // a file this process may not write is refused here, untouched.
         let file = open_existing_for_write(target)?;
+        // Judge the file that was opened, not the name looked up before it.
+        let meta = file.metadata()?;
+        if let Some(check) = check {
+            check(Some(&meta))?;
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -70,6 +102,8 @@ pub fn atomic_write(target: &Path, bytes: &[u8]) -> std::io::Result<Landed> {
         }
         drop(file);
         keep_mode = Some(meta.permissions());
+    } else if let Some(check) = check {
+        check(existing.as_ref())?;
     }
     let mut builder = tempfile::Builder::new();
     builder.prefix(".amux-save-");
@@ -86,7 +120,11 @@ pub fn atomic_write(target: &Path, bytes: &[u8]) -> std::io::Result<Landed> {
         tmp.as_file().set_permissions(mode)?;
     }
     tmp.as_file().sync_all()?;
-    tmp.persist(target).map_err(|e| e.error)?;
+    if check.is_some() && existing.is_none() {
+        tmp.persist_noclobber(target).map_err(|e| e.error)?;
+    } else {
+        tmp.persist(target).map_err(|e| e.error)?;
+    }
     #[cfg(unix)]
     if let Ok(d) = std::fs::File::open(dir) {
         // The rename is durable once the directory entry is.
@@ -193,10 +231,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.txt");
         let b = dir.path().join("b.txt");
-        std::fs::write(&a, "v1").unwrap();
+        // Longer old contents than new: an in-place write without the
+        // truncate would leave "v2rsion-one".
+        std::fs::write(&a, "version-one").unwrap();
         std::fs::hard_link(&a, &b).unwrap();
         assert_eq!(atomic_write(&a, b"v2").unwrap(), Landed::InPlaceHardLinked);
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "v2");
+    }
+
+    /// The in-place branch opens the target by name; the check that it is a
+    /// regular file happened earlier, so a link swapped in between must make
+    /// the open fail rather than be followed (round-2 review N3).
+    #[cfg(unix)]
+    #[test]
+    fn the_in_place_open_refuses_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let err = open_existing_for_write(&link).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
     }
 
     #[cfg(unix)]
@@ -216,6 +271,51 @@ mod tests {
         assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
                    std::fs::metadata(&reference).unwrap().permissions().mode() & 0o777,
                    "a new file gets what std::fs::write would have given it");
+    }
+
+    /// ai-config #227: the check sees the opened file's own metadata, the
+    /// link itself, or nothing, and a refusal leaves the target untouched.
+    #[cfg(unix)]
+    #[test]
+    fn the_check_judges_what_is_at_the_target_and_a_refusal_writes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let no_exec: TargetCheck = &|m| match m {
+            Some(m) if m.file_type().is_symlink() => Err(std::io::Error::other("link")),
+            Some(m) if m.permissions().mode() & 0o111 != 0 => Err(std::io::Error::other("exec")),
+            _ => Ok(()),
+        };
+        let exe = dir.path().join("run.sh");
+        std::fs::write(&exe, "#!/bin/sh").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(atomic_write_checked(&exe, b"pwned", no_exec).unwrap_err().to_string(), "exec");
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "#!/bin/sh");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+        assert_eq!(atomic_write_checked(&link, b"pwned", no_exec).unwrap_err().to_string(), "link");
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        let seen = std::cell::Cell::new(false);
+        let fresh = dir.path().join("fresh.txt");
+        atomic_write_checked(&fresh, b"new", &|m| { seen.set(m.is_none()); Ok(()) }).unwrap();
+        assert!(seen.get(), "an empty name is judged as None");
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "new");
+    }
+
+    /// An entry that appears after the check judged an empty name (here the
+    /// check itself plants it, as a racing writer would) fails the write
+    /// rather than being replaced unjudged.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_that_appears_after_the_check_is_not_clobbered() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("late.txt");
+        let err = atomic_write_checked(&target, b"mine", &|_| {
+            std::fs::write(&target, "theirs").unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "theirs");
     }
 
     #[cfg(unix)]
