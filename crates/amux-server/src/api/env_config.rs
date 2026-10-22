@@ -696,6 +696,7 @@ async fn apply(
     // ---- schedules: create the absent ones via the real scheduler path -----
     if !sched_writes.is_empty() {
         let writes = sched_writes;
+        let schedule_author = origin.clone();
         // Capture the result, don't swallow it: a swallowed insert error is
         // exactly how this shipped creating 0 schedules with a 200 (a NOT NULL
         // column left unset). A failure now lands in `errors` in the response.
@@ -731,6 +732,7 @@ async fn apply(
                     let mut m = serde_json::Map::new();
                     m.insert("title".into(), json!(title));
                     m.insert("session".into(), json!(worker));
+                    m.insert("created_by".into(), json!(schedule_author));
                     m.insert("command".into(), json!(command));
                     m.insert("kind".into(), json!("tmux"));
                     m.insert("sched_type".into(), json!(sched_type));

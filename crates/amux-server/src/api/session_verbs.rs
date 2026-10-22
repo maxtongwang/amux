@@ -12632,24 +12632,24 @@ pub(crate) struct AutoDelivery {
 /// or refused (with the reason). `ok == true` never means "delivered" on its
 /// own — read `submitted`.
 /// A schedule's delivery guard, set by the scheduler: `sched:<id>` for a
-/// schedule the OWNER authored, `wsched:<id>` for one a worker authored
-/// (ai-config#210). Both are schedules for run bookkeeping.
+/// schedule the owner authored or a worker authored for itself; `wsched:<id>`
+/// for cross-target worker input (ai-config#210). Both retain run bookkeeping.
 pub(crate) fn is_schedule_guard(guard: &str) -> bool {
     guard.starts_with("sched:") || guard.starts_with(WORKER_SCHEDULE_GUARD)
 }
 
-/// Prefix of a worker-authored schedule's delivery guard. It is a schedule,
-/// never owner configuration: delivered as automation, origin-stamped with its
-/// author, and refused by an isolated worker like any peer input.
+/// Prefix of a cross-target worker schedule's delivery guard: automation,
+/// origin-stamped with its author, and refused by an isolated target.
+/// Self-authored schedules use `sched:` and retain their stored authorship.
 pub(crate) const WORKER_SCHEDULE_GUARD: &str = "wsched:";
 
 /// Guards for deliveries that carry the OWNER's own standing configuration
-/// rather than amux steering: an owner-authored schedule (`sched:`) and the
+/// rather than amux steering: an owner- or self-authored schedule (`sched:`) and the
 /// goal keeper continuing an owner-set /goal (`goal:`, Ethan 2026-09-26: "this
 /// needs to have been continued automatically on the harness level. especially
 /// since its a /goal"). Both reach isolated workers, as owner input. A
-/// worker-authored schedule (`wsched:`) is NOT one: only text the owner set up
-/// is owner input (ai-config#210).
+/// cross-target worker schedule (`wsched:`) is NOT one. Self-schedules are
+/// accepted standing input only to their author (PR #56 N1).
 pub(crate) fn is_owner_configured_guard(guard: &str) -> bool {
     (is_schedule_guard(guard) && !guard.starts_with(WORKER_SCHEDULE_GUARD)) || guard.starts_with("goal:")
 }

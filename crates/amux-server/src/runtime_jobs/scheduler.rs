@@ -1843,6 +1843,15 @@ pub(crate) fn legacy_worker_author(by_who: &str, registered: impl Fn(&str) -> bo
         .then(|| name.to_string())
 }
 
+/// A shell runs with its target's session, run token and vault secrets. A
+/// worker may therefore author one only for itself, including legacy rows.
+pub(crate) fn shell_author_refusal(author: Option<&str>, target: &str, kind: &str) -> Option<String> {
+    let author = author.filter(|w| !w.is_empty())?;
+    (kind == "shell" && author != target.trim()).then(|| format!(
+        "shell schedule refused: worker author '{author}' may run only as itself, not target '{target}'"
+    ))
+}
+
 pub struct LiveDeliverer {
     state: crate::api::AppState,
 }
@@ -2175,6 +2184,32 @@ pub fn reserve_applies_to(source: &str) -> bool {
 #[async_trait::async_trait]
 impl Deliverer for LiveDeliverer {
     async fn deliver(&self, sched: &DurableSchedule, source: &str) -> RunOutcome {
+        let session = sched.str_field("session").to_string();
+        let author = {
+            let conn = match self.state.store.read() {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::warn!(schedule = %sched.id(), %error, verdict = "schedule_author_read_failed",
+                        measured = true, n_considered = 1, "schedule refused: cannot read authorship");
+                    return RunOutcome::Refused { reason: format!("cannot read schedule authorship: {error}") };
+                }
+            };
+            schedule_worker_author(Some(&conn), sched)
+        };
+        if let Some(reason) = shell_author_refusal(author.as_deref(), &session, sched.str_field("kind")) {
+            tracing::warn!(schedule = %sched.id(), session, author, verdict = "schedule_shell_author_mismatch",
+                measured = true, n_considered = 1, "{reason}");
+            return RunOutcome::Refused { reason };
+        }
+        // Reuse send's live group/receive/isolation decision on every fire;
+        // a boundary accepted when the row was written may no longer exist.
+        if let Some(w) = author.as_deref().filter(|w| *w != session) {
+            if let Some((code, reason)) = crate::api::session_verbs::send_group_refusal(w, &session) {
+                tracing::warn!(schedule = %sched.id(), session, author = w, code,
+                    verdict = "schedule_delivery_group_refused", measured = true, n_considered = 1, "{reason}");
+                return RunOutcome::Refused { reason };
+            }
+        }
         if sched.str_field("kind") == "shell" {
             // NOT GATED BY THE RESERVE, and the exemption is the point: a shell
             // schedule wakes no model turn, so it consumes none of the plan
@@ -2240,18 +2275,17 @@ impl Deliverer for LiveDeliverer {
             };
         }
 
-        let session = sched.str_field("session").to_string();
         let text = delivered_text(&command, source);
-        // PROVENANCE (ai-config#210). Only a schedule the OWNER authored is
-        // owner configuration. A worker-authored one is delivered as
-        // automation under the `wsched:` guard, stamped with its author, so an
-        // isolated worker refuses it like any peer input and a normal worker
-        // sees who it is from.
-        let author = {
-            let conn = self.state.store.read().ok();
-            schedule_worker_author(conn.as_deref(), sched)
-        };
+        // Cross-target worker input retains the automation guard and stamp.
+        // Self-authored schedules are standing input to that same worker,
+        // including isolated workers; persisted authorship stays unchanged.
         let (text, guard) = match &author {
+            Some(w) if w == &session => {
+                tracing::info!(schedule = %sched.id(), session, author = %w,
+                    verdict = "worker_self_schedule_delivered", measured = true, n_considered = 1,
+                    "self-authored schedule uses the standing schedule input path");
+                (text, format!("sched:{}", sched.id()))
+            }
             Some(w) => {
                 tracing::info!(schedule = %sched.id(), session = %session, author = %w,
                     verdict = "worker_schedule_delivered_as_automation", measured = true, n_considered = 1,
@@ -3042,6 +3076,7 @@ mod shell_output_tests {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     /// ai-config#210: who authored a schedule's delivered content.
     #[test]
     fn a_schedule_author_comes_from_run_now_then_created_by_then_the_creation_audit() {
@@ -3215,7 +3250,86 @@ mod tests {
         // 3. The same schedule authored by the OWNER still reaches the isolated worker.
         let out = live.deliver(&row("O1", "iso", ""), "cron").await;
         assert!(!matches!(out, RunOutcome::Refused { .. }), "owner configuration still reaches an isolated worker: {out:?}");
+        // Existing isolated self rows retain authorship and still fire.
+        let self_row = row("SELF", "iso", "iso");
+        let saved = self_row.clone();
+        state.store.write_async(move |conn| {
+            insert_schedule(conn, &saved)?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        let self_row = get_schedule(&state.store.read().unwrap(), "SELF").unwrap().unwrap();
+        let out = live.deliver(&self_row, "manual:test").await;
+        assert!(matches!(out, RunOutcome::Queued { .. } | RunOutcome::Delivered { .. }), "N1 isolated self row must fire: {out:?}");
         drop(panes);
+    }
+
+    #[tokio::test]
+    async fn review_b1_fire_refuses_legacy_cross_target_shell_and_allows_self() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        for name in ["dev-a", "dev-b"] {
+            std::fs::write(home.path().join(format!("sessions/{name}.env")), "CC_TAGS=dev\n").unwrap();
+        }
+        let (store, _dir) = store();
+        let state = crate::api::AppState { store, started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let marker = home.path().join("executed");
+        let mut row = make_row("LEGACY", "dev-b", None, "2020-01-01T00:00");
+        row.set("kind", json!("shell"));
+        row.set("command", json!(format!("printf %s \"$AMUX_SESSION\" > '{}'", marker.display())));
+        // NULL created_by uses the legacy creation audit.
+        state.store.write_async(|conn| {
+            insert_audit(conn, "LEGACY", "created", "", "", "api-create", "dev-a")?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        let live = LiveDeliverer::new(state);
+        let out = live.deliver(&row, "cron").await;
+        assert!(matches!(&out, RunOutcome::Refused { reason } if reason.contains("shell") && reason.contains("author")), "B1 legacy shell must refuse: {out:?}");
+        assert!(!marker.exists(), "refusal must happen before shell side effects");
+        row.set("created_by", json!("dev-a"));
+        row.set("session", json!("dev-a"));
+        let out = live.deliver(&row, "cron").await;
+        assert!(matches!(out, RunOutcome::ShellOk { .. }), "self shell is allowed: {out:?}");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "dev-a");
+        row.set("created_by", json!(""));
+        row.set("session", json!("dev-b"));
+        let out = live.deliver(&row, "cron").await;
+        assert!(matches!(out, RunOutcome::ShellOk { .. }), "owner shell unchanged: {out:?}");
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "dev-b");
+    }
+
+    #[tokio::test]
+    async fn review_b2_delivery_rechecks_group_changes_after_write() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        for name in ["dev-a", "dev-b"] {
+            std::fs::write(home.path().join(format!("sessions/{name}.env")), "CC_TAGS=dev\n").unwrap();
+        }
+        let (store, _dir) = store();
+        let mut row = make_row("GROUP", "dev-b", None, "2020-01-01T00:00");
+        row.set("created_by", json!("dev-a"));
+        assert!(crate::api::session_verbs::send_group_refusal("dev-a", "dev-b").is_none());
+        let saved = row.clone();
+        store.write_async(move |conn| {
+            insert_schedule(conn, &saved)?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        // A bounded private fixture session keeps this a delivery test; it
+        // exits on its own and never touches another worker's tmux session.
+        let pane = crate::api::session_verbs::tmux_command()
+            .args(["new-session", "-d", "-s", "amux-dev-b", "sleep 30"])
+            .output().expect("private tmux fixture");
+        assert!(pane.status.success(), "{}", String::from_utf8_lossy(&pane.stderr));
+        std::fs::write(home.path().join("sessions/dev-b.env"), "CC_TAGS=ops\n").unwrap();
+        assert!(crate::api::session_verbs::send_group_refusal("dev-a", "dev-b").is_some());
+        let state = crate::api::AppState { store, started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let row = get_schedule(&state.store.read().unwrap(), "GROUP").unwrap().unwrap();
+        let out = LiveDeliverer::new(state.clone()).deliver(&row, "manual:test").await;
+        assert!(matches!(&out, RunOutcome::Refused { reason } if reason.contains("group")), "B2 changed group must refuse at the send boundary: {out:?}");
+        assert_eq!(state.store.read().unwrap().query_row("SELECT COUNT(*) FROM steering_queue", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     }
 
     #[tokio::test]
