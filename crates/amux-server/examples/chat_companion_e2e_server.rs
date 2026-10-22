@@ -48,8 +48,17 @@ async fn main() {
     let tls = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls));
     let recovered = amux_server::api::chat_worker::recover_all(&state).await;
     tracing::info!(?recovered, port, "private Chat E2E rig ready");
-    axum_server::bind_rustls(([0, 0, 0, 0], port).into(), tls)
+    axum_server::bind_rustls((bind_ip(), port).into(), tls)
         .serve(router(state).into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await
         .unwrap();
+}
+
+/// Loopback unless AMUX_BIND names another address, so running this rig never
+/// raises the macOS incoming-connections dialog.
+fn bind_ip() -> std::net::IpAddr {
+    match std::env::var("AMUX_BIND") {
+        Ok(v) => v.parse().unwrap_or_else(|_| panic!("AMUX_BIND must be an IP address, got {v:?}")),
+        Err(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+    }
 }

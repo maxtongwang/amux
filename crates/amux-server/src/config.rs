@@ -302,10 +302,7 @@ mod bind_tests {
 
     #[test]
     fn bind_default_and_both_loopback_families() {
-        assert_eq!(
-            parse_bind_ip(None).unwrap(),
-            std::net::Ipv4Addr::UNSPECIFIED
-        );
+        assert_eq!(parse_bind_ip(None).unwrap(), std::net::Ipv4Addr::UNSPECIFIED);
         for ip in ["127.0.0.1", "::1"] {
             assert_eq!(
                 parse_bind_ip(Some(ip)).unwrap(),
