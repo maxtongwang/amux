@@ -115,9 +115,12 @@ SIX = ["http://127.0.0.1:+8824", "http://127.0.0.1: 8824", "http://127.0.0.1:88_
 # Shapes the allow-list refuses even with a harmless port.
 NOT_SHAPE = ["HTTP://127.0.0.1:41234", "http://127.0.0.1:041234", "http://127.0.0.1:88240",
              "https://cloud.example", "http://127.0.0.1:41234/a b", "ftp://127.0.0.1:41234",
-             "http://127.0.0.1:41234\nhttps://localhost:8824", "http://127.0.0.1:41234/\x07"]
+             "http://127.0.0.1:41234\nhttps://localhost:8824", "http://127.0.0.1:41234/\x07",
+             "http://127.0.0.1:41234/a@b", "http://127.0.0.1:41234/a\\b",
+             " http://127.0.0.1:41234", "http://127.0.0.1:41234 "]
 ESCAPES = ESCAPES + SIX + NOT_SHAPE
-KEPT = ["http://127.0.0.1:41234", "https://localhost:65535/x?y=1", "http://[::1]:9", "file:///tmp/health.json"]
+KEPT = ["http://127.0.0.1:41234", "https://localhost:65535/x?y=1", "http://[::1]:9", "file:///tmp/health.json",
+        "http://127.0.0.1:41234/a-b_c.txt/sub?x=1&y=2#ok"]
 ENDPOINT_PORT = ["https://localhost:%d" % FIXTURE_PORT, "http://0.0.0.0:0%d/x" % FIXTURE_PORT]
 
 
