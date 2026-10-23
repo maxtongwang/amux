@@ -149,6 +149,13 @@ active build/test consumers make it defer rather than delete their executables.
 A held/failed cache refresh preserves the previous source fingerprint and records
 that no test ran. Retry after those consumers finish.
 
+Steering stuck notices keep their once-per-row receipts in `session_events`.
+The idle timer lives in the per-lane skip record and resets on restart: downtime
+cannot prove continuous idle. An undelivered row past 60s needs an owner draft,
+a recorded boundary refusal, or a fresh 60s of observed idle before alerting. Delivery, busy/held
+lanes and missing observations clear the idle timer. WARNs record row age,
+`idle_undelivered_s` and `refusal` separately.
+
 | Surface | Recovery evidence |
 | --- | --- |
 | Board, worker configuration, schedules, messages, steering, journal, history, request log | Existing real-process restart persistence matrix |

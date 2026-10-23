@@ -23,6 +23,17 @@
 //! in-process dicts; the decision function is a pure port of Python's
 //! `urgent_alert_decision` so the 38-page storm (MF-427) replays exactly.
 
+// Reuse the dashboard's existing `alerts` SSE envelope. Durable producers keep
+// their own ledger receipt; this channel only wakes currently connected views.
+pub(crate) fn dashboard_alerts() -> &'static tokio::sync::broadcast::Sender<String> {
+    static TX: std::sync::OnceLock<tokio::sync::broadcast::Sender<String>> = std::sync::OnceLock::new();
+    TX.get_or_init(|| tokio::sync::broadcast::channel(256).0)
+}
+
+pub(crate) fn publish_dashboard_alert(alert: serde_json::Value) {
+    let _ = dashboard_alerts().send(serde_json::json!({"type":"alerts","payload":[alert]}).to_string());
+}
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
