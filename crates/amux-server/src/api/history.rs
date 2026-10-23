@@ -34,6 +34,7 @@
 //! - One deliberate deviation: a non-numeric `?limit=`/`?offset=` falls
 //!   back to the default (500/0) where Python's bare `int()` answers 500.
 
+use super::session_verbs::MIN_DELIVERY_MATCH_CHARS;
 use super::settings::amux_home;
 use super::AppState;
 use crate::db::{PendingEvent, WriteOutcome};
@@ -155,7 +156,6 @@ fn attach_linked_cards(conn: &rusqlite::Connection, rows: &mut [Value]) -> rusql
 
 const PROVENANCE_WINDOW_MS: i64 = 6 * 3600 * 1000;
 const PROVENANCE_DELIVERIES: usize = 64;
-const PROVENANCE_MIN_MATCH_CHARS: usize = 16;
 const PROVENANCE_STAMP_PATTERN: &str = r"\[(?:quoted )?amux-origin:\s*([^\]\r\n]+)\]";
 
 /// Owner attribution describes the input channel, not every word in a turn.
@@ -167,7 +167,8 @@ fn attach_owner_provenance(conn: &rusqlite::Connection, rows: &mut [Value]) -> r
         return Ok(());
     }
     // One query for the page; never match a pane capture against itself or a
-    // queued message that has no delivery evidence. Bound candidates per entry.
+    // queued message that has no delivery evidence. Only non-owner origins
+    // establish relay provenance. Bound candidates per entry.
     let placeholders = vec!["?"; ids.len()].join(",");
     let sql = format!(
         "SELECT owner_id,text,origin FROM (SELECT o.id AS owner_id,d.text,d.origin, \
@@ -175,6 +176,7 @@ fn attach_owner_provenance(conn: &rusqlite::Connection, rows: &mut [Value]) -> r
          FROM cmd_history o JOIN cmd_history d ON d.session=o.session AND d.id<>o.id \
          AND d.ts BETWEEN o.ts-{PROVENANCE_WINDOW_MS} AND o.ts \
          WHERE o.id IN ({placeholders}) AND COALESCE(d.delivery,'')<>'pane' \
+         AND COALESCE(d.origin,'')<>'' \
          AND (d.delivery='direct' OR d.delivered_at IS NOT NULL)) \
          WHERE recent<={PROVENANCE_DELIVERIES}"
     );
@@ -200,7 +202,10 @@ fn attach_owner_provenance(conn: &rusqlite::Connection, rows: &mut [Value]) -> r
         let stamp_senders: BTreeSet<_> = spans.iter().map(|(_, _, s)| s.clone()).collect();
         if let Some(candidates) = row["id"].as_i64().and_then(|id| deliveries.get(&id)) {
             for (delivered, origin) in candidates {
-                if let Some(start) = text.find(delivered).filter(|_| delivered.chars().count() >= PROVENANCE_MIN_MATCH_CHARS) {
+                if delivered.chars().filter(|c| !c.is_whitespace()).count() < MIN_DELIVERY_MATCH_CHARS {
+                    continue;
+                }
+                if let Some(start) = text.find(delivered) {
                     spans.push((start, start + delivered.len(), origin.clone()));
                 } else if super::session_verbs::held_delivery_matching(text, session, &[(delivered.clone(), origin.clone())]).is_some() {
                     spans.push((0, text.len(), origin.clone()));
@@ -1543,6 +1548,100 @@ mod tests {
         for id in [3, 4] {
             let (_, row) = send(&app, "GET", &format!("/api/history/{id}"), None).await;
             assert_eq!(row["mixed_provenance"], false, "lane and delivery age must match: {row}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ai194b_owner_history_repeated_owner_sends_are_not_relayed() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, state, _db) = app_with_state();
+        for (lane, earlier, repeated) in [
+            ("owner-exact", "please check the build status now", "please check the build status now"),
+            ("owner-contained", "please check the build status now", "please check the build status now and report back"),
+            ("owner-short", "yes", "yes"),
+        ] {
+            state.store.write(move |c| {
+                c.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery) VALUES (?1,'user',?2,1000,'','direct')",
+                    rusqlite::params![earlier, lane])?;
+                c.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery,delivered_at) VALUES (?1,'user',?2,1500,'','queued',1500)",
+                    rusqlite::params![earlier, lane])?;
+                c.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery) VALUES (?1,'user',?2,2000,'','pane')",
+                    rusqlite::params![repeated, lane])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            }).unwrap();
+            let (status, rows) = send(&app, "GET", &format!("/api/history?session={lane}"), None).await;
+            assert_eq!(status, StatusCode::OK, "{rows}");
+            let rows = rows.as_array().unwrap();
+            assert_eq!(rows.len(), 3);
+            for row in rows {
+                assert_eq!(row["mixed_provenance"], false, "owner's own earlier sends are not relay evidence: {row}");
+                assert!(row.get("provenance_matches").is_none(), "{row}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ai194b_owner_history_short_relay_is_not_a_match() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, state, _db) = app_with_state();
+        for (lane, relay) in [("short-yes", "yes"), ("short-command", "/status"), ("short-unicode", "你好世界"), ("short-spaced", "a b c d e")] {
+            state.store.write(move |c| {
+                c.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery) VALUES (?1,'session',?2,1000,'re-ops-lead','direct')",
+                    rusqlite::params![relay, lane])?;
+                for text in [relay.to_string(), format!("Owner draft {relay}")] {
+                    c.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery) VALUES (?1,'user',?2,2000,'','pane')",
+                        rusqlite::params![text, lane])?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            }).unwrap();
+            let (status, rows) = send(&app, "GET", &format!("/api/history?session={lane}"), None).await;
+            assert_eq!(status, StatusCode::OK, "{rows}");
+            let owners: Vec<_> = rows.as_array().unwrap().iter().filter(|r| r["sender"] == "owner").collect();
+            assert_eq!(owners.len(), 2);
+            for row in owners {
+                assert_eq!(row["mixed_provenance"], false, "short exact/contained relay is not evidence: {row}");
+                assert!(row.get("provenance_matches").is_none(), "{row}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ai194b_owner_history_long_nonempty_origin_relay_matches() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, state, _db) = app_with_state();
+        // The eight-character boundary applies to both exact and contained
+        // matches; peer attribution must survive either delivery mode.
+        const RELAY: &str = "abcdefgh";
+        state.store.write(|c| {
+            for (lane, delivery, delivered_at) in [("relay-direct", "direct", None), ("relay-queued", "queued", Some(1000_i64))] {
+                c.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery,delivered_at) VALUES (?1,'session',?2,1000,'re-ops-lead',?3,?4)",
+                    rusqlite::params![RELAY, lane, delivery, delivered_at])?;
+                for text in [RELAY.to_string(), format!("Owner draft {RELAY}")] {
+                    c.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery) VALUES (?1,'user',?2,2000,'','pane')",
+                        rusqlite::params![text, lane])?;
+                }
+            }
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        for lane in ["relay-direct", "relay-queued"] {
+            let (status, rows) = send(&app, "GET", &format!("/api/history?session={lane}"), None).await;
+            assert_eq!(status, StatusCode::OK, "{rows}");
+            let owners: Vec<_> = rows.as_array().unwrap().iter().filter(|r| r["sender"] == "owner").collect();
+            assert_eq!(owners.len(), 2);
+            for owner in owners {
+                let (status, row) = send(&app, "GET", &format!("/api/history/{}", owner["id"]), None).await;
+                assert_eq!(status, StatusCode::OK, "{row}");
+                for row in [owner, &row] {
+                    assert_eq!(row["mixed_provenance"], true, "{row}");
+                    assert_eq!(row["provenance_matches"][0]["sender"], "re-ops-lead", "{row}");
+                    let segments = row["provenance_segments"].as_array().unwrap();
+                    assert_eq!(segments.last().unwrap()["text"], RELAY, "{row}");
+                    assert_eq!(segments.last().unwrap()["provenance"], "relayed", "{row}");
+                }
+            }
         }
     }
 

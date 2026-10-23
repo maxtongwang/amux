@@ -10743,18 +10743,14 @@ fn amux_delivered_text(state: &AppState, name: &str, draft: &str) -> bool {
 }
 
 /// Pure core of [`held_amux_delivery`]: `rows` are `(text, origin)`.
+/// This authorises clearing/submission, so short exact matches are never proof
+/// of ownership: they can just as easily be an owner's new draft.
 pub(crate) fn held_delivery_matching(draft: &str, name: &str, rows: &[(String, String)]) -> Option<String> {
     let exact = rows.iter().find_map(|(text, origin)| {
         let stamped = origin_stamped(origin, name, text);
         std::iter::once(text.clone())
             .chain(stamped)
-            .find(|t| {
-                // Receipt recognition includes short sends such as `/status`.
-                // The retry-Enter helper's eight-character safety floor must
-                // not hide recorded text; still require the entire composer.
-                let want: String = t.split_whitespace().collect();
-                !want.is_empty() && draft == want
-            })
+            .find(|t| composer_holds_this_delivery(draft, t))
     });
     // A COLLAPSED PASTE HIDES ITS TEXT (AMUX-5463: 5 of 8 stuck messages read
     // as a chip). The chip still carries its size: Claude's `+M lines` (the
@@ -10763,6 +10759,9 @@ pub(crate) fn held_delivery_matching(draft: &str, name: &str, rows: &[(String, S
     exact.or_else(|| {
         rows.iter().find_map(|(text, origin)| {
             let sent = origin_stamped(origin, name, text).unwrap_or_else(|| text.clone());
+            if sent.chars().filter(|c| !c.is_whitespace()).count() < MIN_DELIVERY_MATCH_CHARS {
+                return None;
+            }
             let (prefix, body) = delivery_parts(&sent);
             let prefix_sq: String = prefix.split_whitespace().collect();
             let chip = draft.strip_prefix(prefix_sq.as_str())?;
@@ -13042,6 +13041,8 @@ async fn submit_project_execution_draft_if_owned(
     Some(send_outcome(submission, generating, retried))
 }
 
+pub(crate) const MIN_DELIVERY_MATCH_CHARS: usize = 8;
+
 /// Does the composer hold EXACTLY the message steering is delivering right now?
 ///
 /// Then the draft is amux's own earlier paste whose Enter never took (the lane
@@ -13053,7 +13054,7 @@ async fn submit_project_execution_draft_if_owned(
 /// above, for every steering delivery. Pure so the exact-match rule is tested.
 fn composer_holds_this_delivery(draft: &str, text: &str) -> bool {
     let want: String = text.split_whitespace().collect();
-    want.chars().count() >= 8 && draft == want
+    want.chars().count() >= MIN_DELIVERY_MATCH_CHARS && draft == want
 }
 
 /// Submit the lane's own pasted steering message at an idle boundary. Returns
@@ -57046,6 +57047,24 @@ mod composer_guard_tests {
         super::super::worker_exec::fake_pane::composer(name, pane);
     }
 
+    #[test]
+    fn ai194b_held_delivery_matching_requires_floor_and_whole_composer() {
+        for short in ["yes", "/status", "1234567", "你好世界", "a b c d e"] {
+            let rows = vec![(short.to_string(), String::new())];
+            let draft: String = short.split_whitespace().collect();
+            assert_eq!(held_delivery_matching(&draft, "w", &rows), None, "short exact match: {short}");
+            let chip = format!("[PastedContent{}chars]", short.chars().count());
+            assert_eq!(held_delivery_matching(&chip, "w", &rows), None, "a chip cannot bypass the floor");
+        }
+        for long in ["12345678", "一二三四五六七八", "deploy the new build to staging now"] {
+            let rows = vec![(long.to_string(), String::new())];
+            let draft: String = long.split_whitespace().collect();
+            assert_eq!(held_delivery_matching(&draft, "w", &rows).as_deref(), Some(long));
+            assert_eq!(held_delivery_matching(&format!("owner{draft}"), "w", &rows), None);
+            assert_eq!(held_delivery_matching(&format!("{draft}owner"), "w", &rows), None);
+        }
+    }
+
     #[tokio::test]
     async fn ai194b_direct_send_queues_owner_draft_without_typing() {
         use super::super::worker_exec::fake_pane::{self, Composer};
@@ -57114,10 +57133,84 @@ mod composer_guard_tests {
             "SELECT delivery,submit_verdict,type FROM cmd_history WHERE session=?1", [LANE],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
         assert_eq!(row, ("direct".into(), "stuck".into(), "amux".into()));
-        assert_eq!(held_amux_delivery(&state, LANE, AI194B_COMMAND).as_deref(), Some(AI194B_COMMAND));
         let mixed = composer_state(&fake_pane::capture(LANE).unwrap()).typed().unwrap().to_string();
         assert!(mixed.contains("Katelladraft/status"));
         assert_eq!(held_amux_delivery(&state, LANE, &mixed), None, "never claim the combined owner draft");
+
+        // Both the mixed box and the short command left after the owner
+        // removes their draft stay untouched by subsequent direct sends.
+        for only_command in [false, true] {
+            if only_command {
+                fake_pane::composer(LANE, Composer { text: AI194B_COMMAND.into(), ..Default::default() });
+            }
+            let before = fake_pane::capture(LANE).unwrap();
+            let keys = fake_pane::keys(LANE);
+            let typed = fake_pane::typed(LANE);
+            let ((ok, reply), queue_id) = send_text_with_queue_id(
+                &state, LANE, "follow-up relay message", false, SendOrigin::Owner,
+            ).await;
+            assert!(ok && reply.starts_with("queued (steering)"), "{reply}");
+            assert!(queue_id.is_some());
+            assert_eq!(fake_pane::keys(LANE), keys, "follow-up must send neither C-u nor Enter");
+            assert_eq!(fake_pane::typed(LANE), typed, "follow-up must not type");
+            assert_eq!(fake_pane::capture(LANE).unwrap(), before);
+        }
+        let row: (String, String, String) = state.store.read().unwrap().query_row(
+            "SELECT delivery,submit_verdict,type FROM cmd_history WHERE session=?1", [LANE],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(row, ("direct".into(), "stuck".into(), "amux".into()), "follow-up preserves the race receipt");
+    }
+
+    #[tokio::test]
+    async fn ai194b_short_owner_draft_matching_stuck_delivery_is_not_touched() {
+        use super::super::worker_exec::fake_pane::{self, Composer};
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _db) = super::tests::state();
+        const LANE: &str = "ai194b-short-owner";
+        ai194b_lane(LANE, Composer { text: "yes".into(), ..Default::default() });
+        state.store.write(|c| {
+            c.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery,submit_verdict) VALUES ('yes','session',?1,?2,'re-ops-lead','direct','stuck')",
+                rusqlite::params![LANE, now_i64() * 1000])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let ((ok, reply), queue_id) = send_text_with_queue_id(
+            &state, LANE, "an unrelated relay message", false, SendOrigin::Owner,
+        ).await;
+        assert!(ok && reply.starts_with("queued (steering)"), "{reply}");
+        let queued: String = state.store.read().unwrap().query_row(
+            "SELECT text FROM steering_queue WHERE id=?1 AND session=?2",
+            rusqlite::params![queue_id.unwrap(), LANE], |r| r.get(0)).unwrap();
+        assert_eq!(queued, "an unrelated relay message");
+        assert!(fake_pane::keys(LANE).is_empty(), "must send neither C-u nor Enter");
+        assert!(fake_pane::typed(LANE).is_empty(), "must not type over the owner draft");
+        assert_eq!(composer_state(&fake_pane::capture(LANE).unwrap()).typed(), Some("yes"));
+    }
+
+    #[tokio::test]
+    async fn ai194b_long_stuck_delivery_is_recognised_and_replaced() {
+        use super::super::worker_exec::fake_pane::{self, Composer};
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _db) = super::tests::state();
+        const LANE: &str = "ai194b-long-held";
+        const HELD: &str = "deploy the new build to staging now";
+        const NEXT: &str = "check the deployment report";
+        ai194b_lane(LANE, Composer { text: HELD.into(), ..Default::default() });
+        state.store.write(|c| {
+            c.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery,submit_verdict) VALUES (?1,'amux',?2,?3,'','direct','stuck')",
+                rusqlite::params![HELD, LANE, now_i64() * 1000])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let draft = composer_state(&fake_pane::capture(LANE).unwrap()).typed().unwrap().to_string();
+        assert_eq!(held_amux_delivery(&state, LANE, &draft).as_deref(), Some(HELD));
+        let ((ok, reply), queue_id) = send_text_with_queue_id(&state, LANE, NEXT, false, SendOrigin::Owner).await;
+        assert!(ok && reply == "sent", "{reply}");
+        assert!(queue_id.is_none());
+        assert!(fake_pane::keys(LANE).iter().any(|k| k == "C-u"));
+        assert_eq!(fake_pane::keys(LANE).iter().filter(|k| *k == "Enter").count(), 1);
+        assert_eq!(fake_pane::typed(LANE), vec![(NEXT.into(), "terminal")]);
+        assert!(composer_state(&fake_pane::capture(LANE).unwrap()).typed().is_none());
     }
 
     fn claude(text: &str) -> String {
