@@ -208,8 +208,16 @@ pub(crate) mod fake_pane {
     /// verification must run through the production terminal send pipeline.
     pub(crate) fn terminal_output(args: &[&str]) -> Option<std::process::Output> {
         use std::os::unix::process::ExitStatusExt;
-        let target = args.windows(2).find(|a| a[0] == "-t")?[1];
-        let name = target.strip_prefix("=amux-")?.trim_end_matches(':');
+        // Match only a registered fake pane's canonical exact target. A bare
+        // or prefix target must never turn real terminal I/O into fake success.
+        let home = crate::config::amux_home();
+        let name = FRAMES.lock().unwrap().iter().find_map(|(h, name, _, _)| {
+            let pt = crate::backend::tmux::pane_target(&format!("amux-{name}"));
+            (h == &home && args.windows(2).any(|pair|
+                pair[0].strip_prefix('-') == Some("t") && pair[1] == pt.as_str()))
+                .then(|| name.clone())
+        })?;
+        let name = name.as_str();
         let raw = frame(name)?;
         let stdout = match args[0] {
             "capture-pane" => raw,

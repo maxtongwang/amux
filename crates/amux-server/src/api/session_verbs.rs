@@ -21863,7 +21863,18 @@ fn format_local_time(epoch: f64) -> String {
 }
 
 pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64) -> SteerDelivery {
-    let Some(signals) = boundary_signals(state, Some(name)).await else {
+    let signals = boundary_signals(state, Some(name)).await;
+    steer_delivery_from_signals(state, name, age_s, signals.as_ref())
+}
+
+// The drain and its diagnostics consume the same pane/boundary observation.
+fn steer_delivery_from_signals(
+    state: &AppState,
+    name: &str,
+    age_s: f64,
+    signals: Option<&super::sessions_legacy::FleetSignals>,
+) -> SteerDelivery {
+    let Some(signals) = signals else {
         return steer_no_signal(name, age_s, "no-boundary-signals");
     };
     let Some(status) = signals.turn_boundary_status(name) else {
@@ -22641,8 +22652,9 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
             })
             .await;
     }
+    let mut stuck_tick = SteeringStuckTick::default();
     if queued.is_empty() {
-        warn_steering_stuck(state).await;
+        warn_steering_stuck(state, &stuck_tick).await;
         return 0;
     }
     // ONE DELIVERY per lane per tick, oldest first. Delivering a whole backlog
@@ -22691,13 +22703,30 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
             }
             continue;
         }
-        if guard == "project-steering" && project_send_hold(state, &session, Some(&id)).is_some() {
-            // Recheck in the writer; if the hold lifted in between, release our
-            // claim so the next pass delivers it rather than stranding it.
-            if claim_steering_row(&state.store, &id).await {
-                unclaim_steering_row(&state.store, &id).await;
+        if guard == "project-steering" {
+            if let Some(reason) = project_send_hold(state, &session, Some(&id)) {
+                skip(&session, &id, &reason);
+                // This path does not reach the normal boundary probe below.
+                // Preserve its actual refusal, subject to the same lane holds.
+                if lane_block_reason(&session).await.is_none()
+                    && !crate::api::prompt_block::blocked_now(&session, now_f64())
+                {
+                    let signals = boundary_signals(state, Some(&session)).await;
+                    let owner_draft = signals.as_ref().and_then(|s| s.panes.get(&session))
+                        .is_some_and(|raw| foreign_composer_draft(state, &session, raw).is_some());
+                    if owner_draft || steer_delivery_from_signals(state, &session, 0.0, signals.as_ref()) == SteerDelivery::AtBoundary {
+                        stuck_tick.rows.insert(id.clone(), SteeringStuckRow {
+                            session: session.clone(), refusal: Some(reason),
+                        });
+                    }
+                }
+                // Recheck in the writer; if the hold lifted in between, release
+                // our claim so the next pass delivers it rather than stranding it.
+                if claim_steering_row(&state.store, &id).await {
+                    unclaim_steering_row(&state.store, &id).await;
+                }
+                continue;
             }
-            continue;
         }
 
         if id.starts_with("board-drive-resume:") {
@@ -23021,7 +23050,17 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
             }
         }
         let age = now_f64() - due_at;
-        let decision = steer_delivery_for(state, &session, age).await;
+        let signals = boundary_signals(state, Some(&session)).await;
+        let decision = steer_delivery_from_signals(state, &session, age, signals.as_ref());
+        let owner_draft = signals.as_ref().and_then(|s| s.panes.get(&session))
+            .is_some_and(|raw| foreign_composer_draft(state, &session, raw).is_some());
+        let prompt_blocked = crate::api::prompt_block::blocked_now(&session, now_f64());
+        if !prompt_blocked && (owner_draft || decision == SteerDelivery::AtBoundary) {
+            stuck_tick.rows.insert(id.clone(), SteeringStuckRow {
+                session: session.clone(),
+                refusal: owner_draft.then(|| "the input box holds text amux did not type".into()),
+            });
+        }
         let mid_turn = match decision {
             SteerDelivery::Hold if guard == "project-execution" && age >= steer_max_age_s() => {
                 tracing::warn!(
@@ -23116,6 +23155,12 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         };
         if !ok {
             skip(&session, &id, &format!("send-refused: {msg}"));
+            if decision == SteerDelivery::AtBoundary && !prompt_blocked && !owner_draft {
+                stuck_tick.rows.insert(id.clone(), SteeringStuckRow {
+                    session: session.clone(),
+                    refusal: Some(format!("delivery was refused at a turn boundary: {msg}")),
+                });
+            }
             // A row the pass decided to deliver mid-turn and could not is the
             // state that hid for an hour on 2026-10-06; name its reason where
             // the hourly delivery count looks.
@@ -23222,6 +23267,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
             .await;
         delivered += 1;
         delivered_lanes.insert(session.clone());
+        stuck_tick.delivered_lanes.insert(session.clone());
         steer_skips().lock().unwrap().remove(&session);
         capture_delivered_steering(
             state,
@@ -23259,7 +23305,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
     // trace anywhere, so finding it took a hand-written DB read. The age comes
     // from `queued_at`, so this needs no new state to be true after a restart.
     warn_on_stalled_lanes(state).await;
-    warn_steering_stuck(state).await;
+    warn_steering_stuck(state, &stuck_tick).await;
     delivered
 }
 
@@ -23275,47 +23321,55 @@ fn steering_stuck_unmeasured(error: impl std::fmt::Display) {
     }
 }
 
-/// Only an owner's draft or an idle, undelivered lane needs intervention at
-/// 60s. Reuse the drain's hold and boundary decisions, never an age-based guess
-/// about whether a busy lane ought to be idle. In-flight rows stay unmarked.
-/// Re-select under the serialized writer for durable once-per-row receipts.
-async fn warn_steering_stuck(state: &AppState) -> usize {
-    let now = now_f64();
-    let lanes = state.store.read().and_then(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT session FROM steering_queue WHERE delivering_since IS NULL AND MAX(queued_at,COALESCE(deliver_at,0))<=?1 \
-             AND NOT EXISTS(SELECT 1 FROM session_events WHERE idem='steering-stuck:'||steering_queue.id)",
-        )?;
-        let lanes = stmt.query_map([now - STEERING_STUCK_SECS], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(lanes)
-    });
-    let lanes = match lanes {
-        Ok(lanes) => lanes,
-        Err(error) => {
-            steering_stuck_unmeasured(error);
-            return 0;
+#[derive(Default)]
+struct SteeringStuckTick {
+    // Unlike the drain's visited set (which also contains busy lanes), this
+    // contains only lanes with a successful delivery in this tick.
+    delivered_lanes: std::collections::HashSet<String>,
+    rows: BTreeMap<String, SteeringStuckRow>,
+}
+
+struct SteeringStuckRow {
+    session: String,
+    // None: observed idle without delivery. Some: an actual refusal/draft.
+    refusal: Option<String>,
+}
+
+/// Consume only this tick's observations: never re-probe a pane after delivery
+/// or reinterpret a busy decision as idle because the turn ended mid-tick.
+async fn warn_steering_stuck(state: &AppState, tick: &SteeringStuckTick) -> usize {
+    warn_steering_stuck_at(state, tick, now_f64()).await
+}
+
+async fn warn_steering_stuck_at(state: &AppState, tick: &SteeringStuckTick, now: f64) -> usize {
+    let reasons = {
+        let home = crate::config::amux_home();
+        let mut skips = steer_skips().lock().unwrap();
+        for (session, record) in skips.iter_mut() {
+            record.idle_rows.retain(|(h, id), _| h != &home || tick.rows.get(id).is_some_and(|row|
+                row.session == *session && row.refusal.is_none()
+                    && !tick.delivered_lanes.contains(session)));
         }
+        let mut reasons = BTreeMap::new();
+        for (id, row) in &tick.rows {
+            if tick.delivered_lanes.contains(&row.session) {
+                continue;
+            }
+            let (reason, idle_s) = match &row.refusal {
+                Some(reason) => (reason.clone(), None),
+                None => {
+                    let record = skips.entry(row.session.clone()).or_default();
+                    let since = record.idle_rows.entry((home.clone(), id.clone())).or_insert(now);
+                    if now - *since < STEERING_STUCK_SECS {
+                        continue;
+                    }
+                    ("the lane is idle but the message has not been delivered".into(), Some(now - *since))
+                }
+            };
+            reasons.insert(id.clone(), (row.session.clone(), reason, idle_s));
+        }
+        reasons
     };
-    let mut reasons = BTreeMap::new();
-    for session in lanes {
-        // AMUX-2238: paused and rate-limited queues are held on purpose. Other
-        // unreachable lanes and permission prompts have their own diagnostics.
-        if lane_block_reason(&session).await.is_some()
-            || crate::api::prompt_block::blocked_now(&session, now)
-        {
-            continue;
-        }
-        let raw = tmux_capture(&session, 15).await;
-        let reason = if foreign_composer_draft(state, &session, &raw).is_some() {
-            "the input box holds text amux did not type"
-        } else if steer_delivery_for(state, &session, 0.0).await == SteerDelivery::AtBoundary {
-            "the lane is idle but the message has not been delivered"
-        } else {
-            continue;
-        };
-        reasons.insert(session, reason);
-    }
     // Empty, claimed-only and intentionally held queues never wait on a writer.
     if reasons.is_empty() {
         return 0;
@@ -23333,10 +23387,12 @@ async fn warn_steering_stuck(state: &AppState) -> usize {
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         for (id, session, sender, age) in rows {
-            let Some(reason) = reasons.get(&session) else { continue };
+            let Some((observed_session, reason, idle_s)) = reasons.get(&id) else { continue };
+            if observed_session != &session { continue; }
             let detail = format!("Message {id} to '{session}' is still undelivered after {}s: {reason}.", age as i64);
             let payload = json!({"id":id,"lane":session,"sender":sender,"age_s":age as i64,
-                "detail":detail,"verdict":"steering_stuck","measured":true,"n_considered":1});
+                "detail":detail,"idle_undelivered_s":idle_s,"refusal":idle_s.is_none(),
+                "verdict":"steering_stuck","measured":true,"n_considered":1});
             let n = conn.execute(
                 "INSERT OR IGNORE INTO session_events(ts,session,type,data,idem,source) VALUES(?1,?2,'steering.stalled',?3,?4,'steering')",
                 rusqlite::params![now,session,payload.to_string(),format!("steering-stuck:{id}")],
@@ -23348,7 +23404,7 @@ async fn warn_steering_stuck(state: &AppState) -> usize {
                     rusqlite::params![now,sender,payload.to_string(),format!("steering-stuck-sender:{id}")],
                 )?;
             }
-            written.lock().unwrap().push((id,session,age,detail));
+            written.lock().unwrap().push((id,session,age,detail,*idle_s));
         }
         Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
     }).await;
@@ -23358,8 +23414,9 @@ async fn warn_steering_stuck(state: &AppState) -> usize {
     }
     let notices = std::mem::take(&mut *notices.lock().unwrap());
     let count = notices.len();
-    for (id, session, age, detail) in notices {
-        tracing::warn!(session, queue_id=%id, age_s=age as i64, detail=%detail, measured=true, n_considered=1,
+    for (id, session, age, detail, idle_s) in notices {
+        tracing::warn!(session, queue_id=%id, age_s=age as i64, idle_undelivered_s=?idle_s,
+            refusal=idle_s.is_none(), detail=%detail, measured=true, n_considered=1,
             verdict="steering_stuck", "steering message needs intervention");
         super::alerts::publish_dashboard_alert(json!({"type":"steering_stuck","session":session,"message":detail,"id":id}));
     }
@@ -23370,7 +23427,14 @@ async fn warn_steering_stuck(state: &AppState) -> usize {
 /// FICTION ACROSS A RESTART — deliberately: it is a debug surface, and the
 /// durable fact (how long the oldest row has been queued) lives in
 /// `steering_queue.queued_at` where the stall warning reads it from.
-type SkipRecord = (String, String, f64); // (row id, reason, when)
+#[derive(Clone, Default)]
+struct SkipRecord {
+    last: (String, String, f64), // (row id, reason, when)
+    // A restart cannot prove the lane stayed idle during downtime: require a
+    // fresh 60s of observations. Busy/hold/claim/empty ticks and delivery clear
+    // these timers; only notification receipts must survive in SQLite.
+    idle_rows: BTreeMap<(std::path::PathBuf, String), f64>,
+}
 fn steer_skips() -> &'static std::sync::Mutex<BTreeMap<String, SkipRecord>> {
     static M: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, SkipRecord>>> =
         std::sync::OnceLock::new();
@@ -23398,8 +23462,8 @@ pub(crate) fn steer_skip_snapshot() -> BTreeMap<String, (String, f64)> {
         .lock()
         .map(|m| {
             m.iter()
-                .filter(|(_, (_, _, at))| *at > 0.0)
-                .map(|(k, (_, reason, at))| (k.clone(), (reason.clone(), now - at)))
+                .filter(|(_, record)| record.last.2 > 0.0)
+                .map(|(k, record)| (k.clone(), (record.last.1.clone(), now - record.last.2)))
                 .collect()
         })
         .unwrap_or_default()
@@ -23456,10 +23520,8 @@ fn stall_dedupe_key(session: &str, cond: &str, last_skip: &str) -> String {
 
 fn skip(session: &str, id: &str, reason: &str) {
     tracing::debug!(session = %session, id = %id, reason = %reason, "steering skipped");
-    steer_skips().lock().unwrap().insert(
-        session.to_string(),
-        (id.to_string(), reason.to_string(), now_f64()),
-    );
+    steer_skips().lock().unwrap().entry(session.to_string()).or_default().last =
+        (id.to_string(), reason.to_string(), now_f64());
 }
 
 /// Lanes whose oldest queued message is older than the delivery deadline are
@@ -23493,7 +23555,8 @@ async fn warn_on_stalled_lanes(state: &AppState) {
         }
         let reason = skips
             .get(&session)
-            .map(|(_, r, _)| r.clone())
+            .filter(|record| record.last.2 > 0.0)
+            .map(|record| record.last.1.clone())
             .unwrap_or_else(|| "unknown (no skip recorded since this process started)".into());
         // `blocked`/`cond`/`bucket` are computed HERE rather than below so the log
         // line can share the event path's dedupe key. Same call, same frequency —
@@ -23674,7 +23737,7 @@ async fn steering_debug(State(state): State<AppState>) -> Response {
     for (session, oldest, count, senders) in rows {
         let (last_id, reason, at) = skips
             .get(&session)
-            .cloned()
+            .map(|record| record.last.clone())
             .unwrap_or_else(|| (String::new(), String::new(), 0.0));
         // LIVE, not remembered. `last_skip_reason` is in-memory and empty after
         // a restart — which is exactly when someone is most likely to be
@@ -23898,7 +23961,8 @@ pub(crate) async fn steer_try_deliver_now(state: &AppState, session: &str, id: &
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(session)
-                .map(|(_, reason, _)| reason.clone())
+                .filter(|record| record.last.2 > 0.0)
+                .map(|record| record.last.1.clone())
                 .unwrap_or_else(|| "boundary seen, no row delivered".to_string())
         };
         tracing::info!(session, delivery_id = id, measured = true, n_considered = 1,
@@ -39098,11 +39162,9 @@ mod tests {
         ai194_lane("ghost-target", AI194_GHOST);
         assert!(matches!(composer_state(AI194_GHOST), ComposerState::Placeholder(_)));
         assert!(composer_state(&strip_ansi(AI194_GHOST)).typed().is_some(), "control: stripping SGR destroys the evidence");
-        ai194_lane("ghost-direct", AI194_GHOST);
-        let (ok, message) = send_text(&st, "ghost-direct", "hello directly", false, SendOrigin::Owner).await;
-        assert!(ok, "{message}");
-        assert_eq!(submission_verdict(ok, &message).0, Some(true), "{message}");
-        assert_eq!(super::super::worker_exec::fake_pane::typed("ghost-direct"), vec![("hello directly".into(), "owner")]);
+        // The pure admission predicate plus the sanctioned drain below cover
+        // the terminal path without entering send_text's auto-wake path.
+        assert!(foreign_composer_draft(&st, "ghost-target", AI194_GHOST).is_none());
         // Both panes fall through the fake adapter into send_text_inner_bound.
         // The fake only emulates terminal I/O: production must admit the dim
         // suggestion and preserve this real owner draft in the same tick.
@@ -39247,11 +39309,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ai194_busy_owner_draft_still_alerts_with_the_draft_reason() {
+        let (logs, _guard, _peer) = held_capture_logs();
+        let (st, dir) = state();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        let _fleet = super::super::sessions_legacy::suppress_fleet_for_test();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        ai194_lane("draft-source", AI194_EMPTY);
+        let raw = AI194_BUSY.replace("❯ \n", "❯ owner draft\n");
+        ai194_lane("ai194-busy-draft", &raw);
+        assert_eq!(steer_delivery_for(&st, "ai194-busy-draft", 0.0).await, SteerDelivery::Hold);
+        ai194_queue(&st, "busy-draft-row", "ai194-busy-draft", 61.0).await;
+        let mut dashboard = super::super::alerts::dashboard_alerts().subscribe();
+        assert_eq!(steer_deliver_tick(&st).await, 0);
+        let details = ai194_notice_details(&st, "busy-draft-row");
+        assert_eq!(details.len(), 2);
+        assert!(details.iter().all(|(_, _, detail)| detail.contains("the input box holds text amux did not type")));
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 1);
+        assert!(dashboard.try_recv().is_ok());
+        assert!(dashboard.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn ai194_amux_owned_busy_draft_is_not_an_owner_draft_stall() {
         let (logs, _guard, _peer) = held_capture_logs();
         let (st, dir) = state();
         let _home = crate::api::settings::test_env::set_home(dir.path());
+        let _fleet = super::super::sessions_legacy::suppress_fleet_for_test();
         std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        ai194_lane("draft-source", AI194_EMPTY);
         let raw = AI194_BUSY.replace("❯ \n", "❯ amux pending delivery\n");
         ai194_lane("ai194-owned", &raw);
         st.store.write_async(|conn| {
@@ -39262,7 +39348,7 @@ mod tests {
         assert_eq!(steer_delivery_for(&st, "ai194-owned", 0.0).await, SteerDelivery::Hold);
         ai194_queue(&st, "owned-row", "ai194-owned", 61.0).await;
         let mut dashboard = super::super::alerts::dashboard_alerts().subscribe();
-        assert_eq!(warn_steering_stuck(&st).await, 0);
+        assert_eq!(steer_deliver_tick(&st).await, 0);
         ai194_assert_unmarked(&st, "owned-row");
         assert_eq!(held_capture_count(&logs, "steering_stuck"), 0);
         assert!(dashboard.try_recv().is_err());
@@ -39277,10 +39363,29 @@ mod tests {
         ai194_lane("ai194-idle", AI194_EMPTY);
         assert_eq!(steer_delivery_for(&st, "ai194-idle", 0.0).await, SteerDelivery::AtBoundary);
         ai194_queue(&st, "idle-row", "ai194-idle", 61.0).await;
+        let mut tick = SteeringStuckTick::default();
+        tick.rows.insert("idle-row".into(), SteeringStuckRow {
+            session: "ai194-idle".into(), refusal: None,
+        });
+        let now = now_f64();
         let mut dashboard = super::super::alerts::dashboard_alerts().subscribe();
-        // Simulate a missed delivery while the lane is already at a boundary.
-        assert_eq!(warn_steering_stuck(&st).await, 1);
-        assert_eq!(warn_steering_stuck(&st).await, 0);
+        // Row age alone is insufficient. Simulate successive drain observations
+        // of this same row remaining idle without a delivery or refusal.
+        assert_eq!(warn_steering_stuck_at(&st, &tick, now).await, 0);
+        skip("ai194-idle", "idle-row", "boundary seen, no delivery");
+        assert_eq!(warn_steering_stuck_at(&st, &tick, now + 59.0).await, 0);
+        ai194_assert_unmarked(&st, "idle-row");
+        assert!(dashboard.try_recv().is_err());
+        skip("ai194-idle", "idle-row", "boundary seen, no delivery");
+        assert_eq!(warn_steering_stuck_at(&st, &tick, now + 60.0).await, 1);
+        assert_eq!(st.store.read().unwrap().query_row(
+            "SELECT json_extract(data,'$.idle_undelivered_s') FROM session_events WHERE idem='steering-stuck:idle-row'",
+            [], |r| r.get::<_, f64>(0),
+        ).unwrap(), 60.0);
+        // Reopening SQLite preserves the once-per-row receipt.
+        let mut restarted = st.clone();
+        restarted.store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        assert_eq!(warn_steering_stuck_at(&restarted, &tick, now + 65.0).await, 0);
         assert_eq!(held_capture_count(&logs, "steering_stuck"), 1);
         let details = ai194_notice_details(&st, "idle-row");
         assert_eq!(details.len(), 2);
@@ -39294,12 +39399,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ai194_threshold_is_two_sided_and_claimed_rows_are_not_stuck() {
+    async fn ai194_next_row_after_delivery_does_not_alert_and_delivers_next_tick() {
+        let (logs, _guard, _peer) = held_capture_logs();
+        let (st, dir) = state();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        let _fleet = super::super::sessions_legacy::suppress_fleet_for_test();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        ai194_lane("draft-source", AI194_EMPTY);
+        ai194_lane("ai194-next-row", AI194_EMPTY);
+        ai194_queue(&st, "first-row", "ai194-next-row", 70.0).await;
+        ai194_queue(&st, "next-row", "ai194-next-row", 65.0).await;
+        st.store.write_async(|conn| {
+            conn.execute("UPDATE steering_queue SET text='second message from sender' WHERE id='next-row'", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        let mut dashboard = super::super::alerts::dashboard_alerts().subscribe();
+        assert_eq!(steer_deliver_tick(&st).await, 1);
+        ai194_assert_unmarked(&st, "next-row");
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 0);
+        assert!(dashboard.try_recv().is_err());
+        assert_eq!(steer_deliver_tick(&st).await, 1);
+        assert!(ai194_notice_details(&st, "next-row").is_empty());
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 0);
+        assert!(dashboard.try_recv().is_err());
+        let conn = st.store.read().unwrap();
+        assert_eq!(conn.query_row(
+            "SELECT COUNT(*) FROM steering_history WHERE id IN ('first-row','next-row')",
+            [], |r| r.get::<_, i64>(0),
+        ).unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn ai194_delivered_lane_is_skipped_even_with_a_recorded_refusal() {
+        let (logs, _guard, _peer) = held_capture_logs();
+        let (st, dir) = state();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        let _fleet = super::super::sessions_legacy::suppress_fleet_for_test();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        ai194_lane("draft-source", AI194_EMPTY);
+        ai194_lane("ai194-delivered", AI194_EMPTY);
+        ai194_queue(&st, "refused-before-delivery", "ai194-delivered", 120.0).await;
+        ai194_queue(&st, "delivered-after-refusal", "ai194-delivered", 115.0).await;
+        st.store.write_async(|conn| {
+            // Empty automation is refused without touching the pane; the next
+            // valid row on this same lane still gets its turn in this tick.
+            conn.execute("UPDATE steering_queue SET text='' WHERE id='refused-before-delivery'", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        let mut dashboard = super::super::alerts::dashboard_alerts().subscribe();
+        assert_eq!(steer_deliver_tick(&st).await, 1);
+        ai194_assert_unmarked(&st, "refused-before-delivery");
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 0);
+        assert!(dashboard.try_recv().is_err());
+        // Control: without a delivery, the old row's actual refusal alerts.
+        assert_eq!(steer_deliver_tick(&st).await, 0);
+        let details = ai194_notice_details(&st, "refused-before-delivery");
+        assert_eq!(details.len(), 2);
+        assert!(details.iter().all(|(_, _, detail)| detail.contains("an empty message from a worker or automation is not delivered")));
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 1);
+        assert!(dashboard.try_recv().is_ok());
+        assert!(dashboard.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ai194_idle_timer_resets_on_delivery_missing_observation_and_restart() {
         let (logs, _guard, _peer) = held_capture_logs();
         let (st, dir) = state();
         let _home = crate::api::settings::test_env::set_home(dir.path());
         std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
-        ai194_lane("ai194-threshold", AI194_EMPTY);
+        ai194_lane("ai194-idle-reset", AI194_EMPTY);
+        ai194_queue(&st, "idle-reset-row", "ai194-idle-reset", 120.0).await;
+        let mut tick = SteeringStuckTick::default();
+        tick.rows.insert("idle-reset-row".into(), SteeringStuckRow {
+            session: "ai194-idle-reset".into(), refusal: None,
+        });
+        let now = now_f64();
+        let mut dashboard = super::super::alerts::dashboard_alerts().subscribe();
+        assert_eq!(warn_steering_stuck_at(&st, &tick, now).await, 0);
+        tick.delivered_lanes.insert("ai194-idle-reset".into());
+        assert_eq!(warn_steering_stuck_at(&st, &tick, now + 60.0).await, 0);
+        tick.delivered_lanes.clear();
+        assert_eq!(warn_steering_stuck_at(&st, &tick, now + 61.0).await, 0);
+        // A busy/held/claimed row has no eligible observation in this tick.
+        assert_eq!(warn_steering_stuck_at(&st, &SteeringStuckTick::default(), now + 120.0).await, 0);
+        assert_eq!(warn_steering_stuck_at(&st, &tick, now + 121.0).await, 0);
+        // A process restart loses observations, so it must re-prove continuity.
+        steer_skips().lock().unwrap().get_mut("ai194-idle-reset").unwrap().idle_rows.clear();
+        let mut restarted = st.clone();
+        restarted.store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        assert_eq!(warn_steering_stuck_at(&restarted, &tick, now + 181.0).await, 0);
+        ai194_assert_unmarked(&st, "idle-reset-row");
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 0);
+        assert!(dashboard.try_recv().is_err());
+        assert_eq!(warn_steering_stuck_at(&restarted, &tick, now + 241.0).await, 1);
+        assert_eq!(warn_steering_stuck_at(&restarted, &tick, now + 246.0).await, 0);
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 1);
+        assert!(dashboard.try_recv().is_ok());
+        assert!(dashboard.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ai194_threshold_is_two_sided_and_claimed_rows_are_not_stuck() {
+        let (logs, _guard, _peer) = held_capture_logs();
+        let (st, dir) = state();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        let _fleet = super::super::sessions_legacy::suppress_fleet_for_test();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        ai194_lane("draft-source", AI194_EMPTY);
+        ai194_lane("ai194-threshold", AI194_DRAFT);
         // Literal ages deliberately do not derive from STEERING_STUCK_SECS:
         // moving the configured threshold in either direction must fail.
         ai194_queue(&st, "threshold-row", "ai194-threshold", 59.0).await;
@@ -39310,17 +39517,17 @@ mod tests {
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         }).await.unwrap();
         let mut dashboard = super::super::alerts::dashboard_alerts().subscribe();
-        assert_eq!(warn_steering_stuck(&st).await, 0, "59s is below the threshold");
+        assert_eq!(steer_deliver_tick(&st).await, 0);
         ai194_assert_unmarked(&st, "threshold-row");
         assert!(ai194_notice_details(&st, "claimed-row").is_empty());
-        assert_eq!(held_capture_count(&logs, "steering_stuck"), 0);
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 0, "59s is below the threshold");
         assert!(dashboard.try_recv().is_err());
         st.store.write_async(|conn| {
             conn.execute("UPDATE steering_queue SET queued_at=?1 WHERE id='threshold-row'", [now_f64() - 61.0])?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         }).await.unwrap();
-        assert_eq!(warn_steering_stuck(&st).await, 1, "61s is above the threshold");
-        assert_eq!(held_capture_count(&logs, "steering_stuck"), 1);
+        assert_eq!(steer_deliver_tick(&st).await, 0);
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 1, "61s is above the threshold");
         assert_eq!(ai194_notice_details(&st, "threshold-row").len(), 2);
         assert!(ai194_notice_details(&st, "claimed-row").is_empty());
         let alert: Value = serde_json::from_str(&dashboard.try_recv().unwrap()).unwrap();
