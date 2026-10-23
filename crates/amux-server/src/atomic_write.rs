@@ -70,13 +70,6 @@ fn write_judged(target: &Path, bytes: &[u8], check: Option<TargetCheck>) -> std:
         _ => Path::new("."),
     };
     let existing = std::fs::symlink_metadata(target).ok();
-    if existing.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
-        // Seen when a link was planted at an upload or save name (PR #48
-        // round 3); the old in-place writes followed it.
-        tracing::warn!(target: "amux::file", path = %target.display(), measured = true, n_considered = 1,
-            verdict = "atomic_write_replaced_symlink",
-            "a symlink sat at the write target: replaced by a regular file, not followed");
-    }
     let mut keep_mode = None;
     if existing.as_ref().is_some_and(|m| m.file_type().is_file()) {
         // Opening for write (no truncate, no follow) is the permission check:
@@ -104,6 +97,13 @@ fn write_judged(target: &Path, bytes: &[u8], check: Option<TargetCheck>) -> std:
         keep_mode = Some(meta.permissions());
     } else if let Some(check) = check {
         check(existing.as_ref())?;
+    }
+    if existing.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
+        // Report replacement only AFTER the target check accepts it; a
+        // refused upload must not also claim the symlink was replaced.
+        tracing::warn!(target: "amux::file", path = ?target, measured = true, n_considered = 1,
+            verdict = "atomic_write_replaced_symlink",
+            "a symlink sat at the write target: replaced by a regular file, not followed");
     }
     let mut builder = tempfile::Builder::new();
     builder.prefix(".amux-save-");

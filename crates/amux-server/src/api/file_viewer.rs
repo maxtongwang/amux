@@ -19,7 +19,7 @@
 //! - ebook sets `EBOOK_RENDERABLE` etc.     py:156-158
 //!
 //! Path guards are IMPORTED from api/fs.rs (`is_path_allowed`,
-//! `is_dangerous_write`) — one port of the containment rules, not two.
+//! `write_refusal_response`) — one port of the containment rules, not two.
 //!
 //! Deliberate differences from the python origin, all named:
 //! - **Durable prepare jobs.** Python held remux job state in process memory,
@@ -52,7 +52,7 @@
 //!   shutil.which quietly fails there.
 
 use super::fs::{
-    expanduser, git_show_file, is_dangerous_write, is_path_allowed, j, mtime_secs, not_found, resolve_nonstrict,
+    expanduser, git_show_file, write_refusal_response, is_path_allowed, j, mtime_secs, not_found, resolve_nonstrict,
     parse_body, parse_qs, pystr, qs_get, real_list_dirs, resolve_rel_candidates,
     resolve_rel_descend,
 };
@@ -758,8 +758,8 @@ async fn put_file(req: Request) -> Response {
     if !p.is_absolute() {
         return j(400, json!({"error": "absolute path required"}));
     }
-    if !is_path_allowed(&p) {
-        return j(403, json!({"error": "access denied"}));
+    if let Some(refusal) = write_refusal_response(&p, "viewer_put") {
+        return refusal;
     }
     let ext = py_suffix(&p);
     // A spreadsheet saved from the viewer arrives as bytes (content_base64);
@@ -778,14 +778,6 @@ async fn put_file(req: Request) -> Response {
             json!({"error": format!("file type not writable: {ext}")}),
         );
     }
-    // Code-execution-vector writes are refused even when extensionless
-    // (shell rc files, launch agents, git hooks) — py:67924.
-    if is_dangerous_write(&p) {
-        return j(
-            403,
-            json!({"error": "refused: writing this file could execute code"}),
-        );
-    }
     // The gates above already judged the file a symlink names
     // (resolve_nonstrict); the write below lands there too.
     if let Some(parent) = resolve_nonstrict(&p).parent() {
@@ -800,7 +792,7 @@ async fn put_file(req: Request) -> Response {
     if let Some(want) = body.get("expected_etag").and_then(|v| v.as_str()) {
         if let Some(have) = current_etag(&p) {
             if have != want {
-                tracing::warn!(target: "amux::file", path = %pystr(&p), expected = want, current = %have,
+                tracing::warn!(target: "amux::file", path = ?p, expected = ?want, current = %have,
                     measured = true, n_considered = 1, verdict = "file_save_conflict",
                     "file save refused: the file changed on disk since it was opened");
                 return j(
@@ -831,7 +823,7 @@ async fn put_file(req: Request) -> Response {
             json!({"ok": true, "path": pystr(&p), "etag": current_etag(&p).unwrap_or_default()}),
         ),
         Err(e) => {
-            tracing::warn!(target: "amux::file", path = %pystr(&p), error = %e,
+            tracing::warn!(target: "amux::file", path = ?p, error = ?e,
                 measured = true, n_considered = 1, verdict = "file_save_failed",
                 "file save failed; the previous version is kept");
             j(500, json!({"error": e.to_string()}))
@@ -3027,13 +3019,213 @@ pub(crate) mod tests {
 
     // -- PUT /api/file ------------------------------------------------------
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_refusal_viewer_resolved_hidden_paths_and_executables() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let app = app();
+        let td = tempfile::Builder::new().prefix("amux-viewer-").tempdir().unwrap();
+        let protected = td.path().join(".config");
+        std::fs::create_dir(&protected).unwrap();
+        symlink(&protected, td.path().join("alias")).unwrap();
+        let ordinary = td.path().join("ordinary");
+        std::fs::create_dir(&ordinary).unwrap();
+        symlink(&ordinary, td.path().join(".hidden-alias")).unwrap();
+        let executable = td.path().join("tool.txt");
+        std::fs::write(&executable, "keep").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (path, code) in [
+            (td.path().join("alias/notes.txt"), "write_dotfile_refused"),
+            (td.path().join(".hidden-alias/notes.txt"), "write_dotfile_refused"),
+            (executable.clone(), "write_executable_refused"),
+        ] {
+            let (st, _, bytes) = send(&app, HttpRequest::builder().method("PUT").uri("/api/file")
+                .body(Body::from(json!({"path": path, "content": "new"}).to_string())).unwrap()).await;
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+            assert_eq!(v["code"], code);
+            assert_eq!(v["ok"], false);
+        }
+        assert!(!protected.join("notes.txt").exists());
+        assert!(!ordinary.join("notes.txt").exists());
+        assert_eq!(std::fs::read_to_string(executable).unwrap(), "keep");
+    }
+
+    #[tokio::test]
+    async fn write_refusal_viewer_put() {
+        let app = app();
+        // A temporary home-shaped tree, never the owner's home or global env.
+        let home = tempfile::Builder::new().prefix("amux-write-").tempdir().unwrap();
+        for name in ["notes.md", ".gitconfig"] {
+            let path = home.path().join(name);
+            std::fs::write(&path, "keep").unwrap();
+            let req = HttpRequest::builder().method("PUT").uri("/api/file")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"path": path, "content": "new"}).to_string())).unwrap();
+            let (st, _, bytes) = send(&app, req).await;
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            if name == "notes.md" {
+                assert_eq!(st, StatusCode::OK, "{v}");
+                assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
+            } else {
+                assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+                assert_eq!(v["ok"], false);
+                assert_eq!(v["code"], "write_dotfile_refused");
+                assert!(v["error"].is_string());
+                assert_eq!(std::fs::read_to_string(path).unwrap(), "keep");
+            }
+        }
+    }
+
+    // Use the existing env guard: viewer PUT must exercise the real home resolver.
+    fn draw_test_home() -> (tempfile::TempDir, crate::api::settings::test_env::HomeGuard) {
+        let dir = tempfile::Builder::new().prefix("amux-draw-").tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap().join(".amux");
+        std::fs::create_dir(&home).unwrap();
+        let guard = crate::api::settings::test_env::set_home(&home);
+        (dir, guard)
+    }
+
+    async fn draw_test_put(app: &axum::Router, path: &Path) -> (StatusCode, Value) {
+        let (status, _, bytes) = send(app, HttpRequest::builder().method("PUT").uri("/api/file")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"path": path, "content": "new"}).to_string())).unwrap()).await;
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn write_refusal_draw_save_library_and_recents() {
+        let (_dir, _guard) = draw_test_home();
+        let app = app();
+        let root = crate::config::amux_home().join("draw");
+        // The entire Draw root initially does not exist: resolve its existing prefix.
+        for name in ["drawings/x.excalidraw", "library.excalidrawlib", "recents.json"] {
+            let path = root.join(name);
+            let (status, body) = draw_test_put(&app, &path).await;
+            assert_eq!(status, StatusCode::OK, "{name}: {body}");
+            assert_eq!(body["ok"], true);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_refusal_draw_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let (dir, _guard) = draw_test_home();
+        let app = app();
+        let root = crate::config::amux_home().join("draw");
+        let outside = std::fs::canonicalize(dir.path()).unwrap().join(".ssh");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+        // notes.txt isolates containment from the independent authorized_keys rule.
+        for name in ["notes.txt", "authorized_keys"] {
+            let (status, body) = draw_test_put(&app, &root.join("link").join(name)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{name}: {body}");
+            assert_eq!(body["code"], "write_dotfile_refused", "{body}");
+            assert!(!outside.join(name).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn write_refusal_draw_keeps_repo_gitignore_hidden() {
+        let (dir, _guard) = draw_test_home();
+        let app = app();
+        let repo = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let path = repo.join(".gitignore");
+        std::fs::write(&path, "keep").unwrap();
+        let (status, body) = draw_test_put(&app, &path).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "write_dotfile_refused");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "keep");
+    }
+
+    #[tokio::test]
+    async fn write_refusal_draw_rejects_siblings_and_prefix_tricks() {
+        let (_dir, _guard) = draw_test_home();
+        let app = app();
+        let home = crate::config::amux_home();
+        for path in [home.join("notdraw/x"), home.join("drawx/x"), home.join("x"),
+            home.with_file_name(".amuxdraw").join("x"), home.join("draw/../notdraw/x")] {
+            let (status, body) = draw_test_put(&app, &path).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{}: {body}", path.display());
+            assert_eq!(body["code"], "write_dotfile_refused");
+            assert!(!path.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_refusal_draw_requires_requested_path_inside_root() {
+        use std::os::unix::fs::symlink;
+        let (dir, _guard) = draw_test_home();
+        let app = app();
+        let root = crate::config::amux_home().join("draw");
+        std::fs::create_dir_all(root.join("drawings")).unwrap();
+        symlink(root.join("drawings"), root.join("internal")).unwrap();
+        let (status, body) = draw_test_put(&app, &root.join("internal/ok.excalidraw")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(std::fs::read_to_string(root.join("drawings/ok.excalidraw")).unwrap(), "new");
+        // A visible alias outside Draw must not borrow its hidden-directory waiver.
+        let alias = std::fs::canonicalize(dir.path()).unwrap().join("alias");
+        symlink(&root, &alias).unwrap();
+        let (status, body) = draw_test_put(&app, &alias.join("outside.excalidraw")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "write_dotfile_refused");
+        assert!(!root.join("outside.excalidraw").exists());
+    }
+
+    #[tokio::test]
+    async fn write_refusal_draw_keeps_dangerous_and_executable_guards() {
+        let (_dir, _guard) = draw_test_home();
+        let app = app();
+        let root = crate::config::amux_home().join("draw");
+        for name in ["authorized_keys", ".zshrc", "evil.plist", "bin/notes.txt"] {
+            let path = root.join(name);
+            let (status, body) = draw_test_put(&app, &path).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{name}: {body}");
+            assert_eq!(body["code"], "write_dangerous_write_refused", "{body}");
+            assert!(!path.exists());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            std::fs::create_dir_all(&root).unwrap();
+            let executable = root.join("tool.txt");
+            std::fs::write(&executable, "keep").unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            symlink(&executable, root.join("alias.txt")).unwrap();
+            for path in [&executable, &root.join("alias.txt")] {
+                let (status, body) = draw_test_put(&app, path).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+                assert_eq!(body["code"], "write_executable_refused");
+                assert_eq!(std::fs::read_to_string(&executable).unwrap(), "keep");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn write_refusal_draw_keeps_sensitive_home_guard() {
+        // No real home: the task's test process has a private scratch HOME.
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let sensitive = crate::api::fs::resolve_nonstrict(&home).join(".ssh");
+        let _guard = crate::api::settings::test_env::set_home(&sensitive);
+        let path = sensitive.join("draw/notes.txt");
+        let (status, body) = draw_test_put(&app(), &path).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "write_path_not_allowed");
+        assert!(!path.exists());
+    }
+
     /// The spreadsheet viewer's save: bytes for .xlsx only, refused when the
     /// file changed on disk since it was opened, never half-written.
     #[tokio::test]
     async fn put_file_writes_xlsx_bytes_and_refuses_a_stale_save() {
         use base64::Engine as _;
         let app = app();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new().prefix("amux-viewer-").tempdir().unwrap();
         let target = dir.path().join("book.xlsx");
         std::fs::write(&target, b"PK-original").unwrap();
         let put = |body: Value| {
@@ -3082,7 +3274,7 @@ pub(crate) mod tests {
     async fn put_file_saves_text_atomically_keeping_mode_and_links() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let app = app();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new().prefix("amux-viewer-").tempdir().unwrap();
         let put = |path: &std::path::Path, content: &str| {
             HttpRequest::builder().method("PUT").uri("/api/file")
                 .header("content-type", "application/json")
@@ -3090,14 +3282,14 @@ pub(crate) mod tests {
         };
         let target = dir.path().join("scene.excalidraw");
         std::fs::write(&target, "{\"old\":true}").unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
         let ino_before = std::fs::metadata(&target).unwrap().ino();
         let (status, _, body) = send(&app, put(&target, "{\"new\":true}")).await;
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"new\":true}");
         assert_ne!(std::fs::metadata(&target).unwrap().ino(), ino_before,
             "the save is a rename of a complete file, not a rewrite in place");
-        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755, "the mode is kept");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o640, "the mode is kept");
 
         // Through a symlink: the link stays a link and its file gets the bytes.
         let link = dir.path().join("link.excalidraw");
@@ -3156,7 +3348,7 @@ pub(crate) mod tests {
         use base64::Engine as _;
         use std::os::unix::fs::PermissionsExt;
         let app = app();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new().prefix("amux-viewer-").tempdir().unwrap();
         let victim = dir.path().join(".bashrc");
         std::fs::write(&victim, "# rc").unwrap();
         let book = dir.path().join("book.xlsx");
@@ -3192,7 +3384,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn put_file_writes_texts_and_refuses_vectors() {
         let app = app();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new().prefix("amux-viewer-").tempdir().unwrap();
         let target = dir.path().join("new/notes.md");
         let (status, _, body) = send(
             &app,
@@ -3281,7 +3473,8 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["error"], "refused: writing this file could execute code");
+        assert_eq!(v["code"], "write_dangerous_write_refused");
+        assert_eq!(v["ok"], false);
         assert!(!ak.exists());
     }
 

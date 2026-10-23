@@ -1004,7 +1004,7 @@ pub fn is_path_allowed(p: &Path) -> bool {
 
 /// Python `_DANGEROUS_WRITE_*` + `_is_dangerous_write` (py:670-698):
 /// basenames/suffixes/dir-markers whose write is a code-execution primitive,
-/// checked on upload in ADDITION to `is_path_allowed`.
+/// used by the shared mutation policy in addition to `is_path_allowed`.
 const DANGEROUS_WRITE_BASENAMES: &[&str] = &[
     ".zshrc",
     ".zprofile",
@@ -1060,6 +1060,68 @@ pub fn is_dangerous_write(p: &Path) -> bool {
     DANGEROUS_WRITE_DIR_MARKERS.iter().any(|m| hay.contains(m))
 }
 
+/// Shared mutation policy. `path` is the requested/resolved name within
+/// the API's namespace (absolute for /api/fs and /api/file, relative to the
+/// configured root for /api/files); `target` is its filesystem location.
+/// Callers judge BOTH requested and resolved names before any mutation,
+/// retaining the requested filesystem location as `target` for both checks.
+pub(crate) fn write_refusal(path: &Path, target: &Path) -> Option<(&'static str, &'static str)> {
+    let resolved = resolve_nonstrict(target);
+    let draw_root = resolve_nonstrict(&crate::config::amux_home().join("draw"));
+    // Draw alone may live under a hidden data directory. Judge the original
+    // request too: neither an outside alias nor an escaping link earns a waiver.
+    let draw_target = target.starts_with(&draw_root) && resolved.starts_with(&draw_root);
+    if !draw_target && path.components().any(|component| {
+        matches!(component, Component::Normal(name) if name.as_encoded_bytes().starts_with(b"."))
+    }) {
+        return Some((
+            "write_dotfile_refused",
+            "File mutations may not target dotfiles or files inside hidden directories.",
+        ));
+    }
+    if !is_path_allowed(target) {
+        return Some((
+            "write_path_not_allowed",
+            "File mutations may not target sensitive home or system paths.",
+        ));
+    }
+    if is_dangerous_write(target) {
+        return Some((
+            "write_dangerous_write_refused",
+            "File mutations may not target files that could execute code.",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Ok(metadata) = std::fs::symlink_metadata(&resolved) {
+            if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+                return Some((
+                    "write_executable_refused",
+                    "File mutations may not target existing executable files.",
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// General filesystem APIs have no rooted namespace: judge every component
+/// of the expanded request and its resolved target, and report one refusal.
+pub(crate) fn write_refusal_response(path: &Path, operation: &str) -> Option<Response> {
+    let resolved = resolve_nonstrict(path);
+    for candidate in [path, resolved.as_path()] {
+        if let Some((code, error)) = write_refusal(candidate, path) {
+            tracing::warn!(target: "amux::fs", path = ?path, resolved = ?resolved,
+                operation, verdict = code, measured = true, n_considered = 1,
+                "filesystem mutation refused: {error}");
+            return Some(j(403, json!({"ok": false, "code": code, "error": error})));
+        }
+    }
+    None
+}
+
 pub(crate) fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
@@ -1092,8 +1154,8 @@ async fn mkdir(req: Request) -> Response {
     if !p.is_absolute() {
         return j(400, json!({"error": "absolute path required"}));
     }
-    if !is_path_allowed(&p) {
-        return j(403, json!({"error": "access denied"}));
+    if let Some(refusal) = write_refusal_response(&p, "mkdir") {
+        return refusal;
     }
     // Python: p.mkdir(parents=True, exist_ok=False) — existing FINAL dir is
     // the 409; parents are created freely.
@@ -1570,10 +1632,11 @@ async fn upload(req: Request) -> Response {
         Some(d) if !d.is_empty() => d,
         _ => return j(400, json!({"error": "missing 'dir' field"})),
     };
-    let dest_dir = resolve_nonstrict(&expanduser(&target_dir));
-    if !is_path_allowed(&dest_dir) {
-        return j(403, json!({"error": "access denied"}));
+    let requested_dir = expanduser(&target_dir);
+    if let Some(refusal) = write_refusal_response(&requested_dir, "upload") {
+        return refusal;
     }
+    let dest_dir = resolve_nonstrict(&requested_dir);
     if !dest_dir.is_dir() {
         return j(
             400,
@@ -1588,11 +1651,8 @@ async fn upload(req: Request) -> Response {
         };
         let safe_name = sanitize_upload_name(filename);
         let mut dest = dest_dir.join(&safe_name);
-        // Refuse code-execution-vector uploads (launch agents, shell rc,
-        // .plist/.command/.desktop) — uploads have no extension allowlist.
-        if is_dangerous_write(&dest) {
-            saved.push(json!({"name": safe_name, "error": "refused: could execute code"}));
-            continue;
+        if let Some(refusal) = write_refusal_response(&requested_dir.join(&safe_name), "upload") {
+            return refusal;
         }
         // Never clobber by default — a person dragging a file into the
         // dashboard must not lose the one already there; `overwrite=1` is
@@ -1611,6 +1671,10 @@ async fn upload(req: Request) -> Response {
                 dest = dest_dir.join(format!("{stem}_{i}{suffix}"));
                 i += 1;
             }
+        }
+        // Collision suffixes select another target; judge that name too.
+        if let Some(refusal) = write_refusal_response(&dest, "upload") {
+            return refusal;
         }
         // Atomic, and never through a name planted at dest: a symlink there
         // is replaced, not followed (it used to be written through in place).
@@ -1650,10 +1714,11 @@ async fn rename(req: Request) -> Response {
     if new_name.contains('/') || new_name.contains('\0') || new_name == "." || new_name == ".." {
         return j(400, json!({"error": "invalid name"}));
     }
-    let src = resolve_nonstrict(&expanduser(&src_path));
-    if !is_path_allowed(&src) {
-        return j(403, json!({"error": "access denied"}));
+    let requested_src = expanduser(&src_path);
+    if let Some(refusal) = write_refusal_response(&requested_src, "rename_source") {
+        return refusal;
     }
+    let src = resolve_nonstrict(&requested_src);
     if !src.exists() {
         return j(404, json!({"error": "not found"}));
     }
@@ -1661,22 +1726,27 @@ async fn rename(req: Request) -> Response {
     // viewer's multi-select "Move to...", 2026-10-15). Absent, it renames in
     // place exactly as before.
     let dest_dir = body_str(&body, "dest_dir").trim().to_string();
-    let parent = if dest_dir.is_empty() {
-        src.parent().unwrap_or(Path::new("/")).to_path_buf()
+    let requested_parent = if dest_dir.is_empty() {
+        requested_src.parent().unwrap_or(Path::new("/")).to_path_buf()
     } else {
-        let d = resolve_nonstrict(&expanduser(&dest_dir));
-        if !d.is_dir() {
+        expanduser(&dest_dir)
+    };
+    let requested_dst = requested_parent.join(&new_name);
+    if let Some(refusal) = write_refusal_response(&requested_dst, "rename_destination") {
+        return refusal;
+    }
+    let parent = resolve_nonstrict(&requested_parent);
+    if !dest_dir.is_empty() {
+        if !parent.is_dir() {
             return j(400, json!({"error": "destination is not a folder"}));
         }
-        if d.starts_with(&src) {
+        if parent.starts_with(&src) {
             return j(400, json!({"error": "cannot move a folder into itself"}));
         }
-        d
-    };
-    let dst = parent.join(&new_name);
-    if !is_path_allowed(&dst) {
-        return j(403, json!({"error": "access denied"}));
     }
+    // rename replaces the final directory entry; resolving the parent keeps
+    // that behavior for a dangling destination link, instead of following it.
+    let dst = parent.join(&new_name);
     if dst.exists() {
         return j(409, json!({"error": "target already exists"}));
     }
@@ -2931,10 +3001,11 @@ async fn delete_path(req: Request) -> Response {
     if target_path.is_empty() {
         return j(400, json!({"error": "missing 'path'"}));
     }
-    let target = resolve_nonstrict(&expanduser(&target_path));
-    if !is_path_allowed(&target) {
-        return j(403, json!({"error": "access denied"}));
+    let requested = expanduser(&target_path);
+    if let Some(refusal) = write_refusal_response(&requested, "delete") {
+        return refusal;
     }
+    let target = resolve_nonstrict(&requested);
     if !target.exists() {
         return j(404, json!({"error": "not found"}));
     }
@@ -3452,17 +3523,201 @@ mod tests {
 
     // ---- endpoint behavior (statuses + bodies pinned to the Python source) ----
 
+    // ai-config #226: each route must refuse before changing the filesystem,
+    // while an ordinary sibling remains writable. Visible temp roots exercise
+    // the target component, rather than tempfile's default hidden root.
+    fn write_root() -> tempfile::TempDir {
+        tempfile::Builder::new().prefix("amux-write-").tempdir().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_refusal_checks_requested_and_resolved_names_and_executables() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let app = app();
+        let td = write_root();
+        let hidden = td.path().join(".config");
+        let ordinary = td.path().join("ordinary");
+        std::fs::create_dir(&hidden).unwrap();
+        std::fs::create_dir(&ordinary).unwrap();
+        symlink(&hidden, td.path().join("alias")).unwrap();
+        symlink(&ordinary, td.path().join(".hidden-alias")).unwrap();
+        for name in [".config", "alias", ".hidden-alias"] {
+            let dir = td.path().join(name);
+            let file = dir.join("notes.txt");
+            std::fs::write(&file, "keep").unwrap();
+            let body = mp_body("XX", &[("dir", None, dir.to_str().unwrap().as_bytes()), ("overwrite", None, b"1"), ("file", Some("notes.txt"), b"new")]);
+            let (st, v) = call(&app, "POST", "/api/fs/upload", Some("multipart/form-data; boundary=XX"), body).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{name}: {v}");
+            for (method, route, body) in [
+                ("POST", "/api/fs/mkdir", json!({"path": dir.join("new")})),
+                ("POST", "/api/fs/rename", json!({"path": file, "new_name": "moved.txt"})),
+                ("POST", "/api/fs/rename", json!({"path": td.path().join("source.txt"), "new_name": "new.txt", "dest_dir": dir})),
+                ("DELETE", "/api/fs/delete", json!({"path": file})),
+            ] {
+                std::fs::write(td.path().join("source.txt"), "source").unwrap();
+                let (st, v) = call(&app, method, route, Some("application/json"), serde_json::to_vec(&body).unwrap()).await;
+                assert_eq!(st, StatusCode::FORBIDDEN, "{name} {route}: {v}");
+                assert_eq!(v["code"], "write_dotfile_refused");
+                assert_eq!(v["ok"], false);
+            }
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep");
+            assert!(!dir.join("new").exists());
+            assert!(!dir.join("new.txt").exists());
+            assert!(!dir.join("moved.txt").exists());
+        }
+        let executable = td.path().join("tool.txt");
+        std::fs::write(&executable, "keep").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let body = mp_body("XX", &[("dir", None, td.path().to_str().unwrap().as_bytes()), ("overwrite", None, b"1"), ("file", Some("tool.txt"), b"new")]);
+        let (st, v) = call(&app, "POST", "/api/fs/upload", Some("multipart/form-data; boundary=XX"), body).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        for (method, route, body) in [
+            ("POST", "/api/fs/rename", json!({"path": executable, "new_name": "moved.txt"})),
+            ("POST", "/api/fs/rename", json!({"path": td.path().join("source.txt"), "new_name": "tool.txt"})),
+            ("DELETE", "/api/fs/delete", json!({"path": executable})),
+        ] {
+            let (st, v) = call(&app, method, route, Some("application/json"), serde_json::to_vec(&body).unwrap()).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{route}: {v}");
+            assert_eq!(v["code"], "write_executable_refused");
+        }
+        assert_eq!(std::fs::read_to_string(executable).unwrap(), "keep");
+    }
+
+    #[test]
+    fn write_refusal_log_is_one_measured_warning_with_escaped_paths() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Capture(bytes.clone());
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_max_level(tracing::Level::WARN).with_writer(move || sink.clone()).finish();
+        let td = write_root();
+        let path = td.path().join(".config\nFORGED\r/notes.txt");
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(write_refusal_response(&path, "test").unwrap().status(), StatusCode::FORBIDDEN);
+        });
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert_eq!(log.lines().count(), 1, "{log:?}");
+        assert!(log.contains("WARN") && log.contains("verdict=\"write_dotfile_refused\""), "{log}");
+        assert!(log.contains("measured=true") && log.contains("n_considered=1"), "{log}");
+        assert!(log.contains("\\nFORGED\\r"), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn write_refusal_fs_upload() {
+        let app = app();
+        let td = write_root();
+        let dir = td.path().to_str().unwrap();
+        let upload = |dir: &str| mp_body("XX", &[("dir", None, dir.as_bytes()), ("file", Some("settings.json"), b"payload")]);
+        let (st, v) = call(&app, "POST", "/api/fs/upload", Some("multipart/form-data; boundary=XX"), upload(dir)).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(std::fs::read(td.path().join("settings.json")).unwrap(), b"payload");
+        let hidden = td.path().join(".claude");
+        std::fs::create_dir(&hidden).unwrap();
+        let (st, v) = call(&app, "POST", "/api/fs/upload", Some("multipart/form-data; boundary=XX"), upload(hidden.to_str().unwrap())).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["code"], "write_dotfile_refused");
+        assert!(v["error"].is_string());
+        assert!(!hidden.join("settings.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_replaces_an_ordinary_dangling_destination_link() {
+        let app = app();
+        let td = write_root();
+        let src = td.path().join("source.txt");
+        let destination = td.path().join("destination.txt");
+        let untouched = td.path().join("untouched.txt");
+        std::fs::write(&src, "moved").unwrap();
+        std::os::unix::fs::symlink(&untouched, &destination).unwrap();
+        let (st, v) = call(&app, "POST", "/api/fs/rename", Some("application/json"),
+            serde_json::to_vec(&json!({"path": src, "new_name": "destination.txt"})).unwrap()).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(!std::fs::symlink_metadata(&destination).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), "moved");
+        assert!(!untouched.exists());
+    }
+
+    #[tokio::test]
+    async fn write_refusal_rename() {
+        let app = app();
+        let td = write_root();
+        let src = td.path().join("source.txt");
+        std::fs::write(&src, "keep").unwrap();
+        let rename = |name: &str| serde_json::to_vec(&json!({"path": src, "new_name": name})).unwrap();
+        let (st, v) = call(&app, "POST", "/api/fs/rename", Some("application/json"), rename("ordinary.txt")).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        std::fs::rename(td.path().join("ordinary.txt"), &src).unwrap();
+        let (st, v) = call(&app, "POST", "/api/fs/rename", Some("application/json"), rename(".zshenv")).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["code"], "write_dotfile_refused");
+        assert!(v["error"].is_string());
+        assert!(!td.path().join(".zshenv").exists());
+        assert_eq!(std::fs::read_to_string(&src).unwrap(), "keep");
+    }
+
+    #[tokio::test]
+    async fn write_refusal_delete() {
+        let app = app();
+        let td = write_root();
+        for name in ["ordinary.txt", ".zshrc"] {
+            let path = td.path().join(name);
+            std::fs::write(&path, "keep").unwrap();
+            let (st, v) = call(&app, "DELETE", "/api/fs/delete", Some("application/json"), serde_json::to_vec(&json!({"path": path})).unwrap()).await;
+            if name == "ordinary.txt" {
+                assert_eq!(st, StatusCode::OK, "{v}");
+                assert!(!path.exists());
+            } else {
+                assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+                assert_eq!(v["ok"], false);
+                assert_eq!(v["code"], "write_dotfile_refused");
+                assert!(v["error"].is_string());
+                assert_eq!(std::fs::read_to_string(path).unwrap(), "keep");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn write_refusal_mkdir() {
+        let app = app();
+        let td = write_root();
+        for name in ["ordinary", ".ssh"] {
+            let path = td.path().join(name);
+            let (st, v) = call(&app, "POST", "/api/fs/mkdir", Some("application/json"), serde_json::to_vec(&json!({"path": path})).unwrap()).await;
+            if name == "ordinary" {
+                assert_eq!(st, StatusCode::OK, "{v}");
+                assert!(path.is_dir());
+            } else {
+                assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+                assert_eq!(v["ok"], false);
+                assert_eq!(v["code"], "write_dotfile_refused");
+                assert!(v["error"].is_string());
+                assert!(!path.exists());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn upload_saves_suffixes_and_refuses_dangerous() {
         let app = app();
-        let td = tempfile::tempdir().unwrap();
+        let td = write_root();
         let dir = td.path().to_string_lossy().into_owned();
         let body = mp_body(
             "XX",
             &[
                 ("dir", None, dir.as_bytes()),
                 ("file", Some("a.txt"), b"one"),
-                ("file", Some("evil.plist"), b"<plist/>"),
             ],
         );
         let (st, v) = call(
@@ -3475,10 +3730,11 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "{v}");
         assert_eq!(v["saved"][0], json!({"name": "a.txt", "size": 3}));
-        assert_eq!(
-            v["saved"][1],
-            json!({"name": "evil.plist", "error": "refused: could execute code"})
-        );
+        let refused = mp_body("XX", &[("dir", None, dir.as_bytes()), ("file", Some("evil.plist"), b"<plist/>")]);
+        let (refused_status, refused_body) = call(&app, "POST", "/api/fs/upload", Some("multipart/form-data; boundary=XX"), refused).await;
+        assert_eq!(refused_status, StatusCode::FORBIDDEN, "{refused_body}");
+        assert_eq!(refused_body["ok"], false);
+        assert_eq!(refused_body["code"], "write_dangerous_write_refused");
         assert_eq!(
             std::fs::read_to_string(td.path().join("a.txt")).unwrap(),
             "one"
@@ -3529,7 +3785,7 @@ mod tests {
     #[tokio::test]
     async fn an_overwrite_upload_replaces_a_planted_link_instead_of_writing_through_it() {
         let app = app();
-        let td = tempfile::tempdir().unwrap();
+        let td = write_root();
         let victim = td.path().join("victim.txt");
         std::fs::write(&victim, "keep").unwrap();
         std::os::unix::fs::symlink(&victim, td.path().join("a.txt")).unwrap();
@@ -3593,7 +3849,7 @@ mod tests {
     #[tokio::test]
     async fn rename_with_dest_dir_moves_into_another_folder() {
         let app = app();
-        let td = tempfile::tempdir().unwrap();
+        let td = write_root();
         let (a, b) = (td.path().join("a"), td.path().join("b"));
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
@@ -3617,7 +3873,7 @@ mod tests {
     #[tokio::test]
     async fn mkdir_rename_delete_lifecycle() {
         let app = app();
-        let td = tempfile::tempdir().unwrap();
+        let td = write_root();
         let newdir = td.path().join("made/nested");
         let (st, v) = call(
             &app,
