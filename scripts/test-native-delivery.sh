@@ -10,6 +10,8 @@ fixture_home=$(cd "$fixture_home" && pwd -P)
 chmod 700 "$fixture_home"
 touch "$fixture_home/.native-delivery-fixture"
 export AMUX_HOME="$fixture_home"
+# Exercise the shipped feature-disabled resolver regardless of the server flag.
+export AMUX_NATIVE_CLAUDE_DELIVERY=0
 export CARGO_TARGET_DIR="$HOME/.amux/rust-build-target/verification"
 finish() {
   local result=$?

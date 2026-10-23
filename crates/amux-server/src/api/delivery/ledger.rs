@@ -33,6 +33,8 @@ pub(super) struct Attempt {
     pub state: ReceiptState,
     pub created_at: f64,
     pub write_attempted_at: Option<f64>,
+    pub unknown_since: Option<f64>,
+    pub observation_count: u32,
 }
 
 impl Attempt {
@@ -74,11 +76,13 @@ impl Attempt {
             executable_sha256: target.process.executable_sha256.clone(),
             registry_sha256: target.registry_sha256.clone(),
             relay_pid: relay.pid,
-            relay_start: relay.instance.clone(),
+            relay_start: relay.registry_start.clone(),
             body_sha256: wire::sha256(wire::neutralize(body).as_bytes()),
             state: ReceiptState::Reserved,
             created_at: now(),
             write_attempted_at: None,
+            unknown_since: None,
+            observation_count: 0,
         })
     }
 }
@@ -108,6 +112,8 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         state: ReceiptState::from_str(&state).ok_or(rusqlite::Error::InvalidQuery)?,
         created_at: r.get("created_at")?,
         write_attempted_at: r.get("write_attempted_at")?,
+        unknown_since: r.get("unknown_since")?,
+        observation_count: r.get("observation_count")?,
     })
 }
 
@@ -194,7 +200,7 @@ pub(super) fn transition(
     if (!old.may_advance(next) && !receiver_lost) || old == next {
         return Ok(false);
     }
-    let n = conn.execute("UPDATE native_delivery_attempts SET state=?2,reason=?3,updated_at=?4,evidence_at=CASE WHEN ?2 IN ('held','admitted','consumed','denied','refused','expired','dropped') THEN ?4 ELSE evidence_at END WHERE attempt_id=?1 AND state=?5",
+    let n = conn.execute("UPDATE native_delivery_attempts SET state=?2,reason=?3,updated_at=?4,unknown_since=CASE WHEN ?2='unknown' THEN COALESCE(unknown_since,?4) ELSE unknown_since END,evidence_at=CASE WHEN ?2 IN ('held','admitted','consumed','denied','refused','expired','dropped') THEN ?4 ELSE evidence_at END WHERE attempt_id=?1 AND state=?5",
         params![id,next.as_str(),reason,at,old.as_str()])?;
     if n > 0 {
         conn.execute("INSERT OR IGNORE INTO session_events(ts,session,type,data,idem,source) SELECT ?2,session,'message.native_delivery',?3,?4,'native-delivery' FROM native_delivery_attempts WHERE attempt_id=?1",
@@ -357,7 +363,7 @@ pub(crate) fn candidate(store: &SharedStore, queue: &str) -> Option<super::Verif
 /// Restart does not mean cancellation. Even a reserved intent may have been
 /// followed by a write whose next commit was lost; retain queue ownership.
 pub(crate) fn recover(conn: &Connection) -> rusqlite::Result<usize> {
-    let n=conn.execute("UPDATE native_delivery_attempts SET state='unknown',reason='server_restart',updated_at=?1 WHERE state IN ('reserved','written_unconfirmed','held')",[now()])?;
+    let n=conn.execute("UPDATE native_delivery_attempts SET state='unknown',reason='server_restart',updated_at=?1,unknown_since=COALESCE(unknown_since,?1) WHERE state IN ('reserved','written_unconfirmed','held')",[now()])?;
     if n > 0 {
         tracing::warn!(
             measured = true,
@@ -377,6 +383,9 @@ fn receipt_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "endpoint_pid":a.endpoint_pid,"endpoint_start":a.endpoint_start,"endpoint_session":a.endpoint_session,
         "state":a.state,"reason":r.get::<_,String>("reason")?,"created_at":a.created_at,
         "updated_at":r.get::<_,f64>("updated_at")?,"evidence_at":r.get::<_,Option<f64>>("evidence_at")?,
+        "unknown_deadline":a.unknown_since.map(|at|at+super::UNKNOWN_HOLD_S),
+        "may_have_been_delivered":a.state==ReceiptState::Uncertain,
+        "status_note":if a.state==ReceiptState::Uncertain {Some("may have been delivered")}else{None},
         "write_attempted_at":a.write_attempted_at,"admitted":a.state.admitted(),"consumed":a.state==ReceiptState::Consumed}),
     )
 }
@@ -598,8 +607,8 @@ pub(super) async fn reconcile_with(
     let store = state.store.clone();
     let at = clock.now();
     let result=store.read_async(move |conn| {
-        let mut stmt=conn.prepare("SELECT * FROM native_delivery_attempts WHERE next_observation_at<=?1 AND (state IN ('reserved','written_unconfirmed','held','admitted','unknown') OR (state IN ('consumed','denied','refused','expired','dropped') AND finalized_at IS NULL)) ORDER BY next_observation_at,created_at LIMIT ?2")?;
-        let rows=stmt.query_map(params![at,super::RECONCILE_BATCH_SIZE],row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut stmt=conn.prepare("SELECT * FROM native_delivery_attempts WHERE next_observation_at<=?1 AND ((state IN ('reserved','written_unconfirmed','held','unknown') OR (state='admitted' AND (finalized_at IS NULL OR created_at+?3>?1))) OR (state IN ('consumed','denied','refused','expired','dropped','uncertain') AND finalized_at IS NULL)) ORDER BY next_observation_at,created_at LIMIT ?2")?;
+        let rows=stmt.query_map(params![at,super::RECONCILE_BATCH_SIZE,super::RECONCILE_MAX_AGE_S],row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }).await;
     let attempts = match result {
@@ -612,6 +621,16 @@ pub(super) async fn reconcile_with(
     for a in attempts {
         let (probe, reader, host) = (a.clone(), artifacts.clone(), host.clone());
         let evidence = tokio::task::spawn_blocking(move || {
+            if probe.state.terminal()
+                || (probe.state == ReceiptState::Unknown
+                    && probe
+                        .unknown_since
+                        .is_some_and(|since| at >= since + super::UNKNOWN_HOLD_S))
+                || (probe.state == ReceiptState::Admitted
+                    && at >= probe.created_at + super::RECONCILE_MAX_AGE_S)
+            {
+                return Ok(false);
+            }
             let receiver = host.process(probe.endpoint_pid)?;
             if receiver.uid != probe.endpoint_uid
                 || receiver.instance != probe.endpoint_start
@@ -627,13 +646,16 @@ pub(super) async fn reconcile_with(
             let live_relay = host
                 .process(probe.relay_pid)
                 .ok()
-                .is_some_and(|p| p.instance == probe.relay_start);
+                .is_some_and(|p| p.registry_start == probe.relay_start);
             let captured_relay = records.iter().any(|r| {
                 artifact_matches(&probe, r)
                     && r["origin"]["verifiedPeerProcStart"].as_str()
                         == Some(probe.relay_start.as_str())
             });
-            Ok(live_relay || captured_relay)
+            if !live_relay && !captured_relay {
+                return Err("relay_start_evidence_mismatch");
+            }
+            Ok(true)
         })
         .await;
         let positive = matches!(evidence, Ok(Ok(true)));
@@ -644,17 +666,123 @@ pub(super) async fn reconcile_with(
         let id = a.id.clone();
         let result=store.write_async(move |conn| {
             let mut changed=false;
-            if positive {changed|=transition(conn,&id,ReceiptState::Consumed,"exact_receiver_artifact",at)?;}
+            if a.state == ReceiptState::Unknown && a.unknown_since.is_some_and(|since| at >= since + super::UNKNOWN_HOLD_S) {
+                changed|=transition(conn,&id,ReceiptState::Uncertain,"unknown_hold_deadline",at)?;
+            }
+            else if positive {changed|=transition(conn,&id,ReceiptState::Consumed,"exact_receiver_artifact",at)?;}
             else if receiver_lost {changed|=transition(conn,&id,ReceiptState::Unknown,"receiver_instance_changed",at)?;}
             else if at-a.created_at>OBSERVATION_TIMEOUT_S && matches!(a.state,ReceiptState::Reserved|ReceiptState::WrittenUnconfirmed) {
                 changed|=transition(conn,&id,ReceiptState::Unknown,"observation_deadline",at)?;
             }
             changed|=finalize(conn,&id)?;
-            conn.execute("UPDATE native_delivery_attempts SET next_observation_at=?2 WHERE attempt_id=?1",params![id,at+super::RECONCILE_INTERVAL_S])?;
+            conn.execute("UPDATE native_delivery_attempts SET next_observation_at=?2,observation_count=observation_count+1 WHERE attempt_id=?1",params![id,next_observation(&a,at)])?;
             Ok(WriteOutcome{applied:changed,events:if changed {message_events(conn,ReceiptLookup::Attempts(&[id]))?}else{vec![]}})
         }).await;
         if let Err(e) = result {
             tracing::warn!(error=%e,attempt_id=%a.id,measured=false,n_considered=1,verdict="native_reconcile_failed","native attempt retained");
+        }
+    }
+}
+
+fn next_observation(a: &Attempt, at: f64) -> f64 {
+    let delay = (super::RECONCILE_INTERVAL_S * 2f64.powi(a.observation_count.min(4) as i32))
+        .min(super::RECONCILE_MAX_INTERVAL_S);
+    let next = at + delay;
+    if a.state == ReceiptState::Unknown {
+        return a
+            .unknown_since
+            .map_or(next, |since| next.min(since + super::UNKNOWN_HOLD_S));
+    }
+    next
+}
+
+/// Abandon ordering only; this never cancels a Claude write or permits replay.
+pub(super) fn abandon(conn: &Connection, session: &str, id: &str) -> rusqlite::Result<bool> {
+    let attempt = conn
+        .query_row(
+            "SELECT * FROM native_delivery_attempts WHERE session=?1 AND attempt_id=?2",
+            params![session, id],
+            row,
+        )
+        .optional()?;
+    let Some(a) = attempt else { return Ok(false) };
+    if !matches!(
+        a.state,
+        ReceiptState::Reserved
+            | ReceiptState::WrittenUnconfirmed
+            | ReceiptState::Unknown
+            | ReceiptState::Uncertain
+    ) {
+        return Ok(false);
+    }
+    let changed = transition(conn, id, ReceiptState::Uncertain, "owner_abandoned", now())?;
+    Ok(finalize(conn, id)? || changed || a.state == ReceiptState::Uncertain)
+}
+
+pub(crate) async fn abandon_action(
+    state: &super::super::AppState,
+    session: &str,
+    headers: &axum::http::HeaderMap,
+    body: &Value,
+) -> axum::response::Response {
+    use axum::{
+        http::{StatusCode, Uri},
+        response::IntoResponse,
+        Json,
+    };
+    let is_owner = super::super::session_verbs::worker_origin(headers).is_empty()
+        && !super::super::org::is_verified_local_member(headers)
+        && (state.auth_token.is_none()
+            || super::super::auth::has_owner_token(state, headers, &Uri::from_static("/")));
+    if !is_owner {
+        tracing::warn!(
+            session,
+            verdict = "native_abandon_owner_only",
+            measured = true,
+            n_considered = 1,
+            "only the owner may abandon native ordering"
+        );
+        return (StatusCode::FORBIDDEN, Json(json!({"ok":false,"code":"native_abandon_owner_only","error":"Abandon requires direct owner input and the owner credential."}))).into_response();
+    }
+    let Some(id) = body["attempt_id"]
+        .as_str()
+        .filter(|id| super::valid_uuid(id))
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok":false,"code":"invalid_attempt_id"})),
+        )
+            .into_response();
+    };
+    let (session, id) = (session.to_string(), id.to_string());
+    let (target, attempt) = (session.clone(), id.clone());
+    let result = state
+        .store
+        .write_async(move |conn| {
+            let applied = abandon(conn, &target, &attempt)?;
+            Ok(WriteOutcome {
+                applied,
+                events: if applied {
+                    message_events(conn, ReceiptLookup::Attempts(&[attempt]))?
+                } else {
+                    vec![]
+                },
+            })
+        })
+        .await;
+    match result {
+        Ok(reply) if reply.applied => {
+            let receipt = state.store.read().and_then(|c| Ok(c.query_row(
+                "SELECT * FROM native_delivery_attempts WHERE session=?1 AND attempt_id=?2",params![session,id],receipt_row)?));
+            match receipt {
+                Ok(receipt) => Json(json!({"ok":true,"delivery_receipt":receipt})).into_response(),
+                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"ok":false,"code":"native_receipt_unmeasured"}))).into_response(),
+            }
+        }
+        Ok(_) => (StatusCode::CONFLICT,Json(json!({"ok":false,"code":"native_attempt_not_abandonable","error":"No ambiguous attempt on this worker; held approvals and confirmed receipts cannot be abandoned."}))).into_response(),
+        Err(e) => {
+            tracing::warn!(error=%e,verdict="native_abandon_failed",measured=false,n_considered=1,"native attempt retained");
+            (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"ok":false,"code":"native_abandon_failed"}))).into_response()
         }
     }
 }
@@ -671,7 +799,7 @@ pub(super) fn finalize(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
             params![a.session,a.message_id,a.state.as_str(),a.queue_id])?;
         if let Some(queue) = &a.queue_id {
             n += conn.execute("DELETE FROM steering_queue WHERE id=?1", [queue])?;
-            n+=conn.execute("UPDATE schedule_runs SET status='refused',submission=?2,note=COALESCE(note,'') || ' · native disposition confirmed' WHERE queue_id=?1 AND status='queued'",params![queue,a.state.as_str()])?;
+            n+=conn.execute("UPDATE schedule_runs SET status='refused',submission=?2,note=COALESCE(note,'') || ' · native disposition: ' || ?2 WHERE queue_id=?1 AND status='queued'",params![queue,a.state.as_str()])?;
         }
         n+=conn.execute("UPDATE native_delivery_attempts SET finalized_at=?2 WHERE attempt_id=?1 AND finalized_at IS NULL",params![id,at])?;
         return Ok(n > 0);

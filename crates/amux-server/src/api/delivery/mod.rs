@@ -25,7 +25,7 @@ pub(super) const MAX_AUTH_FILE_BYTES: usize = 4096;
 pub(super) const AUTH_TOKEN_HEX_CHARS: usize = 32;
 pub(super) const MAX_SENDER_NAME_CHARS: usize = 64;
 pub(super) const RELAY_SUFFIX_HEX_CHARS: usize = 8;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub(super) const EXECUTABLE_HASH_BUFFER_BYTES: usize = 65_536;
 #[cfg(target_os = "macos")]
 pub(super) const MAX_PROCESS_START_BYTES: u64 = 256;
@@ -42,6 +42,10 @@ pub(super) const PROCESS_TIMEOUT: Duration = Duration::from_secs(1);
 pub(super) const RECONCILE_BATCH_SIZE: usize = 16;
 pub(super) const RECEIPT_BATCH_ROWS: usize = 128;
 pub(super) const RECONCILE_INTERVAL_S: f64 = 30.0;
+/// Bound uncertainty without implying cancellation or authorizing a resend.
+pub(super) const UNKNOWN_HOLD_S: f64 = 300.0;
+pub(super) const RECONCILE_MAX_INTERVAL_S: f64 = 300.0;
+pub(super) const RECONCILE_MAX_AGE_S: f64 = 3600.0;
 pub(super) const ARTIFACT_TAIL_BYTES: u64 = 4 * 1024 * 1024;
 pub(super) const REVIEWED_VERSION: &str = "2.1.303";
 pub(super) const REVIEWED_SHA256: &str =
@@ -96,6 +100,7 @@ pub(crate) enum ReceiptState {
     Expired,
     Dropped,
     Unknown,
+    Uncertain,
 }
 
 impl ReceiptState {
@@ -111,6 +116,7 @@ impl ReceiptState {
             Self::Expired => "expired",
             Self::Dropped => "dropped",
             Self::Unknown => "unknown",
+            Self::Uncertain => "uncertain",
         }
     }
     pub fn from_str(s: &str) -> Option<Self> {
@@ -119,10 +125,24 @@ impl ReceiptState {
     pub fn admitted(self) -> bool {
         matches!(self, Self::Admitted | Self::Consumed)
     }
+    pub fn submitted(self) -> Option<bool> {
+        if self.admitted() {
+            return Some(true);
+        }
+        if self.terminal() && self != Self::Uncertain {
+            return Some(false);
+        }
+        None
+    }
     pub fn terminal(self) -> bool {
         matches!(
             self,
-            Self::Consumed | Self::Denied | Self::Refused | Self::Expired | Self::Dropped
+            Self::Consumed
+                | Self::Denied
+                | Self::Refused
+                | Self::Expired
+                | Self::Dropped
+                | Self::Uncertain
         )
     }
     pub fn may_advance(self, next: Self) -> bool {
@@ -134,6 +154,10 @@ impl ReceiptState {
         }
         match next {
             Self::Reserved => false,
+            Self::Uncertain => matches!(
+                self,
+                Self::Reserved | Self::WrittenUnconfirmed | Self::Unknown
+            ),
             Self::WrittenUnconfirmed => self == Self::Reserved,
             Self::Held => matches!(
                 self,

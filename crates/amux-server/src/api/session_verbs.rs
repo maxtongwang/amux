@@ -12590,7 +12590,7 @@ pub(crate) async fn send_text(
 /// a failure (ethos rule 3).
 pub(crate) fn submission_verdict(ok: bool, msg: &str) -> (Option<bool>, &'static str) {
     if let Some(state) = super::delivery::ReceiptState::from_result(msg) {
-        return (if state.admitted() { Some(true) } else if state.terminal() { Some(false) } else { None }, state.as_str());
+        return (state.submitted(), state.as_str());
     }
     if ok && msg == "no suggestion found" {
         // An empty composer submit is a probe for a suggested prompt. Finding
@@ -23680,7 +23680,7 @@ async fn steering_debug(State(state): State<AppState>) -> Response {
 /// caller can win this UPDATE for a given row -- a losing caller means
 /// someone else is already delivering it (or already has), which is
 /// contention, not a delivery refusal.
-async fn claim_steering_row(store: &crate::db::SharedStore, id: &str) -> bool {
+pub(super) async fn claim_steering_row(store: &crate::db::SharedStore, id: &str) -> bool {
     use rusqlite::OptionalExtension;
     let id = id.to_string();
     store
@@ -27013,6 +27013,9 @@ pub(crate) async fn steer_mutate(
     headers: &HeaderMap,
     body: &Value,
 ) -> Response {
+    if *method == Method::POST && body.get("action").and_then(Value::as_str) == Some("abandon") {
+        return super::delivery::ledger::abandon_action(state, name, headers, body).await;
+    }
     if *method == Method::DELETE {
         let msg_id = body_str(body, "id");
         let sent = body.get("sent").map(py_truthy).unwrap_or(false);

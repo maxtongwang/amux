@@ -19,7 +19,7 @@ const normalize = new Function(extract('_msgNorm') + '\nreturn _msgNorm;')();
 const labels = {
   reserved:'native reserved', written_unconfirmed:'native unconfirmed', held:'held by Claude',
   admitted:'admitted to Claude queue', consumed:'received by Claude', denied:'denied by Claude',
-  refused:'refused by Claude', expired:'expired in Claude', dropped:'dropped by Claude', unknown:'native delivery unknown',
+  refused:'refused by Claude', expired:'expired in Claude', dropped:'dropped by Claude', unknown:'native delivery unknown', uncertain:'may have been delivered',
 };
 
 for (const [state, label] of Object.entries(labels)) {

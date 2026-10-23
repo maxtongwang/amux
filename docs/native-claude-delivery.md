@@ -20,6 +20,12 @@ other providers and worker execution types retain their existing paths.
 Discovery reads the registry's actual messaging socket, session and process
 start, checks the running executable, and revalidates before write. A global
 `claude --version`, a successful connect or a PID-shaped filename is insufficient.
+Executable hashes are cached by path, device, inode, size, mtime and ctime,
+including nanoseconds. Process identity and registry checks still run for every
+write. A stale conversation binding after `/clear` is re-resolved once from the
+pane-bound, fully verified registry and adopted through the existing ownership
+checks before delivery continues. Multiple current endpoints refuse refresh
+with `registry_session_ambiguous`.
 Unknown executable profiles and missing compatible inboxes select the existing
 paste adapter before writing. Unsafe paths, identity mismatches and protocol
 anomalies stop delivery. Quarantine is tied to the process instance and executable
@@ -43,17 +49,26 @@ class is omitted; receiver mode is never copied to manufacture parity.
 | `admitted` | Verified held-release callback proves queue admission |
 | `consumed` | Exact receiver artifact IDs, body hash and process provenance match |
 | `denied`, `refused`, `expired`, `dropped` | Native disposition; never paste around it |
-| `unknown` | Observation deadline, ambiguous I/O or restart; never automatic resend |
+| `unknown` | Ambiguous I/O or restart; ordered for `UNKNOWN_HOLD_S` (300 seconds), never resent |
+| `uncertain` | May have been delivered; hold expired or owner abandoned ordering, never resent |
 
 The ledger is `native_delivery_attempts`. A unique source key prevents duplicate
 attempts across concurrent drains and restart. Write intent commits before the
 first write call, including auth. A native-owned steering row remains claimed
-and ordered until evidence permits completion; a SQL guard prevents legacy
-cleanup or cancellation from erasing uncertain writes. Clearing Amux cannot
+and ordered until evidence permits completion or the bounded unknown hold ends.
+`unknown_since` persists the first ambiguity, so restarts do not extend the hold.
+At its deadline the attempt becomes terminal `uncertain`; the original queue row
+is removed while its immutable source key and Messages receipt remain. Later rows
+can proceed. `submitted` remains `null`, and history never claims delivery.
+A SQL guard prevents legacy cleanup from erasing pending attempts. Clearing Amux cannot
 cancel a message already parked in Claude.
 
 The existing timer reconciles bounded batches, including after disabling the
-flag. A lost callback, missing artifact or expired observation deadline proves
+flag. Observation intervals back off from 30 to at most 300 seconds. Unknown
+observations stop at the hold deadline; admitted artifact probes stop one hour
+after attempt creation (admission evidence and late verified callbacks remain).
+Held approvals retain ordering until evidence or restart; they cannot be
+abandoned. A lost callback, missing artifact or expired observation deadline proves
 neither consumption nor cancellation. Normal artifact adoption requires exact
 command UUID, receiver session, relay PID and body hash; a native message ID,
 when exposed by the artifact, must also match. This includes
@@ -79,6 +94,7 @@ never supplied by a body field or inferred from an origin stamp.
 | --- | --- |
 | `POST /api/workers/{worker}/send` | JSON `text` and stable client `msg_id`; returns `ok`, `id`, `submitted`, `submission`, optional `queue_id` and `delivery_receipt` |
 | `GET /api/sessions/{worker}/send?msg_id={client_id}` | Read durable acceptance and the current `delivery_receipt` without sending again |
+| `POST /api/workers/{worker}/steer` | Owner-only JSON `{"action":"abandon","attempt_id":"<UUID>"}`; releases ambiguous ordering immediately and returns the `uncertain` receipt |
 | `GET /api/history/{id}` | Existing Messages row by numeric ID or `MSG-{id}`, with its current receipt |
 | `GET /api/history?session={worker}` | History rows with receipts batched by exact client/queue IDs |
 
@@ -100,9 +116,19 @@ Neither authorizes another transport or a fresh send.
 
 The CLI reads the same structured evidence on first replies, retry replies and
 late receipts. It prints `ADMITTED` or `RECEIVED` only with positive evidence;
-other native states print a refusal or unconfirmed result, return nonzero and
-say not to resend. Responses without a structured receipt retain existing CLI
-behavior. Machine clients should use the API state rather than parsing prose.
+`written_unconfirmed` reports that exact state, says not to resend and exits 0
+because acceptance is the normal result without a positive ACK. Other pending
+and negative states return nonzero. `uncertain` says “may have been delivered”.
+Responses without a structured receipt retain existing CLI behavior. Machine clients should use the API state rather than parsing prose.
+
+The owner can use `amux delivery abandon <worker> <attempt-id>` to end an ambiguous
+hold immediately. This does not cancel delivery in Claude, authorize a resend,
+or bypass a held approval. Worker requests (including self requests), invited
+members and requests missing the configured owner bearer are refused with
+`native_abandon_owner_only`. Attempt IDs are scoped to the target worker;
+unknown, missing or non-abandonable IDs return `native_attempt_not_abandonable`.
+Retrying an already uncertain attempt is idempotent. Receipts include
+`unknown_deadline`, `may_have_been_delivered` and `status_note`.
 
 ## Fixture verification
 
@@ -124,6 +150,7 @@ scripts/test-native-delivery.sh
 CARGO_TARGET_DIR="$HOME/.amux/rust-build-target/verification" scripts/safe-cargo.sh clippy --workspace --all-targets -- -D warnings
 node --test e2e/native-delivery-chip.test.mjs e2e/board-delivery-chip.test.mjs
 python3 scripts/test-native-delivery-cli.py
+python3 scripts/test-native-delivery-schema.py
 ```
 
 The fake server establishes client and recovery behavior, not compatibility with

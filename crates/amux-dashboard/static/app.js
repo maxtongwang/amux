@@ -23451,7 +23451,7 @@ function _msgDeliveryChip(e) {
     const receipt = e.delivery_receipt;
     const labels = {reserved:'native reserved', written_unconfirmed:'native unconfirmed', held:'held by Claude',
       admitted:'admitted to Claude queue', consumed:'received by Claude', denied:'denied by Claude', refused:'refused by Claude',
-      expired:'expired in Claude', dropped:'dropped by Claude', unknown:'native delivery unknown'};
+      expired:'expired in Claude', dropped:'dropped by Claude', unknown:'native delivery unknown', uncertain:'may have been delivered'};
     const confirmed = receipt.state === 'admitted' || receipt.state === 'consumed';
     label = labels[receipt.state] || 'native delivery unknown';
     color = confirmed ? '#3fb950' : '#d29922'; bg = confirmed ? 'rgba(63,185,80,0.14)' : 'rgba(210,153,34,0.16)';

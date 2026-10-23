@@ -110,8 +110,9 @@ impl DeliveryTransport for ClaudeUdsV1 {
         if expected.is_none() {
             return DeliveryOutcome::UnavailableBeforeWrite("no_receiver_session_binding");
         }
+        let binding = expected.clone();
         let discovery = tokio::task::spawn_blocking(move || {
-            system::discover(&LocalHost, &config, &pids, expected.as_deref())
+            system::discover_current(&LocalHost, &config, &pids, binding.as_deref())
         })
         .await;
         let target = match discovery {
@@ -122,6 +123,16 @@ impl DeliveryTransport for ClaudeUdsV1 {
             Ok(Err(DiscoveryError::Quarantined(why))) => return DeliveryOutcome::Quarantined(why),
             Err(_) => return DeliveryOutcome::Quarantined("discovery_task_failed"),
         };
+        if expected.as_deref() != Some(target.session.as_str()) {
+            super::super::session_verbs::adopt_reported_conv_id(ctx.name, &target.session);
+            if super::super::session_verbs::load_meta(ctx.name)
+                .get("cc_conversation_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(target.session.as_str())
+            {
+                return DeliveryOutcome::Quarantined("receiver_session_refresh_refused");
+            }
+        }
         let relay = match LocalHost.process(std::process::id()) {
             Ok(p) => p,
             Err(why) => return DeliveryOutcome::Quarantined(why),

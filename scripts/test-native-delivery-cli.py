@@ -67,17 +67,17 @@ _send_via_api fixture-receiver prose
             else:
                 self.assertNotIn('sent to fixture-receiver', combined)
                 self.assertIn('delivery_receipt:', combined)
-                if expected:
+                if expected or state == 'written_unconfirmed':
                     self.assertIn('Do NOT resend', combined)
                 else:
                     self.assertIn('RECEIVED' if state == 'consumed' else 'ADMITTED', combined)
             self.assertEqual((root / 'flushed').exists(), expected == 0)
 
     def test_unconfirmed_and_hold(self):
-        for state in ('reserved', 'written_unconfirmed', 'held', 'unknown'):
+        for state in ('reserved', 'written_unconfirmed', 'held', 'unknown', 'uncertain'):
             for path in ('first', 'retry', 'late'):
                 with self.subTest(state=state, path=path):
-                    self.probe(state, path, 1)
+                    self.probe(state, path, 0 if state == 'written_unconfirmed' else 1)
 
     def test_native_dispositions(self):
         for state in ('denied', 'refused', 'expired', 'dropped'):
@@ -103,6 +103,40 @@ _send_via_api fixture-receiver prose
                     self.probe('future-state', path, 1, malformed=malformed)
 
 
-result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromTestCase(ReceiptMatrix))
+class AbandonAction(unittest.TestCase):
+    def test_shipped_abandon_cli_uses_scoped_owner_gated_api_and_reports_failure(self):
+        global probes
+        for status in ('ok', 'denied', 'unavailable'):
+            probes += 1
+            with tempfile.TemporaryDirectory(prefix='native-abandon-cli-') as temp:
+                (Path(temp) / 'auth_token').write_text('fixture-owner-bearer\n')
+                script = Path(temp) / 'probe.sh'
+                script.write_text(function('cmd_delivery') + r'''
+resolve_session() { echo fixture-worker; }
+_curl() {
+  printf '%s\n' "$@" > "$FIXTURE/request"
+  case "$FIXTURE_STATUS" in
+    ok) echo '{"ok":true,"delivery_receipt":{"state":"uncertain","status_note":"may have been delivered"}}' ;;
+    denied) echo '{"ok":false,"code":"native_abandon_owner_only"}' ;;
+    unavailable) return 22 ;;
+  esac
+}
+cmd_delivery abandon fixture-worker fixture-attempt
+''')
+                result = subprocess.run(['bash', str(script)], env=dict(os.environ, FIXTURE=temp,
+                    FIXTURE_STATUS=status, AMUX_API='fixture://injected', CC_HOME=temp), capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0 if status == 'ok' else 1, result.stdout + result.stderr)
+                request = (Path(temp) / 'request').read_text()
+                self.assertIn('fixture://injected/api/workers/fixture-worker/steer', request)
+                self.assertIn('"action": "abandon"', request)
+                self.assertIn('"attempt_id": "fixture-attempt"', request)
+                self.assertIn('X-Amux-Worker:', request)
+                self.assertIn('Authorization: Bearer fixture-owner-bearer', request)
+                if status == 'ok':
+                    self.assertIn('may have been delivered', result.stdout)
+
+
+
+result = unittest.TextTestRunner(verbosity=1).run(unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(case) for case in (ReceiptMatrix, AbandonAction)]))
 print(f'CLI receipt matrix: {probes} fixture probes, {len(result.failures)} failures, {len(result.errors)} errors')
 raise SystemExit(not result.wasSuccessful())

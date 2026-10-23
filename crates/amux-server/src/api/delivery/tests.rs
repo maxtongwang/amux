@@ -99,11 +99,13 @@ fn attempt(queue: Option<&str>) -> Attempt {
         executable_sha256: REVIEWED_SHA256.into(),
         registry_sha256: wire::sha256(b"registry"),
         relay_pid: identity().pid,
-        relay_start: identity().instance,
+        relay_start: identity().registry_start,
         body_sha256: wire::sha256(b"same body"),
         state: ReceiptState::Reserved,
         created_at: now(),
         write_attempted_at: None,
+        unknown_since: None,
+        observation_count: 0,
     }
 }
 fn status(a: &Attempt, status: &str) -> Value {
@@ -243,6 +245,52 @@ async fn registry_uses_explicit_or_moved_aside_path_and_rejects_stale_identity()
     private_file(&registry, good.to_string().as_bytes());
     let t = system::discover(&host, dir.path(), &[host.0.pid], Some("s")).unwrap();
     assert_eq!(t.socket, socket);
+    let refreshed =
+        system::discover_current(&host, dir.path(), &[host.0.pid], Some("pre-clear-session"))
+            .unwrap();
+    assert_eq!(refreshed.session, "s");
+    assert_eq!(refreshed.process, host.0);
+    struct TwoPeers(ProcessIdentity);
+    impl Host for TwoPeers {
+        fn process(&self, pid: u32) -> Result<ProcessIdentity, &'static str> {
+            let mut identity = self.0.clone();
+            identity.pid = pid;
+            Ok(identity)
+        }
+        fn uid(&self) -> u32 {
+            self.0.uid
+        }
+    }
+    let second = dir
+        .path()
+        .join("sessions")
+        .join(format!("{}.json", host.0.pid + 1));
+    let mut other = good.clone();
+    other["pid"] = json!(host.0.pid + 1);
+    other["sessionId"] = json!("other");
+    private_file(&second, other.to_string().as_bytes());
+    assert!(matches!(
+        system::discover_current(
+            &TwoPeers(identity()),
+            dir.path(),
+            &[host.0.pid, host.0.pid + 1],
+            Some("pre-clear-session")
+        ),
+        Err(system::DiscoveryError::Quarantined(
+            "registry_session_ambiguous"
+        ))
+    ));
+    std::fs::remove_file(second).unwrap();
+    let mut missing_pid = good.clone();
+    missing_pid.as_object_mut().unwrap().remove("pid");
+    private_file(&registry, missing_pid.to_string().as_bytes());
+    assert!(matches!(
+        system::discover_current(&host, dir.path(), &[host.0.pid], Some("pre-clear-session")),
+        Err(system::DiscoveryError::Quarantined(
+            "registry_process_mismatch"
+        ))
+    ));
+    private_file(&registry, good.to_string().as_bytes());
     assert!(system::discover(&host, dir.path(), &[host.0.pid], Some("other")).is_err());
     for (field, value) in [
         ("procStart", json!("reused-pid")),
@@ -417,6 +465,7 @@ fn native_submission_boundary_and_late_http_result_never_fabricate_or_regress_ev
         ReceiptState::Expired,
         ReceiptState::Dropped,
         ReceiptState::Unknown,
+        ReceiptState::Uncertain,
     ] {
         let (ok, message) = state.result("fixture");
         let (submitted, submission) = crate::api::session_verbs::submission_verdict(ok, &message);
@@ -425,7 +474,7 @@ fn native_submission_boundary_and_late_http_result_never_fabricate_or_regress_ev
             submitted,
             if state.admitted() {
                 Some(true)
-            } else if state.terminal() {
+            } else if state.terminal() && state != ReceiptState::Uncertain {
                 Some(false)
             } else {
                 None
@@ -885,7 +934,9 @@ impl ledger::ArtifactReader for Records {
 async fn observation_timeout_is_unknown_and_exact_artifacts_reconcile_without_resend() {
     let dir = private_dir();
     let store = Arc::new(crate::db::Store::open(&dir.path().join("db")).unwrap());
-    let a = attempt(Some("queued"));
+    let mut a = attempt(Some("queued"));
+    // The pre-restart relay is gone; only Claude's captured lstart can prove it.
+    a.relay_pid += 1;
     let insert = a.clone();
     store
         .write_async(move |c| {
@@ -915,7 +966,7 @@ async fn observation_timeout_is_unknown_and_exact_artifacts_reconcile_without_re
         assert!(ledger::queue_owned(&c, "queued").unwrap());
     }
     let record = json!({"type":"user","uuid":a.command_uuid,"sessionId":a.endpoint_session,
-        "origin":{"kind":"peer","verifiedPeerPid":a.relay_pid,"verifiedPeerProcStart":a.relay_start,
+        "origin":{"kind":"peer","verifiedPeerPid":a.relay_pid,"verifiedPeerProcStart":"Thu Oct 22 01:02:03 2026",
             "msg_id":a.msg_id,"members":[{"body":"different"},{"body":"same body"}]}});
     let later = FixedClock(clock.0 + RECONCILE_INTERVAL_S + 1.0);
     let mut reused = identity();
@@ -932,7 +983,7 @@ async fn observation_timeout_is_unknown_and_exact_artifacts_reconcile_without_re
         (1, 1, 0),
         "PID reuse is not artifact proof"
     );
-    let later = FixedClock(later.0 + RECONCILE_INTERVAL_S + 1.0);
+    let later = FixedClock(later.0 + 2.0 * RECONCILE_INTERVAL_S + 1.0);
     ledger::reconcile_with(&st, host, &later, Arc::new(Records(vec![record]))).await;
     let c = store.read().unwrap();
     assert_eq!(counts(&c), (0, 1, 1));
@@ -1203,8 +1254,8 @@ fn crash_child() {
     unreachable!();
 }
 
-#[test]
-fn sigkill_recovery_retains_ambiguity_and_adopts_only_committed_receipts() {
+#[tokio::test]
+async fn sigkill_recovery_retains_ambiguity_and_adopts_only_committed_receipts() {
     use std::os::unix::process::ExitStatusExt;
     for phase in [
         "before_write",
@@ -1251,6 +1302,38 @@ fn sigkill_recovery_retains_ambiguity_and_adopts_only_committed_receipts() {
             assert!(ledger::queue_owned(&c, "queue").unwrap());
         }
         assert!(!ledger::finalize(&c, &id).unwrap());
+        c.execute("INSERT INTO steering_queue(id,session,text,queued_at) VALUES('later','receiver','later',2)",[]).unwrap();
+        assert_eq!(ledger::queue_blocked(&c, "later").unwrap(), !admitted);
+        drop(c);
+        let store = Arc::new(crate::db::Store::open(&path).unwrap());
+        let st = state(store.clone());
+        let host = Arc::new(CountingHost(AtomicUsize::new(0)));
+        ledger::reconcile_with(
+            &st,
+            host.clone(),
+            &FixedClock(now() + UNKNOWN_HOLD_S + 1.0),
+            Arc::new(Records(vec![])),
+        )
+        .await;
+        let c = store.read().unwrap();
+        assert_eq!(
+            counts(&c),
+            if admitted { (1, 1, 1) } else { (1, 1, 0) },
+            "{phase}: restart must release later rows without false delivery"
+        );
+        assert!(!ledger::queue_blocked(&c, "later").unwrap());
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM native_delivery_attempts", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            1,
+            "no duplicate native attempt after {phase}"
+        );
+        drop(c);
+        assert!(super::super::session_verbs::claim_steering_row(&store, "later").await);
+        record_later_delivery(&st).await;
     }
 }
 
@@ -1485,7 +1568,9 @@ fn sigkill_native_wire_and_reverse_receipts_recover_without_replaying() {
             configure_blocking_fixture_stream(&stream);
             let mut reader = std::io::BufReader::new(stream);
             let mut line = String::new();
-            let n = reader.read_line(&mut line).expect("fixture native frame read");
+            let n = reader
+                .read_line(&mut line)
+                .expect("fixture native frame read");
             if peer_phase == "before_write" {
                 assert_eq!(n, 0);
                 return 0;
@@ -1583,4 +1668,422 @@ fn sigkill_native_wire_and_reverse_receipts_recover_without_replaying() {
             1
         );
     }
+}
+
+#[tokio::test]
+async fn restart_unknown_has_a_deadline_releasing_later_rows_without_resend() {
+    let dir = private_dir();
+    let store = Arc::new(crate::db::Store::open(&dir.path().join("db")).unwrap());
+    let a = attempt(Some("old"));
+    {
+        let c = store.read().unwrap();
+        fixture_row(&c, &a);
+        ledger::mark_write_conn(&c, &a.id, now()).unwrap();
+        c.execute("INSERT INTO steering_queue(id,session,text,queued_at) VALUES('later','receiver','later',2)", []).unwrap();
+        assert_eq!(ledger::recover(&c).unwrap(), 1);
+        assert!(ledger::queue_blocked(&c, "later").unwrap());
+    }
+    let st = state(store.clone());
+    let host = Arc::new(CountingHost(AtomicUsize::new(0)));
+    let since = store
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT unknown_since FROM native_delivery_attempts",
+            [],
+            |r| r.get::<_, f64>(0),
+        )
+        .unwrap();
+    for (offset, probes) in [
+        (0.0, 1),
+        (RECONCILE_INTERVAL_S + 1.0, 2),
+        (2.0 * RECONCILE_INTERVAL_S + 2.0, 2),
+    ] {
+        ledger::reconcile_with(
+            &st,
+            host.clone(),
+            &FixedClock(since + offset),
+            Arc::new(Records(vec![])),
+        )
+        .await;
+        let c = store.read().unwrap();
+        assert_eq!(
+            host.0.load(Ordering::SeqCst),
+            probes,
+            "unknown backoff at {offset}"
+        );
+        assert!(ledger::queue_blocked(&c, "later").unwrap());
+        assert_eq!(ledger::recover(&c).unwrap(), 0);
+        assert_eq!(
+            c.query_row(
+                "SELECT unknown_since FROM native_delivery_attempts",
+                [],
+                |r| r.get::<_, f64>(0)
+            )
+            .unwrap(),
+            since,
+            "restart never extends the hold"
+        );
+    }
+    let clock = FixedClock(now() + UNKNOWN_HOLD_S + 1.0); // UNKNOWN_HOLD: five minutes after restart.
+    ledger::reconcile_with(&st, host.clone(), &clock, Arc::new(Records(vec![]))).await;
+    {
+        let c = store.read().unwrap();
+        let retained = ledger::find(&c, &a.session, &a.source_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.state.as_str(), "uncertain");
+        assert!(!ledger::queue_blocked(&c, "later").unwrap());
+        assert_eq!(
+            counts(&c),
+            (1, 1, 0),
+            "only the later row survives; never falsely delivered"
+        );
+        assert!(
+            !ledger::insert(&c, &a).unwrap(),
+            "the original source is never resent"
+        );
+    }
+    // The real queue claim boundary now admits the later row once.
+    assert!(super::super::session_verbs::claim_steering_row(&store, "later").await);
+    ledger::reconcile_with(
+        &st,
+        host.clone(),
+        &FixedClock(clock.0 + RECONCILE_MAX_AGE_S),
+        Arc::new(Records(vec![])),
+    )
+    .await;
+    assert_eq!(
+        host.0.load(Ordering::SeqCst),
+        2,
+        "uncertain attempts stop all probes"
+    );
+    record_later_delivery(&st).await;
+    assert!(!super::super::session_verbs::claim_steering_row(&store, "old").await);
+    assert!(!super::super::session_verbs::claim_steering_row(&store, "later").await);
+}
+
+#[test]
+fn executable_hash_cache_reuses_only_an_unchanged_file_fingerprint() {
+    let dir = private_dir();
+    let path = dir.path().join("executable");
+    let mut cache = system::ExecutableHashes::default();
+    let hash = |cache: &mut system::ExecutableHashes| {
+        let mut file = std::fs::File::open(&path).unwrap();
+        let metadata = file.metadata().unwrap();
+        cache.hash(&path, &mut file, &metadata).unwrap()
+    };
+    std::fs::write(&path, b"first").unwrap();
+    assert_eq!(hash(&mut cache), wire::sha256(b"first"));
+    assert_eq!(hash(&mut cache), wire::sha256(b"first"));
+    assert_eq!(
+        cache.hashes, 1,
+        "unchanged path/inode/size/mtime is hashed once"
+    );
+    std::fs::write(&path, b"second longer").unwrap();
+    assert_eq!(hash(&mut cache), wire::sha256(b"second longer"));
+    let replacement = dir.path().join("replacement");
+    std::fs::write(&replacement, b"different new").unwrap();
+    std::fs::rename(replacement, &path).unwrap();
+    assert_eq!(hash(&mut cache), wire::sha256(b"different new"));
+    assert_eq!(
+        cache.hashes, 3,
+        "size/mtime changes and inode replacement invalidate the cache"
+    );
+}
+
+#[tokio::test]
+async fn real_native_flag_off_selects_paste_and_creates_no_attempt() {
+    assert!(
+        !enabled(),
+        "run fixtures with AMUX_NATIVE_CLAUDE_DELIVERY unset"
+    );
+    let dir = private_dir();
+    let store = Arc::new(crate::db::Store::open(&dir.path().join("db")).unwrap());
+    let st = state(store.clone());
+    let cfg = super::super::session_verbs::EnvFile::default();
+    let mode = super::super::session_verbs::SendMode {
+        defer_if_busy: false,
+        from_steering: false,
+        allow_mid_turn: false,
+        hook_confirmed_idle: false,
+        origin: super::super::session_verbs::SendOrigin::Automation,
+        native_peer: Some(VerifiedPeer {
+            sender: "peer".into(),
+            message_id: uuid(),
+            body_stamped: false,
+        }),
+    };
+    let mut queue = None;
+    let mut ctx = DeliveryContext {
+        state: &st,
+        name: "receiver",
+        text: "prose",
+        cfg: &cfg,
+        mode: &mode,
+        admitted_claim: None,
+        payload_kind: PayloadKind::PeerProse,
+        sender_permission_class: None,
+        delivery: None,
+        queue_id: &mut queue,
+    };
+    assert_eq!(
+        claude::ClaudeUdsV1.capabilities(&ctx),
+        Eligibility::UnavailableBeforeWrite("feature_disabled")
+    );
+    let paste = Recording {
+        outcome: "paste",
+        calls: AtomicUsize::new(0),
+    };
+    let result = resolve(&mut ctx, &[&claude::ClaudeUdsV1, &paste]).await;
+    assert!(result.0);
+    assert_eq!(paste.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store
+            .read()
+            .unwrap()
+            .query_row("SELECT count(*) FROM native_delivery_attempts", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        0
+    );
+    assert!(queue.is_none());
+}
+
+#[tokio::test]
+async fn abandon_is_owner_only_scoped_idempotent_and_never_claims_delivery() {
+    use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+    let dir = private_dir();
+    let store = Arc::new(crate::db::Store::open(&dir.path().join("db")).unwrap());
+    let a = attempt(Some("abandon"));
+    fixture_row(&store.read().unwrap(), &a);
+    let mut st = state(store.clone());
+    st.auth_token = Some("fixture-owner".into());
+    let body = json!({"action":"abandon","attempt_id":a.id});
+    let action = super::super::session_verbs::steer_mutate;
+    // Omitting identity cannot turn a worker into the owner on an authenticated host.
+    assert_eq!(
+        action(&st, "receiver", &Method::POST, &HeaderMap::new(), &body)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let mut owner = HeaderMap::new();
+    owner.insert(
+        "authorization",
+        HeaderValue::from_static("Bearer fixture-owner"),
+    );
+    let mut member = owner.clone();
+    member.insert(
+        "x-amux-local-member-verified",
+        HeaderValue::from_static("1"),
+    );
+    assert_eq!(
+        action(&st, "receiver", &Method::POST, &member, &body)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        action(
+            &st,
+            "receiver",
+            &Method::POST,
+            &owner,
+            &json!({"action":"abandon","attempt_id":"malformed"})
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let mut worker = owner.clone();
+    worker.insert("x-amux-worker", HeaderValue::from_static("receiver"));
+    assert_eq!(
+        action(&st, "receiver", &Method::POST, &worker, &body)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        action(&st, "another-worker", &Method::POST, &owner, &body)
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    for _ in 0..2 {
+        let response = action(&st, "receiver", &Method::POST, &owner, &body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let receipt: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(receipt["delivery_receipt"]["state"], "uncertain");
+        assert_eq!(
+            receipt["delivery_receipt"]["status_note"],
+            "may have been delivered"
+        );
+    }
+    let c = store.read().unwrap();
+    assert_eq!(counts(&c), (0, 1, 0));
+    assert!(!ledger::insert(&c, &a).unwrap());
+    let held = attempt(Some("approval"));
+    fixture_row(&c, &held);
+    ledger::transition(&c, &held.id, ReceiptState::Held, "fixture", now()).unwrap();
+    assert!(
+        !ledger::abandon(&c, "receiver", &held.id).unwrap(),
+        "abandon cannot bypass a held approval"
+    );
+}
+
+struct CountingHost(AtomicUsize);
+impl Host for CountingHost {
+    fn process(&self, _: u32) -> Result<ProcessIdentity, &'static str> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(identity())
+    }
+    fn uid(&self) -> u32 {
+        identity().uid
+    }
+}
+
+#[tokio::test]
+async fn admitted_reconciliation_backs_off_and_stops_even_after_restart() {
+    let dir = private_dir();
+    let store = Arc::new(crate::db::Store::open(&dir.path().join("db")).unwrap());
+    let a = attempt(Some("admitted"));
+    {
+        let c = store.read().unwrap();
+        fixture_row(&c, &a);
+        ledger::mark_write_conn(&c, &a.id, now()).unwrap();
+        ledger::transition(&c, &a.id, ReceiptState::Admitted, "fixture", now()).unwrap();
+    }
+    let st = state(store.clone());
+    let host = Arc::new(CountingHost(AtomicUsize::new(0)));
+    for (offset, count) in [
+        (0.0, 1),
+        (RECONCILE_INTERVAL_S + 1.0, 2),
+        (2.0 * RECONCILE_INTERVAL_S + 2.0, 2),
+        (3.0 * RECONCILE_INTERVAL_S + 2.0, 3),
+        (RECONCILE_MAX_AGE_S + 1.0, 3),
+    ] {
+        ledger::reconcile_with(
+            &st,
+            host.clone(),
+            &FixedClock(a.created_at + offset),
+            Arc::new(Records(vec![])),
+        )
+        .await;
+        assert_eq!(
+            host.0.load(Ordering::SeqCst),
+            count,
+            "probe count at {offset}"
+        );
+    }
+    let c = store.read().unwrap();
+    assert_eq!(
+        ledger::recover(&c).unwrap(),
+        0,
+        "restart does not resume admitted probes"
+    );
+    assert_eq!(counts(&c), (0, 1, 1));
+}
+
+#[test]
+fn unknown_deadline_cannot_overwrite_a_concurrent_held_callback() {
+    let c = memory();
+    let a = attempt(Some("held"));
+    fixture_row(&c, &a);
+    ledger::transition(&c, &a.id, ReceiptState::Unknown, "fixture", now()).unwrap();
+    ledger::transition(&c, &a.id, ReceiptState::Held, "callback", now()).unwrap();
+    assert!(!ledger::transition(
+        &c,
+        &a.id,
+        ReceiptState::Uncertain,
+        "unknown_hold_deadline",
+        now()
+    )
+    .unwrap());
+    assert!(ledger::queue_blocked(&c, "held").unwrap());
+}
+
+async fn record_later_delivery(st: &crate::api::AppState) {
+    let cfg = super::super::session_verbs::EnvFile::default();
+    let mode = super::super::session_verbs::SendMode {
+        defer_if_busy: false,
+        from_steering: true,
+        allow_mid_turn: false,
+        hook_confirmed_idle: true,
+        origin: super::super::session_verbs::SendOrigin::Owner,
+        native_peer: None,
+    };
+    let mut queue = None;
+    let mut ctx = DeliveryContext {
+        state: st,
+        name: "receiver",
+        text: "later",
+        cfg: &cfg,
+        mode: &mode,
+        admitted_claim: None,
+        payload_kind: PayloadKind::TerminalInput,
+        sender_permission_class: None,
+        delivery: Some("later"),
+        queue_id: &mut queue,
+    };
+    let paste = Recording {
+        outcome: "paste",
+        calls: AtomicUsize::new(0),
+    };
+    assert_eq!(
+        resolve(&mut ctx, &[&claude::ClaudeUdsV1, &paste]).await,
+        (true, "sent".into())
+    );
+    assert_eq!(paste.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn attempt_constructor_persists_claudes_lstart_instead_of_the_kernel_token() {
+    let dir = private_dir();
+    let store = Arc::new(crate::db::Store::open(&dir.path().join("db")).unwrap());
+    let a = attempt(None);
+    fixture_row(&store.read().unwrap(), &a);
+    let st = state(store);
+    let cfg = super::super::session_verbs::EnvFile::default();
+    let mode = super::super::session_verbs::SendMode {
+        defer_if_busy: false,
+        from_steering: false,
+        allow_mid_turn: false,
+        hook_confirmed_idle: false,
+        origin: super::super::session_verbs::SendOrigin::Automation,
+        native_peer: Some(VerifiedPeer {
+            sender: a.sender.clone(),
+            message_id: a.message_id.unwrap(),
+            body_stamped: false,
+        }),
+    };
+    let mut queue = None;
+    let ctx = DeliveryContext {
+        state: &st,
+        name: "receiver",
+        text: "same body",
+        cfg: &cfg,
+        mode: &mode,
+        admitted_claim: None,
+        payload_kind: PayloadKind::PeerProse,
+        sender_permission_class: None,
+        delivery: None,
+        queue_id: &mut queue,
+    };
+    let target = Target {
+        process: identity(),
+        registry: "/fixture/registry".into(),
+        registry_sha256: wire::sha256(b"registry"),
+        socket: a.endpoint.into(),
+        session: a.endpoint_session,
+        config_dir: "/fixture".into(),
+    };
+    let constructed = Attempt::new(&ctx, &target, &identity(), "same body").unwrap();
+    assert_eq!(constructed.relay_start, "Thu Oct 22 01:02:03 2026");
+    assert_ne!(constructed.relay_start, identity().instance);
 }

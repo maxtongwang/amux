@@ -49,11 +49,11 @@ whole-file write and has reverted a peer's in-flight work twice.
 scripts/test-native-delivery.sh
 node --test e2e/native-delivery-chip.test.mjs e2e/board-delivery-chip.test.mjs
 python3 scripts/test-native-delivery-cli.py
+python3 scripts/test-native-delivery-schema.py
 ```
 
-Pass: all 21 Rust fixture tests, all 14 Messages chip tests, and all 39 CLI receipt
-fixture probes pass. The Rust
-runner creates a private `AMUX_HOME`; its UDS fixtures require socket-bind
+Pass: all Rust fixture tests, 15 Messages/board chip tests, 45 CLI fixture
+probes, and four SQLite upgrade/guard tests pass. The Rust runner creates a private `AMUX_HOME`; its UDS fixtures require socket-bind
 permission. These are targeted tests, not the full server suite. Failed fixture
 directories are retained and printed. No live Claude, tmux, server or user state
 is used. [Profile and enablement requirements](docs/native-claude-delivery.md)

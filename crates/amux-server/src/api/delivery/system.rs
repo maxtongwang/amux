@@ -102,7 +102,7 @@ pub(super) fn discover(
             serde_json::from_slice(&bytes).map_err(|_| Q("registry_protocol"))?;
         let process = host.process(pid).map_err(Q)?;
         if process.uid != host.uid()
-            || v.get("pid").is_some_and(|n| n.as_u64() != Some(pid as u64))
+            || v["pid"].as_u64() != Some(pid as u64)
             || v["procStart"].as_str() != Some(process.registry_start.as_str())
         {
             return Err(Q("registry_process_mismatch"));
@@ -144,6 +144,43 @@ pub(super) fn discover(
         });
     }
     Err(U("no_verified_registry"))
+}
+
+/// /clear rotates the conversation inside the same pane-bound process. Resolve
+/// its current, fully verified registry once before treating metadata as identity failure.
+pub(super) fn discover_current(
+    host: &dyn Host,
+    config: &Path,
+    pids: &[u32],
+    expected: Option<&str>,
+) -> Result<Target, DiscoveryError> {
+    match discover(host, config, pids, expected) {
+        Err(DiscoveryError::Quarantined("registry_session_mismatch")) => {
+            let mut current = None;
+            for &pid in pids {
+                match discover(host, config, &[pid], None) {
+                    Ok(target) => {
+                        if current.is_some() {
+                            return Err(DiscoveryError::Quarantined("registry_session_ambiguous"));
+                        }
+                        current = Some(target);
+                    }
+                    Err(DiscoveryError::Unavailable(_)) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            let current = current.ok_or(DiscoveryError::Unavailable("no_verified_registry"))?;
+            tracing::info!(
+                endpoint_pid = current.process.pid,
+                measured = true,
+                n_considered = 1,
+                verdict = "native_receiver_session_refreshed",
+                "stale conversation re-resolved from the pane-bound registry"
+            );
+            Ok(current)
+        }
+        result => result,
+    }
 }
 
 pub(super) fn revalidate(host: &dyn Host, target: &Target) -> Result<(), &'static str> {
@@ -276,6 +313,78 @@ pub(super) fn peer(stream: &tokio::net::UnixStream) -> Result<(u32, u32), &'stat
     Ok((pid, cred.uid()))
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+struct ExecutableStamp {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+#[cfg(any(target_os = "macos", test))]
+impl From<&std::fs::Metadata> for ExecutableStamp {
+    fn from(m: &std::fs::Metadata) -> Self {
+        Self {
+            device: m.dev(),
+            inode: m.ino(),
+            size: m.len(),
+            modified: (m.mtime(), m.mtime_nsec()),
+            changed: (m.ctime(), m.ctime_nsec()),
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+pub(super) struct ExecutableHashes {
+    entries: std::collections::HashMap<PathBuf, (ExecutableStamp, String)>,
+    #[cfg(test)]
+    pub hashes: usize,
+}
+#[cfg(any(target_os = "macos", test))]
+impl ExecutableHashes {
+    pub fn hash(
+        &mut self,
+        path: &Path,
+        file: &mut std::fs::File,
+        before: &std::fs::Metadata,
+    ) -> Result<String, &'static str> {
+        let stamp = ExecutableStamp::from(before);
+        if let Some((cached, hash)) = self.entries.get(path) {
+            if cached == &stamp {
+                return Ok(hash.clone());
+            }
+        }
+        use sha2::Digest;
+        let mut hash = sha2::Sha256::new();
+        let mut buf = [0u8; super::EXECUTABLE_HASH_BUFFER_BYTES];
+        loop {
+            let n = file.read(&mut buf).map_err(|_| "executable_read")?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buf[..n]);
+        }
+        let after = file.metadata().map_err(|_| "executable_stat")?;
+        if stamp != ExecutableStamp::from(&after) {
+            return Err("executable_changed_during_read");
+        }
+        let hash = hex::encode(hash.finalize());
+        // Cache one fingerprint per path; bound retained versions across upgrades.
+        const MAX_EXECUTABLE_PATHS: usize = 64;
+        if self.entries.len() >= MAX_EXECUTABLE_PATHS {
+            self.entries.clear();
+        }
+        self.entries.insert(path.into(), (stamp, hash.clone()));
+        #[cfg(test)]
+        {
+            self.hashes += 1;
+        }
+        Ok(hash)
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn process(pid: u32) -> Result<ProcessIdentity, &'static str> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -306,26 +415,13 @@ fn process(pid: u32) -> Result<ProcessIdentity, &'static str> {
     if before.mtime() > info.pbi_start_tvsec as i64 {
         return Err("executable_changed_since_start");
     }
-    use sha2::Digest;
-    let mut hash = sha2::Sha256::new();
-    let mut buf = [0u8; super::EXECUTABLE_HASH_BUFFER_BYTES];
-    loop {
-        let n = file.read(&mut buf).map_err(|_| "executable_read")?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buf[..n]);
-    }
-    let after = file.metadata().map_err(|_| "executable_stat")?;
-    if (
-        before.ino(),
-        before.len(),
-        before.mtime(),
-        before.mtime_nsec(),
-    ) != (after.ino(), after.len(), after.mtime(), after.mtime_nsec())
-    {
-        return Err("executable_changed_during_read");
-    }
+    static HASHES: std::sync::OnceLock<std::sync::Mutex<ExecutableHashes>> =
+        std::sync::OnceLock::new();
+    let executable_sha256 = HASHES
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| "executable_cache_poisoned")?
+        .hash(&executable, &mut file, &before)?;
     use wait_timeout::ChildExt;
     let mut child = std::process::Command::new("/bin/ps")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
@@ -370,7 +466,7 @@ fn process(pid: u32) -> Result<ProcessIdentity, &'static str> {
         registry_start,
         instance: format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
         executable,
-        executable_sha256: hex::encode(hash.finalize()),
+        executable_sha256,
     })
 }
 
