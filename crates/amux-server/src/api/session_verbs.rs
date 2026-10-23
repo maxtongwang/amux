@@ -7736,6 +7736,14 @@ fn prior_delivered(
     .ok()
 }
 
+/// Only server-attributed owner requests may carry proof into the recorder.
+pub(crate) fn owner_input_process_origin(headers: &HeaderMap) -> Option<&str> {
+    if super::org::is_verified_local_member(headers) || !hdr_worker(headers).trim().is_empty() {
+        return None;
+    }
+    headers.get(super::process_identity::PROCESS_ORIGIN_HEADER).and_then(|v| v.to_str().ok())
+}
+
 pub(crate) async fn cmd_hist_record_full(
     state: &AppState,
     session: &str,
@@ -7907,8 +7915,6 @@ pub(crate) async fn cmd_hist_record_with_id(
     if session.is_empty() || text.is_empty() {
         return 0;
     }
-    // Every typed reply reaches explicit request correlation, including a
-    // plain yes with no request ID (Max 2026-10-23, ai-config #160).
     if ctype == "user" {
         spawn_task_title(session, text);
     }
@@ -7921,10 +7927,10 @@ pub(crate) async fn cmd_hist_record_with_id(
     let submit_verdict = meta.submit_verdict.map(|v| v.to_string());
     let queued_at_ms = meta.queued_at_ms;
     let repeat_of = meta.repeat_of;
-    // Only the two owner verdicts are stored; anything else is not evidence.
+    // Forwarded owner input can correlate; it still cannot prove direct Remote approval.
     let process_origin = meta
         .process_origin
-        .filter(|v| matches!(*v, "outside" | "remote"))
+        .filter(|v| matches!(*v, "outside" | "remote" | "remote-forwarded"))
         .map(str::to_string);
     // Bounded, and only if it parses as a JSON OBJECT. This lands in a column
     // the Messages tab renders and the Ask panel feeds to a model, so a client
@@ -8228,6 +8234,8 @@ pub(crate) async fn cmd_hist_record_with_id(
     }
     let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
     if row_id > 0 {
+        // Single post-recording resolution point for pane, send, Chat and steering.
+        // on_row reserves replies idempotently in the Store writer transaction.
         Box::pin(super::delegation_grants::on_row(state, row_id)).await;
     }
     row_id
@@ -25486,14 +25494,8 @@ async fn dispatch(
     if let Some(worker) = super::chat_worker::companion_parent(&name) {
         let worker = worker.to_string();
         let receipt = qs_get(&qs, "msg_id");
-        let caller = headers
-            .get("x-amux-session")
-            .or_else(|| headers.get("x-amux-worker"))
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
         return super::chat_worker::companion_route(
-            &state, &worker, method == Method::POST, &action, receipt, &body, &caller,
+            &state, &worker, method == Method::POST, &action, receipt, &body, &headers,
         )
         .await;
     }
@@ -27380,7 +27382,10 @@ pub(crate) async fn steer_mutate(
                 history_type,
                 history_origin,
                 skip_board,
-                DeliveryMeta::queued(now_i64() * 1000),
+                DeliveryMeta {
+                    process_origin: owner_input_process_origin(headers),
+                    ..DeliveryMeta::queued(now_i64() * 1000)
+                },
             )
             .await;
             if let Some(peer)=native_peer.as_ref() {note_history_msg_id(state,row_id,&peer.message_id).await;}
@@ -29166,14 +29171,18 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
         {
             Ok(result) => {
                 if result.disposition == StableEnqueueDisposition::New {
+                    let caller = hdr_worker(headers);
                     let row_id = cmd_hist_record_with_id(
                         state,
                         name,
                         &orig_text,
-                        "user",
-                        member_actor.as_deref().unwrap_or(""),
+                        if caller.is_empty() && origin.is_empty() { "user" } else { "session" },
+                        member_actor.as_deref().unwrap_or(if caller.is_empty() { &origin } else { &caller }),
                         true,
-                        DeliveryMeta::queued(now_i64() * 1000),
+                        DeliveryMeta {
+                            process_origin: owner_input_process_origin(headers),
+                            ..DeliveryMeta::queued(now_i64() * 1000)
+                        },
                     )
                     .await;
                     link_queued_message(state, name, row_id, &result.id).await;
@@ -29431,13 +29440,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             // The process verdict, recorded only for the OWNER's own send: no
             // member actor and no worker identity (a worker pane's request
             // carries its worker header after attribution, whatever it sent).
-            let process_origin = if member_actor.is_none() && hdr_worker(headers).trim().is_empty() {
-                headers
-                    .get(super::process_identity::PROCESS_ORIGIN_HEADER)
-                    .and_then(|v| v.to_str().ok())
-            } else {
-                None
-            };
+            let process_origin = owner_input_process_origin(headers);
             tracing::info!(session = %name, process_origin = process_origin.unwrap_or(""),
                 forwarded = process_origin == Some(super::process_identity::REMOTE_FORWARDED),
                 verdict = "owner_send_process_origin", measured = true, n_considered = 1,

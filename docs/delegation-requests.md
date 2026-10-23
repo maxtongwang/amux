@@ -62,6 +62,29 @@ a direct Remote owner send. Passkey mode requires direct Remote owner proof for
 every application; a pane reply alone does not apply it. Text such as
 `amux grant CODE` is no longer an affirmative or an approval selector.
 
+## Owner input routes
+
+All recorded replies converge on `cmd_hist_record_with_id` →
+`delegation_grants::on_row` → `delegation_requests::resolve_observed`.
+The resolution transaction reserves each reply once, including no-candidate
+outcomes. Reading a request can reconcile a missed resolution, so hook tests
+check the committed resolution before any API read can repair it.
+
+| Entry point | Recording and resolution |
+| --- | --- |
+| Native pane input, provider Remote Control, raw terminal/keys input | Applied `UserPromptSubmit` on `/api/sessions/{name}/report` → `pane_prompts::record`; human pane provenance resolves. The hook must include `state="active"`; HTTP 200 with `applied=false` is an ignored observation. Disabled pane history and isolated status-only hooks intentionally do not record input |
+| Dashboard, phone/Remote, owner CLI `/send`; worker-ID send alias | Recorded direct/queued sends retain verified owner process provenance and resolve; chat-type workers use this path too |
+| Chat tab `/api/sessions/{worker}@chat/send` | Records a `chat` row in the parent worker's Messages with direct delivery and verified owner provenance; resolves requests shown in that parent session |
+| Owner `/steer`, including next-turn UI replies | With history recording enabled, records queued owner provenance and resolves |
+| Project executor `/send` | Records queued owner provenance before the project steering projection; resolves. Peer input retains session-message provenance |
+| Approve button `/api/delegation/grants/{id}/approve` | Applies the selected request through its separate direct Remote proof gate; does not synthesize a typed reply |
+
+Process provenance is taken only from server-attributed owner requests.
+Workers and invited members receive no owner proof. `outside`, `remote`, and
+`remote-forwarded` owner replies can correlate; only `remote` proves direct
+Remote application. No-history sends, board intake, failed/stuck sends,
+automation and peer messages cannot supply typed approval evidence.
+
 ## Records and refusals
 
 Migration **0129** extends `_amux_delegation_grants`; its primary-key `code` is
