@@ -2737,7 +2737,23 @@ mod usage_report_tests {
         steering_delivery(&conn, "s2", "cron", now - 200, "sched:SCHED-456", "");
         ledger_row(&conn, "cron", now - 60, 2.0);
 
-        let md = render_usage_report(&conn, 1, 25, now).unwrap();
+        // Distinct token totals keep the monetary attribution observable after
+        // repricing. Stored dollars deliberately disagree with configured rates.
+        const INPUT_TOKENS_PER_SHARE: i64 = 100_000;
+        for (session, shares) in [("amux", 4), ("solo", 1), ("cron", 2)] {
+            conn.execute(
+                "UPDATE token_ledger SET input=?1, output=0 WHERE session=?2",
+                rusqlite::params![shares * INPUT_TOKENS_PER_SHARE, session],
+            )
+            .unwrap();
+        }
+        let scope = super::super::observability::Scope {
+            since: now - 86_400,
+            until: now + 1,
+            ..Default::default()
+        };
+        let prices = vec![("opus".to_string(), [1.0, 0.0, 0.0, 0.0])];
+        let md = super::render_scoped_usage_report(&conn, &scope, 1, 25, &prices).unwrap();
         let keys = source_keys(&md);
         assert!(
             keys.contains(&"steer:board-drive".to_string()),
@@ -2756,20 +2772,32 @@ mod usage_report_tests {
             "not one bucket per schedule id: {keys:?}"
         );
 
-        // And the money moved with it: $4 of nudge-driven spend that used to be
-        // filed under the human prompt.
+        // Money follows the same source as tokens, using configured rates rather
+        // than stored cost_usd: $0.40 nudge, $0.10 human and $0.20 schedule.
         let section = md.split("## By what triggered the turn").nth(1).unwrap();
         let section = section.split("\n## ").next().unwrap_or(section);
         let nudge_line = section
             .lines()
             .find(|l| l.starts_with("| steer:board-drive"))
             .unwrap();
-        assert!(nudge_line.contains("$4.00"), "{nudge_line}");
-        let human_line = section.lines().find(|l| l.starts_with("| user")).unwrap();
-        assert!(
-            human_line.contains("$1.00"),
-            "only the lane that really typed it: {human_line}"
+        assert_eq!(
+            nudge_line,
+            "| steer:board-drive | $0.40 | 57.1% | 400,000 | 1 |"
         );
+        let human_line = section.lines().find(|l| l.starts_with("| user")).unwrap();
+        assert_eq!(
+            human_line, "| user | $0.10 | 14.3% | 100,000 | 1 |",
+            "only the lane that really typed it"
+        );
+        let schedule_line = section
+            .lines()
+            .find(|l| l.starts_with("| steer:sched |"))
+            .unwrap();
+        assert_eq!(
+            schedule_line,
+            "| steer:sched | $0.20 | 28.6% | 200,000 | 1 |"
+        );
+        assert!(md.contains("$0.70 across 3 API responses"), "{md}");
     }
 
     /// A steering row OLDER than the lane's newest prompt must not win: the rule
