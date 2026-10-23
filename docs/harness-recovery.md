@@ -37,6 +37,26 @@ consecutive failures, recoveries and the last failure time. Review, pre-review,
 verification and land tasks release their live-task claims even after a panic.
 Their next pass re-reads durable state before acting.
 
+## Held message claims
+
+Capture-off and isolated intake persist `claimed_at_ms` in `intake_result`
+when clearing `capture_pending`. The message-capture tick releases claims
+older than 60 seconds only when delivery is still `board`, no card is linked,
+and the intake state is `board_capture_off` or `isolated`. It ignores missing
+or malformed claim timestamps. The durable outbox identity
+`board-conversation-<message id>` prevents a second delivery if the original
+capture finishes late or the server dies between enqueue and receipt marking.
+A recovering sweep logs `held_message_release_recovered`, `n`, and
+`measured=true`.
+
+The `held_claim_` tests in `api::session_verbs::tests` cover Store reopen at
+the capture gate and a live claimant overtaken by recovery. The message-capture
+unit tests cover every sweep predicate and its aggregate log fields.
+`restart_persistence::held_claim_recovers_after_process_sigkill` uses an
+outbox write fault, real SIGKILL, loopback binding and fake tmux; unrelated
+background jobs are disabled. It honors `AMUX_RESTART_BIN` through the existing
+restart rig and runs as part of `scripts/test-harness-recovery.sh`.
+
 ## Orchestration ownership
 
 A native project's `project_group` remains its durable board owner. Legacy
