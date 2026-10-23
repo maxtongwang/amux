@@ -7,11 +7,11 @@
 //! #18 design review):
 //! - owner: any action.
 //! - lead of team T (CC_ORCHESTRATOR=1 AND `leads`): create in T (never
-//!   untagged; never with yolo, flags, isolated or creator); rename, stop and
-//!   tags within {T} on a T worker that is not a peer lead; team rules for T;
-//!   model/effort on a T worker. Tag changes touching `leads`, another team,
-//!   mrpopo or a peer lead are refused even with a max_ref. Any other config
-//!   field, group config, settings and guards are refused.
+//!   untagged; never with yolo, flags, isolated or creator); rename and stop
+//!   a T worker that is not a peer lead; tag changes only through a cited
+//!   grant (no-ops refused); team rules for T; model/effort on a T worker.
+//!   Adding or removing `leads` is refused even with a cited pair. Any other
+//!   config field, group config, settings and guards are refused.
 //! - a `leads` member without CC_ORCHESTRATOR is not a lead, and
 //!   CC_ORCHESTRATOR is never a lead's or a worker's to set.
 //! - self: an explicit env allowlist (model/effort, ...); owner-only keys
@@ -190,34 +190,57 @@ async fn a_lead_renamed_workers_token_still_validates() {
 }
 
 #[tokio::test]
-async fn lead_sets_tags_within_its_team_and_never_widens() {
+async fn lead_changes_tags_only_through_a_cited_grant_and_never_makes_a_lead() {
     let e = setup().await;
     let lead = Who::Worker(DEV_LEAD);
 
+    let before = e.tags(DEV_A);
     let (st, v) = e.call(lead, "PATCH", &cfg(DEV_A), Some(json!({"tags": "dev"}))).await;
-    assert_allowed(st, &v, "lead keeps a T worker inside {T}");
+    assert_code(st, &v, "delegation_not_allowed", "lead no-op tag change");
+    assert_eq!(e.tags(DEV_A), before, "refused no-op changed tags");
+    let before = e.tags(DEV_B);
     let (st, v) = e.call(lead, "PATCH", &cfg(DEV_B), Some(json!({"tags": ""}))).await;
-    assert_allowed(st, &v, "lead removes T");
+    assert_code(st, &v, "cite_missing", "lead removes T without a citation");
+    assert_eq!(e.tags(DEV_B), before, "uncited removal changed tags");
+    assert_eq!(e.latest_grant(), "", "refused tag changes record no grant");
+
+    let t = now_s() - 120.0;
+    let a = e.seed_row(MAX_PANE, &format!("Max, may I remove the dev tag from {DEV_B}'s tags?"), "session", DEV_LEAD, Some("direct"), t);
+    let r = e.seed_pane_prompt(MAX_PANE, "yes", t + 30.0);
+    let (st, v) = e.call(lead, "PATCH", &cfg(DEV_B), Some(json!({"tags": "", "cite": {"ask_row_id": a, "reply_row_id": r}}))).await;
+    assert_allowed(st, &v, "lead removes T through a cited grant");
+    let grant = e.latest_grant();
+    assert_eq!(e.grant_status(&grant), "applied", "cited tag removal is an applied grant");
     assert!(e.tags(DEV_B).is_empty(), "{:?}", e.tags(DEV_B));
 
-    // Refused without a max_ref, and still refused with Max's typed
-    // instruction in the lead's own pane.
+    // Keep every widening/privileged-target case: an own-pane instruction
+    // cannot replace a cited pair, and changing `leads` is never delegable.
     let t = now_s() - 60.0;
-    for (target, tags, ctx) in [
-        (DEV_A, "dev,leads", "adds leads"),
-        (DEV_A, "dev,ops", "adds another team's tag"),
-        (OPS_A, "ops,dev", "pulls another team's worker into T"),
-        (MRPOPO, "leads,dev", "touches mrpopo"),
-        (DEV_LEAD2, "dev", "touches a peer lead"),
+    for (target, tags, ctx, code) in [
+        (DEV_A, "dev,leads", "adds leads", "worker_group_membership_refused"),
+        (DEV_A, "dev,ops", "adds another team's tag", "cite_missing"),
+        (OPS_A, "ops,dev", "pulls another team's worker into T", "cite_missing"),
+        (MRPOPO, "leads,dev", "touches mrpopo", "cite_missing"),
+        (DEV_LEAD2, "dev", "touches a peer lead", "worker_group_membership_refused"),
     ] {
         e.seed_pane_prompt(DEV_LEAD, &format!("set {target} tags to {tags}"), t);
         let before = e.tags(target);
         let (st, v) = e.call(lead, "PATCH", &cfg(target), Some(json!({"tags": tags}))).await;
-        assert_refused(st, &v, &format!("lead {ctx}"));
+        assert_code(st, &v, code, &format!("lead {ctx}"));
         let (st, v) = e.call(lead, "PATCH", &cfg(target), Some(with_ref(json!({"tags": tags}), max_ref(DEV_LEAD, t), "Max asked"))).await;
-        assert_refused_regardless_of_max_ref(st, &v, &format!("lead {ctx} with max_ref"));
+        assert_code(st, &v, code, &format!("lead {ctx} with max_ref"));
         assert_eq!(e.tags(target), before, "lead {ctx}: refused change wrote tags");
     }
+
+    // Even a qualifying pair cannot authorize a lead to add `leads`.
+    let t = now_s() - 30.0;
+    let a = e.seed_row(MAX_PANE, &format!("Max, may I set {DEV_A}'s tags to dev,leads?"), "session", DEV_LEAD, Some("direct"), t);
+    let r = e.seed_pane_prompt(MAX_PANE, "yes", t + 10.0);
+    let before = e.tags(DEV_A);
+    let (st, v) = e.call(lead, "PATCH", &cfg(DEV_A), Some(json!({"tags": "dev,leads", "cite": {"ask_row_id": a, "reply_row_id": r}}))).await;
+    assert_code(st, &v, "worker_group_membership_refused", "lead adds leads with a citation");
+    assert_eq!(e.tags(DEV_A), before, "cited lead promotion changed tags");
+    assert_eq!(e.latest_grant(), grant, "refused lead promotion records no new grant");
 }
 
 // ---- lead of team T: rules, config ------------------------------------------
