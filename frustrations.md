@@ -6183,4 +6183,4 @@ SESSION: mrpopo (reported 2026-10-22/23)
 CARD: #194
 SYMPTOM: Earlier relay text remained in dev-lead, business-lead and mrpopo input boxes until a human pressed Enter; the watcher only recognised one expanded delivery, expired after 30 minutes and could not recover from an already-stamped stuck composer.
 COST: Repeated manual Enter presses to resume ordinary relay delivery; elapsed time not recorded.
-FIX: This branch adds ordered whole-composer ownership, sized-chip matching and bounded idle rearming. See docs/incidents/2026-10-23-held-relay-submit.md; Cargo and private-tmux execution remain blocked by the verification target lock, so validation is pending.
+FIX: PR #66 review fixes require correctly positioned server origin stamps for expanded text and chips, retain the 30-minute candidate window, persist a three-Enter recovery cap, and reconcile all rows in combined submissions. Extracted production-core/SQLite regressions and mutations are recorded in docs/incidents/2026-10-23-held-relay-submit.md; whole-crate verification for this revision is unavailable because the sandbox denies the Cargo target lease. No re-arm claim or whole-crate pass is made.

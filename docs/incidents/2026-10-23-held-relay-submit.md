@@ -34,36 +34,44 @@ Code inspection found three independent recovery gaps: the watcher accepted only
 
 ## Implementation and limits
 
-- Consume complete recent history deliveries in chronological order, at most once per row, with exact coverage of the entire composer. Support expanded/wrapped text and each delivery's sized Claude/Codex paste chip. Owner prefixes, suffixes, punctuation and text between relays refuse submission. No substring ownership matching is introduced; history's word-boundary rules are unchanged.
-- Preserve the eight-character floor, including the existing single-chip recognition path. A size-less `[Pasted text #N]` is not proof of its hidden content and remains protected.
-- Use one watcher per lane and the existing send lock; cancellation releases its lane claim. Every idle Enter follows a fresh ownership/generation/picker check. Verification gets no hidden retry; a dropped Enter returns through the same checks on the next iteration. Slash deliveries are ineligible.
-- Re-arm at the next idle after each 30-minute window, within a six-hour watch budget. Durable recovery reads at most 32 eligible history rows from six hours and runs on every eligible idle sweep, including when a stuck stamp already exists. Combined delivery recognition authorises Enter, not Ctrl-U.
-- Log observed state transitions with `recovered_from_history` and `collapsed_display`, plus explicit composer mismatch, rearm, unconfirmed Enter and budget-exhausted verdicts. Preserve owner text and existing receipt truth.
+PR #66 review of `c5f8955` reproduced an owner paste being claimed by its line count, and the same problem with an owner copying the relay's bare body. The unsubmitted history row was not proof of composer ownership. The review also found incomplete batch reconciliation and an unlimited Enter loop. This revision addresses those findings:
+
+- Require the expected server-generated `[amux-origin: ...]` prefix in position for every recovered delivery, expanded or chipped. Bare chips and bare bodies remain owner text even when their bytes or dimensions match history. This applies to the sweep, watcher fallback, backoff, verifier retry, steering/project rescue, Ctrl-U eligibility and delivered-duplicate clearing. Fresh explicit sends still deliver the owner's requested text.
+- Consume entire stamped deliveries in chronological order, once per row, covering the complete composer. Extra owner text, incorrect stamps, reversed order, extra duplicates, slash commands and unknown-size chips refuse recovery. One watcher per lane and the send lock protect capture, ownership checks, Enter and verification.
+- Keep main's 30-minute candidate window (`HELD_RELAY_WINDOW_S`), including direct-send fallback age. Each watcher also stops after 30 minutes. An eligible idle sweep may start a replacement watcher; this does not renew history eligibility. The former “re-arm” merely renewed a log deadline and has been removed.
+- Limit recovery to three Enters per held sequence (`HELD_RELAY_MAX_ENTER_ATTEMPTS`), shared by retry/rescue/watch paths. Persist hashed sequence counts in lane metadata before pressing, including across watcher respawns and server restarts. Persistence failure refuses Enter. Reaching the cap records `held_relay_enter_cap_reached` at WARN once; subsequent exhausted sweeps do not reset the counter or repeat that warning. Unconfirmed attempts are INFO.
+- Reconcile every history row covered by a combined submission, including `stuck`, `deferred`, `unverified` and queued rows. Match ordered expanded bytes from provider submission evidence, stripping transport paste wrappers. One occurrence still settles one of two identical sends. A confirmed watcher also invokes reconciliation. Keep `reconciled_at` as inferred delivery evidence, rather than an original send receipt.
 
 ## Verification evidence
 
-The committed `relay_idle_submit_tests` cover ordered relays, once-per-row consumption, owner words and punctuation at all positions, short/slash text, wrapped/chipped displays, generation/pickers, age/row/lane scoping, cancellation cleanup and the former deadline. The explicit private-tmux route replay calls the real `send_post` and sweep: a new send parks behind relays older than 30 minutes, an existing stuck stamp recovers, the first Enter drops, the next submits, and owner/slash/picker cases receive no keys. It uses `tmux_command()` and the test-build private socket, temp home/database/files, no model.
+The first review ran Cargo in an isolated environment on the reviewed SHA: relay tests passed and `tmux_target_audit` passed 3/3. The `c5f8955` commit separately records clean clippy. Its broader selected library run reported 163 passed, 1 failed, 3 ignored; the failure was `stop_route_interrupts_busy_tools_without_waiting_for_composer_commands`, also known on main. Those results describe the reviewed SHA, not this revision.
 
-Cargo did not acquire the mandated target directory's build lock. No Cargo compilation or unit/route execution completed. Attempts used `CARGO_TARGET_DIR=$HOME/.amux/rust-build-target/verification`, `AMUX_HOME=/private/tmp/amux-stuck-relay-cargo`, `AMUX_CARGO_MAX_SECONDS=30` (60 for the final test attempt), and `scripts/safe-cargo.sh`:
+This revision uses the committed `scripts/test-held-relay-review.py`. It extracts the actual production functions and in-tree assertions, compiles them with `rustc --test` and cached dependencies, and runs real SQLite queries against a scratch database. Only the Store/event/home adapters are replaced. It does not validate whole-crate wiring, real tmux, or the running server. The cap wiring assertion inspects each recovery call site before its Enter; it is a source assertion, not an async keystroke replay.
 
-| Command after wrapper | Result |
+The command prefix for verification here is:
+
+```bash
+AMUX_HOME=<scratch>/home AMUX_ISOLATED_NO_SANDBOX=1 \
+CARGO_TARGET_DIR=$HOME/.amux/rust-build-target \
+~/.local/bin/amux-isolated <command>
+```
+
+The existing session sandbox stays active. The wrapper's nested `sandbox-exec` was unavailable (`sandbox_apply: Operation not permitted`, exit 71); no permission override was used. Cargo attempts additionally put a scratch refusal stub first on PATH so they cannot invoke real tmux.
+
+| Command after prefix | Result on this revision |
 | --- | --- |
-| `check --workspace --offline` | Exit 124; blocked on build-directory lock, before compilation |
-| `test -p amux-server --lib relay_idle_submit_tests --offline -- --include-ignored --nocapture` | Exit 124; blocked on build-directory lock, no tests run |
-| `clippy --workspace --all-targets --offline -- -D warnings` | Exit 124; blocked on build-directory lock, no lint result |
-
-The sandbox also denies the budget wrapper's `ps` probe; the wrapper explicitly reported those measurements unavailable and retained its timeout. Early unbounded attempts were interrupted (130), not reported as failures of Rust code. The first receipt write was refused by the sandbox; subsequent attempts routed receipts to the temp home.
-
-A separate `rustc --test` check extracts the actual pure functions and five committed assertions, linking the existing cached regex dependency. Its local driver is `/private/tmp/relay194-proof/extract.py`; it does not replace whole-crate checks:
-
-| Command | Result |
-| --- | --- |
-| `python3 /private/tmp/relay194-proof/extract.py --baseline` | 2 core regression assertions fail against the pre-fix matcher (0 passed, 2 failed) |
-| `python3 /private/tmp/relay194-proof/extract.py` | 5 passed, 0 failed |
-| `scripts/mutate.sh run crates/amux-server/src/api/session_verbs.rs 'rows.iter().take(32).rev()' 'rows.iter().take(1).rev()' -- python3 /private/tmp/relay194-proof/extract.py` | Mutation landed; ordered and chip-sequence assertions failed; inverse mutation restored source |
-| `scripts/mutate.sh run crates/amux-server/src/api/session_verbs.rs 'if want.chars().count() < 8 {' 'if want.chars().count() < 1 {' -- python3 /private/tmp/relay194-proof/extract.py` | Mutation landed; short-text assertion failed; inverse mutation restored source |
-| `scripts/mutate.sh run crates/amux-server/src/api/session_verbs.rs 'if !idle || now < *deadline {' 'if now < *deadline {' -- python3 /private/tmp/relay194-proof/extract.py` | Mutation landed; busy-to-idle rearm assertion failed; inverse mutation restored source |
-| `rustfmt --edition 2021 --emit stdout crates/amux-server/src/api/session_verbs.rs > /private/tmp/relay194-rustfmt.rs` | Exit 0, Rust source parsed; emitted formatting was not applied to unrelated code |
+| `python3 scripts/test-held-relay-review.py --source-ref c5f8955 --case <six regression cases>` | 0 passed, 6 failed (exit 101): chip, plain copy, combined pure/SQLite receipts, watch bound and cap wiring |
+| `python3 scripts/test-held-relay-review.py` | 13 passed, 0 failed; actual extracted functions and SQL, scratch adapters |
+| `python3 scripts/test-held-relay-review.py --mutations` | 11 mutations killed by their named assertions with exit 101; driver exit 0; each inverse restored the production source hash |
+| `scripts/safe-cargo.sh check --workspace --offline` | Unavailable: target guard cannot open its lease beside the mandated target (exit 75), before compilation |
+| `scripts/safe-cargo.sh test -p amux-server --lib --offline` | Unavailable for the same lease denial (exit 75), no full library tests executed |
+| `scripts/safe-cargo.sh test -p amux-server --test tmux_target_audit --offline` | Unavailable for the same lease denial (exit 75), no integration tests executed |
+| `scripts/safe-cargo.sh clippy --workspace --all-targets --offline -- -D warnings` | Unavailable for the same lease denial (exit 75), no lint verdict |
+| `rustfmt --edition 2021 --emit stdout crates/amux-server/src/api/session_verbs.rs > <scratch>/parsed.rs` | Exit 0; Rust source parses |
 | `git diff --check` | Exit 0 |
 
-Class sweep: every call to `verify_submitted`, `retry_held_idle_draft` and `spawn_direct_draft_idle_submit`; sweep restart; exact single-delivery and chip matching; both provider chip formats; unchanged owner/history word-boundary semantics. No push, deployment, live tmux or port access. GitHub remote-tip verification was unavailable (`Could not resolve host: github.com`); GitNexus tooling/index is unavailable. The frustrations audit found 409 entries and 0 structural problems; its optional board probe was refused by the sandbox before connecting. The orchestrator must run the queued Cargo checks and private-tmux replay before publishing.
+The six `--case` names, in order, are `owner_chip_matching_a_relay_line_count_never_authorises_keys`, `owner_plain_copy_never_authorises_keys_and_stamps_must_be_in_position`, `combined_receipt_consumes_only_the_submitted_sequence`, `combined_enter_reconciles_each_held_verdict_and_excludes_other_rows`, `history_and_watch_window_remain_thirty_minutes`, and `every_recovery_enter_reserves_the_shared_sequence_budget`.
+
+Mutation coverage: remove the chip's expected stamp prefix; allow the bare body for exact matching; reject valid stamped relays; allow a fourth Enter; remove the watcher's cap reservation; reconcile only one row; omit deferred/unverified candidates; refuse deferred/unverified updates; widen the candidate window to six hours; allow Enter after an attempt persistence failure; and suppress the cap warning. The cap assertion counts actual emitted verdicts, including repeated exhausted sweeps. Each targets its own named case, including a real SQLite assertion for both query mutations.
+
+Class sweep: all `verify_submitted`, `retry_held_idle_draft`, `spawn_direct_draft_idle_submit`, steering/project draft rescue, held-delivery matcher and duplicate-clear callers; both Claude and Codex chip formats; bare/quoted/wrong-position stamps; mixed held verdicts; lane, age and duplicate-row scope. No live tmux, server port, fleet-state write, push or deployment. No private-tmux replay was run because Cargo could not build this revision. Remote-tip verification failed DNS resolution for github.com; GitNexus/index is unavailable.

@@ -9837,20 +9837,36 @@ async fn note_history_msg_id(state: &AppState, row_id: i64, msg_id: &str) {
 /// Recent `cmd_history` rows recorded as stuck whose text is the prompt the
 /// provider just reported submitted. Pure over the candidate rows.
 pub(crate) fn stuck_rows_matching(prompt: &str, candidates: &[(i64, String)]) -> Vec<i64> {
-    let norm = super::pane_prompts::normalize(prompt);
-    if norm.chars().count() < 8 {
+    let norm = super::pane_prompts::normalize(&transcript_unwrap(prompt));
+    if norm.chars().count() < 8 || norm.len() > 256 * 1024 {
         return vec![];
     }
-    // ONE SUBMITTED PROMPT SETTLES ONE ROW. Two identical messages stuck
-    // or queued for the same lane are two sends; a single submission must not
-    // confirm both (dev-lead 2026-10-17: each send gets only its own receipt).
-    // Candidates are newest first; the newest match is the one in the box.
-    candidates
-        .iter()
+    // Consume each row once in send order. Retain all offsets so overlapping
+    // messages cannot hide a complete sequence; newest identical sends win.
+    let mut matched = std::collections::BTreeMap::from([(0usize, Vec::new())]);
+    for (id, text) in candidates.iter().rev() {
+        let want = super::pane_prompts::normalize(&transcript_unwrap(text));
+        if want.chars().count() < 8 { continue; }
+        let mut next = matched.clone();
+        for (&offset, prior) in &matched {
+            let Some(rest) = norm[offset..].strip_prefix(&want) else { continue; };
+            if !rest.is_empty() && !rest.starts_with(' ') { continue; }
+            let end = norm.len() - rest.trim_start().len();
+            let mut ids = prior.clone();
+            ids.push(*id);
+            next.insert(end, ids);
+        }
+        if next.len() > 128 { return vec![]; }
+        matched = next;
+    }
+    if let Some(ids) = matched.remove(&norm.len()) {
+        return ids;
+    }
+    // Legacy provider prompts may include a timestamp/wrapper. Preserve the
+    // existing single-row inference, never infer a batch by containment.
+    candidates.iter()
         .filter(|(_, text)| super::pane_prompts::same_text(&norm, &super::pane_prompts::normalize(text)))
-        .map(|(id, _)| *id)
-        .take(1)
-        .collect()
+        .map(|(id, _)| *id).take(1).collect()
 }
 
 /// A MESSAGE RECORDED STUCK THAT LATER WENT IN IS DELIVERED (AMUX-5463).
@@ -9879,13 +9895,17 @@ pub(crate) async fn reconcile_stuck_on_submit(state: &AppState, session: &str, p
         .and_then(|c| {
             let mut st = c
                 .prepare(
-                    "SELECT id, text FROM cmd_history WHERE session=?1 \
-                     AND (submit_verdict='stuck' OR (delivery='queued' AND delivered_at IS NULL)) \
-                     AND ts>?2 ORDER BY id DESC LIMIT 16",
+                    "SELECT id, text, origin FROM cmd_history WHERE session=?1 \
+                     AND (submit_verdict IN ('stuck','deferred','unverified') OR (delivery='queued' AND delivered_at IS NULL)) \
+                     AND ts>?2 ORDER BY id DESC LIMIT 32",
                 )
                 .ok()?;
             let rows = st
-                .query_map(rusqlite::params![session, since_ms], |r| Ok((r.get(0)?, r.get(1)?)))
+                .query_map(rusqlite::params![session, since_ms], |r| {
+                    let text: String = r.get(1)?;
+                    let origin: String = r.get(2)?;
+                    Ok((r.get(0)?, stamped_held_delivery(&text, &origin, session).unwrap_or(text)))
+                })
                 .ok()?;
             Some(rows.flatten().collect())
         })
@@ -9902,7 +9922,7 @@ pub(crate) async fn reconcile_stuck_on_submit(state: &AppState, session: &str, p
             for id in &write_ids {
                 let n = conn.execute(
                     "UPDATE cmd_history SET submit_verdict='confirmed', delivered_at=COALESCE(delivered_at, ?2), \
-                     reconciled_at=?2 WHERE id=?1 AND (submit_verdict='stuck' OR (delivery='queued' AND delivered_at IS NULL))",
+                     reconciled_at=?2 WHERE id=?1 AND (submit_verdict IN ('stuck','deferred','unverified') OR (delivery='queued' AND delivered_at IS NULL))",
                     rusqlite::params![id, at],
                 )?;
                 if n == 1 {
@@ -10682,7 +10702,7 @@ async fn draft_in_the_way(
 /// clears or submits it. Rows are the lane's recent history still recorded as
 /// unsubmitted; a peer message is compared in its stamped form, as typed.
 fn held_amux_delivery(state: &AppState, name: &str, draft: &str) -> Option<String> {
-    let since_ms = (now_i64() - 1800) * 1000;
+    let since_ms = (now_i64() - HELD_RELAY_WINDOW_S) * 1000;
     let rows: Vec<(String, String)> = state
         .store
         .read()
@@ -10705,9 +10725,9 @@ fn held_amux_delivery(state: &AppState, name: &str, draft: &str) -> Option<Strin
 }
 
 /// Whether `draft` is a message amux itself delivered to this lane in the last
-/// six hours (any path but a prompt typed into the pane).
+/// 30 minutes (any path but a prompt typed into the pane).
 fn amux_delivered_text(state: &AppState, name: &str, draft: &str) -> bool {
-    let since_ms = (now_i64() - 6 * 3600) * 1000;
+    let since_ms = (now_i64() - HELD_RELAY_WINDOW_S) * 1000;
     let rows: Vec<(String, String)> = state
         .store
         .read()
@@ -10730,27 +10750,8 @@ fn amux_delivered_text(state: &AppState, name: &str, draft: &str) -> bool {
 
 /// Pure core of [`held_amux_delivery`]: `rows` are `(text, origin)`.
 pub(crate) fn held_delivery_matching(draft: &str, name: &str, rows: &[(String, String)]) -> Option<String> {
-    let exact = rows.iter().find_map(|(text, origin)| {
-        let stamped = origin_stamped(origin, name, text);
-        std::iter::once(text.clone())
-            .chain(stamped)
-            .find(|t| composer_holds_this_delivery(draft, t))
-    });
-    // A COLLAPSED PASTE HIDES ITS TEXT (AMUX-5463: 5 of 8 stuck messages read
-    // as a chip). The chip still carries its size: Claude's `+M lines` (the
-    // lines after the first) or Codex's `N chars`. The newest unsubmitted row
-    // of that size, behind the same typed prefix, is the one in the box.
-    exact.or_else(|| {
-        rows.iter().find_map(|(text, origin)| {
-            let sent = origin_stamped(origin, name, text).unwrap_or_else(|| text.clone());
-            if sent.chars().filter(|c| !c.is_whitespace()).count() < 8 {
-                return None;
-            }
-            let (prefix, body) = delivery_parts(&sent);
-            let prefix_sq: String = prefix.split_whitespace().collect();
-            let chip = draft.strip_prefix(prefix_sq.as_str())?;
-            paste_chip_fits(chip, &body).then_some(sent)
-        })
+    rows.iter().find_map(|row| {
+        held_composer_delivery_matching(draft, name, std::slice::from_ref(row))
     })
 }
 
@@ -10781,9 +10782,7 @@ fn project_execution_composer_owns_text(raw: &str, text: &str) -> bool {
     let Some(pending) = state.typed() else {
         return false;
     };
-    let tail = send_tail_squashed(text);
-    let pending_sq: String = pending.split_whitespace().collect();
-    !tail.is_empty() && pending_sq.contains(&tail)
+    held_composer_delivery_matching(pending, "", &[(text.into(), String::new())]).is_some()
 }
 
 /// Codex's model/path line is footer chrome, not a continuation of the input.
@@ -11648,10 +11647,14 @@ pub(crate) fn jsonl_content_matches(content: &str, needle: &str) -> bool {
 /// Transcript text with Claude Code's `<pasted_content ...>` wrapper tags
 /// removed and all whitespace dropped: what was typed plus what was pasted.
 fn transcript_squash(s: &str) -> String {
+    transcript_unwrap(s).split_whitespace().collect()
+}
+
+fn transcript_unwrap(s: &str) -> std::borrow::Cow<'_, str> {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| regex::Regex::new(r"</?pasted_content[^>]*>").expect("paste wrapper regex"));
-    re.replace_all(s, "").split_whitespace().collect()
+    re.replace_all(s, "")
 }
 
 /// The evidence scan itself, over already-parsed records — pure so it can be
@@ -12204,11 +12207,16 @@ async fn verify_submitted(
         // its active footer yet; bare Enter can submit/queue our pending text.
         // ...and only OUR pending text: the box must hold exactly this message
         // (or its own paste chip) right now, or the Enter is not pressed.
-        let (prefix, body) = delivery_parts(text);
-        if let ComposerOwner::Foreign(foreign) = composer_owner(&tmux_capture(name, 25).await, &prefix, &body, true) {
+        let retry_frame = tmux_capture(name, 25).await;
+        let draft = composer_state(&retry_frame);
+        if draft.typed().is_none_or(|draft| held_composer_delivery_matching(draft, "", &[(text.into(), String::new())]).is_none()) {
+            let foreign = draft.typed().unwrap_or("");
             tracing::warn!(session = %name, chars = foreign.chars().count(), measured = true, n_considered = 1,
                 verdict = "retry_enter_foreign_composer_text",
                 "the composer holds text this send did not type; retry Enter not pressed");
+            return (Submission::Stuck, retried);
+        }
+        if !reserve_held_relay_enter(name, text) {
             return (Submission::Stuck, retried);
         }
         send_key(name, "Enter").await;
@@ -12998,6 +13006,9 @@ async fn submit_project_execution_draft_if_owned(
     if let Some(reason) = project_send_hold(state, name, delivery) {
         return Some((false, reason));
     }
+    if !reserve_held_relay_enter(name, text) {
+        return Some((false, "held relay Enter cap reached or attempt could not be persisted".into()));
+    }
     tracing::warn!(
         session = %name,
         delivery_id = %id,
@@ -13026,7 +13037,8 @@ async fn submit_project_execution_draft_if_owned(
 
 /// Does the composer hold EXACTLY the message steering is delivering right now?
 ///
-/// Then the draft is amux's own earlier paste whose Enter never took (the lane
+/// Only stamped text can establish that the draft is amux's earlier paste
+/// whose Enter never took (the lane
 /// was mid-turn), not a human's unsaved thought. `steering_draft_preserved`
 /// used to protect it from its own sender: measured 2026-09-24 on amux-helper,
 /// the owner's first queued message sat pasted in the composer from 06:27 and
@@ -13035,7 +13047,16 @@ async fn submit_project_execution_draft_if_owned(
 /// above, for every steering delivery. Pure so the exact-match rule is tested.
 fn composer_holds_this_delivery(draft: &str, text: &str) -> bool {
     let want: String = text.split_whitespace().collect();
-    want.chars().count() >= 8 && draft == want
+    origin_stamp_split(text).is_some() && want.chars().count() >= 8 && draft == want
+}
+
+/// History origin or the send's full stamped bytes supply the expected prefix.
+/// Bare bodies and chips never establish composer ownership, even on equality.
+fn stamped_held_delivery(text: &str, origin: &str, name: &str) -> Option<String> {
+    if origin.is_empty() {
+        return origin_stamp_split(text).map(|_| text.to_string());
+    }
+    origin_stamped(origin, name, text)
 }
 
 fn held_composer_delivery_matching(draft: &str, name: &str, rows: &[(String, String)]) -> Option<String> {
@@ -13051,7 +13072,7 @@ fn held_composer_delivery_matching(draft: &str, name: &str, rows: &[(String, Str
             continue;
         }
         let mut next = matched.clone();
-        for sent in std::iter::once(text.clone()).chain(origin_stamped(origin, name, text)) {
+        if let Some(sent) = stamped_held_delivery(text, origin, name) {
             let want: String = sent.split_whitespace().collect();
             if want.chars().count() < 8 {
                 continue;
@@ -13061,7 +13082,7 @@ fn held_composer_delivery_matching(draft: &str, name: &str, rows: &[(String, Str
                 let end = if rest.starts_with(&want) {
                     Some(offset + want.len())
                 } else {
-                    let (prefix, body) = delivery_parts(&sent);
+                    let (prefix, body) = origin_stamp_split(&sent)?;
                     let prefix: String = prefix.split_whitespace().collect();
                     rest.strip_prefix(&prefix).and_then(|chip| {
                         let end = chip.find(']')? + 1;
@@ -13094,7 +13115,7 @@ fn held_amux_composer(state: &AppState, name: &str, draft: &str) -> Option<Strin
          AND (submit_verdict IN ('stuck','deferred','unverified') OR (delivery='queued' AND delivered_at IS NULL)) \
          ORDER BY id DESC LIMIT 32",
     ).ok()?;
-    let rows = st.query_map(rusqlite::params![name, (now_i64() - DIRECT_DRAFT_MAX_AGE_S) * 1000],
+    let rows = st.query_map(rusqlite::params![name, (now_i64() - HELD_RELAY_WINDOW_S) * 1000],
         |r| Ok((r.get(0)?, r.get(1)?))).ok()?.collect::<rusqlite::Result<Vec<(String, String)>>>().ok()?;
     held_composer_delivery_matching(draft, name, &rows)
 }
@@ -13118,6 +13139,9 @@ async fn submit_own_steering_draft(
             false,
             "this message is already pasted in the composer; the lane is mid-turn, so it is submitted at the next idle boundary".into(),
         ));
+    }
+    if !reserve_held_relay_enter(name, text) {
+        return Some((false, "held relay Enter cap reached or attempt could not be persisted".into()));
     }
     let preview = chars_truncate(&draft, 120);
     tracing::warn!(
@@ -14385,8 +14409,8 @@ fn direct_draft_watches() -> &'static std::sync::Mutex<std::collections::HashSet
 
 /// Press Enter on a direct message amux pasted mid-turn, at the lane's next
 /// idle boundary, only when its complete contents are known deliveries. Owner
-/// edits stop the watch. Re-arm at idle after 30 minutes, with a six-hour cap;
-/// every exit is a counted verdict.
+/// edits stop the watch. The 30-minute history window and persistent three-
+/// attempt cap also apply when an idle sweep starts a replacement watcher.
 /// `grace_s`: for this long an EMPTY box does not end the watch (Claude Code
 /// can clear the box and restore the text a second or more later); only the
 /// transcript recording the message, or the grace running out, does.
@@ -14543,6 +14567,9 @@ async fn retry_held_idle_draft(state: &AppState, name: &str, text: &str, sent_at
             verdict = "held_draft_retry_look", "stuck idle message: re-read before retrying Enter");
         match step {
             HeldDraftStep::PressEnter => {
+                if !reserve_held_relay_enter(name, text) {
+                    return (Submission::Stuck, presses, "enter_cap_stopped");
+                }
                 presses += 1;
                 let at = now_f64();
                 send_key(name, "Enter").await;
@@ -14568,18 +14595,46 @@ async fn retry_held_idle_draft(state: &AppState, name: &str, text: &str, sent_at
     (Submission::Stuck, presses, "still_held")
 }
 
-const DIRECT_DRAFT_MAX_AGE_S: i64 = 6 * 3600;
-const DIRECT_DRAFT_REARM_S: f64 = 1800.0;
+// Retain main's 30-minute ownership window: stale ledger rows must not
+// explain an owner's later input. Sweeps do not extend this candidate age.
+const HELD_RELAY_WINDOW_S: i64 = 30 * 60;
+// Three recovery Enters cover dropped keys without an unbounded idle loop.
+const HELD_RELAY_MAX_ENTER_ATTEMPTS: u64 = 3;
+const HELD_RELAY_ATTEMPTS_KEY: &str = "held_relay_enter_attempts";
 
 fn direct_draft_watch_budget(started: f64, now: f64) -> bool {
-    now - started < DIRECT_DRAFT_MAX_AGE_S as f64
+    now - started < HELD_RELAY_WINDOW_S as f64
 }
 
-fn direct_draft_rearm_at_idle(deadline: &mut f64, now: f64, idle: bool) -> bool {
-    if !idle || now < *deadline {
+/// Reserve before pressing, under the send lock. Persist across sweep respawns
+/// and restarts; a failed write refuses Enter. Hashes retain no message bodies.
+fn reserve_held_relay_enter(name: &str, text: &str) -> bool {
+    use sha2::Digest;
+    let key = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+    let mut meta = load_meta(name);
+    let mut attempts = meta.get(HELD_RELAY_ATTEMPTS_KEY).and_then(Value::as_object).cloned().unwrap_or_default();
+    let now = now_i64();
+    attempts.retain(|_, row| row.get("at").and_then(Value::as_i64).is_some_and(|at| now - at < HELD_RELAY_WINDOW_S));
+    let row = attempts.entry(key.clone()).or_insert_with(|| json!({"at":now,"presses":0,"warned":false}));
+    let presses = row["presses"].as_u64().unwrap_or(HELD_RELAY_MAX_ENTER_ATTEMPTS);
+    if presses >= HELD_RELAY_MAX_ENTER_ATTEMPTS {
+        if row["warned"] != true {
+            row["warned"] = json!(true);
+            meta.insert(HELD_RELAY_ATTEMPTS_KEY.into(), json!(attempts));
+            save_meta(name, &meta);
+            tracing::warn!(session = name, presses, measured = true, n_considered = 1,
+                verdict = "held_relay_enter_cap_reached", "held sequence recovery stopped after its Enter cap");
+        }
         return false;
     }
-    *deadline = now + DIRECT_DRAFT_REARM_S;
+    row["presses"] = json!(presses + 1);
+    meta.insert(HELD_RELAY_ATTEMPTS_KEY.into(), json!(attempts));
+    save_meta(name, &meta);
+    if load_meta(name).get(HELD_RELAY_ATTEMPTS_KEY) != meta.get(HELD_RELAY_ATTEMPTS_KEY) {
+        tracing::warn!(session = name, measured = false, n_considered = 1,
+            verdict = "held_relay_attempt_write_failed", "Enter refused: could not persist recovery attempt");
+        return false;
+    }
     true
 }
 
@@ -14612,7 +14667,6 @@ fn spawn_direct_draft_idle_submit(state: &AppState, name: &str, text: &str, sent
     tokio::spawn(async move {
         let _watch = watch; // cancellation/panic also releases the lane claim
         let started = now_f64();
-        let mut deadline = started + DIRECT_DRAFT_REARM_S;
         let mut last_step = None;
         let verdict: &'static str = loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -14623,6 +14677,7 @@ fn spawn_direct_draft_idle_submit(state: &AppState, name: &str, text: &str, sent
                 && (jsonl_submission_since(&name, &text, sent_at)
                     || muse_user_intent_since(&name, &text, sent_at))
             {
+                reconcile_stuck_on_submit(&state, &name, &text).await;
                 break "direct_draft_confirmed_by_transcript";
             }
             if !is_running(&name).await {
@@ -14636,8 +14691,11 @@ fn spawn_direct_draft_idle_submit(state: &AppState, name: &str, text: &str, sent
                     let history = held_amux_composer(&state, &name, &draft);
                     let recovered_from_history = history.is_some();
                     let collapsed_display = is_collapsed_paste(&draft) || draft.to_lowercase().contains("[pastedcontent");
-                    match history.or_else(||
-                        held_composer_delivery_matching(&draft, "", &[(text.clone(), String::new())])) {
+                    match history.or_else(|| {
+                        (sent_at > 0.0 && direct_draft_watch_budget(sent_at, now_f64()))
+                            .then(|| held_composer_delivery_matching(&draft, "", &[(text.clone(), String::new())]))
+                            .flatten()
+                    }) {
                         Some(held) => (held, recovered_from_history, collapsed_display),
                         None => {
                             tracing::warn!(session = %name, composer_chars = draft.chars().count(),
@@ -14663,29 +14721,28 @@ fn spawn_direct_draft_idle_submit(state: &AppState, name: &str, text: &str, sent
                     verdict = "direct_draft_idle_submit_observed", "held relay watcher state");
                 last_step = Some(step);
             }
-            let rearmed = direct_draft_rearm_at_idle(&mut deadline, now_f64(), step == HeldDraftStep::PressEnter);
             if step != HeldDraftStep::PressEnter {
                 continue;
             }
-            if rearmed {
-                tracing::warn!(session = %name, measured = true, n_considered = 1,
-                    verdict = "direct_draft_idle_submit_rearmed", "known held relays reached idle after the watch window; re-armed within the six-hour budget");
+            if !reserve_held_relay_enter(&name, &held) {
+                break "direct_draft_idle_enter_cap_stopped";
             }
             let sent_at = now_f64();
             send_key(&name, "Enter").await;
             // All retries return through the ownership/idle/picker read above.
             let (sub, _) = verify_submitted(&state, &name, &held, sent_at, false).await;
             if sub == Submission::Confirmed {
+                reconcile_stuck_on_submit(&state, &name, &held).await;
                 break "direct_draft_submitted_at_idle";
             }
-            tracing::warn!(session = %name, submission = ?sub, measured = true, n_considered = 1,
+            tracing::info!(session = %name, submission = ?sub, measured = true, n_considered = 1,
                 verdict = "direct_draft_idle_enter_not_confirmed",
                 "idle Enter on the held direct message was not confirmed; will retry while it is still there");
         };
         let preview = chars_truncate(&text, 80);
-        if matches!(verdict, "direct_draft_submitted_at_idle" | "direct_draft_left_composer" | "direct_draft_confirmed_by_transcript") {
+        if matches!(verdict, "direct_draft_submitted_at_idle" | "direct_draft_left_composer" | "direct_draft_confirmed_by_transcript" | "direct_draft_idle_enter_cap_stopped") {
             tracing::info!(session = %name, %preview, measured = true, n_considered = 1, verdict,
-                "held direct message resolved");
+                "held direct message watcher stopped");
         } else {
             tracing::warn!(session = %name, %preview, measured = true, n_considered = 1, verdict,
                 "held direct message was not submitted by amux");
@@ -49600,10 +49657,9 @@ mod submission_gate_tests {
     #[test]
     fn project_execution_draft_match_requires_visible_project_packet_tail() {
         let packet = "For an unavailable concrete same-project output, POST /api/projects/single-image-gs7/tasks/PIG-4/required-outputs with the exact artifact path and verification note.";
-        assert!(project_execution_composer_owns_text(
-            &frame_stuck_idle(packet),
-            packet
-        ));
+        assert!(!project_execution_composer_owns_text(&frame_stuck_idle(packet), packet));
+        let sent = origin_stamped("dev-lead", "w", packet).unwrap();
+        assert!(project_execution_composer_owns_text(&frame_stuck_idle(&sent), &sent));
         assert!(!project_execution_composer_owns_text(
             &frame_stuck_idle("human typed unrelated draft"),
             packet
@@ -49630,10 +49686,9 @@ mod submission_gate_tests {
     #[test]
     fn composer_owns_text_with_spaces() {
         let msg = "deploy the new version to staging now";
-        assert!(project_execution_composer_owns_text(
-            &frame_stuck_idle(msg),
-            msg
-        ));
+        assert!(!project_execution_composer_owns_text(&frame_stuck_idle(msg), msg));
+        let sent = origin_stamped("dev-lead", "w", msg).unwrap();
+        assert!(project_execution_composer_owns_text(&frame_stuck_idle(&sent), &sent));
         assert!(!project_execution_composer_owns_text(
             &frame_cleared(),
             msg
@@ -50503,15 +50558,18 @@ mod composer_state_tests {
         // Cleared (the first, unwound acceptance): nothing to press.
         assert_eq!(held_draft_step(LIVE_PLACEHOLDER, OURS), HeldDraftStep::Left);
         // Restored, intact, idle: press Enter again.
-        assert_eq!(held_draft_step(LIVE_TYPED, OURS), HeldDraftStep::PressEnter);
+        assert_eq!(held_draft_step(LIVE_TYPED, OURS), HeldDraftStep::HumanChanged);
+        let sent = origin_stamped("dev-lead", "w", OURS).unwrap();
+        let stamped_frame = LIVE_TYPED.replace(OURS, &sent);
+        assert_eq!(held_draft_step(&stamped_frame, &sent), HeldDraftStep::PressEnter);
         // A person changed the box in between: never press on their text.
         assert_eq!(
             held_draft_step(LIVE_TYPED, "[10:20 PM] something the owner typed instead"),
             HeldDraftStep::HumanChanged
         );
         // A turn is running (the footer says so): leave it to the idle watcher.
-        let generating = LIVE_TYPED.replace("\u{b7} \u{2190} 2 agents", "\u{b7} esc to interrupt");
-        assert_eq!(held_draft_step(&generating, OURS), HeldDraftStep::Generating);
+        let generating = stamped_frame.replace("\u{b7} \u{2190} 2 agents", "\u{b7} esc to interrupt");
+        assert_eq!(held_draft_step(&generating, &sent), HeldDraftStep::Generating);
         // No composer drawn: wait, do not press.
         assert_eq!(held_draft_step("", OURS), HeldDraftStep::Wait);
         // The backoff is real and bounded: several looks, growing, under ~11s.
@@ -50593,8 +50651,8 @@ mod composer_state_tests {
         let squash = |t: &str| t.split_whitespace().collect::<String>();
         assert_eq!(
             held_delivery_matching(&squash("deploy the new build to staging now"), "w", &rows).as_deref(),
-            Some("deploy the new build to staging now"),
-            "the owner's own held send resumes"
+            None,
+            "an unstamped held send cannot distinguish an owner copy"
         );
         let stamped = origin_stamped("re-ops-lead", "w", "check the lease numbers again").unwrap();
         assert_eq!(held_delivery_matching(&squash(&stamped), "w", &rows), Some(stamped.clone()),
@@ -56735,7 +56793,8 @@ mod stale_draft_tests {
 
     #[test]
     fn the_composer_holding_this_exact_delivery_is_amuxs_own_paste() {
-        let text = "this isn\u{2019}t right @/Users/ethan/.amux/uploads/a056f2d8dd0d-image.png";
+        let sent = origin_stamped("dev-lead", "w", "this isn\u{2019}t right @/Users/ethan/.amux/uploads/a056f2d8dd0d-image.png").unwrap();
+        let text = sent.as_str();
         let draft: String = text.split_whitespace().collect();
         assert!(composer_holds_this_delivery(&draft, text));
         // A human who typed more, or only part of it, keeps the guard.
@@ -57199,7 +57258,7 @@ mod composer_guard_tests {
             "the main Enter is preceded by the ownership check");
         let verify = &src[src.find("async fn verify_submitted(").unwrap()..];
         let retry = verify.find("verdict = \"retry_enter_foreign_composer_text\"").expect("retry guard");
-        assert!(verify[retry..retry + 600].contains("send_key(name, \"Enter\")"), "the retry Enter is guarded");
+        assert!(verify[retry..retry + 900].contains("send_key(name, \"Enter\")"), "the retry Enter is guarded");
     }
 
     /// Review of #9, B2: a typed stamp before a paste must still be found in the
@@ -57245,10 +57304,10 @@ mod composer_guard_tests {
     fn amux_own_held_paste_chip_is_recognised_by_its_size() {
         let three = "line one\nline two\nline three".to_string();
         let rows = vec![(three.clone(), String::new()), ("one line only".to_string(), String::new())];
-        assert_eq!(held_delivery_matching("[Pastedtext#3+2lines]", "w", &rows), Some(three.clone()));
+        assert_eq!(held_delivery_matching("[Pastedtext#3+2lines]", "w", &rows), None);
         assert_eq!(held_delivery_matching("[Pastedtext#3+9lines]", "w", &rows), None, "a chip of another size is not ours");
         let codex_chip = format!("[PastedContent{}chars]", three.chars().count());
-        assert_eq!(held_delivery_matching(&codex_chip, "w", &rows), Some(three.clone()));
+        assert_eq!(held_delivery_matching(&codex_chip, "w", &rows), None);
         let peer = vec![(three.clone(), "re-ops-lead".to_string())];
         let stamped = origin_stamped("re-ops-lead", "w", &three).unwrap();
         let stamp_sq: String = origin_stamp_split(&stamped).unwrap().0.split_whitespace().collect();
@@ -57402,13 +57461,94 @@ mod relay_idle_submit_tests {
         (dir, state)
     }
 
+    #[test]
+    fn owner_chip_matching_a_relay_line_count_never_authorises_keys() {
+        let text = "status line one\nstatus line two\nstatus line three";
+        for origin in ["dev-lead", "", "w"] {
+            let rows = vec![(text.into(), origin.into())];
+            for chip in ["[Pastedtext#12+2lines]".to_string(), format!("[PastedContent{}chars]", text.chars().count())] {
+                assert_eq!(held_composer_delivery_matching(&chip, "w", &rows), None, "Enter: {origin}");
+                assert_eq!(held_delivery_matching(&chip, "w", &rows), None, "Ctrl-U: {origin}");
+            }
+        }
+    }
+
+    #[test]
+    fn owner_plain_copy_never_authorises_keys_and_stamps_must_be_in_position() {
+        let text = "status line one\nstatus line two\nstatus line three";
+        for origin in ["dev-lead", "", "w"] {
+            let rows = vec![(text.into(), origin.into())];
+            let draft = squashed(text);
+            assert_eq!(held_composer_delivery_matching(&draft, "w", &rows), None, "Enter: {origin}");
+            assert_eq!(held_delivery_matching(&draft, "w", &rows), None, "Ctrl-U: {origin}");
+            assert!(!composer_holds_this_delivery(&draft, text));
+        }
+        let sent = origin_stamped("dev-lead", "w", text).unwrap();
+        let rows = vec![(text.into(), "dev-lead".into())];
+        let (stamp, body) = delivery_parts(&sent);
+        for draft in [format!("{body}{stamp}"), format!("owner{sent}"), sent.replace("dev-lead", "other-lead"), sent.replace("[amux-origin:", "[quoted amux-origin:")] {
+            assert_eq!(held_composer_delivery_matching(&squashed(&draft), "w", &rows), None);
+            assert_eq!(held_delivery_matching(&squashed(&draft), "w", &rows), None);
+        }
+    }
+
+    #[test]
+    fn owner_copy_retry_and_project_rescue_preserve_bare_input() {
+        let text = "status line one\nstatus line two\nstatus line three";
+        for shown in [text, "[Pasted text #12 +2 lines]"] {
+            assert_eq!(held_draft_step(&frame(shown), text), HeldDraftStep::HumanChanged);
+            assert!(!project_execution_composer_owns_text(&frame(shown), text));
+        }
+    }
+
+    #[test]
+    fn combined_receipt_consumes_only_the_submitted_sequence() {
+        let a = origin_stamped("dev-lead", "w", "first complete relay").unwrap();
+        let b = origin_stamped("business-lead", "w", "second complete relay").unwrap();
+        let rows = vec![(4, a.clone()), (3, "unrelated relay text".into()), (2, b.clone()), (1, a.clone())];
+        assert_eq!(stuck_rows_matching(&format!("{a}\n{b}"), &rows), vec![1,2]);
+        assert_eq!(stuck_rows_matching(&a, &rows), vec![4]);
+        let prompt = format!("{a}\n<pasted_content id=\"2\">{b}</pasted_content>");
+        assert_eq!(stuck_rows_matching(&prompt, &rows), vec![1,2]);
+        assert_eq!(stuck_rows_matching(&format!("{b}\n{a}"), &rows), vec![2,4]);
+    }
+
+    #[tokio::test]
+    async fn combined_enter_reconciles_each_held_verdict_and_excludes_other_rows() {
+        let (_dir, state) = test_state();
+        let a = "first complete relay";
+        let b = "second complete relay";
+        let c = "third complete relay";
+        state.store.write(move |db| {
+            for (id, lane, text, origin, verdict) in [(1, "w", a, "dev-lead", "stuck"),
+                (2, "w", b, "business-lead", "deferred"), (3, "w", c, "dev-lead", "unverified"),
+                (4, "other", a, "dev-lead", "stuck"), (5, "w", "unrelated complete relay", "dev-lead", "stuck"),
+                (6, "w", a, "dev-lead", "stuck")] {
+                db.execute("INSERT INTO cmd_history(id,text,type,session,origin,ts,submit_verdict) VALUES(?1,?2,'user',?3,?4,?5,?6)",
+                    rusqlite::params![id, text, lane, origin, now_i64()*1000, verdict])?;
+            }
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let prompt = [origin_stamped("dev-lead", "w", a).unwrap(), origin_stamped("business-lead", "w", b).unwrap(), origin_stamped("dev-lead", "w", c).unwrap()].join("\n");
+        assert_eq!(reconcile_stuck_on_submit(&state, "w", &prompt).await, 3);
+        let db = state.store.read().unwrap();
+        let mut q = db.prepare("SELECT id FROM cmd_history WHERE delivered_at IS NOT NULL AND reconciled_at IS NOT NULL AND submit_verdict='confirmed' ORDER BY id").unwrap();
+        let ids = q.query_map([], |r| r.get::<_, i64>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(ids, vec![1,2,3]);
+        drop(q);
+        drop(db);
+        assert_eq!(held_amux_composer(&state, "w", &squashed(&prompt)), None);
+    }
+
     fn squashed(text: &str) -> String { text.split_whitespace().collect() }
 
     #[test]
     fn ordered_relays_fill_the_whole_composer() {
         let a = "first relay from the dev lead";
         let b = "second relay from the business lead";
-        let rows = vec![(b.into(), String::new()), (a.into(), String::new())];
+        let a = origin_stamped("dev-lead", "w", a).unwrap();
+        let b = origin_stamped("business-lead", "w", b).unwrap();
+        let rows = vec![(b.clone(), String::new()), (a.clone(), String::new())];
         let joined = format!("{a}\n{b}");
         assert_eq!(held_composer_delivery_matching(&squashed(&joined), "w", &rows), Some(joined));
         assert_eq!(held_composer_delivery_matching(&squashed(&format!("{b} {a}")), "w", &rows), None);
@@ -57419,8 +57559,8 @@ mod relay_idle_submit_tests {
 
     #[test]
     fn rows_are_consumed_once_and_owner_word_boundaries_are_not_substring_matches() {
-        let relay = "complete relay message";
-        let row = (relay.to_string(), String::new());
+        let relay = origin_stamped("dev-lead", "w", "complete relay message").unwrap();
+        let row = (relay.clone(), String::new());
         let twice = format!("{relay}\n{relay}");
         assert_eq!(held_composer_delivery_matching(&squashed(&twice), "w", std::slice::from_ref(&row)), None);
         assert_eq!(held_composer_delivery_matching(&squashed(&twice), "w", &[row.clone(), row.clone()]), Some(twice));
@@ -57428,7 +57568,7 @@ mod relay_idle_submit_tests {
             format!("{relay}后"), format!("[{relay}]"), "complete relay messag".into()] {
             assert_eq!(held_composer_delivery_matching(&squashed(&owner), "w", std::slice::from_ref(&row)), None, "{owner}");
         }
-        assert_eq!(held_composer_delivery_matching("12345678", "w", &[("12345678".into(), String::new())]), Some("12345678".into()));
+        assert_eq!(held_composer_delivery_matching("12345678", "w", &[("12345678".into(), String::new())]), None);
         assert_eq!(held_delivery_matching("[Pastedtext#1+0lines]", "w", &[("yes".into(), String::new())]), None);
     }
 
@@ -57466,25 +57606,81 @@ mod relay_idle_submit_tests {
         for slash in ["/status", "/model change", "/btw explain this"] {
             assert_ne!(held_draft_step(&frame(slash), slash), HeldDraftStep::PressEnter);
         }
-        let chip = frame("[Pasted text #7 +2 lines]");
-        assert_eq!(held_draft_step(&chip, text), HeldDraftStep::PressEnter);
+        let sent = origin_stamped("dev-lead", "w", text).unwrap();
+        let stamp = delivery_parts(&sent).0;
+        let chip = frame(&format!("{stamp}[Pasted text #7 +2 lines]"));
+        assert_eq!(held_draft_step(&chip, &sent), HeldDraftStep::PressEnter);
         let busy = format!("✻ Galloping… (12s · ↓ 84 tokens)\n{chip}\nesc to interrupt\n");
-        assert_eq!(held_draft_step(&busy, text), HeldDraftStep::Generating);
+        assert_eq!(held_draft_step(&busy, &sent), HeldDraftStep::Generating);
         let picker = format!("{}Choose a model\n❯ 1. Yes\n  2. Cancel\nEnter to select · Esc to cancel\n", frame(text));
         assert_ne!(held_draft_step(&picker, text), HeldDraftStep::PressEnter);
     }
 
     #[test]
-    fn busy_past_the_old_deadline_can_rearm_but_the_total_budget_is_bounded() {
-        assert!(direct_draft_watch_budget(100.0, 100.0 + DIRECT_DRAFT_REARM_S + 1.0));
-        let mut deadline = 100.0 + DIRECT_DRAFT_REARM_S;
-        assert!(!direct_draft_rearm_at_idle(&mut deadline, 2000.0, false));
-        assert_eq!(deadline, 1900.0, "generation does not consume an idle rearm");
-        assert!(direct_draft_rearm_at_idle(&mut deadline, 2001.0, true));
-        assert_eq!(deadline, 3801.0);
-        assert!(!direct_draft_rearm_at_idle(&mut deadline, 2002.0, true));
-        assert!(!direct_draft_watch_budget(100.0, 100.0 + DIRECT_DRAFT_MAX_AGE_S as f64));
-        assert!(!direct_draft_watch_budget(100.0, 100.0 + DIRECT_DRAFT_MAX_AGE_S as f64 + 1.0));
+    fn history_and_watch_window_remain_thirty_minutes() {
+        assert_eq!(HELD_RELAY_WINDOW_S, 1800);
+        assert!(direct_draft_watch_budget(100.0, 1899.0));
+        assert!(!direct_draft_watch_budget(100.0, 1900.0));
+    }
+
+    #[test]
+    fn every_recovery_enter_reserves_the_shared_sequence_budget() {
+        let src = include_str!("session_verbs.rs");
+        for function in ["async fn verify_submitted(", "async fn retry_held_idle_draft(",
+            "fn spawn_direct_draft_idle_submit(", "async fn submit_own_steering_draft(",
+            "async fn submit_project_execution_draft_if_owned("] {
+            let body = &src[src.find(function).expect(function)..];
+            let enter = body.find("send_key(").expect("recovery key");
+            assert!(body[..enter].contains("reserve_held_relay_enter("), "{function}: cap must guard Enter");
+        }
+    }
+
+    #[test]
+    fn attempt_persistence_failure_refuses_enter() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        std::fs::write(sessions_dir(), "a file prevents the attempt directory").unwrap();
+        let sent = origin_stamped("dev-lead", "w", "complete held relay").unwrap();
+        assert!(!reserve_held_relay_enter("w", &sent));
+    }
+
+    #[test]
+    fn enter_cap_survives_watch_respawn_and_logs_exhaustion_once() {
+        struct Warnings(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl tracing::Subscriber for Warnings {
+            fn enabled(&self, m: &tracing::Metadata<'_>) -> bool { *m.level() == tracing::Level::WARN }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id { tracing::span::Id::from_u64(1) }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                event.record(&mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                    if field.name() == "verdict" && format!("{value:?}") == "\"held_relay_enter_cap_reached\"" {
+                        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let warnings = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _tracing = tracing::subscriber::set_default(Warnings(warnings.clone()));
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let sent = origin_stamped("dev-lead", "w", "complete held relay").unwrap();
+        assert_eq!(HELD_RELAY_MAX_ENTER_ATTEMPTS, 3);
+        for _ in 0..3 { assert!(reserve_held_relay_enter("w", &sent)); }
+        for _ in 0..3 { assert!(!reserve_held_relay_enter("w", &sent)); }
+        let meta = load_meta("w");
+        let attempts = meta[HELD_RELAY_ATTEMPTS_KEY].as_object().unwrap();
+        assert_eq!(attempts.len(), 1);
+        let row = attempts.values().next().unwrap();
+        assert_eq!(row["presses"], 3);
+        assert_eq!(row["warned"], true);
+        let before = std::fs::read(meta_path("w")).unwrap();
+        assert!(!reserve_held_relay_enter("w", &sent));
+        assert_eq!(std::fs::read(meta_path("w")).unwrap(), before, "an exhausted sweep does not re-arm or log again");
+        assert!(reserve_held_relay_enter("w", &origin_stamped("dev-lead", "w", "a different held sequence").unwrap()));
+        assert_eq!(warnings.load(std::sync::atomic::Ordering::SeqCst), 1, "one actual cap WARN across replacement watches");
     }
 
     #[tokio::test]
@@ -57506,17 +57702,26 @@ mod relay_idle_submit_tests {
         let (_dir, state) = test_state();
         let now = now_i64() * 1000;
         state.store.write(move |c| {
-            for (id, lane, text, age) in [(1, "relay-test", "first complete relay", 1900),
-                (2, "relay-test", "second complete relay", 1850),
+            for (id, lane, text, age) in [(1, "relay-test", "first complete relay", 60),
+                (2, "relay-test", "second complete relay", 30),
                 (3, "other-test", "foreign lane message", 0),
-                (4, "relay-test", "expired complete relay", DIRECT_DRAFT_MAX_AGE_S + 1)] {
-                c.execute("INSERT INTO cmd_history(id,text,type,session,ts,submit_verdict) VALUES(?1,?2,'user',?3,?4,'stuck')",
+                (4, "relay-test", "expired complete relay", HELD_RELAY_WINDOW_S + 1),
+                (5, "relay-test", "status line one\nstatus line two\nstatus line three", 2 * 3600)] {
+                c.execute("INSERT INTO cmd_history(id,text,type,session,ts,submit_verdict,origin) VALUES(?1,?2,'user',?3,?4,'stuck','dev-lead')",
                     rusqlite::params![id, text, lane, now - age * 1000])?;
             }
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         }).unwrap();
-        let expected = "first complete relay\nsecond complete relay";
-        assert_eq!(held_amux_composer(&state, "relay-test", &squashed(expected)), Some(expected.into()));
+        let expected = ["first complete relay", "second complete relay"].map(|t| origin_stamped("dev-lead", "relay-test", t).unwrap()).join("\n");
+        assert_eq!(held_amux_composer(&state, "relay-test", &squashed(&expected)), Some(expected));
+        let old = origin_stamped("dev-lead", "relay-test", "status line one\nstatus line two\nstatus line three").unwrap();
+        assert_eq!(held_amux_composer(&state, "relay-test", "[Pastedtext#12+2lines]"), None);
+        assert_eq!(held_amux_composer(&state, "relay-test", &squashed(&old)), None);
+        assert_eq!(held_amux_delivery(&state, "relay-test", &squashed(&old)), None);
+        let expired = origin_stamped("dev-lead", "relay-test", "expired complete relay").unwrap();
+        assert_eq!(held_amux_composer(&state, "relay-test", &squashed(&expired)), None);
+        let other = origin_stamped("dev-lead", "relay-test", "foreign lane message").unwrap();
+        assert_eq!(held_amux_composer(&state, "relay-test", &squashed(&other)), None);
         for foreign in ["foreign lane message", "expired complete relay", "first complete relay owner"] {
             assert_eq!(held_amux_composer(&state, "relay-test", &squashed(foreign)), None);
         }
@@ -57538,11 +57743,15 @@ mod relay_idle_submit_tests {
         let _home = crate::api::settings::test_env::set_home(home.path());
         let (_db_dir, state) = test_state();
         std::fs::create_dir_all(sessions_dir()).unwrap();
-        let a = "first relay complete";
-        let b = "second relay complete";
+        let a_body = "first relay complete";
+        let b_body = "second relay complete";
+        let a = origin_stamped("dev-lead", "", a_body).unwrap();
+        let b = origin_stamped("dev-lead", "", b_body).unwrap();
+        let multiline = origin_stamped("dev-lead", "", "first line\nsecond line\nthird line").unwrap();
+        let stamp = delivery_parts(&multiline).0;
         for (case, visible, should_submit) in [
             ("ordered", format!("{a} {b}"), true),
-            ("chip", format!("[Pasted text #7 +2 lines] {b}"), true),
+            ("chip", format!("{stamp}[Pasted text #7 +2 lines] {b}"), true),
             ("owner-prefix", format!("owner {a} {b}"), false),
             ("owner-suffix", format!("{a} {b}x"), false),
             ("owner-middle", format!("{a} owner {b}"), false),
@@ -57554,9 +57763,9 @@ mod relay_idle_submit_tests {
             std::fs::write(env_path(&lane), "CC_AUTO_START=0\nCC_PROVIDER=claude\nCC_DIR=/tmp\nCC_AUTO_CONTINUE=0\n").unwrap();
             let lane_copy = lane.clone();
             state.store.write(move |c| {
-                for text in ["first line\nsecond line\nthird line", a, b, "yes", "/status"] {
-                    c.execute("INSERT INTO cmd_history(text,type,session,ts,submit_verdict) VALUES(?1,'user',?2,?3,'stuck')",
-                        rusqlite::params![text, lane_copy, (now_i64() - 1900) * 1000])?;
+                for text in ["first line\nsecond line\nthird line", a_body, b_body, "yes", "/status"] {
+                    c.execute("INSERT INTO cmd_history(text,type,session,ts,submit_verdict,origin) VALUES(?1,'user',?2,?3,'stuck','dev-lead')",
+                        rusqlite::params![text, lane_copy, (now_i64() - 60) * 1000])?;
                 }
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             }).unwrap();
