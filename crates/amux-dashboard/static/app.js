@@ -49400,55 +49400,101 @@ function _fmtTok(n) {
   if (n >= 1e3) return (n/1e3).toFixed(1) + 'k';
   return String(n);
 }
+const _COST_BASIS = 'list-price equivalent on Max subscriptions, not billed';
+function _costScope(d, extra) {
+  const q = new URLSearchParams({ since: d.since, until: d.until });
+  if (d.session) q.set('session', d.session);
+  if (d.group) q.set('group', d.group);
+  if (d.worker_id) q.set('worker_id', d.worker_id);
+  for (const [key, value] of Object.entries(extra || {})) if (value !== undefined && value !== null) q.set(key, value);
+  return q.toString();
+}
+function _costEvidenceLink(d, extra, label) {
+  return `<details data-query="${esc(_costScope(d, extra))}" ontoggle="if(this.open)_costEvidence(this)"><summary>${esc(label)}</summary><div class="cost-evidence"></div></details>`;
+}
+function _costResponseRows(rows) {
+  const days = new Map();
+  for (const r of rows) {
+    const day = new Date(r.ts * 1000).toISOString().slice(0, 10);
+    if (!days.has(day)) days.set(day, []);
+    days.get(day).push(r);
+  }
+  return [...days].map(([day, responses]) => `<details open><summary>${esc(day)} UTC</summary>` + responses.map(r => {
+    const a = r.attribution || {};
+    const ref = a.primary ? `${a.primary.kind}: ${a.primary.id}` : 'No work reference';
+    const compaction = r.compaction?.measured ? 'Explicit compaction boundary: ' + JSON.stringify(r.compaction.evidence) : 'Compaction: unknown (no retained boundary on this response)';
+    return `<div class="cost-row"><div class="cost-row-top"><span class="cost-row-label">${esc(r.response_id || 'Response ID unknown')} · ${esc(r.model || 'Model unknown')}</span><span class="cost-row-cost" title="${_COST_BASIS}">${r.priced ? _fmtUsd(r.cost) : 'Unpriced'}</span></div><div class="cost-row-sub">${esc(new Date(r.ts * 1000).toISOString())} · context ${_fmtTok(r.context_tokens)} · ${esc(ref)} · ${esc(a.reason || 'unknown')} / ${esc(a.source || 'unknown')}<br>${esc(a.worker_id || 'No worker identity')} · alias: ${esc(r.historical_alias || 'unknown')} · attempt ${esc(a.attempt ?? 'unknown')} / generation ${esc(a.generation ?? 'unknown')}<br>${esc(compaction)}</div></div>`;
+  }).join('') + '</details>').join('');
+}
+async function _costEvidence(node, more) {
+  if (node.dataset.loading || (!more && node.dataset.loaded)) return;
+  node.dataset.loading = '1';
+  const body = node.querySelector('.cost-evidence');
+  const q = new URLSearchParams(node.dataset.query);
+  q.set('limit', '100');
+  if (more && node.dataset.after) q.set('after_id', node.dataset.after);
+  const button = body.querySelector('button');
+  if (button) button.disabled = true;
+  try {
+    const response = await fetch(API + '/api/observability/ledger?' + q.toString());
+    const d = await response.json();
+    if (!response.ok || d.error || d.measured !== true || !Array.isArray(d.rows) || d.n_considered !== d.rows.length) throw new Error(d.error || 'Evidence not measured or malformed');
+    if (button) button.remove();
+    if (!more) body.innerHTML = '';
+    body.insertAdjacentHTML('beforeend', _costResponseRows(d.rows || []) || 'No responses in this scope.');
+    node.dataset.loaded = '1';
+    node.dataset.after = d.next_after_id == null ? '' : String(d.next_after_id);
+    if (node.dataset.after) body.insertAdjacentHTML('beforeend', '<button onclick="_costEvidence(this.closest(\'details[data-query]\'),true)">More responses</button>');
+  } catch (error) {
+    if (button) button.disabled = false;
+    const message = document.createElement('div');
+    message.textContent = 'Could not load evidence: ' + error.message;
+    body.appendChild(message);
+  } finally {
+    delete node.dataset.loading;
+  }
+}
 function _costBars(rows, labelKey, opts) {
   opts = opts || {};
   if (!rows || !rows.length) return '<div style="color:var(--dim);font-size:0.82rem;padding:8px 0;">No data.</div>';
   const max = Math.max(...rows.map(r => r.cost || 0), 0.0001);
   return rows.slice(0, opts.limit || 30).map(r => {
-    const label = esc(String(r[labelKey] != null && r[labelKey] !== '' ? r[labelKey] : (opts.emptyLabel || '\u2014')));
+    const rawLabel = opts.worker ? (r.current_alias || r.session || opts.emptyLabel) : r[labelKey] != null && r[labelKey] !== '' ? r[labelKey] : (opts.emptyLabel || '\u2014');
+    const label = esc(String(rawLabel));
     const pct = Math.max(2, Math.round(100 * (r.cost || 0) / max));
-    const sub = (r.tokens != null ? _fmtTok(r.tokens) + ' tok' : '') + (r.turns != null ? ' \u00B7 ' + r.turns + ' turns' : '');
-    const click = opts.onSession ? ` onclick="_costOpenSession('${escJs(r[labelKey]||'')}')" style="cursor:pointer;"` : '';
-    return `<div class="cost-row"${click}>
-      <div class="cost-row-top"><span class="cost-row-label">${label}</span><span class="cost-row-cost">${_fmtUsd(r.cost)}</span></div>
-      <div class="cost-bar-track"><div class="cost-bar-fill" style="width:${pct}%;"></div></div>
-      <div class="cost-row-sub">${sub}</div>
-    </div>`;
+    let sub = (r.tokens != null ? _fmtTok(r.tokens) + ' tok' : '') + (r.turns != null ? ' · ' + r.turns + ' responses' : '');
+    if (r.unpriced_turns) sub += ' · ' + r.unpriced_turns + ' unpriced';
+    if (opts.worker) sub += '<br>' + esc(r.worker_id || 'No stable worker ID') + ' · current: ' + esc(r.current_alias || 'unknown') + ' · historical: ' + esc((r.historical_aliases || []).join(', ') || r.session || 'unknown');
+    if (r.work_reference) sub += '<br>' + esc(r.work_reference.kind + ': ' + r.work_reference.id + ' · ' + r.work_reference.source);
+    const card = r.work_kind === 'card' ? `<button onclick="openBoardDetail('${escJs(r.work_id)}')">Open card</button>` : '';
+    const evidence = opts.scope ? _costEvidenceLink(opts.scope, opts.filter(r), 'Responses / context / compaction') : '';
+    return `<div class="cost-row"><div class="cost-row-top"><span class="cost-row-label">${label}</span><span class="cost-row-cost" title="${_COST_BASIS}">${r.cost_status === 'partial' ? '≥ ' : ''}${_fmtUsd(r.cost)}</span></div><div class="cost-bar-track"><div class="cost-bar-fill" style="width:${pct}%;"></div></div><div class="cost-row-sub">${sub}</div>${card}${evidence}</div>`;
   }).join('');
 }
 function _costRender(d, opts) {
   opts = opts || {};
+  const coverage = d.attribution_coverage || {};
   const cards = `<div class="cost-cards">
-    <div class="cost-card" title="What these tokens would cost at LIST PRICE with no plan. On a Claude plan this is not money you spend, it is the value of the usage. Doron read &quot;est. cost&quot; as a bill and changed what plan he was going to buy on the strength of it (AF-494)."><div class="cost-card-v">${_fmtUsd(d.total_cost)}</div><div class="cost-card-l">est. list price${opts.perSession?'':' \u00B7 on Max'}</div></div>
+    <div class="cost-card" title="${_COST_BASIS}; billed dollars unknown, not measured."><div class="cost-card-v">${d.unpriced_turns ? '≥ ' : ''}${_fmtUsd(d.total_cost)}</div><div class="cost-card-l">${_COST_BASIS}</div></div>
     <div class="cost-card"><div class="cost-card-v">${_fmtTok(d.total_tokens)}</div><div class="cost-card-l">tokens</div></div>
-    <div class="cost-card"><div class="cost-card-v">${(d.total_turns||0).toLocaleString()}</div><div class="cost-card-l">turns</div></div>
-    <div class="cost-card"><div class="cost-card-v">${d.cache_hit_pct||0}%</div><div class="cost-card-l">cache hit</div></div>
-    ${d.delegated_turns ? `<div class="cost-card" title="Subagent turns, charged to the lane that delegated them. Counted since 2026-08-11 (AMUX-2894) \u2014 before that they were invisible, so a lane that delegates looked cheaper than one working inline."><div class="cost-card-v">${_fmtUsd(d.delegated_cost)}</div><div class="cost-card-l">of which delegated</div></div>` : ''}
+    <div class="cost-card"><div class="cost-card-v">${(d.total_turns || 0).toLocaleString()}</div><div class="cost-card-l">API responses</div></div>
+    <div class="cost-card"><div class="cost-card-v">${d.cache_hit_pct || 0}%</div><div class="cost-card-l">cache hit</div></div>
+    ${d.delegated_turns ? `<div class="cost-card" title="Included in the total; ${_COST_BASIS}"><div class="cost-card-v">${_fmtUsd(d.delegated_cost)}</div><div class="cost-card-l">of which delegated · equivalent, not billed</div></div>` : ''}
   </div>`;
-  // The ledger's own freshness, not this slice's. A rollup over a STALE ledger
-  // renders perfectly and shows small numbers, and small is indistinguishable
-  // from quiet — which is exactly how token_ledger sat 36h dead behind a
-  // confident zero (AMUX-2892). Say it where the numbers are read.
   const staleS = d.ledger_stale_s;
-  const staleBanner = (typeof staleS === 'number' && staleS > 3600)
-    ? `<div style="margin:0 0 10px;padding:8px 10px;border:1px solid var(--red);border-radius:8px;font-size:0.78rem;color:var(--red);">
-         These figures stop ${staleS >= 86400 ? Math.round(staleS/86400) + 'd' : Math.round(staleS/3600) + 'h'} ago \u2014 the token-ledger indexer has not run since.
-         <span style="color:var(--dim);">Everything below is real but INCOMPLETE; check the token-ledger job.</span>
-       </div>`
-    : '';
+  const staleBanner = typeof staleS === 'number' && staleS > 3600 ? `<div style="color:var(--red);">Ledger is ${Math.round(staleS / 3600)}h stale; figures are incomplete.</div>` : '';
   const sec = (title, body) => `<div class="cost-section"><div class="cost-section-h">${title}</div>${body}</div>`;
   let html = staleBanner + cards;
-  html += sec('By task', _costBars(d.by_task, 'title', { limit: 20, emptyLabel: 'Ambient (untasked)' }));
-  if (!opts.perSession) html += sec('By worker', _costBars(d.by_session, 'session', { limit: 20, onSession: true, emptyLabel: '(ad-hoc)' }));
-  html += sec('By model', _costBars(d.by_model, 'model', { limit: 8 }));
-  // by-day sparkline bars
+  html += sec('Attribution coverage', `<div class="cost-row-sub">${coverage.measured ? `${coverage.attributed_responses || 0} / ${coverage.responses || 0} responses linked (${coverage.percent == null ? 'unknown' : coverage.percent.toFixed(1) + '%'})` : 'Not measured'} · No worker identity: ${coverage.no_worker_identity ?? 'unknown'} · No work reference: ${coverage.no_work_reference ?? 'unknown'}<br>${d.unpriced_turns || 0} unpriced responses · Billed dollars: unknown (not measured)</div>`);
+  html += sec('By work reference', _costBars(d.by_work_reference || d.by_task, 'title', { limit: 20, emptyLabel: 'Unattributed work', scope: d, filter: r => r.work_id ? { work_kind: r.work_kind, work_id: r.work_id } : { unattributed: 'true' } }));
+  html += sec(opts.perSession ? 'Worker identity' : 'By worker', _costBars(d.by_session, 'current_alias', { limit: 20, emptyLabel: 'No worker identity', worker: true, scope: d, filter: r => r.worker_id ? { worker_id: r.worker_id } : r.session ? { session: r.session } : { unknown_worker: 'true' } }));
+  html += sec('By model', _costBars(d.by_model, 'model', { limit: 8, emptyLabel: 'Model unknown' }));
+  html += sec('By conversation → day → response', _costBars(d.by_conversation, 'conversation', { limit: 30, scope: d, filter: r => ({ conversation: r.conversation }) }));
   const days = d.by_day || [];
   const dmax = Math.max(...days.map(x => x.cost || 0), 0.0001);
-  const dayBars = days.length ? '<div class="cost-days-chart">' + days.map(x =>
-    `<div class="cost-day" title="${x.day}: ${_fmtUsd(x.cost)}"><div class="cost-day-fill" style="height:${Math.max(3,Math.round(100*(x.cost||0)/dmax))}%;"></div></div>`
-  ).join('') + '</div>' + `<div class="cost-day-labels"><span>${days[0]?.day||''}</span><span>${days[days.length-1]?.day||''}</span></div>` : '<div style="color:var(--dim);font-size:0.82rem;">No data.</div>';
-  html += sec('By day', dayBars);
-  html += `<div style="font-size:0.68rem;color:var(--dim);margin-top:14px;line-height:1.5;">Cost is the equivalent per-token API price (from ~/.amux/prices.json) applied to every turn amux read from the transcripts \u2014 mostly cache reads of large contexts. Attributed to a task while its board card was <b>In&nbsp;Progress</b> for that worker; the rest is \u201CAmbient\u201D. No model was asked anything to compute this.</div>`;
+  const dayBars = days.length ? '<div class="cost-days-chart">' + days.map(x => `<div class="cost-day" title="${esc(x.day)} UTC: ${_fmtUsd(x.cost)} · ${_COST_BASIS}"><div class="cost-day-fill" style="height:${Math.max(3, Math.round(100 * (x.cost || 0) / dmax))}%;"></div></div>`).join('') + '</div>' + `<div class="cost-day-labels"><span>${esc(days[0]?.day || '')} UTC</span><span>${esc(days[days.length - 1]?.day || '')} UTC</span></div>` : '<div>No data.</div>';
+  html += sec('By day (UTC)', dayBars);
+  html += `<div style="font-size:0.68rem;color:var(--dim);margin-top:14px;line-height:1.5;overflow-wrap:anywhere;">${_COST_BASIS}. Prices: ${esc(d.cost_basis?.version || 'unknown')}; as-of ${esc(d.cost_basis?.as_of || 'unknown / unverified')}. Window [${esc(d.since ?? 'unknown')}, ${esc(d.until ?? 'unknown')}) Unix seconds, UTC. Work links use turn snapshots and bounded historical intervals. Unattributed work is missing evidence of a work reference; it does not measure idleness. Compaction is shown only where a retained boundary provides evidence.</div>`;
   return html;
 }
 // ── Messages > Trends (AMUX-2179 relocated) ────────────────────────────────

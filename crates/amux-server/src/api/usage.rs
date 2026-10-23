@@ -1171,12 +1171,6 @@ async fn get_attribution(
 // Known limits are printed in the report itself, not left to a comment, because
 // the reader of a dashboard never reads the source.
 
-#[derive(serde::Deserialize, Default)]
-struct ReportQuery {
-    days: Option<i64>,
-    limit: Option<usize>,
-}
-
 fn md_money(v: f64) -> String {
     format!("${:.2}", v)
 }
@@ -1213,7 +1207,7 @@ fn md_table(
     rows: &[(String, f64, i64, i64)],
     total_cost: f64,
 ) -> String {
-    let mut s = format!("\n## {title}\n\n| {key_header} | Cost | Share | Tokens | Turns |\n|---|---:|---:|---:|---:|\n");
+    let mut s = format!("\n## {title}\n\n| {key_header} | List-price equivalent (not billed) | Share | Tokens | Responses |\n|---|---:|---:|---:|---:|\n");
     if rows.is_empty() {
         s.push_str("| (none in window) | | | | |\n");
     }
@@ -1230,184 +1224,186 @@ fn md_table(
     s
 }
 
-const REPORT_TOKENS: &str = "(input + cache_read + cache_write + output)";
-
-fn grouped(
-    conn: &rusqlite::Connection,
-    select_key: &str,
-    cutoff: i64,
-    limit: usize,
-) -> rusqlite::Result<Vec<(String, f64, i64, i64)>> {
-    let sql = format!(
-        "SELECT {select_key} AS k, COALESCE(SUM(cost_usd),0), COALESCE(SUM{REPORT_TOKENS},0), COUNT(*) \
-         FROM token_ledger WHERE ts > ?1 GROUP BY k ORDER BY 2 DESC LIMIT ?2"
-    );
-    let mut st = conn.prepare(&sql)?;
-    let rows = st.query_map(rusqlite::params![cutoff, limit as i64], |r| {
-        Ok((
-            r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-            r.get::<_, f64>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, i64>(3)?,
-        ))
-    })?;
-    rows.collect()
-}
-
-/// Render the report. Pure over a connection so a test can pin its shape.
+/// Shared with the JSON rollup: identical scope, prices and response population.
+#[cfg(test)]
 pub(crate) fn render_usage_report(
     conn: &rusqlite::Connection,
     days: i64,
     limit: usize,
     now: i64,
 ) -> rusqlite::Result<String> {
-    let cutoff = now - days * 86_400;
-    let total_rows: i64 = conn.query_row("SELECT COUNT(*) FROM token_ledger", [], |r| r.get(0))?;
-    let (total_cost, total_tokens, turns): (f64, i64, i64) = conn.query_row(
-        &format!("SELECT COALESCE(SUM(cost_usd),0), COALESCE(SUM{REPORT_TOKENS},0), COUNT(*) FROM token_ledger WHERE ts > ?1"),
-        [cutoff],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
-    let fresh: Option<i64> =
-        conn.query_row("SELECT MAX(ts) FROM token_ledger", [], |r| r.get(0))?;
-    let (cache_read, input_side): (i64, i64) = conn.query_row(
-        "SELECT COALESCE(SUM(cache_read),0), COALESCE(SUM(input + cache_read + cache_write),0) FROM token_ledger WHERE ts > ?1",
-        [cutoff],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let scope = super::observability::Scope {
+        since: now + 1 - days * 86_400,
+        until: now + 1,
+        ..Default::default()
+    };
+    render_scoped_usage_report(
+        conn,
+        &scope,
+        days,
+        limit,
+        &crate::runtime_jobs::token_ledger::default_prices(),
+    )
+}
 
-    let mut md = String::new();
-    md.push_str(&format!("# Token usage, last {days} day(s)\n\n"));
-    md.push_str(&format!(
-        "- **Total:** {} across {} API responses, {} tokens {REPORT_TOKENS}\n",
-        md_money(total_cost),
-        turns,
-        md_tokens(total_tokens)
-    ));
-    md.push_str(&format!(
-        "- **Cache hit:** {} of input-side tokens were cache reads\n",
-        pct(cache_read as f64, input_side as f64)
-    ));
-    md.push_str(&format!(
-        "- **Measured:** {} ledger rows in window of {} total; ledger fresh through {}\n",
-        turns,
-        total_rows,
-        fresh
-            .map(|t| chrono::DateTime::from_timestamp(t, 0)
-                .map(|d| d.to_rfc3339())
-                .unwrap_or_default())
-            .unwrap_or_else(|| "never".into())
-    ));
-    md.push_str("- **Cost basis:** list price per model from runtime_jobs/token_ledger.rs (or ~/.amux/prices.json), not the plan invoice\n");
-
-    md.push_str(&md_table(
-        "By worker",
-        "Worker",
-        &grouped(conn, "session", cutoff, limit)?,
-        total_cost,
-    ));
-    md.push_str(&md_table(
-        "By model",
-        "Model",
-        &grouped(conn, "model", cutoff, limit)?,
-        total_cost,
-    ));
+fn render_scoped_usage_report(
+    conn: &rusqlite::Connection,
+    scope: &super::observability::Scope,
+    days: i64,
+    limit: usize,
+    table: &[(String, [f64; 4])],
+) -> rusqlite::Result<String> {
+    let d = super::observability::summarize(conn, scope, table)?;
+    let total = d["total_cost"].as_f64().unwrap_or_default();
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM token_ledger", [], |r| r.get(0))?;
+    let mut md=format!("# Token usage, last {days} day(s)\n\n- **Total:** {} across {} API responses, {} tokens\n- **Measured:** {} ledger rows in window of {count} total; ledger fresh through {}\n- **Window:** [{} , {}) Unix seconds; timezone UTC, day boundaries UTC\n- **Cost basis:** {}. Billed dollars: unknown (not measured).\n- **Prices:** {}; as-of unknown/unverified; configured rates per million tokens.\n- **Unpriced responses:** {} (included in token totals, excluded from equivalent dollars).\n- **Attribution coverage:** {} / {} responses; {} with no worker identity; {} with no work reference.\n- **Context:** peak {} tokens (input + cache_read + cache_write per response).\n- **Compaction:** {} retained explicit boundaries; measured={}; absence is unknown.\n",
+        md_money(total),d["total_turns"],md_tokens(d["total_tokens"].as_i64().unwrap_or_default()),d["total_turns"],d["ledger_fresh_through"],scope.since,scope.until,super::observability::COST_BASIS,d["cost_basis"]["version"],d["unpriced_turns"],d["attribution_coverage"]["attributed_responses"],d["total_turns"],d["attribution_coverage"]["no_worker_identity"],d["attribution_coverage"]["no_work_reference"],d["context"]["peak_tokens"],d["compaction"]["boundaries"],d["compaction"]["measured"]);
+    for (heading, group, key) in [
+        ("By worker", "by_session", "session"),
+        ("By model", "by_model", "model"),
+        ("By work reference", "by_work_reference", "title"),
+        ("By attribution reason", "by_attribution_reason", "key"),
+        ("By attribution source", "by_attribution_source", "key"),
+        ("By day (UTC)", "by_day", "day"),
+        ("Top conversations", "by_conversation", "conversation"),
+    ] {
+        let rows: Vec<_> = d[group]
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(limit)
+            .map(|r| {
+                let label = if group == "by_session" {
+                    let session = r[key]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("No worker identity");
+                    match r["worker_id"].as_str() {
+                        Some(id) => format!(
+                            "{} ({id}; historical aliases: {})",
+                            r["current_alias"].as_str().unwrap_or(session),
+                            r["historical_aliases"]
+                        ),
+                        None => session.into(),
+                    }
+                } else if group == "by_work_reference" && r["work_id"].is_string() {
+                    format!(
+                        "{} / {}: {}",
+                        r["work_kind"].as_str().unwrap_or(""),
+                        r["work_id"].as_str().unwrap_or(""),
+                        r[key].as_str().unwrap_or("")
+                    )
+                } else {
+                    r[key].as_str().unwrap_or("unknown").to_string()
+                };
+                (
+                    label,
+                    r["cost"].as_f64().unwrap_or_default(),
+                    r["tokens"].as_i64().unwrap_or_default(),
+                    r["turns"].as_i64().unwrap_or_default(),
+                )
+            })
+            .collect();
+        md.push_str(&md_table(heading, key, &rows, total));
+    }
+    let sub = d["delegated_cost"].as_f64().unwrap_or_default();
+    let sub_turns = d["delegated_turns"].as_i64().unwrap_or_default();
     md.push_str(&md_table(
         "Main conversation vs subagents",
         "Kind",
-        &grouped(
-            conn,
-            "CASE WHEN conversation LIKE 'agent-%' THEN 'subagent' ELSE 'main' END",
-            cutoff,
-            limit,
-        )?,
-        total_cost,
+        &[
+            (
+                "subagent".into(),
+                sub,
+                d["delegated_tokens"].as_i64().unwrap_or_default(),
+                sub_turns,
+            ),
+            (
+                "main".into(),
+                total - sub,
+                d["total_tokens"].as_i64().unwrap_or_default()
+                    - d["delegated_tokens"].as_i64().unwrap_or_default(),
+                d["total_turns"].as_i64().unwrap_or_default() - sub_turns,
+            ),
+        ],
+        total,
     ));
-
-    // Prompt source: the same definition /api/usage/attribution uses, now
-    // including steering deliveries (AMUX-4582).
-    let mut st = conn.prepare(
-        &format!(
-            "WITH lg AS (SELECT ts, session, cost_usd, input, cache_read, cache_write, output FROM token_ledger WHERE ts > ?1), {PROMPT_SOURCE_SRC} \
-             SELECT {PROMPT_SOURCE_TRIG} AS trig, \
-                    SUM(cost_usd), SUM(input + cache_read + cache_write + output), COUNT(*) \
-             FROM src GROUP BY 1 ORDER BY 2 DESC"
-        ),
-    )?;
-    let sources: Vec<(String, f64, i64, i64)> = st
-        .query_map([cutoff], |r| {
-            Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+    md.push_str(
+        "\nDelegated equivalents are included in the total, with the same price/billing basis.\n",
+    );
+    // Retain prompt-source analysis, pricing the same scoped rows with the same
+    // configured rates instead of summing stale stored money values.
+    let (filter, args) = scope.sql();
+    let mut st=conn.prepare(&format!("WITH lg AS (SELECT * FROM token_ledger WHERE {filter}), {PROMPT_SOURCE_SRC} SELECT {PROMPT_SOURCE_TRIG},model,SUM(input),SUM(cache_read),SUM(cache_write),SUM(output),COUNT(*) FROM src GROUP BY 1,2"))?;
+    let mut sources: std::collections::BTreeMap<String, (f64, i64, i64)> =
+        std::collections::BTreeMap::new();
+    let parts = st.query_map(rusqlite::params_from_iter(args), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            [r.get::<_, i64>(2)?, r.get(3)?, r.get(4)?, r.get(5)?],
+            r.get::<_, i64>(6)?,
+        ))
+    })?;
+    for row in parts {
+        let (key, model, tokens, turns) = row?;
+        let entry = sources.entry(key).or_default();
+        entry.0 += crate::runtime_jobs::token_ledger::turn_cost_usd(table, &model, tokens);
+        entry.1 += tokens.iter().sum::<i64>();
+        entry.2 += turns;
+    }
+    let mut rows: Vec<_> = sources
+        .into_iter()
+        .map(|(k, (cost, tokens, turns))| (k, cost, tokens, turns))
+        .collect();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1));
     md.push_str(&md_table(
         "By what triggered the turn",
         "Source (prompt or steering guard)",
-        &sources,
-        total_cost,
+        &rows,
+        total,
     ));
-
-    // By card: attributed rows only; the stale task_windows problem is named.
-    md.push_str(&md_table(
-        "By board card",
-        "Card",
-        &grouped(conn, "NULLIF(task, '')", cutoff, limit)?,
-        total_cost,
-    ));
-
-    md.push_str(&md_table(
-        "By day (UTC)",
-        "Day",
-        &{
-            let mut st = conn.prepare(&format!(
-                "SELECT date(ts, 'unixepoch') AS d, SUM(cost_usd), SUM{REPORT_TOKENS}, COUNT(*) FROM token_ledger \
-                 WHERE ts > ?1 GROUP BY d ORDER BY d DESC"
-            ))?;
-            let rows: Vec<(String, f64, i64, i64)> = st
-                .query_map([cutoff], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            rows
-        },
-        total_cost,
-    ));
-
-    md.push_str(&md_table(
-        "Top conversations",
-        "Worker / conversation",
-        &grouped(conn, "session || ' / ' || conversation", cutoff, limit)?,
-        total_cost,
-    ));
-
-    md.push_str(
-        "\n## Known limits of these numbers\n\n\
-         - Subagent rows indexed before migration 70 can be billed more than once per API response (AMUX-4580); newer rows are keyed by message id.\n\
-         - Card attribution reads `token_ledger.task`, filled from `task_windows`, which has had no writer since 2026-08-09 (AMUX-4581).\n\
-         - Nudges, schedule fires and auto-compacts delivered through the steering queue are credited to the prompt before them (AMUX-4582).\n\
-         - Codex and Gemini usage is not captured yet (AMUX-4583).\n",
-    );
+    md.push_str("\n## Known limits of these numbers\n\n- Historical response-ID/counter repair requires a separate reviewed backfill; this report does not rewrite history.\n- Work attribution uses recorded turn snapshots and bounded historical attempts/claims, never today's current card. Unattributed work does not imply idle work.\n- Claude, Codex and Gemini usage is captured when retained transcripts supply counters. Unknown and empty models remain unpriced.\n- Prompt-source proximity is evidence of delivery, not proof of causation. Compaction cost and billed subscription dollars are not measured.\n- GET /api/observability/ledger exposes paginated response/context/compaction evidence with the same filters.\n");
     Ok(md)
 }
 
-/// GET /api/usage/report.md?days=N&limit=M (AMUX-4584). `days` 1..365 (default 7),
-/// `limit` rows per breakdown 1..200 (default 25). text/markdown.
+/// Markdown accepts the same scope selectors and exact boundaries as JSON.
 async fn get_usage_report_md(
     State(state): State<AppState>,
-    axum::extract::Query(q): axum::extract::Query<ReportQuery>,
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
 ) -> Response {
-    let days = q.days.unwrap_or(7).clamp(1, 365);
-    let limit = q.limit.unwrap_or(25).clamp(1, 200);
-    let store = state.store.clone();
-    let out = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-        let conn = store.read()?;
-        Ok(render_usage_report(
-            &conn,
-            days,
-            limit,
-            chrono::Utc::now().timestamp(),
-        )?)
-    })
-    .await;
+    let query = q.as_deref().unwrap_or("");
+    let (scope, days, _) = match super::observability::scope(query, chrono::Utc::now().timestamp())
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":e,"measured":false,"n_considered":0})),
+            )
+                .into_response()
+        }
+    };
+    let p = crate::api::fs::parse_qs(query);
+    let limit = match crate::api::fs::qs_get(&p, "limit")
+        .map(|v| v.parse::<usize>())
+        .transpose()
+    {
+        Ok(n) => n.unwrap_or(25).clamp(1, 200),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"invalid limit","measured":false,"n_considered":0})),
+            )
+                .into_response()
+        }
+    };
+    let table = crate::runtime_jobs::token_ledger::prices(&crate::config::amux_home());
+    let out = state.store.read().and_then(|conn| {
+        render_scoped_usage_report(&conn, &scope, days, limit, &table).map_err(Into::into)
+    });
     match out {
-        Ok(Ok(md)) => (
+        Ok(md) => (
             StatusCode::OK,
             [(
                 axum::http::header::CONTENT_TYPE,
@@ -1416,14 +1412,9 @@ async fn get_usage_report_md(
             md,
         )
             .into_response(),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string(), "measured": false })),
-        )
-            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string(), "measured": false })),
+            Json(json!({"error":e.to_string(),"measured":false,"n_considered":0})),
         )
             .into_response(),
     }
@@ -2847,7 +2838,7 @@ mod usage_report_tests {
         let md = render_usage_report(&conn, 1, 25, now).unwrap();
         assert!(md.starts_with("# Token usage, last 1 day(s)"), "{md}");
         assert!(
-            md.contains("$15.00 across 3 API responses"),
+            md.contains("$0.01 across 3 API responses"),
             "window excludes the old row: {md}"
         );
         assert!(
@@ -2858,11 +2849,11 @@ mod usage_report_tests {
         let studio = worker.find("studio-plg").unwrap();
         let amux = worker.find("| amux |").unwrap();
         assert!(
-            studio < amux,
-            "sorted by cost, the $9 worker first: {worker}"
+            amux < studio,
+            "sorted by repriced equivalent, Opus worker first: {worker}"
         );
         assert!(
-            md.contains("| subagent | $1.00 |"),
+            md.contains("| subagent | $0.00 |"),
             "subagent vs main split: {md}"
         );
         assert!(

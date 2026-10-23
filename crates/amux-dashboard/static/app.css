@@ -5984,7 +5984,7 @@
   .cost-row-cost { font-size: 0.83rem; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; flex-shrink: 0; }
   .cost-bar-track { height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; margin: 4px 0 2px; }
   .cost-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--green)); border-radius: 3px; }
-  .cost-row-sub { font-size: 0.68rem; color: var(--dim); }
+  .cost-row-sub { font-size: 0.68rem; color: var(--dim); overflow-wrap: anywhere; }
   .cost-days-chart { display: flex; align-items: flex-end; gap: 2px; height: 70px; }
   .cost-day { flex: 1; height: 100%; display: flex; align-items: flex-end; }
   .cost-day-fill { width: 100%; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 3px; opacity: 0.8; }

@@ -2943,6 +2943,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         path: "/api/observability",
         methods: &["GET"],
     },
+    RouteEntry {
+        path: "/api/observability/ledger",
+        methods: &["GET"],
+    },
     // Connectors (integrations): registry + status, credential paste, OAuth
     // begin/callback, live Test, and the DWD token mint (AMUX-3362). `list` is
     // GET; credentials/auth/test/token are POST; callback is the GET landing.

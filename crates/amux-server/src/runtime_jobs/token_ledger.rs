@@ -60,18 +60,22 @@ const MODEL_PRICES_DEFAULT: &[(&str, [f64; 4])] = &[
     ("deepseek", [0.0, 0.0, 0.0, 0.0]),
     ("phi", [0.0, 0.0, 0.0, 0.0]),
 ];
-const PRICE_DEFAULT: [f64; 4] = [3.0, 0.30, 3.75, 15.0];
+pub(crate) const PRICE_DEFAULT: [f64; 4] = [3.0, 0.30, 3.75, 15.0];
 
 /// py:18114 — `<synthetic>` turns carry usage that was never billed.
 fn model_is_skipped(model: &str) -> bool {
-    model.is_empty() || model == "<synthetic>"
+    model == "<synthetic>"
+}
+
+pub(crate) fn default_prices() -> Vec<(String, [f64; 4])> {
+    MODEL_PRICES_DEFAULT
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), *v))
+        .collect()
 }
 
 pub(crate) fn prices(home: &Path) -> Vec<(String, [f64; 4])> {
-    let mut table: Vec<(String, [f64; 4])> = MODEL_PRICES_DEFAULT
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), *v))
-        .collect();
+    let mut table = default_prices();
     let Ok(text) = std::fs::read_to_string(home.join("prices.json")) else {
         return table;
     };
@@ -90,14 +94,17 @@ pub(crate) fn prices(home: &Path) -> Vec<(String, [f64; 4])> {
         let mut ok = true;
         for (i, x) in arr.iter().enumerate() {
             match x.as_f64() {
-                Some(f) => rates[i] = f,
-                None => ok = false,
+                Some(f) if f.is_finite() && f >= 0.0 => rates[i] = f,
+                _ => ok = false,
             }
         }
         if !ok {
             continue;
         }
-        let key = k.to_lowercase();
+        let key = k.trim().to_lowercase();
+        if key.is_empty() {
+            continue;
+        }
         match table.iter_mut().find(|(t, _)| *t == key) {
             Some(row) => row.1 = rates,
             None => table.push((key, rates)),
@@ -124,6 +131,9 @@ pub(crate) fn prices(home: &Path) -> Vec<(String, [f64; 4])> {
 /// because that is the owner saying "price the unknowns like this", which is a
 /// decision they are entitled to make.
 fn price_for_model(table: &[(String, [f64; 4])], model: &str) -> Option<[f64; 4]> {
+    if model.trim().is_empty() || model_is_skipped(model) {
+        return None;
+    }
     let m = model.to_lowercase();
     for (key, rates) in table {
         if key != "_default" && m.contains(key.as_str()) {
@@ -178,6 +188,10 @@ pub(crate) struct LedgerRow {
     pub tokens: [i64; 4],
     pub cost: f64,
     pub message_id: Option<String>,
+    pub request_id: Option<String>,
+    pub parent_conversation: Option<String>,
+    pub parent_started_at: Option<i64>,
+    pub compaction: Option<String>,
 }
 
 /// One conversation's parsed turns plus the cursor state to commit.
@@ -219,12 +233,12 @@ pub(crate) fn warn_unpriced(
     let expected: usize = batches.iter().map(|b| b.rows.len()).sum();
     if guessed > 0 {
         tracing::warn!(
-            verdict = %format!("{provider}_rows_priced_by_default"),
+            verdict = %format!("{provider}_rows_unpriced"),
             rows = guessed,
             models = %models.into_iter().collect::<Vec<_>>().join(","),
             measured = true,
             n_considered = expected,
-            "{provider} turns carry the DEFAULT price: their token counts are measured, their cost is not. \
+            "{provider} turns have no configured price: their token counts are measured, their cost is unknown. \
              Set real rates for these models in ~/.amux/prices.json (config, no redeploy)."
         );
     }
@@ -232,12 +246,12 @@ pub(crate) fn warn_unpriced(
 
 /// Commit parsed turns to the ledger and update cursors. Returns rows inserted.
 ///
-/// This is the shared write path for codex and gemini. Claude's own
-/// `index_once_at` keeps its richer variant (request_id column, per-pass cap,
-/// task attribution) rather than forcing those into a generic interface.
+/// All providers use `persist_response` for pricing and provenance. Claude
+/// additionally commits skill usage and its per-pass cursor in the same write.
 pub(crate) async fn commit_ledger_batch(
     store: &SharedStore,
     batches: Vec<LedgerFileBatch>,
+    table: Vec<(String, [f64; 4])>,
 ) -> anyhow::Result<usize> {
     if batches.is_empty() {
         return Ok(0);
@@ -247,25 +261,15 @@ pub(crate) async fn commit_ledger_batch(
         .write_async(move |conn| {
             let mut n = 0usize;
             {
-                let mut ins = conn.prepare(
-                    "INSERT INTO token_ledger
-                       (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd, message_id)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-                     ON CONFLICT(conversation, message_id) WHERE message_id IS NOT NULL
-                     DO UPDATE SET output = MAX(output, excluded.output),
-                                   cost_usd = MAX(cost_usd, excluded.cost_usd)",
-                )?;
+                let resolver =
+                    super::work_attribution::Resolver::load(conn, chrono::Utc::now().timestamp())?;
                 let mut cur = conn.prepare(
                     "INSERT INTO ledger_cursor (conversation, offset, mtime) VALUES (?1,?2,?3)
                      ON CONFLICT(conversation) DO UPDATE SET offset=?2, mtime=?3",
                 )?;
                 for b in &batches {
                     for r in &b.rows {
-                        ins.execute(rusqlite::params![
-                            r.ts, r.session, r.conversation, r.model,
-                            r.tokens[0], r.tokens[1], r.tokens[2], r.tokens[3],
-                            r.cost, r.message_id
-                        ])?;
+                        persist_response(conn, r, &resolver, &table)?;
                         n += 1;
                     }
                     cur.execute(rusqlite::params![b.conversation, b.offset as i64, b.mtime])?;
@@ -310,20 +314,9 @@ fn jsonl_owner_title(path: &Path, claims: &BTreeMap<String, String>) -> String {
     crate::api::session_verbs::conversation_owner(path, claims)
 }
 
-struct Turn {
-    ts: i64,
-    session: String,
-    conversation: String,
-    model: String,
-    tokens: [i64; 4],
-    cost: f64,
-    /// `message.id` of the API response this usage belongs to (AMUX-4580).
-    /// The key that makes billing exact; None only for lines that carry no id.
-    message_id: Option<String>,
-    request_id: Option<String>,
-}
+type Turn = LedgerRow;
 
-/// Usage lines dropped because their `message.id` was already billed in the
+/// Usage fragments merged because their `message.id` was already seen in the
 /// same pass, process-lifetime (AMUX-4580). Published beside the insert count so
 /// a subagent-heavy day shows how much double billing the key prevented.
 pub static LEDGER_DUPLICATE_MESSAGES: std::sync::atomic::AtomicU64 =
@@ -428,26 +421,45 @@ fn parse_from_with_skills(
         return (offset, vec![], vec![]);
     }
     let mut new_off = offset;
-    let mut out = Vec::new();
+    let mut out: Vec<Turn> = Vec::new();
+    let mut compaction = None;
+    let mut compaction_offset = None;
+    let mut counter_merges = 0usize;
     let mut skills: Vec<SkillUse> = Vec::new();
     let mut prev_sig: Option<(i64, i64, i64)> = None;
     // AMUX-4580: responses already billed in this pass, by message id.
-    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for raw in BufReader::new(f).split(b'\n') {
-        let Ok(mut bytes) = raw else { break };
-        // `split` strips the delimiter; the cursor must still count it or every
-        // line permanently shifts the offset backwards by one byte and the
-        // NEXT pass re-reads a partial line as garbage.
-        let consumed = bytes.len() as u64 + 1;
-        new_off += consumed;
+    let mut seen_ids: HashMap<String, usize> = HashMap::new();
+    let mut reader = BufReader::new(f);
+    loop {
+        let mut bytes = Vec::new();
+        let Ok(consumed) = reader.read_until(b'\n', &mut bytes) else {
+            break;
+        };
+        if consumed == 0 {
+            break;
+        }
+        let terminated = bytes.last() == Some(&b'\n');
+        if terminated {
+            bytes.pop();
+        }
         if bytes.last() == Some(&b'\r') {
             bytes.pop();
         }
-        let Ok(e) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
+        let e = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(e) => e,
+            Err(_) if !terminated => break, // leave an unfinished JSON line for the next pass
+            Err(_) => {
+                new_off += consumed as u64;
+                continue;
+            }
         };
+        new_off += consumed as u64;
         // Before the usage check: a typed command carries no usage block.
         skills.extend(skill_uses_in(&e, owner, fallback_ts));
+        if e["type"] == "system" && e["subtype"] == "compact_boundary" {
+            compaction_offset = Some(new_off - consumed as u64);
+            compaction = Some(serde_json::json!({"measured":true,"source":"transcript_boundary","timestamp":e["timestamp"],"trigger":e["compactMetadata"]["trigger"],"pre_tokens":e["compactMetadata"]["preTokens"]}).to_string());
+        }
         let msg = &e["message"];
         let u = &msg["usage"];
         if !u.is_object() {
@@ -458,7 +470,7 @@ fn parse_from_with_skills(
         if model_is_skipped(&model) {
             continue;
         }
-        let g = |k: &str| u[k].as_i64().unwrap_or(0);
+        let g = |k: &str| u[k].as_i64().unwrap_or(0).max(0);
         let tokens = [
             g("input_tokens"),
             g("cache_read_input_tokens"),
@@ -477,7 +489,18 @@ fn parse_from_with_skills(
             .filter(|s| !s.is_empty())
             .map(str::to_string);
         if let Some(id) = message_id.as_deref() {
-            if !seen_ids.insert(id.to_string()) {
+            if let Some(&index) = seen_ids.get(id) {
+                let previous = &mut out[index];
+                if previous.tokens != tokens {
+                    counter_merges += 1;
+                }
+                for (old, new) in previous.tokens.iter_mut().zip(tokens) {
+                    *old = (*old).max(new);
+                }
+                if previous.model.is_empty() {
+                    previous.model = model.clone();
+                }
+                previous.cost = turn_cost_usd(table, &previous.model, previous.tokens);
                 LEDGER_DUPLICATE_MESSAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 continue;
             }
@@ -496,6 +519,9 @@ fn parse_from_with_skills(
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|d| d.timestamp())
             .unwrap_or(fallback_ts);
+        if let Some(id) = &message_id {
+            seen_ids.insert(id.clone(), out.len());
+        }
         out.push(Turn {
             ts,
             session: owner.to_string(),
@@ -504,11 +530,23 @@ fn parse_from_with_skills(
             tokens,
             cost: turn_cost_usd(table, &model, tokens),
             message_id,
+            parent_conversation: None,
+            parent_started_at: None,
+            compaction: compaction.take(),
             request_id: e["requestId"]
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
         });
+        compaction_offset = None;
+    }
+    // Keep an unattached boundary before the cursor until a response carries
+    // its evidence; a crash or a parse pass between the two must not lose it.
+    if let Some(boundary) = compaction_offset {
+        new_off = new_off.min(boundary);
+    }
+    if counter_merges > 0 {
+        tracing::info!(verdict="ledger_counter_fragments_merged",conversation=%conversation,merged_fragments=counter_merges,measured=true,n_considered=out.len(),"merged streamed response counter discrepancies before pricing");
     }
     (new_off, out, skills)
 }
@@ -855,7 +893,16 @@ pub async fn index_once_at(
                         .or_insert_with(|| jsonl_owner_title(pp, claims))
                         .clone(),
                 };
-                let (new_off, turns, skill_uses) = parse_from_with_skills(&jf, start, mtime, &owner, &table);
+                let (new_off, mut turns, skill_uses) =
+                    parse_from_with_skills(&jf, start, mtime, &owner, &table);
+                if let Some(parent) = &parent {
+                    let id = parent.file_stem().map(|s| s.to_string_lossy().to_string());
+                    let started = transcript_started_at(&jf);
+                    for turn in &mut turns {
+                        turn.parent_conversation = id.clone();
+                        turn.parent_started_at = started;
+                    }
+                }
                 pending.push((conv, new_off, mtime, turns, skill_uses));
             }
         }
@@ -877,18 +924,7 @@ pub async fn index_once_at(
         .write_async(move |conn| {
             let mut n = 0usize;
             {
-                let mut ins = conn.prepare(
-                    // A response already billed by an EARLIER pass (the cursor
-                    // resumed mid-message, or a repeat landed after a flush)
-                    // updates its row to the larger output instead of adding one.
-                    "INSERT INTO token_ledger
-                       (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd,
-                        message_id, request_id)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
-                     ON CONFLICT(conversation, message_id) WHERE message_id IS NOT NULL
-                     DO UPDATE SET output = MAX(output, excluded.output),
-                                   cost_usd = MAX(cost_usd, excluded.cost_usd)",
-                )?;
+                let resolver=super::work_attribution::Resolver::load(conn,chrono::Utc::now().timestamp())?;
                 let mut cur = conn.prepare(
                     "INSERT INTO ledger_cursor (conversation, offset, mtime) VALUES (?1,?2,?3)
                      ON CONFLICT(conversation) DO UPDATE SET offset=?2, mtime=?3",
@@ -901,11 +937,7 @@ pub async fn index_once_at(
                         sk.execute(rusqlite::params![u.uuid, u.skill, u.source, u.session, u.ts])?;
                     }
                     for t in turns {
-                        ins.execute(rusqlite::params![
-                            t.ts, t.session, t.conversation, t.model,
-                            t.tokens[0], t.tokens[1], t.tokens[2], t.tokens[3], t.cost,
-                            t.message_id, t.request_id
-                        ])?;
+                        persist_response(conn,t,&resolver,&table)?;
                         n += 1;
                     }
                     cur.execute(rusqlite::params![conv, *off as i64, mtime])?;
@@ -932,76 +964,11 @@ pub async fn index_once_at(
 /// held until the writer went away. A genuinely long claim loses attribution
 /// for its tail, which is a bounded error; an unclosed one silently absorbs
 /// every later turn on that lane, which is not.
+#[cfg(test)]
 const MAX_CLAIM_WINDOW_S: i64 = 24 * 3600;
 
-/// How long one writer acquisition may spend applying claim windows (AMUX-4750).
-///
-/// A TIME BUDGET, after counting failed twice. The chunk was sized by dividing
-/// a total by an item count: 500 windows was "~200ms" at an implied 0.4ms per
-/// UPDATE, and measured 738ms. Resized to 150 on the corrected 1.5ms, it
-/// measured 696ms, implying ~4.6ms. The per-window cost is not a constant to
-/// divide by — most windows match nothing and return instantly while a few scan
-/// a real range — so no fixed count bounds the worst case. Elapsed time does,
-/// directly, and it is what the card actually asks about.
-///
-/// The hold is this budget plus at most one UPDATE, because the check happens
-/// after each one rather than before. That overshoot is real and measured: at a
-/// 200ms budget the worst hold was 292ms, so a single UPDATE can cost ~90ms.
-/// 120 + ~90 is ~210ms, inside the 250ms this card asks for, at roughly 33
-/// acquisitions for a full pass.
-const HOLD_BUDGET_MS: u128 = 120;
-
-/// Ledger rows one UPDATE may attribute (AMUX-4750).
-///
-/// THE TIME BUDGET CANNOT BOUND A HOLD BELOW ITS SLOWEST SINGLE STATEMENT, and
-/// at a 120ms budget the worst hold measured 563ms, so one UPDATE took ~440ms.
-/// That one is not waste: a 24-hour window over a busy lane genuinely matches
-/// thousands of rows, and each is a write plus an index update.
-///
-/// So the statement gets a cap too. A window with more rows than this attributes
-/// the rest on a later cycle, which is safe here for a reason specific to this
-/// job: it re-derives every window from scratch every 120 seconds and only ever
-/// fills rows still unattributed, so an interrupted window is resumed rather
-/// than lost. A job without that property would need a cursor instead.
-const ROWS_PER_UPDATE: i64 = 2_000;
-
-/// Fill `token_ledger.task` for turns that fall inside a card's claim window on
-/// the SAME lane. Only touches unattributed rows.
-///
-/// WHY NOT `task_windows` (AMUX-4581). It has had no writer since the Python
-/// cutover: 484 rows, newest `entered_doing` 2026-08-09, measured 37 days
-/// stale. Four of those windows never closed, and the old query read
-/// `COALESCE(left_doing, now)`, so each one stretched from last July to the
-/// present and swallowed everything after it. Measured over 7 days before this
-/// change: AMUX-1808 took $2,680 of ownerless conversations and AMUX-2598 took
-/// $1,618 of every `amux` turn. The Cost tab's by-task bars were reporting
-/// which stale row won a race, not where the money went.
-///
-/// TWO causes, both fixed here, because swapping the table alone would have
-/// rebuilt the same trap on fresher data:
-///
-/// 1. THE UNBOUNDED WINDOW. `task_attempts` is the live record (written at both
-///    lease choke points), but an attempt that never closes would extend to now
-///    exactly as those four windows did. Capped at `MAX_CLAIM_WINDOW_S`.
-///
-/// 2. THE EMPTY SESSION MATCHING ITSELF. Three of the four absorbing windows
-///    had `session = ''`, and the old `WHERE session=?2` matched them against
-///    ledger rows whose session is also `''` — every ownerless conversation on
-///    the box. An empty lane is not an identity, so a blank on EITHER side now
-///    attributes nothing. This is the clause that actually drained AMUX-1808,
-///    and it is independent of which table the windows come from.
-///
-/// `task.claimed` covers the era before attempts existed: it is the only record
-/// of a claim for ledger rows older than the first attempt row. Its interval
-/// runs to the lane's next claim, capped the same way, so it cannot become an
-/// open window either.
-/// Claim windows, derived from a read-only snapshot (AMUX-4750).
-///
-/// PURE, AND OUTSIDE THE WRITER. This whole derivation used to run inside
-/// `write_async`, so the single writer was held for two full-table scans, a
-/// JSON parse per claim and an O(n^2) scan, every 120 seconds. Measured on the
-/// live DB: 9,294 claims, which is ~43M comparisons of pure CPU while every
-/// non-GET request in the fleet waits behind `record_receipt`.
+/// Legacy interval-construction oracle retained for historical test cases.
+#[cfg(test)]
 fn claim_windows(
     attempts: Vec<(String, String, i64, i64)>,
     claims: Vec<(String, String, i64)>,
@@ -1043,136 +1010,7 @@ fn claim_windows(
 }
 
 pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
-    let now = chrono::Utc::now().timestamp();
-    // READ PHASE, off the writer. The snapshot can be a moment stale relative
-    // to the write below and it does not matter: a claim recorded in that gap
-    // is picked up on the next cycle, and the UPDATE only ever fills rows that
-    // are still unattributed, so nothing is overwritten by arriving late.
-    let (wins, bounds) = store
-        .read_async(move |conn| {
-            let mut attempts: Vec<(String, String, i64, i64)> = Vec::new();
-            // The live source. `min(a, b)` is SQLite's two-argument scalar min.
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT card, worker, started_at, \
-                        min(COALESCE(ended_at, ?1), started_at + ?2) \
-                 FROM task_attempts \
-                 WHERE COALESCE(worker,'') <> '' AND COALESCE(card,'') <> '' \
-                 ORDER BY started_at",
-            ) {
-                if let Ok(rows) = stmt.query_map([now, MAX_CLAIM_WINDOW_S], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                }) {
-                    attempts.extend(rows.flatten());
-                }
-            }
-
-            attempts.extend(crate::project_execution::outputs::usage_windows(conn,now,MAX_CLAIM_WINDOW_S)?);
-
-            // The historical source: one interval per claim, ending at that
-            // lane's next claim. `data` carries {"issue": "<id>", ...}.
-            let claims: Vec<(String, String, i64)> = {
-                let mut stmt = conn.prepare(
-                    "SELECT session, data, CAST(ts AS INTEGER) FROM session_events \
-                     WHERE type='task.claimed' AND COALESCE(session,'') <> '' \
-                     AND NOT EXISTS(SELECT 1 FROM issues i WHERE i.project_group IS NOT NULL \
-                       AND i.id=CASE WHEN json_valid(session_events.data) THEN json_extract(session_events.data,'$.issue') END) \
-                     ORDER BY session, ts",
-                )?;
-                let rows = stmt.query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                        r.get::<_, i64>(2)?,
-                    ))
-                })?;
-                rows.flatten().collect()
-            };
-            // The ts range that still has anything to attribute. A window
-            // outside it cannot match a row, so issuing its UPDATE is a
-            // guaranteed no-op — and in the steady state that is nearly all of
-            // them, because this job re-derives the whole of history every
-            // cycle and history was attributed on the first one.
-            let bounds: Option<(i64, i64)> = conn
-                .query_row(
-                    "SELECT MIN(ts), MAX(ts) FROM token_ledger WHERE task=''",
-                    [],
-                    |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
-                )
-                .ok()
-                .and_then(|(lo, hi)| Some((lo?, hi?)));
-            Ok((claim_windows(attempts, claims, now), bounds))
-        })
-        .await?;
-
-    let Some((lo, hi)) = bounds else {
-        // Nothing is unattributed. Taking the writer to prove that is the cost
-        // this whole job used to pay unconditionally.
-        return Ok(());
-    };
-    let pending: Vec<(String, String, i64, i64)> = wins
-        .into_iter()
-        .filter(|(task, session, from, to)| {
-            !session.trim().is_empty() && !task.trim().is_empty() && to >= from
-                // Overlaps the unattributed range, so the UPDATE can match.
-                && *from <= hi && *to >= lo
-        })
-        .collect();
-    if pending.is_empty() {
-        return Ok(());
-    }
-    // BOUND THE HOLD, not the total work (AMUX-4750). Moving the derivation out
-    // left ~10,000 UPDATEs, and at ~0.4ms each that is still a ~4s hold on the
-    // single writer, which is a floor under every non-GET request in the fleet.
-    // Chunking does not make the job cheaper; it stops any one interactive write
-    // being stuck behind all of it. 500 x ~0.4ms is ~200ms, inside the 250ms
-    // this card asks for, and the loop yields the writer between chunks.
-    let pending = std::sync::Arc::new(pending);
-    let mut done = 0usize;
-    while done < pending.len() {
-        let consumed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (windows, counter, start_at) = (pending.clone(), consumed.clone(), done);
-        store
-            .write_async(move |conn| {
-                let started = std::time::Instant::now();
-                // rowid-IN, because a plain UPDATE..LIMIT needs a nonstandard
-                // SQLite build flag — the same shape the retention trims use.
-                let mut stmt = conn.prepare_cached(
-                    "UPDATE token_ledger SET task=?1 WHERE rowid IN ( \
-                       SELECT rowid FROM token_ledger \
-                        WHERE task='' AND session=?2 AND COALESCE(session,'') <> '' \
-                          AND ts>=?3 AND ts<=?4 LIMIT ?5)",
-                )?;
-                let mut n = 0usize;
-                for (task, session, from, to) in &windows[start_at..] {
-                    stmt.execute(rusqlite::params![task, session, from, to, ROWS_PER_UPDATE])?;
-                    n += 1;
-                    if started.elapsed().as_millis() >= HOLD_BUDGET_MS {
-                        break;
-                    }
-                }
-                counter.store(n, std::sync::atomic::Ordering::Relaxed);
-                Ok(WriteOutcome {
-                    applied: n > 0,
-                    events: vec![],
-                })
-            })
-            .await?;
-        let n = consumed.load(std::sync::atomic::Ordering::Relaxed);
-        // A zero would mean the closure applied nothing, which cannot happen
-        // while windows remain — but looping on it forever is the failure mode
-        // worth refusing outright rather than reasoning about.
-        if n == 0 {
-            tracing::warn!(
-                target: "amux::token_ledger",
-                verdict = "attribute_no_progress",
-                remaining = pending.len() - done,
-                "a writer acquisition applied no claim window; stopping rather than spinning"
-            );
-            break;
-        }
-        done += n;
-    }
-    Ok(())
+    super::work_attribution::backfill(store).await
 }
 
 /// Every 120s by default. A cheap no-op on a fully-indexed tree (one stat per
@@ -1565,6 +1403,26 @@ mod tests {
             "msg_A billed once despite non-adjacent repeats; msg_B kept though its counts match"
         );
         assert_eq!(turns[0].request_id.as_deref(), Some("req_msg_A"));
+    }
+
+    #[test]
+    fn streamed_fragments_merge_all_counters_before_pricing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stream.jsonl");
+        let body = [
+            line_with_id("opus", "2026-09-14T18:00:00Z", "msg_A", 20, 30, 40, 3),
+            line_with_id("opus", "2026-09-14T18:00:01Z", "msg_A", 10, 35, 45, 30),
+        ]
+        .join("\n")
+            + "\n";
+        std::fs::write(&path, body).unwrap();
+        let (_, turns) = parse_from(&path, 0, 0, "lane", &table());
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tokens, [20, 35, 45, 30]);
+        assert_eq!(
+            turns[0].cost,
+            turn_cost_usd(&table(), "opus", [20, 35, 45, 30])
+        );
     }
 
     #[test]
@@ -2142,4 +2000,135 @@ mod skill_usage_tests {
         names.sort();
         assert_eq!(names, ["slop", "standup"]);
     }
+}
+
+/// One persistence path for all providers. Repricing the component-wise maxima
+/// is essential: MAX(old_cost,new_cost) underprices complementary fragments.
+fn persist_response(
+    conn: &rusqlite::Connection,
+    row: &LedgerRow,
+    resolver: &super::work_attribution::Resolver,
+    table: &[(String, [f64; 4])],
+) -> rusqlite::Result<()> {
+    use rusqlite::OptionalExtension;
+    debug_assert!(row.cost.is_finite(), "parsed cost must be finite");
+    let previous = if let Some(id) = &row.message_id {
+        conn.query_row("SELECT input,cache_read,cache_write,output,model FROM token_ledger WHERE conversation=?1 AND message_id=?2",rusqlite::params![row.conversation,id],|r| Ok(([r.get::<_,i64>(0)?,r.get(1)?,r.get(2)?,r.get(3)?],r.get::<_,String>(4)?))).optional()?
+    } else {
+        None
+    };
+    let mut tokens = row.tokens;
+    let mut model = row.model.clone();
+    if let Some((old, old_model)) = previous {
+        if old != tokens {
+            tracing::info!(verdict="ledger_counter_replay_merged",conversation=%row.conversation,response_id=?row.message_id,"merged response counters across passes");
+        }
+        for (t, p) in tokens.iter_mut().zip(old) {
+            *t = (*t).max(p);
+        }
+        if model.is_empty() {
+            model = old_model;
+        }
+    }
+    let a = if let Some(parent) = row.parent_conversation.as_deref() {
+        resolver.resolve_child(&row.session, parent, row.parent_started_at, row.ts)
+    } else {
+        resolver.resolve(&row.session, &row.conversation, None, row.ts)
+    };
+    let cost = turn_cost_usd(table, &model, tokens);
+    conn.execute("INSERT INTO token_ledger(ts,session,conversation,model,input,cache_read,cache_write,output,cost_usd,message_id,request_id,worker_id,attribution,task,parent_conversation,compaction)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+        ON CONFLICT(conversation,message_id) WHERE message_id IS NOT NULL DO UPDATE SET
+        input=excluded.input,cache_read=excluded.cache_read,cache_write=excluded.cache_write,output=excluded.output,
+        model=excluded.model,cost_usd=excluded.cost_usd,compaction=COALESCE(token_ledger.compaction,excluded.compaction)",
+        rusqlite::params![row.ts,row.session,row.conversation,model,tokens[0],tokens[1],tokens[2],tokens[3],cost,row.message_id,row.request_id,a.worker_id,serde_json::to_string(&a).unwrap(),a.card(),row.parent_conversation,row.compaction])?;
+    if a.primary.is_none() {
+        tracing::debug!(verdict="usage_attribution_coverage_gap",reason=%a.reason,worker_id=?a.worker_id,measured=true,n_considered=1,"response retained without work attribution");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod response_accounting_tests {
+    use super::*;
+    #[test]
+    fn replay_merges_complementary_maxima_and_reprices_one_response() {
+        let c = crate::db::migrate::test_memdb();
+        let resolver = super::super::work_attribution::Resolver::load(&c, 200).unwrap();
+        let table = default_prices();
+        let mut row = LedgerRow {
+            ts: 100,
+            session: "".into(),
+            conversation: "conv".into(),
+            model: "opus".into(),
+            tokens: [10, 100, 0, 3],
+            cost: 0.0,
+            message_id: Some("response".into()),
+            request_id: Some("request".into()),
+            parent_conversation: None,
+            parent_started_at: None,
+            compaction: None,
+        };
+        persist_response(&c, &row, &resolver, &table).unwrap();
+        row.tokens = [20, 50, 10, 30];
+        persist_response(&c, &row, &resolver, &table).unwrap();
+        persist_response(&c, &row, &resolver, &table).unwrap();
+        let (count, input, cache, write, out, cost): (i64, i64, i64, i64, i64, f64) = c
+            .query_row(
+                "SELECT COUNT(*),input,cache_read,cache_write,output,cost_usd FROM token_ledger",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!((count, input, cache, write, out), (1, 20, 100, 10, 30));
+        assert_eq!(cost, turn_cost_usd(&table, "opus", [20, 100, 10, 30]));
+    }
+    #[test]
+    fn incomplete_transcript_line_waits_and_explicit_compaction_is_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conv.jsonl");
+        let prefix="{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":967000}}\n";
+        std::fs::write(&path, format!("{prefix}{{\"message\":")).unwrap();
+        let (off, rows) = parse_from(&path, 0, 100, "", &default_prices());
+        assert!(rows.is_empty());
+        assert_eq!(off, 0, "an unattached boundary remains before the cursor");
+        let body=format!("{prefix}{{\"message\":{{\"id\":\"r\",\"model\":\"opus\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n");
+        std::fs::write(&path, &body).unwrap();
+        let (_, rows) = parse_from(&path, 0, 100, "", &default_prices());
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].compaction.as_deref().unwrap().contains("967000"));
+        let (end, rows) = parse_from(&path, off, 100, "", &default_prices());
+        assert_eq!(end, body.len() as u64);
+        assert_eq!(rows.len(), 1);
+    }
+    #[test]
+    fn empty_models_are_unpriced_even_with_an_explicit_default() {
+        let table = vec![("_default".into(), [1.0; 4])];
+        assert!(!model_is_priced(&table, ""));
+        assert!(!model_is_priced(&table, "<synthetic>"));
+    }
+}
+
+/// Child transcripts record their start before any usage. Only typed timestamps
+/// from that transcript establish which parent work the run inherited.
+pub(crate) fn transcript_started_at(path: &Path) -> Option<i64> {
+    let file = std::fs::File::open(path).ok()?;
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .find_map(|line| {
+            let e = serde_json::from_str::<Value>(&line).ok()?;
+            chrono::DateTime::parse_from_rfc3339(e["timestamp"].as_str()?)
+                .ok()
+                .map(|t| t.timestamp())
+        })
 }

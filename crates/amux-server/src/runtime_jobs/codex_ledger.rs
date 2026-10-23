@@ -10,15 +10,16 @@
 //! Codex writes the same thing Claude does, in a different place and shape:
 //! `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, one `event_msg` per
 //! `token_count` carrying `info.last_token_usage` (the delta for that turn) and
-//! `info.total_token_usage` (cumulative). This reads the DELTA, keyed by the
-//! event's own `ordinal`, so a re-read cannot double-bill.
+//! `info.total_token_usage` (cumulative). Cumulative differences suppress repeated
+//! events; prefix replay retains model/counter state across incremental passes.
+//! Native ordinals (or byte boundaries when absent) keep replays idempotent.
 //!
 //! Attribution prefers a validated native CLI session ID plus its recorded cwd.
 //! Directory-only fallback is allowed only when one worker owns the directory.
 //! Project workers share a checkout, so its path alone cannot identify a turn.
 use crate::db::SharedStore;
 use std::collections::{BTreeMap, HashMap};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 /// One codex turn's usage, as the ledger stores it.
@@ -31,6 +32,7 @@ pub(crate) struct CodexTurn {
     pub model: String,
     /// `[input, cache_read, cache_write, output]`, matching `token_ledger`.
     pub tokens: [i64; 4],
+    pub compaction: Option<String>,
 }
 
 /// `~/.codex/sessions`, from the OS home. Codex writes here, NOT into amux's
@@ -102,27 +104,51 @@ fn rollout_identity(path: &Path) -> Option<serde_json::Value> {
 /// that spent nothing, and a ledger row of four zeros is noise a reader has to
 /// explain.
 pub(crate) fn parse_codex_from(path: &Path, offset: u64) -> (u64, Vec<CodexTurn>) {
-    let Ok(mut f) = std::fs::File::open(path) else {
+    let Ok(f) = std::fs::File::open(path) else {
         return (offset, vec![]);
     };
-    if offset > 0 && f.seek(SeekFrom::Start(offset)).is_err() {
-        return (offset, vec![]);
-    }
-    let mut new_off = offset;
+    // Replay the prefix for cumulative/model state; emit only new records.
+    // This is intentionally read-only: no historical response-ID rewrite.
+    let mut new_off = 0;
+    let mut cumulative: Option<[i64; 4]> = None;
+    let mut seen_ordinals = std::collections::HashSet::new();
     let mut out = Vec::new();
     let mut model = String::new();
-    for raw in BufReader::new(f).split(b'\n') {
-        let Ok(mut bytes) = raw else { break };
-        // `split` drops the delimiter; the cursor must still count it, or every
-        // line shifts the offset back by one byte and the next pass re-reads a
-        // partial line as garbage (the same trap the Claude parser records).
-        new_off += bytes.len() as u64 + 1;
+    let mut compaction = None;
+    let mut compaction_offset = None;
+    let mut reader = BufReader::new(f);
+    loop {
+        let mut bytes = Vec::new();
+        let Ok(consumed) = reader.read_until(b'\n', &mut bytes) else {
+            break;
+        };
+        if consumed == 0 {
+            break;
+        }
+        let terminated = bytes.last() == Some(&b'\n');
+        if terminated {
+            bytes.pop();
+        }
         if bytes.last() == Some(&b'\r') {
             bytes.pop();
         }
-        let Ok(e) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
+        let e = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(e) => e,
+            Err(_) if !terminated => break, // leave an unfinished JSON line for the next pass
+            Err(_) => {
+                new_off += consumed as u64;
+                continue;
+            }
         };
+        new_off += consumed as u64;
+        if e["type"] == "compacted"
+            || e.pointer("/payload/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("context_compacted")
+        {
+            compaction_offset = Some(new_off - consumed as u64);
+            compaction=Some(serde_json::json!({"measured":true,"source":"codex_context_compacted","timestamp":e["timestamp"]}).to_string());
+        }
         // The model is named by turn context events, not by `session_meta`.
         // Remember the most recent one: it is what the turns below were spent on.
         for key in ["/payload/model", "/model", "/payload/turn_context/model"] {
@@ -138,22 +164,56 @@ pub(crate) fn parse_codex_from(path: &Path, offset: u64) -> (u64, Vec<CodexTurn>
         {
             continue;
         }
-        let Some(last) = e.pointer("/payload/info/last_token_usage") else {
+        let usage = |v: &serde_json::Value| -> [i64; 4] {
+            let n = |k: &str| v[k].as_i64().unwrap_or(0).max(0);
+            [
+                n("input_tokens"),
+                n("cached_input_tokens"),
+                n("cache_write_input_tokens"),
+                n("output_tokens"),
+            ]
+        };
+        let total = e
+            .pointer("/payload/info/total_token_usage")
+            .filter(|v| v.is_object())
+            .map(usage);
+        let last = e
+            .pointer("/payload/info/last_token_usage")
+            .filter(|v| v.is_object())
+            .map(usage);
+        let raw = if let Some(total) = total {
+            let previous = cumulative.unwrap_or([0; 4]);
+            cumulative = Some(total);
+            if total == previous {
+                continue;
+            }
+            if total.iter().zip(previous).any(|(n, p)| *n < p) {
+                tracing::warn!(
+                    verdict = "codex_cumulative_reset",
+                    measured = true,
+                    n_considered = 1,
+                    "cumulative token counters reset; starting a new counter epoch"
+                );
+                total
+            } else {
+                std::array::from_fn(|i| total[i] - previous[i])
+            }
+        } else if let Some(last) = last {
+            tracing::debug!(
+                verdict = "codex_cumulative_unavailable",
+                measured = false,
+                "using last usage; cumulative reconciliation unavailable"
+            );
+            last
+        } else {
             continue;
         };
-        let n = |k: &str| last.get(k).and_then(serde_json::Value::as_i64).unwrap_or(0);
-        // `input_tokens` INCLUDES the cached part (measured on a live rollout:
-        // 58880 input of which 57344 cached), and `total_tokens` is input +
-        // output, so `reasoning_output_tokens` is already inside output_tokens
-        // and must not be added again.
-        let cache_read = n("cached_input_tokens");
-        let fresh_input = (n("input_tokens") - cache_read).max(0);
-        let tokens = [
-            fresh_input,
-            cache_read,
-            n("cache_write_input_tokens"),
-            n("output_tokens"),
-        ];
+        if new_off <= offset {
+            compaction = None;
+            compaction_offset = None;
+            continue;
+        }
+        let tokens = [(raw[0] - raw[1]).max(0), raw[1], raw[2], raw[3]];
         if tokens.iter().all(|t| *t == 0) {
             continue;
         }
@@ -168,13 +228,21 @@ pub(crate) fn parse_codex_from(path: &Path, offset: u64) -> (u64, Vec<CodexTurn>
         let ordinal = e
             .get("ordinal")
             .and_then(serde_json::Value::as_i64)
-            .unwrap_or(-1);
+            .unwrap_or(new_off as i64);
+        if !seen_ordinals.insert(ordinal) {
+            continue;
+        }
         out.push(CodexTurn {
             ts,
             ordinal,
             model: model.clone(),
             tokens,
+            compaction: compaction.take(),
         });
+        compaction_offset = None;
+    }
+    if let Some(boundary) = compaction_offset.filter(|b| *b >= offset) {
+        new_off = new_off.min(boundary);
     }
     (new_off, out)
 }
@@ -397,6 +465,13 @@ pub async fn index_once_at(
         let size = meta.len();
         let offset = cursors.get(&conversation).copied().unwrap_or(0);
         let lane = rollout_owner(&path, &native, workdirs, &owners);
+        let identity = rollout_identity(&path);
+        let parent = identity
+            .as_ref()
+            .and_then(|v| v.pointer("/source/subagent/thread_spawn/parent_thread_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(|id| format!("codex:{}", id.rsplit('-').next().unwrap_or(id)));
+        let started = super::token_ledger::transcript_started_at(&path);
         if !lane.is_empty() {
             repairs.push((conversation.clone(), lane.clone()));
         }
@@ -425,6 +500,10 @@ pub async fn index_once_at(
                     model: t.model,
                     tokens: t.tokens,
                     cost,
+                    request_id: None,
+                    parent_conversation: parent.clone(),
+                    parent_started_at: started,
+                    compaction: t.compaction,
                     message_id: Some(format!("ord:{}", t.ordinal)),
                 }
             })
@@ -438,7 +517,7 @@ pub async fn index_once_at(
     }
 
     token_ledger::warn_unpriced("codex", &table, &batches);
-    let inserted = token_ledger::commit_ledger_batch(store, batches).await?;
+    let inserted = token_ledger::commit_ledger_batch(store, batches, table).await?;
     let repairs = {
         let c = store.read()?;
         ownership_repairs(&c, &repairs)?
@@ -504,7 +583,7 @@ mod tests {
         output: i64,
     ) -> String {
         format!(
-            r#"{{"timestamp":"{ts}","ordinal":{ordinal},"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":999999,"cached_input_tokens":0,"output_tokens":999}},"last_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"cache_write_input_tokens":{cache_write},"output_tokens":{output},"reasoning_output_tokens":{reasoning},"total_tokens":{total}}},"model_context_window":258400}}}}}}"#,
+            r#"{{"timestamp":"{ts}","ordinal":{ordinal},"type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"cache_write_input_tokens":{cache_write},"output_tokens":{output},"reasoning_output_tokens":{reasoning},"total_tokens":{total}}},"model_context_window":258400}}}}}}"#,
             reasoning = output / 3,
             total = input + output,
         )
@@ -883,5 +962,70 @@ mod tests {
             })
         })
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cumulative_accounting_tests {
+    use super::*;
+    use serde_json::json;
+    fn count(ordinal: Option<i64>, input: i64, cached: i64, out: i64) -> String {
+        let mut event = json!({"type":"event_msg","timestamp":"2026-10-23T10:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":input,"cached_input_tokens":cached,"output_tokens":out},"last_token_usage":{"input_tokens":999,"output_tokens":999}}}});
+        if let Some(n) = ordinal {
+            event["ordinal"] = json!(n);
+        }
+        event.to_string() + "\n"
+    }
+    #[test]
+    fn cumulative_deltas_ignore_repeated_events_and_carry_model_across_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let prefix = format!(
+            "{}\n{}{}",
+            json!({"type":"turn_context","payload":{"model":"gpt-fixture"}}),
+            count(Some(1), 100, 60, 10),
+            count(Some(2), 100, 60, 10)
+        );
+        std::fs::write(&path, &prefix).unwrap();
+        let (off, rows) = parse_codex_from(&path, 0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tokens, [40, 60, 0, 10]);
+        std::fs::write(
+            &path,
+            format!(
+                "{prefix}{}{}",
+                count(Some(3), 250, 160, 30),
+                count(Some(4), 250, 160, 30)
+            ),
+        )
+        .unwrap();
+        let (end, rows) = parse_codex_from(&path, off);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "gpt-fixture");
+        assert_eq!(rows[0].tokens, [50, 100, 0, 20]);
+        assert!(parse_codex_from(&path, end).1.is_empty());
+        let (_, all) = parse_codex_from(&path, 0);
+        assert_eq!(
+            all.iter()
+                .map(|r| r.tokens.iter().sum::<i64>())
+                .sum::<i64>(),
+            280
+        );
+    }
+    #[test]
+    fn missing_ordinals_use_stable_byte_keys_and_incomplete_lines_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let first = count(None, 100, 10, 2);
+        let second = count(None, 200, 20, 4);
+        std::fs::write(&path, format!("{first}{}", &second[..10])).unwrap();
+        let (off, rows) = parse_codex_from(&path, 0);
+        assert_eq!(off, first.len() as u64);
+        assert_eq!(rows.len(), 1);
+        std::fs::write(&path, format!("{first}{second}")).unwrap();
+        let (_, again) = parse_codex_from(&path, off);
+        assert_eq!(again.len(), 1);
+        assert_ne!(rows[0].ordinal, again[0].ordinal);
+        assert_eq!(again[0].model, "");
     }
 }
