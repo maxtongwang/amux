@@ -163,13 +163,23 @@ fn contained_delivery_start(text: &str, delivered: &str) -> Option<usize> {
     if delivered.chars().count() < MIN_CONTAINED_MATCH_CHARS {
         return None;
     }
-    static WORD_BOUNDARY: OnceLock<Regex> = OnceLock::new();
-    let boundary = WORD_BOUNDARY.get_or_init(|| Regex::new(r"\b").expect("word boundary regex"));
-    // Search every occurrence: an embedded fragment can precede a real quote.
-    text.match_indices(delivered).map(|(start, _)| start).find(|start| {
-        [*start, *start + delivered.len()].into_iter().all(|offset| {
-            boundary.find_at(text, offset).is_some_and(|m| m.start() == offset)
-        })
+    let first = delivered.chars().next()?;
+    let last = delivered.chars().next_back()?;
+    // CJK letters are word characters: adjacent CJK text needs a separator,
+    // like Latin text, to avoid treating word fragments as relay evidence.
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let joins_word = |left: Option<char>, right: Option<char>| {
+        left.is_some_and(is_word) && right.is_some_and(is_word)
+    };
+    // Search by the first character so overlapping occurrences are considered:
+    // an embedded fragment can precede a real quote, even in a repeated phrase.
+    text.match_indices(first).map(|(start, _)| start).find(|start| {
+        if !text[*start..].starts_with(delivered) {
+            return false;
+        }
+        let before = text[..*start].chars().next_back();
+        let after = text[*start + delivered.len()..].chars().next();
+        !joins_word(Some(first), before) && !joins_word(Some(last), after)
     })
 }
 
@@ -1651,6 +1661,76 @@ mod tests {
                 assert!(row.get("provenance_matches").is_none(), "{row}");
             }
         }
+    }
+
+    #[test]
+    fn ai194b_owner_history_contained_match_boundary_matrix() {
+        const RELAY: &str = "Status update from re-ops: Katella lease countersigned";
+        const PHRASE: &str = "go ahead with it"; // Exactly 16 characters, including spaces.
+        const CJK: &str = "租约已经由双方正式签署请归档并通知大家";
+        let cases = [
+            ("trailing-dot", format!("{RELAY}."), format!("yes add both {RELAY}."), true),
+            ("trailing-question", format!("{RELAY}?"), format!("yes add both {RELAY}?"), true),
+            ("trailing-exclamation", format!("{RELAY}!"), format!("yes add both {RELAY}!"), true),
+            ("trailing-cjk-period", format!("{RELAY}。"), format!("yes add both {RELAY}。"), true),
+            ("trailing-cjk-question", format!("{RELAY}？"), format!("yes add both {RELAY}？"), true),
+            ("leading-bracket", format!("[{RELAY}"), format!("yes add both [{RELAY}"), true),
+            ("leading-paren", format!("({RELAY}"), format!("yes add both ({RELAY}"), true),
+            ("leading-cjk-quote", format!("「{RELAY}"), format!("yes add both 「{RELAY}"), true),
+            ("punctuation-both-edges", format!("[{RELAY}]"), format!("owner[{RELAY}]owner"), true),
+            ("punctuation-before-word", format!("{RELAY}."), format!("yes {RELAY}.next"), true),
+            ("word-before-punctuation", format!("[{RELAY}"), format!("owner[{RELAY}"), true),
+            ("glued-prefix", RELAY.into(), format!("yes add both x{RELAY}"), false),
+            ("glued-suffix", RELAY.into(), format!("yes add both {RELAY}x"), false),
+            ("underscore-prefix", RELAY.into(), format!("yes _{RELAY}"), false),
+            ("underscore-suffix", RELAY.into(), format!("yes {RELAY}_"), false),
+            ("unicode-prefix", RELAY.into(), format!("yes é{RELAY}"), false),
+            ("unicode-suffix", RELAY.into(), format!("yes {RELAY}é"), false),
+            ("digit-prefix", RELAY.into(), format!("yes 7{RELAY}"), false),
+            ("digit-suffix", RELAY.into(), format!("yes {RELAY}7"), false),
+            ("continue", "continue".into(), "please continue with the plan you drafted".into(), false),
+            ("approved", "approved".into(), "not approved yet, wait for Max".into(), false),
+            ("phrase-bounded", PHRASE.into(), format!("please {PHRASE} now"), true),
+            ("phrase-cut-prefix", PHRASE.into(), format!("please fore{PHRASE} now"), false),
+            ("phrase-cut-suffix", PHRASE.into(), "please go ahead with items now".into(), false),
+            ("contained-fifteen", "go ahead with i".into(), "please go ahead with i now".into(), false),
+            ("cjk-glued-prefix", CJK.into(), format!("好的{CJK}"), false),
+            ("cjk-glued-suffix", CJK.into(), format!("{CJK}好的"), false),
+            ("cjk-space", CJK.into(), format!("好的 {CJK}"), true),
+            ("cjk-punctuation", CJK.into(), format!("好的，{CJK}。"), true),
+            ("at-start", RELAY.into(), format!("{RELAY} then add both"), true),
+            ("later-bounded-occurrence", RELAY.into(), format!("x{RELAY} then {RELAY}."), true),
+            ("overlapping-bounded-occurrence", "go go go go go go".into(), "xgo go go go go go go".into(), true),
+            ("newline-boundaries", RELAY.into(), format!("yes\n{RELAY}\nthanks"), true),
+            ("whole-eight", "abcdefgh".into(), "abcdefgh".into(), true),
+            ("whole-seven", "abcdefg".into(), "abcdefg".into(), false),
+            ("whole-eight-cjk", "一二三四五六七八".into(), "一二三四五六七八".into(), true),
+            ("whole-seven-cjk", "一二三四五六七".into(), "一二三四五六七".into(), false),
+            ("whole-space-floor", "a b c d e".into(), "a b c d e".into(), false),
+            ("empty-peer", "".into(), "plain owner input".into(), false),
+        ];
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cmd_history (id INTEGER PRIMARY KEY, text TEXT, type TEXT, \
+             session TEXT, ts INTEGER, origin TEXT, delivery TEXT, delivered_at INTEGER);"
+        ).unwrap();
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for (case, relay, owner, mixed) in cases {
+            conn.execute("DELETE FROM cmd_history", []).unwrap();
+            conn.execute(
+                "INSERT INTO cmd_history(id,text,type,session,ts,origin,delivery) \
+                 VALUES (1,?1,'session','boundary-matrix',1000,'re-ops-lead','direct'), \
+                        (2,?2,'user','boundary-matrix',2000,'','pane')",
+                rusqlite::params![relay, owner],
+            ).unwrap();
+            let mut rows = [json!({"id":2,"text":owner,"session":"boundary-matrix","sender":"owner"})];
+            attach_owner_provenance(&conn, &mut rows).unwrap();
+            actual.push((case, rows[0]["mixed_provenance"].as_bool().unwrap()));
+            expected.push((case, mixed));
+        }
+        // Compare after evaluating every row so a mutation exposes every affected case.
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
