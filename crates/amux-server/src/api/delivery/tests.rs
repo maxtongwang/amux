@@ -119,6 +119,22 @@ fn fixture_row(c: &Connection, a: &Attempt) {
     c.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery,submit_verdict,msg_id,queue_id,card_id) VALUES('same body','session',?1,1000,'verified-peer','queued','reserved',?2,?3,?4)",params![a.session,a.message_id,a.queue_id,a.card_id]).unwrap();
     assert!(ledger::insert(c, a).unwrap());
 }
+/// Fixture mutations use the same single-writer boundary as production.
+fn fixture_write(
+    store: &crate::db::SharedStore,
+    change: impl FnOnce(&Connection) + Send + 'static,
+) {
+    store
+        .write(move |conn| {
+            change(conn);
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
+        })
+        .unwrap();
+}
+
 fn counts(c: &Connection) -> (i64, i64, i64) {
     (
         c.query_row("SELECT count(*) FROM steering_queue", [], |r| r.get(0))
@@ -1675,14 +1691,14 @@ async fn restart_unknown_has_a_deadline_releasing_later_rows_without_resend() {
     let dir = private_dir();
     let store = Arc::new(crate::db::Store::open(&dir.path().join("db")).unwrap());
     let a = attempt(Some("old"));
-    {
-        let c = store.read().unwrap();
-        fixture_row(&c, &a);
-        ledger::mark_write_conn(&c, &a.id, now()).unwrap();
+    let seed = a.clone();
+    fixture_write(&store, move |c| {
+        fixture_row(c, &seed);
+        ledger::mark_write_conn(c, &seed.id, now()).unwrap();
         c.execute("INSERT INTO steering_queue(id,session,text,queued_at) VALUES('later','receiver','later',2)", []).unwrap();
-        assert_eq!(ledger::recover(&c).unwrap(), 1);
-        assert!(ledger::queue_blocked(&c, "later").unwrap());
-    }
+        assert_eq!(ledger::recover(c).unwrap(), 1);
+        assert!(ledger::queue_blocked(c, "later").unwrap());
+    });
     let st = state(store.clone());
     let host = Arc::new(CountingHost(AtomicUsize::new(0)));
     let since = store
@@ -1713,7 +1729,7 @@ async fn restart_unknown_has_a_deadline_releasing_later_rows_without_resend() {
             "unknown backoff at {offset}"
         );
         assert!(ledger::queue_blocked(&c, "later").unwrap());
-        assert_eq!(ledger::recover(&c).unwrap(), 0);
+        fixture_write(&store, |c| assert_eq!(ledger::recover(c).unwrap(), 0));
         assert_eq!(
             c.query_row(
                 "SELECT unknown_since FROM native_delivery_attempts",
@@ -1739,11 +1755,14 @@ async fn restart_unknown_has_a_deadline_releasing_later_rows_without_resend() {
             (1, 1, 0),
             "only the later row survives; never falsely delivered"
         );
-        assert!(
-            !ledger::insert(&c, &a).unwrap(),
-            "the original source is never resent"
-        );
     }
+    let original = a.clone();
+    fixture_write(&store, move |c| {
+        assert!(
+            !ledger::insert(c, &original).unwrap(),
+            "the original source is never resent"
+        )
+    });
     // The real queue claim boundary now admits the later row once.
     assert!(super::super::session_verbs::claim_steering_row(&store, "later").await);
     ledger::reconcile_with(
@@ -1858,7 +1877,8 @@ async fn abandon_is_owner_only_scoped_idempotent_and_never_claims_delivery() {
     let dir = private_dir();
     let store = Arc::new(crate::db::Store::open(&dir.path().join("db")).unwrap());
     let a = attempt(Some("abandon"));
-    fixture_row(&store.read().unwrap(), &a);
+    let seed = a.clone();
+    fixture_write(&store, move |c| fixture_row(c, &seed));
     let mut st = state(store.clone());
     st.auth_token = Some("fixture-owner".into());
     let body = json!({"action":"abandon","attempt_id":a.id});
@@ -1925,16 +1945,17 @@ async fn abandon_is_owner_only_scoped_idempotent_and_never_claims_delivery() {
             "may have been delivered"
         );
     }
-    let c = store.read().unwrap();
-    assert_eq!(counts(&c), (0, 1, 0));
-    assert!(!ledger::insert(&c, &a).unwrap());
-    let held = attempt(Some("approval"));
-    fixture_row(&c, &held);
-    ledger::transition(&c, &held.id, ReceiptState::Held, "fixture", now()).unwrap();
-    assert!(
-        !ledger::abandon(&c, "receiver", &held.id).unwrap(),
-        "abandon cannot bypass a held approval"
-    );
+    assert_eq!(counts(&store.read().unwrap()), (0, 1, 0));
+    fixture_write(&store, move |c| {
+        assert!(!ledger::insert(c, &a).unwrap());
+        let held = attempt(Some("approval"));
+        fixture_row(c, &held);
+        ledger::transition(c, &held.id, ReceiptState::Held, "fixture", now()).unwrap();
+        assert!(
+            !ledger::abandon(c, "receiver", &held.id).unwrap(),
+            "abandon cannot bypass a held approval"
+        );
+    });
 }
 
 struct CountingHost(AtomicUsize);
@@ -1953,12 +1974,12 @@ async fn admitted_reconciliation_backs_off_and_stops_even_after_restart() {
     let dir = private_dir();
     let store = Arc::new(crate::db::Store::open(&dir.path().join("db")).unwrap());
     let a = attempt(Some("admitted"));
-    {
-        let c = store.read().unwrap();
-        fixture_row(&c, &a);
-        ledger::mark_write_conn(&c, &a.id, now()).unwrap();
-        ledger::transition(&c, &a.id, ReceiptState::Admitted, "fixture", now()).unwrap();
-    }
+    let seed = a.clone();
+    fixture_write(&store, move |c| {
+        fixture_row(c, &seed);
+        ledger::mark_write_conn(c, &seed.id, now()).unwrap();
+        ledger::transition(c, &seed.id, ReceiptState::Admitted, "fixture", now()).unwrap();
+    });
     let st = state(store.clone());
     let host = Arc::new(CountingHost(AtomicUsize::new(0)));
     for (offset, count) in [
@@ -1981,13 +2002,14 @@ async fn admitted_reconciliation_backs_off_and_stops_even_after_restart() {
             "probe count at {offset}"
         );
     }
-    let c = store.read().unwrap();
-    assert_eq!(
-        ledger::recover(&c).unwrap(),
-        0,
-        "restart does not resume admitted probes"
-    );
-    assert_eq!(counts(&c), (0, 1, 1));
+    fixture_write(&store, |c| {
+        assert_eq!(
+            ledger::recover(c).unwrap(),
+            0,
+            "restart does not resume admitted probes"
+        )
+    });
+    assert_eq!(counts(&store.read().unwrap()), (0, 1, 1));
 }
 
 #[test]
@@ -2047,7 +2069,8 @@ fn attempt_constructor_persists_claudes_lstart_instead_of_the_kernel_token() {
     let dir = private_dir();
     let store = Arc::new(crate::db::Store::open(&dir.path().join("db")).unwrap());
     let a = attempt(None);
-    fixture_row(&store.read().unwrap(), &a);
+    let seed = a.clone();
+    fixture_write(&store, move |c| fixture_row(c, &seed));
     let st = state(store);
     let cfg = super::super::session_verbs::EnvFile::default();
     let mode = super::super::session_verbs::SendMode {
