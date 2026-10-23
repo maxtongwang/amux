@@ -38,12 +38,6 @@ const ALLOW: &[(&str, &str, &str)] = &[
     // Live-endpoint guards: 0.0.0.0 is a client URL host they must refuse, not a bind.
     ("crates/amux-cli/src/main.rs", "\"LOCALHOST\", \"0.0.0.0\", \"127.1\"",
      "test input: host spellings the live-endpoint guard refuses"),
-    ("scripts/lib/amux-endpoint.sh", "(the server binds 0.0.0.0)",
-     "comment"),
-    ("scripts/lib/amux_endpoint.py", "0.0.0.0, so any host on a live port",
-     "docstring"),
-    ("scripts/lib/amux_endpoint.py", "LOCALHOST, 0.0.0.0, 127.1,",
-     "docstring"),
     ("scripts/test-cli-isolated-endpoint.sh", "http://0.0.0.0:8824",
      "client URL the guard must refuse"),
     ("scripts/test-endpoint-clients-isolated.py", "\"http://0.0.0.0:8824\",",
