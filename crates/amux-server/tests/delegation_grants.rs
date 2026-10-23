@@ -70,11 +70,27 @@ async fn newer_unanswered_request_gets_yes_and_older_window_never_does() {
 #[tokio::test]
 async fn negated_free_text_never_creates_or_funds_a_request() {
     let e=setup().await;
-    let a=e.seed_row(MAX_PANE,&format!("Max, rather than enable yolo for {DEV_A}, may I enable yolo for {DEV_B}?"),"session",MRPOPO,Some("direct"),now_s());
-    let r=e.seed_pane_prompt(MAX_PANE,"yes",now_s());
+    // Keep this specimen runnable against faba94781: seed only shipped
+    // columns, with the original N2 binding, so the pre-fix failure is the
+    // unauthorized config write rather than a missing 0129 fixture column.
+    let pair=std::sync::Arc::new(std::sync::Mutex::new((0i64,0i64)));
+    let out=pair.clone();
+    let ask=format!("Max, rather than enable yolo for {DEV_A}, may I enable yolo for {DEV_B}?");
+    let bindings=serde_json::to_string(&std::collections::BTreeMap::from([(DEV_A,format!("inc-{DEV_A}")),(DEV_B,format!("inc-{DEV_B}"))])).unwrap();
+    let at=(now_s()*1000.0) as i64;
+    e.store.write(move|c| {
+        c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts,cite_worker_ids) VALUES(?1,?2,'session',?3,'direct',?4,?5)",
+            rusqlite::params![MAX_PANE,ask,MRPOPO,at,bindings])?;
+        let ask=c.last_insert_rowid();
+        c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts) VALUES(?1,'yes','user','pane','pane',?2)",rusqlite::params![MAX_PANE,at+1])?;
+        *out.lock().unwrap()=(ask,c.last_insert_rowid());
+        Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
+    }).unwrap();
+    let (a,r)=*pair.lock().unwrap();
     let before=e.config_snapshot();
     let (st,v)=e.call(Who::Worker(MRPOPO),"PATCH",&cfg(DEV_A),Some(cited(json!({"toggle_yolo":true}),json!({"ask_row_id":a,"reply_row_id":r})))).await;
     let attempted=(st,v);
+    assert_eq!(before,e.config_snapshot(),"contrast prose must not authorize the excluded worker change");
     let (st,v)=e.call(Who::Worker(MRPOPO),"GET","/api/delegation/requests",None).await;
     assert_allowed(st,&v,"request list");
     assert_eq!(v["requests"],json!([]));
