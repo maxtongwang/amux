@@ -689,6 +689,7 @@ const MIGRATIONS: &[Migration] = &[
         name: "0125_delegation_grants",
         sql: include_str!("../../migrations/0125_delegation_grants.sql"),
     },
+    // Unmerged PR #18: pair uniqueness, spent marker and stable worker binding.
     Migration {
         version: 126,
         name: "0126_delegation_grant_citation_pair",

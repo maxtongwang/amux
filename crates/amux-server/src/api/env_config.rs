@@ -312,8 +312,9 @@ async fn apply(
             if name.is_empty() || sessions.join(format!("{name}.env")).exists() {
                 return None;
             }
-            let action = crate::api::delegation::Action::CreateWorker { tags: w.groups.clone(), settings: env_spec_settings(w), owner_only: None };
-            crate::api::delegation::grant_if_allowed(&headers, &crate::api::delegation::Target::NewWorker, &action).map(|g| (name, g, w.groups.clone()))
+            let groups = crate::api::session_verbs::tags_of(Some(&json!(w.groups))).ok()?;
+            let action = crate::api::delegation::Action::CreateWorker { tags: groups.clone(), settings: env_spec_settings(w), owner_only: None };
+            crate::api::delegation::grant_if_allowed(&headers, &crate::api::delegation::Target::NewWorker, &action).map(|g| (name, g, groups))
         }).collect()).unwrap_or_default()
     };
     let resp = apply_inner(State(state.clone()), Query(q), headers, body).await;
@@ -340,7 +341,7 @@ async fn apply_inner(
         .unwrap_or("");
     let raw = String::from_utf8_lossy(&body);
     // JSON is a subset of YAML for serde_yaml, but honor an explicit JSON type.
-    let spec: EnvSpec = if ct.contains("json") {
+    let mut spec: EnvSpec = if ct.contains("json") {
         match serde_json::from_str(&raw) {
             Ok(s) => s,
             Err(e) => return bad(format!("invalid JSON: {e}")),
@@ -352,6 +353,12 @@ async fn apply_inner(
         }
     };
 
+    for worker in &mut spec.workers {
+        worker.groups = match crate::api::session_verbs::tags_of(Some(&json!(worker.groups))) {
+            Ok(groups) => groups,
+            Err(e) => return bad(e),
+        };
+    }
     if let Some(refusal) = worker_apply_refusal(&headers, &spec, dry) {
         return refusal;
     }
@@ -1069,7 +1076,7 @@ fn render_worker_env(w: &WorkerSpec) -> Result<String, String> {
     if !w.dir.is_empty() {
         pairs.push(("CC_DIR", w.dir.clone()));
     }
-    let groups: Vec<String> = w.groups.iter().map(|g| crate::api::session_verbs::norm_label(g)).filter(|g| !g.is_empty()).collect();
+    let groups = crate::api::session_verbs::tags_of(Some(&json!(w.groups)))?;
     if !groups.is_empty() {
         pairs.push(("CC_TAGS", groups.join(",")));
     }
@@ -1140,6 +1147,13 @@ fn write_env_atomic(path: &std::path::Path, body: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::api::sessions_legacy::worker_model_env;
+
+    #[test]
+    fn delegation_env_import_tags_use_canonical_array_grammar() {
+        let spec = WorkerSpec { name:"test-canonical".into(), groups:vec![" OPS ".into(),"dev,DEV".into()], ..Default::default() };
+        let rendered = render_worker_env(&spec).unwrap();
+        assert!(rendered.lines().any(|line| line == "CC_TAGS=\"dev,ops\""),"{rendered}");
+    }
 
     #[test]
     fn round8_env_apply_update_preserves_tokens_across_all_writers() {

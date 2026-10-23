@@ -165,7 +165,7 @@ pub async fn setup() -> Env {
     let sessions = home.path().join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
     for (name, tags, orch) in FLEET {
-        let mut env = format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{tags}\"\n");
+        let mut env = format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{tags}\"\nCC_INCARNATION=\"inc-{name}\"\n");
         if *orch {
             env.push_str("CC_ORCHESTRATOR=\"1\"\n");
         }
@@ -330,14 +330,20 @@ impl Env {
     /// Insert one Messages row; `ts_s` is unix seconds (the table stores ms).
     pub fn seed_row(&self, session: &str, text: &str, ty: &str, origin: &str, delivery: Option<&str>, ts_s: f64) -> i64 {
         let (session, text, ty, origin) = (session.to_string(), text.to_string(), ty.to_string(), origin.to_string());
+        let ids: std::collections::BTreeMap<_, _> = FLEET.iter().map(|(name, _, _)| {
+            let env = self.env_text(name);
+            let inc = env.lines().find_map(|l| l.strip_prefix("CC_INCARNATION=")).unwrap().trim_matches('"').to_string();
+            (name.to_string(), inc)
+        }).collect();
+        let ids = serde_json::to_string(&ids).unwrap();
         let delivery = delivery.map(str::to_string);
         let id = Arc::new(std::sync::atomic::AtomicI64::new(0));
         let out = id.clone();
         self.store
             .write(move |conn| {
                 conn.execute(
-                    "INSERT INTO cmd_history (text, type, session, ts, origin, delivery) VALUES (?1,?2,?3,?4,?5,?6)",
-                    rusqlite::params![text, ty, session, (ts_s * 1000.0) as i64, origin, delivery],
+                    "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, cite_worker_ids) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    rusqlite::params![text, ty, session, (ts_s * 1000.0) as i64, origin, delivery, ids],
                 )?;
                 out.store(conn.last_insert_rowid(), std::sync::atomic::Ordering::SeqCst);
                 Ok(WriteOutcome { applied: true, events: vec![] })

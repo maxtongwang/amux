@@ -19,7 +19,7 @@
 //!   2026-10-19, PR #18 review B4): a widening change cites a PAIR. (1) The
 //!   ask: a message the requesting agent sent into a session (a `session` row
 //!   whose origin is the agent) that names the target worker or layer AND
-//!   each setting in plain words. (2) The reply: Max's own FIRST typed row in
+//!   each setting in plain words (a tag also names add/remove and its target). (2) The reply: Max's own FIRST typed row in
 //!   that session after the ask (human-typed, not an amux delivery), within
 //!   [`ASK_REPLY_WINDOW_S`] of it and at most a day old. In the agent's own
 //!   lane only a non-local Remote owner send counts as the reply
@@ -47,11 +47,14 @@ pub(crate) enum MaxRefRefusal {
     OwnLane,
     /// A single quoted row instead of the (ask, reply) pair.
     PairRequired,
+    PairSpent,
     AskNotFound,
     /// The ask row is not a message the requesting agent sent.
     AskNotFromActor,
     AskMissingTarget,
     AskMissingSetting,
+    TargetIdentityChanged,
+    AskMissingChange,
     /// The reply is in a different session from the ask.
     WrongSession,
     /// The reply is not Max's first typed message after the ask.
@@ -70,10 +73,13 @@ impl MaxRefRefusal {
             Self::Missing => "cite_missing",
             Self::OwnLane => "max_ref_own_lane",
             Self::PairRequired => "cite_pair_required",
+            Self::PairSpent => "cite_pair_spent",
             Self::AskNotFound => "cite_ask_not_found",
             Self::AskNotFromActor => "cite_ask_not_from_actor",
             Self::AskMissingTarget => "cite_ask_missing_target",
             Self::AskMissingSetting => "cite_ask_missing_setting",
+            Self::TargetIdentityChanged => "cite_target_identity_changed",
+            Self::AskMissingChange => "cite_ask_missing_change",
             Self::WrongSession => "cite_reply_wrong_session",
             Self::ReplyNotFirst => "cite_reply_not_first",
             Self::ReplyOutsideWindow => "cite_reply_outside_window",
@@ -103,6 +109,7 @@ struct Row {
     origin: String,
     /// process_origin = remote: a non-local peer (owner proof); never the forwarded verdict.
     remote: bool,
+    worker_ids: String,
 }
 
 /// Which human shape a row has, if any (see the module comment).
@@ -121,7 +128,7 @@ fn human_source(ctype: &str, origin: &str, delivery: &str, process_origin: &str)
     None
 }
 
-const ROW_COLS: &str = "id, session, text, COALESCE(type,''), COALESCE(origin,''), COALESCE(delivery,''), COALESCE(process_origin,''), ts";
+const ROW_COLS: &str = "id, session, text, COALESCE(type,''), COALESCE(origin,''), COALESCE(delivery,''), COALESCE(process_origin,''), ts, COALESCE(cite_worker_ids,'{}')";
 
 fn rows(state: &AppState, sql_where: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<Row>, String> {
     let conn = state.store.read().map_err(|e| e.to_string())?;
@@ -139,6 +146,7 @@ fn rows(state: &AppState, sql_where: &str, params: &[&dyn rusqlite::ToSql]) -> R
                 remote: po == super::process_identity::REMOTE_DIRECT,
                 ctype,
                 origin,
+                worker_ids: r.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -242,6 +250,7 @@ pub(crate) struct Cited {
     pub ask_row_id: i64,
     pub ask_text: String,
     pub reply_text: String,
+    pub target_incarnation: Option<String>,
 }
 
 /// What the ask must name: the target (any one spelling) and EACH setting
@@ -250,6 +259,10 @@ pub(crate) struct Cited {
 pub(crate) struct CiteTerms {
     pub target: Vec<String>,
     pub settings: Vec<Vec<String>>,
+    /// Worker name at request time; the ask must carry the same incarnation.
+    pub worker: Option<String>,
+    /// Each changed tag with its required direction (add/remove).
+    pub tag_changes: Vec<(String, String)>,
 }
 
 /// The reply must come within this long after the ask.
@@ -283,6 +296,23 @@ pub(crate) fn names_exactly(text: &str, name: &str) -> bool {
     })
 }
 
+/// A worker name containing a tag/setting word is not a mention of that
+/// setting. Mask exact target names before checking the requested settings.
+fn setting_text(text: &str, targets: &[String]) -> String {
+    let mut text = text.to_lowercase();
+    for target in targets {
+        let target = target.to_lowercase();
+        if target.is_empty() { continue; }
+        let part = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '.');
+        let spans: Vec<_> = text.match_indices(&target).filter(|(i, _)| {
+            !text[..*i].chars().next_back().is_some_and(part)
+                && !text[*i + target.len()..].chars().next().is_some_and(part)
+        }).map(|(i, _)| i..i + target.len()).collect();
+        for span in spans.into_iter().rev() { text.replace_range(span, " "); }
+    }
+    text
+}
+
 /// Lowercase, `-`/`_`/`:` as spaces, whitespace collapsed.
 fn plain(s: &str) -> String {
     s.to_lowercase().chars().map(|c| if matches!(c, '-' | '_' | ':') { ' ' } else { c }).collect::<String>()
@@ -304,6 +334,34 @@ pub(crate) fn names_phrase(text: &str, phrase: &str) -> bool {
     })
 }
 
+/// Server-derived identities at ASK recording time. Missing/legacy bindings
+/// fail closed at citation time; a name is never rebound to its new holder.
+pub(crate) fn worker_bindings(text: &str) -> String {
+    let home = crate::config::amux_home();
+    let mut ids = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("env") { continue; }
+        let Some(name) = path.file_stem().and_then(|n| n.to_str()) else { continue };
+        if names_exactly(text, name) {
+            if let Ok(id) = super::rename_identity::ensure_incarnation(&home, name) {
+                ids.insert(name.to_string(), id);
+            }
+        }
+    }
+    serde_json::to_string(&ids).expect("string map serializes")
+}
+
+/// Require a directed tag change about this target, not unrelated mentions.
+/// A deliberately bounded grammar: `add [the] TAG tag to WORKER` or
+/// `remove [the] TAG tag from WORKER`. Multiple changes use multiple clauses.
+fn names_tag_change(text: &str, target: &str, tag: &str, direction: &str) -> bool {
+    let preposition = if direction == "add" { "to" } else { "from" };
+    let pattern = format!(r"(?i)\b{}\s+(?:the\s+)?{}\s+tags?\s+{}\s+(?:worker\s+)?{}(?:$|[^\p{{L}}\p{{N}}_.-])",
+        regex::escape(direction), regex::escape(tag), preposition, regex::escape(target));
+    regex::Regex::new(&pattern).is_ok_and(|r| r.is_match(text))
+}
+
 /// Resolve and verify a citation pair for `actor` asking for `terms`.
 pub(crate) fn cite_pair(state: &AppState, cite: Option<&Cite>, actor: &str, terms: &CiteTerms) -> Result<Cited, MaxRefRefusal> {
     cite_pair_at(state, cite, actor, terms, crate::config::now_f64())
@@ -313,8 +371,22 @@ fn one(state: &AppState, id: i64) -> Result<Option<Row>, MaxRefRefusal> {
     rows(state, "id=?1", &[&id]).map(|r| r.into_iter().next()).map_err(|_| MaxRefRefusal::NoSuchRow)
 }
 
+/// Fast refusal, also used for a replay whose change has become a no-op.
+/// The INSERT's unique index is the final authority against racing requests.
+pub(crate) fn pair_unspent(state: &AppState, cite: &Cite) -> Result<(), MaxRefRefusal> {
+    let (Some(ask), Some(reply)) = (cite.ask_row_id, cite.reply_row_id) else { return Ok(()) };
+    let conn = state.store.read().map_err(|_| MaxRefRefusal::NoSuchRow)?;
+    let spent: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM _amux_delegation_grants WHERE ask_row=?1 AND evidence_row=?2)",
+        rusqlite::params![ask, reply], |r| r.get(0),
+    ).map_err(|_| MaxRefRefusal::NoSuchRow)?;
+    if spent { return Err(MaxRefRefusal::PairSpent); }
+    Ok(())
+}
+
 fn cite_pair_at(state: &AppState, cite: Option<&Cite>, actor: &str, terms: &CiteTerms, now: f64) -> Result<Cited, MaxRefRefusal> {
     let cite = cite.ok_or(MaxRefRefusal::Missing)?;
+    pair_unspent(state, cite)?;
     let (Some(ask_id), Some(reply_id)) = (cite.ask_row_id, cite.reply_row_id) else {
         return Err(if cite.row_id.is_some() || cite.session.is_some() || cite.ask_row_id.is_some() || cite.reply_row_id.is_some() {
             MaxRefRefusal::PairRequired
@@ -330,9 +402,30 @@ fn cite_pair_at(state: &AppState, cite: Option<&Cite>, actor: &str, terms: &Cite
     if !terms.target.iter().any(|n| names_exactly(&ask.text, n)) {
         return Err(MaxRefRefusal::AskMissingTarget);
     }
-    if !terms.settings.iter().all(|alts| alts.iter().any(|p| names_phrase(&ask.text, p))) {
+    let settings_text = setting_text(&ask.text, &terms.target);
+    if !terms.settings.iter().all(|alts| alts.iter().any(|p| names_phrase(&settings_text, p))) {
         return Err(MaxRefRefusal::AskMissingSetting);
     }
+    if !terms.tag_changes.iter().all(|(tag, direction)| terms.target.iter().any(|target| names_tag_change(&ask.text, target, tag, direction))) {
+        return Err(MaxRefRefusal::AskMissingChange);
+    }
+    if terms.tag_changes.is_empty() && !terms.settings.iter().all(|alts| {
+        ask.text.split([';', '\n', '?', '!']).any(|clause| {
+            terms.target.iter().any(|target| names_exactly(clause, target))
+                && alts.iter().any(|setting| names_phrase(&setting_text(clause, &terms.target), setting))
+                && ["may I", "can I", "please", "turn on", "turn off", "enable", "disable", "set", "change", "update", "allow", "remove", "add", "make"].iter().any(|word| names_phrase(clause, word))
+        })
+    }) {
+        return Err(MaxRefRefusal::AskMissingChange);
+    }
+    let target_incarnation = if let Some(worker) = &terms.worker {
+        let ids: std::collections::BTreeMap<String, String> = serde_json::from_str(&ask.worker_ids).unwrap_or_default();
+        let current = super::rename_identity::incarnation(&crate::config::amux_home(), worker);
+        if current.is_none() || ids.get(worker) != current.as_ref() {
+            return Err(MaxRefRefusal::TargetIdentityChanged);
+        }
+        current
+    } else { None };
     // (2) The reply: Max's own typed row in the same session.
     let reply = one(state, reply_id)?.ok_or(MaxRefRefusal::NoSuchRow)?;
     if reply.session != ask.session {
@@ -365,6 +458,7 @@ fn cite_pair_at(state: &AppState, cite: Option<&Cite>, actor: &str, terms: &Cite
         ask_row_id: ask.id,
         ask_text: ask.text.chars().take(2000).collect(),
         reply_text: reply.text.chars().take(2000).collect(),
+        target_incarnation,
     })
 }
 
@@ -534,7 +628,7 @@ mod tests {
     const YOLO_ASK: &str = "Max, may I turn on yolo for test-alpha? Reply yes or no.";
 
     fn terms() -> CiteTerms {
-        CiteTerms { target: vec!["test-alpha".into()], settings: vec![vec!["yolo".into(), "CC_FLAGS".into()]] }
+        CiteTerms { target: vec!["test-alpha".into()], settings: vec![vec!["yolo".into(), "CC_FLAGS".into()]], ..Default::default() }
     }
 
     /// The ask: a message `from` sent into `session` (a peer send's row shape).
@@ -565,6 +659,33 @@ mod tests {
         let a2 = ask(&st, "test-desk2", ACTOR, "turn on CC_FLAGS for test-alpha?", NOW - 100.0);
         let r2 = put(&st, R("test-desk2", "go ahead", "user", "", "direct", Some("outside"), NOW - 50.0));
         assert!(check(&st, &pair(a2, r2)).is_ok());
+    }
+
+    #[test]
+    fn citation_identity_is_captured_at_ask_time_and_never_rebound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        let target = tmp.path().join("sessions/test-alpha.env");
+        std::fs::write(&target,"CC_TAGS=dev\nCC_INCARNATION=original-worker\n").unwrap();
+        let st = state(tmp.path());
+        let ids = worker_bindings(YOLO_ASK);
+        let parsed: std::collections::BTreeMap<String,String> = serde_json::from_str(&ids).unwrap();
+        assert_eq!(parsed.get("test-alpha").map(String::as_str),Some("original-worker"));
+        assert_eq!(worker_bindings("test-alpha2 has yolo"),"{}","whole names only");
+        let a = ask(&st,DESK,ACTOR,YOLO_ASK,NOW-60.0);
+        let r = put(&st,pane(DESK,"yes",NOW-30.0));
+        let mut t = terms();
+        t.worker = Some("test-alpha".into());
+        assert_eq!(cite_pair_at(&st,Some(&pair(a,r)),ACTOR,&t,NOW).map(|_|()),Err(MaxRefRefusal::TargetIdentityChanged),"legacy ask has no binding");
+        st.store.write(move |c| {
+            c.execute("UPDATE cmd_history SET cite_worker_ids=?1 WHERE id=?2",rusqlite::params![ids,a])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        assert!(cite_pair_at(&st,Some(&pair(a,r)),ACTOR,&t,NOW).is_ok());
+        std::fs::rename(&target,tmp.path().join("sessions/renamed.env")).unwrap();
+        std::fs::write(&target,"CC_TAGS=dev\nCC_INCARNATION=new-holder\n").unwrap();
+        assert_eq!(cite_pair_at(&st,Some(&pair(a,r)),ACTOR,&t,NOW).map(|_|()),Err(MaxRefRefusal::TargetIdentityChanged));
     }
 
     #[test]

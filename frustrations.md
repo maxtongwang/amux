@@ -6173,3 +6173,25 @@ FIX: Withhold completion while scans or entries fail, persist pending paths, and
   retry at startup or once per minute on identity operations. Successful entries
   leave the pending list; WARN identity_migration_pending reports counts and
   identity_migration_attempt records each bounded pass.
+
+
+## Citation approval could override an owner's reversal
+AREA: delegation
+SEVERITY: breaks
+STATUS: fixed
+DATE: 2026-10-23
+SESSION: pr18-r4
+CARD: maxtongwang/ai-config#160
+SYMPTOM: One cited ask/reply pair could mint repeated grants, including after
+  the owner restored removed membership. Mutable target names and incidental
+  setting mentions also let the request diverge from the cited ask.
+COST: PR #18 round-3 B1 and N1-N5; regression tests await the parent's Cargo
+  run because safe-cargo exits 75 on the sandbox-denied reclaim lock.
+FIX: Reserve one pair with its spent timestamp and exact request in the grant
+  transaction; compare delegated env writes under the writer's locks; bind
+  worker asks/grants to CC_INCARNATION; require directed tag requests and
+  canonical tag serialization. Refusals log delegation_refused with distinct
+  codes, delegation_grant_refused or delegation_state_changed. Array inputs
+  emit tags_array_normalized. SQLite uniqueness mutation failed as expected
+  and reverted; Rust behavioral verification is pending. Handler side effects
+  still span SQLite/files and are not one atomic resource transaction.
