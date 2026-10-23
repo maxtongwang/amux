@@ -263,43 +263,6 @@ async fn download(Query(q): Query<PathParam>) -> Response {
     }
 }
 
-fn upload_refusal(rel: &Path, target: &Path) -> Option<(&'static str, &'static str)> {
-    if rel.components().any(|component| {
-        matches!(component, Component::Normal(name) if name.as_encoded_bytes().starts_with(b"."))
-    }) {
-        return Some((
-            "upload_dotfile_refused",
-            "Uploads may not write dotfiles or files inside hidden directories.",
-        ));
-    }
-    if !crate::api::fs::is_path_allowed(target) {
-        return Some((
-            "upload_path_not_allowed",
-            "Uploads may not write sensitive home or system paths.",
-        ));
-    }
-    if crate::api::fs::is_dangerous_write(target) {
-        return Some((
-            "upload_dangerous_write_refused",
-            "Uploads may not write files that could execute code.",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        if let Ok(metadata) = std::fs::symlink_metadata(target) {
-            if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-                return Some((
-                    "upload_executable_refused",
-                    "Uploads may not overwrite existing executable files.",
-                ));
-            }
-        }
-    }
-    None
-}
-
 /// A refusal decided at the write itself, carried out of `atomic_write_checked`.
 #[derive(Debug)]
 struct UploadRefused(&'static str, &'static str);
@@ -331,7 +294,7 @@ fn upload_target_check(at: Option<&std::fs::Metadata>) -> std::io::Result<()> {
             return refused("upload_hardlink_refused", "Uploads may not overwrite a file that has other hard links.");
         }
         if m.permissions().mode() & 0o111 != 0 {
-            return refused("upload_executable_refused", "Uploads may not overwrite existing executable files.");
+            return refused("write_executable_refused", "Uploads may not overwrite existing executable files.");
         }
     }
     Ok(())
@@ -369,7 +332,7 @@ async fn upload_into(root: PathBuf, headers: &axum::http::HeaderMap, q: &PathPar
     let target = canon_root.join(&rel);
     let refuse = |code: &'static str, error: &'static str| {
         let origin = crate::api::session_verbs::worker_origin(headers);
-        tracing::warn!(target: "amux::files", path = %rel.display(), worker = %origin,
+        tracing::warn!(target: "amux::files", path = ?rel, worker = ?origin,
             verdict = code, measured = true, n_considered = 1,
             "file upload refused: {error}");
         err(
@@ -393,7 +356,7 @@ async fn upload_into(root: PathBuf, headers: &axum::http::HeaderMap, q: &PathPar
         );
     };
     for (r, t) in [(&rel, &target), (&real_rel, &real_target)] {
-        if let Some((code, error)) = upload_refusal(r, t) {
+        if let Some((code, error)) = crate::api::fs::write_refusal(r, t) {
             return refuse(code, error);
         }
     }
@@ -539,7 +502,7 @@ mod tests {
         std::fs::create_dir(dir.path().join(".config")).unwrap();
         std::os::unix::fs::symlink(dir.path().join(".config"), dir.path().join("cfg")).unwrap();
         let (status, v) = put(dir.path(), "cfg/tool.toml", b"cmd = 'pwned'").await;
-        assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("upload_dotfile_refused")), "{v}");
+        assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("write_dotfile_refused")), "{v}");
         assert!(!dir.path().join(".config/tool.toml").exists());
         let (status, v) = put(dir.path(), "cfg/new/tool.toml", b"x").await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
@@ -560,7 +523,7 @@ mod tests {
         let exe = dir.path().join("x.sh");
         std::fs::write(&exe, "#!/bin/sh").unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(code(&exe), Some("upload_executable_refused"));
+        assert_eq!(code(&exe), Some("write_executable_refused"));
         std::os::unix::fs::symlink(&exe, dir.path().join("l")).unwrap();
         assert_eq!(code(&dir.path().join("l")), Some("upload_symlink_refused"));
         std::fs::create_dir(dir.path().join("d")).unwrap();
@@ -625,8 +588,8 @@ mod tests {
             "notes/.envrc",
         ] {
             assert_eq!(
-                upload_refusal(Path::new(rel), &dir.path().join(rel)).map(|(code, _)| code),
-                Some("upload_dotfile_refused"),
+                crate::api::fs::write_refusal(Path::new(rel), &dir.path().join(rel)).map(|(code, _)| code),
+                Some("write_dotfile_refused"),
                 "{rel}"
             );
         }
@@ -638,8 +601,8 @@ mod tests {
         let target = PathBuf::from(std::env::var("HOME").unwrap()).join(".ssh/x");
         assert!(!crate::api::fs::is_path_allowed(&target));
         assert_eq!(
-            upload_refusal(Path::new("x"), &target).map(|(code, _)| code),
-            Some("upload_path_not_allowed")
+            crate::api::fs::write_refusal(Path::new("x"), &target).map(|(code, _)| code),
+            Some("write_path_not_allowed")
         );
     }
 
@@ -648,8 +611,8 @@ mod tests {
         let dir = root();
         for rel in ["Library/LaunchAgents/evil.plist", "bin/run", "x/evil.command"] {
             assert_eq!(
-                upload_refusal(Path::new(rel), &dir.path().join(rel)).map(|(code, _)| code),
-                Some("upload_dangerous_write_refused"),
+                crate::api::fs::write_refusal(Path::new(rel), &dir.path().join(rel)).map(|(code, _)| code),
+                Some("write_dangerous_write_refused"),
                 "{rel}"
             );
         }
@@ -665,11 +628,11 @@ mod tests {
         std::fs::write(&target, "echo test").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
-            upload_refusal(Path::new("tool.sh"), &target).map(|(code, _)| code),
-            Some("upload_executable_refused")
+            crate::api::fs::write_refusal(Path::new("tool.sh"), &target).map(|(code, _)| code),
+            Some("write_executable_refused")
         );
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(upload_refusal(Path::new("tool.sh"), &target), None);
+        assert_eq!(crate::api::fs::write_refusal(Path::new("tool.sh"), &target), None);
     }
 
     #[tokio::test]
@@ -681,7 +644,7 @@ mod tests {
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
         let body = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["code"], "upload_dotfile_refused", "{v}");
+        assert_eq!(v["code"], "write_dotfile_refused", "{v}");
         assert!(!dir.path().join(".bashrc").exists());
         let r = upload_into(dir.path().into(), &h, &up(".ssh/authorized_keys"), Bytes::from_static(b"k")).await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
@@ -696,7 +659,7 @@ mod tests {
         let dir = root();
         for rel in ["notes/a.txt", "Documents/report.pdf"] {
             assert_eq!(
-                upload_refusal(Path::new(rel), &dir.path().join(rel)),
+                crate::api::fs::write_refusal(Path::new(rel), &dir.path().join(rel)),
                 None,
                 "{rel}"
             );
