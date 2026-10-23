@@ -1,3 +1,4 @@
+// Shared Playwright fixtures — track route coverage and serve candidate assets with the server's bootstrap/version.
 /**
  * The e2e `test` every spec should import: page.route stubs that never match
  * are reported instead of passing silently (AF-47).
@@ -45,7 +46,8 @@ import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 
 // Browser-only checks can use a prebuilt API server and explicitly pin the
-// candidate asset. The digest records exactly which bytes the run exercised.
+// candidate asset. The source digest and measured server version identify the
+// served candidate bytes (app.js receives the same version stamp as production).
 const dashboardAssets = [
   ['AMUX_E2E_DASHBOARD_SOURCE', '**/app.js', 'text/javascript'],
   ['AMUX_E2E_DASHBOARD_CSS', '**/app.css', 'text/css'],
@@ -58,7 +60,7 @@ const dashboardAssets = [
   const source = process.env[env];
   if (!source) return [];
   const bytes = readFileSync(source);
-  console.log('[e2e] candidate dashboard asset: ' + source + ' sha256='
+  console.log('[e2e] candidate dashboard asset: ' + source + ' source_sha256='
     + createHash('sha256').update(bytes).digest('hex') + '; API binary is unchanged');
   return [{route: route === '**/' ? /^https?:\/\/[^/]+\/(?:\?.*)?$/ : route, bytes, contentType}];
 });
@@ -160,8 +162,26 @@ export const test = base.extend({
     }
     // A second tab must run the same candidate asset as the first. Page-only
     // overrides silently mixed the candidate outbox with the installed one.
+    // Measured once per context: a later reload reuses it instead of a fetch
+    // that can still be in flight when the test closes the page.
+    let stampedAppJs: string | undefined;
     for (const asset of dashboardAssets) {
       await context.route(asset.route, async route => {
+        if (asset.route === '**/app.js') {
+          // A raw candidate still carries the build placeholder. The real SSE
+          // ping carries this binary's stamped version; serving the placeholder
+          // makes the app correctly reload mid-test as though a deploy landed.
+          if (stampedAppJs === undefined) {
+            const response = await route.fetch({timeout:15000});
+            if (!response.ok()) throw new Error('candidate app.js: server asset HTTP ' + response.status());
+            const served = await response.text();
+            const version = served.match(/^const APP_VER = '([^']+)';/m)?.[1];
+            if (!version || version === '__AMUX_ASSET_VER__') throw new Error('candidate app.js: server version was not measured');
+            stampedAppJs = asset.bytes.toString().replaceAll('__AMUX_ASSET_VER__', version);
+            console.log('[e2e] verdict=candidate_asset_version_stamped measured=true n_considered=1 version=' + version);
+          }
+          return route.fulfill({body:stampedAppJs, contentType:asset.contentType});
+        }
         if (asset.contentType !== 'text/html') return route.fulfill({body:asset.bytes, contentType:asset.contentType});
         // The server injects the real isolated home's bootstrap credentials.
         // Replacing HTML without them tests a refused/auto-reloading shell.
