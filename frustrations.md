@@ -6209,3 +6209,24 @@ FIX: Reserve one pair with its spent timestamp and exact request in the grant
   reads existing incarnations on demand without fleet scans or env writes.
   The populated-old-0126 SQLite probe passed, its reply-index mutation failed
   and reverted; the parent still owns Cargo and Rust regression verification.
+
+## Typed yes bound to another approval
+AREA: delegation
+SEVERITY: breaks
+STATUS: fixed
+DATE: 2026-10-23
+SESSION: pr18-r4
+CARD: maxtongwang/ai-config#160
+SYMPTOM: PR #18 review B1 let one actor spend Max's yes under another actor's
+  question; B2 treated a contrast clause as approval of the excluded change.
+COST: Another review round; free-text matching could not establish approval identity.
+FIX: Max 2026-10-23: approval identity resolution. Supersedes the free-text
+  matcher portion of "Citation approval could override an owner's reversal".
+  Explicit request IDs bind existing actor, target and reply incarnations,
+  exact structured operands and the generated Messages question. A reply
+  resolves only one question in its own unanswered session window; ambiguous
+  and absent candidates fund nothing. Distinct request refusal codes and
+  delegation_request_resolution verdicts survive in the API, CLI and existing
+  dashboard list. 0129 adds the request bindings and resolution receipts;
+  0124-0128 remain unchanged. Rust regressions/mutations await the parent;
+  local CLI/dashboard and SQLite uniqueness/SIGKILL boundary probes pass.
