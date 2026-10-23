@@ -588,6 +588,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn citation_change_with_no_alternatives_cannot_match_empty_text_or_punctuation() {
+        let valid = setting_requests(&["yolo".into()], &["test-alpha".into()], &serde_json::json!(true));
+        let ask = "enable yolo for test-alpha?";
+        assert!(names_changes(ask, std::slice::from_ref(&valid)));
+        // Without the empty-list guard, joining zero alternatives builds an
+        // empty regex branch that matches empty text or a punctuation boundary.
+        for text in ["", "?", ask] {
+            assert!(!names_changes(text, &[vec![]]), "empty alternatives accepted {text:?}");
+            assert!(!names_changes(text, &[valid.clone(), vec![]]), "an empty requirement was skipped for {text:?}");
+        }
+    }
+
+    #[test]
     fn delegation_tag_change_names_target_tag_and_direction_with_optional_tag_noun() {
         for ask in [
             "Max, may I add leads to review-dev-b?",
