@@ -72,6 +72,13 @@ pub(crate) async fn create(State(state): State<AppState>, headers: HeaderMap, Js
     let Ok(uri) = input.path.parse::<axum::http::Uri>() else { return refusal("request_route_invalid", "invalid mutation URI"); };
     let mut req = Request::builder().method(input.method.as_str()).uri(uri);
     *req.headers_mut().expect("validated request URI") = headers;
+    // The draft is a distinct method/path, so it needs its own receipt. Keep
+    // actor/auth headers: the real handler must still judge the same caller.
+    let draft_headers = req.headers_mut().expect("validated request URI");
+    let parent_interaction = draft_headers.remove("x-amux-interaction-id");
+    draft_headers.remove("x-amux-command-kind");
+    tracing::info!(verdict = "delegation_request_draft", parent_interaction_id = ?parent_interaction,
+        method = input.method, path = input.path, "Deriving approval request with a separate interaction receipt");
     req.headers_mut().expect("validated request URI").remove(axum::http::header::CONTENT_LENGTH);
     req.headers_mut().expect("validated request URI").insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/json"));
     let Ok(req) = req.body(Body::from(input.body.to_string())) else { return refusal("request_route_invalid", "invalid mutation request"); };

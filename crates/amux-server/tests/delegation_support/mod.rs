@@ -33,8 +33,7 @@ use tower::ServiceExt;
 /// The owner agent's worker name (docs: agents/owner.md). Only ever created in
 /// the temp home.
 pub const MRPOPO: &str = "mrpopo";
-/// A pane Max types into that is not the actor's own lane: own-lane pane rows are
-/// refused (`max_ref_session_allowed`), so max_ref evidence is seeded here.
+/// The session where an explicit request is shown and Max's reply is recorded.
 pub const MAX_PANE: &str = "review-max-desk";
 pub const DEV_LEAD: &str = "review-dev-lead";
 /// A second lead of team dev: a PEER lead of DEV_LEAD.
@@ -168,19 +167,6 @@ pub fn now_s() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()
 }
 
-/// The spec's citation of a human-typed instruction: `{session, time}`.
-pub fn max_ref(session: &str, time: f64) -> Value {
-    json!({"session": session, "time": time})
-}
-
-/// `body` plus `why`. max_ref citations were replaced by structured grants
-/// (api/delegation_grants.rs); `r` is ignored and kept so older call sites
-/// read the same.
-pub fn with_ref(mut body: Value, _r: Value, why: &str) -> Value {
-    body["why"] = json!(why);
-    body
-}
-
 /// 202 with a pending grant: returns its code, checking the sentence names it.
 #[track_caller]
 pub fn assert_grant_pending(st: StatusCode, v: &Value, ctx: &str) -> String {
@@ -190,9 +176,9 @@ pub fn assert_grant_pending(st: StatusCode, v: &Value, ctx: &str) -> String {
     code
 }
 
-/// Apply by explicit request ID; non-string legacy citations exercise refusals.
-pub fn cited(mut body: Value, cite: Value) -> Value {
-    if cite.is_string() { body["request_id"] = cite; } else { body["cite"] = cite; }
+/// Apply only by explicit request ID; malformed fixtures must fail loudly.
+pub fn with_request(mut body: Value, request_id: Value) -> Value {
+    body["request_id"] = json!(request_id.as_str().expect("explicit request ID must be a string"));
     body
 }
 
@@ -200,9 +186,15 @@ static PANE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 
 impl Env {
     pub async fn request(&self, actor: &str, method: &str, path: &str, body: Value, reply_session: &str) -> String {
-        let (st,v) = self.call(Who::Worker(actor), "POST", "/api/delegation/requests", Some(json!({"method":method,"path":path,"body":body,"reply_session":reply_session}))).await;
+        let (st,v) = self.request_result(actor, method, path, body, reply_session).await;
         assert_eq!(st, StatusCode::ACCEPTED, "explicit request: {v}");
         v["request_id"].as_str().expect("request_id").into()
+    }
+
+    /// Exercise request creation without assuming that the change is delegable.
+    pub async fn request_result(&self, actor: &str, method: &str, path: &str, body: Value, reply_session: &str) -> (StatusCode, Value) {
+        self.call(Who::Worker(actor), "POST", "/api/delegation/requests",
+            Some(json!({"method":method,"path":path,"body":body,"reply_session":reply_session}))).await
     }
 
     pub async fn approved_request(&self, actor: &str, method: &str, path: &str, body: Value) -> Value {
@@ -339,14 +331,6 @@ impl Env {
             })
             .unwrap();
         id.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Raw free-text ask/reply fixture for negative authorization tests. These
-    /// rows create no request and supply no approval authority.
-    pub fn raw_ask_reply(&self, ask: &str) -> Value {
-        let ask = self.seed_row(MAX_PANE, ask, "session", MRPOPO, Some("direct"), now_s() - 60.0);
-        let reply = self.seed_pane_prompt(MAX_PANE, "yes, go ahead", now_s() - 30.0);
-        json!({"ask_row_id": ask, "reply_row_id": reply})
     }
 
     /// A prompt typed into `session`'s pane, in exactly the shape
@@ -493,13 +477,13 @@ pub fn assert_code(st: StatusCode, v: &Value, code: &str, ctx: &str) {
     assert_eq!(v["code"], json!(code), "{ctx}: {v}");
 }
 
-/// Refused for a reason that is NOT a max_ref problem: a valid max_ref cannot
-/// lift it (secrets, permission toggles for leads/self, out-of-team verbs).
+/// A permission-table denial, rather than a missing/invalid approval fixture.
 #[track_caller]
-pub fn assert_refused_regardless_of_max_ref(st: StatusCode, v: &Value, ctx: &str) {
+pub fn assert_permission_refused(st: StatusCode, v: &Value, ctx: &str) {
     assert_refused(st, v, ctx);
-    let code = v["code"].as_str().unwrap_or("");
-    assert!(!["max_ref_", "request_", "grant_", "cite_"].iter().any(|prefix| code.starts_with(*prefix)), "{ctx}: approval evidence cannot lift this; require the permission-table refusal: {v}");
+    let code = v["code"].as_str().unwrap();
+    assert!(!["max_ref_", "request_", "grant_", "cite_"].iter().any(|prefix| code.starts_with(prefix)),
+        "{ctx}: require the permission-table refusal, not an approval error: {v}");
 }
 
 pub fn create_body(dir: &Path, name: &str, tags: Value) -> Value {

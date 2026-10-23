@@ -192,12 +192,11 @@ async fn every_config_mutating_route_consults_delegation() {
             let (st, v) = e.call(Who::Owner, "POST", "/api/workers", Some(json!({"name": DEV_B, "cwd": "/tmp"}))).await;
             assert!(st.is_success(), "fixture: owner registers {DEV_B}'s store row: {st} {v}");
         }
-        // A grant row (mrpopo) cites Max's row in another lane: it applies and
-        // logs the change plus the grant.
+        // A request (mrpopo) is approved in its shown session, then the exact
+        // change applies and logs both the change and the grant.
         let body = if c.needs_ref {
-            // N3: each tag change explicitly names its direction and worker.
             let row = e.approved_request(c.allowed_as,c.method,&c.path,c.allowed.clone()).await;
-            cited(c.allowed.clone(), row)
+            with_request(c.allowed.clone(), row)
         } else {
             c.allowed.clone()
         };

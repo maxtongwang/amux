@@ -1444,6 +1444,59 @@ mod tests {
         v["request_id"].as_str().unwrap().to_string()
     }
 
+    #[tokio::test]
+    async fn explicit_request_draft_uses_a_distinct_receipt_and_preserves_conflict_checks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        let before = snapshot(&state);
+        let app = super::super::router(state.clone());
+        let parent_id = "test-explicit-request";
+        let path = "/api/sessions/test-dev-a/config";
+        let req = Request::builder().method("POST").uri("/api/delegation/requests")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header("x-amux-session", "mrpopo")
+            .header("x-amux-interaction-id", parent_id)
+            .header("x-amux-command-kind", "environment.post")
+            .body(Body::from(json!({"reply_session":"test-desk", "method":"PATCH", "path":path,
+                "body":{"worktree_verify":"one"}}).to_string())).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        assert_eq!(res.headers()["x-amux-interaction-id"], parent_id);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let request_id = body["request_id"].as_str().unwrap();
+        let grant = load(&state, request_id).unwrap();
+        assert_eq!(grant.actor, "mrpopo");
+        assert_eq!(grant.status, "pending");
+        assert_eq!(snapshot(&state), before, "derivation never executes the change");
+        {
+            let conn = state.store.read().unwrap();
+            let mut stmt = conn.prepare("SELECT id,command_kind,method,path,actor FROM _amux_interactions ORDER BY path").unwrap();
+            let receipts = stmt.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?,
+                r.get::<_,String>(2)?, r.get::<_,String>(3)?, r.get::<_,String>(4)?)))
+                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(receipts.len(), 2, "parent and draft both have durable receipts");
+            assert_eq!((receipts[0].0.as_str(), receipts[0].1.as_str(), receipts[0].2.as_str(),
+                receipts[0].3.as_str(), receipts[0].4.as_str()),
+                (parent_id, "environment.post", "POST", "/api/delegation/requests", "mrpopo"));
+            assert_ne!(receipts[1].0, parent_id);
+            assert_eq!((receipts[1].1.as_str(), receipts[1].2.as_str(), receipts[1].3.as_str(), receipts[1].4.as_str()),
+                ("worker.patch", "PATCH", path, "mrpopo"));
+        }
+        // Reusing that ID on a genuinely different command must still fail.
+        let req = Request::builder().method("PATCH").uri(path)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header("x-amux-session", "mrpopo")
+            .header("x-amux-interaction-id", parent_id)
+            .body(Body::from(json!({"worktree_verify":"one"}).to_string())).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(snapshot(&state), before);
+        assert_eq!(load(&state, request_id).unwrap().status, "pending");
+    }
+
     async fn record_reply(state: &AppState, text: &str, source: &str) -> i64 {
         let session="test-desk".to_string();
         let text=text.to_string();

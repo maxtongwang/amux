@@ -35,12 +35,11 @@ async fn each_allowed_delegated_change_appends_exactly_one_entry() {
     assert_eq!(entries.len(), 2, "{entries:?}");
     assert_entry_shape(&entries[1], DEV_A, "self", DEV_A);
 
-    // mrpopo's membership change cites Max's row in another lane: it applies
-    // at once as a grant; the change and the grant are both logged.
-    // N3: the ask names the changed tag and direction for this worker.
+    // mrpopo applies the exact request after Max approves in the shown session;
+    // both the change and the applied grant are logged.
     let row = e.approved_request(MRPOPO,"PATCH",&format!("/api/sessions/{DEV_B}/config"),json!({"tags":"dev,leads"})).await;
     let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &format!("/api/sessions/{DEV_B}/config"),
-        Some(cited(with_ref(json!({"tags": "dev,leads"}), json!(null), "Max asked for a second lead"), row.clone()))).await;
+        Some(with_request(json!({"tags": "dev,leads", "why": "Max asked for a second lead"}), row.clone()))).await;
     assert_allowed(st, &v, "mrpopo membership with a citation");
     let code = e.latest_grant();
     assert_eq!(e.grant_status(&code), "applied");
