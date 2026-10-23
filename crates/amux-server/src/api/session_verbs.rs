@@ -10743,6 +10743,9 @@ pub(crate) fn held_delivery_matching(draft: &str, name: &str, rows: &[(String, S
     exact.or_else(|| {
         rows.iter().find_map(|(text, origin)| {
             let sent = origin_stamped(origin, name, text).unwrap_or_else(|| text.clone());
+            if sent.chars().filter(|c| !c.is_whitespace()).count() < 8 {
+                return None;
+            }
             let (prefix, body) = delivery_parts(&sent);
             let prefix_sq: String = prefix.split_whitespace().collect();
             let chip = draft.strip_prefix(prefix_sq.as_str())?;
@@ -11988,6 +11991,7 @@ pub(crate) enum Submission {
 /// interrupt a just-accepted turn before its spinner/transcript is visible and
 /// restore the input after we have falsely reported submission.
 async fn verify_submitted(
+    state: &AppState,
     name: &str,
     text: &str,
     sent_at: f64,
@@ -12115,7 +12119,7 @@ async fn verify_submitted(
                         // confirm by the transcript or, if the exact message is
                         // back in the box at idle, press Enter again (the manual
                         // Enter that fixed the morning's incidents).
-                        spawn_direct_draft_idle_submit(name, text, sent_at, 90.0);
+                        spawn_direct_draft_idle_submit(state, name, text, sent_at, 90.0);
                         return (Submission::Confirmed, retried);
                     }
                     // The composer has text again: the submission was rolled
@@ -13016,7 +13020,7 @@ async fn submit_project_execution_draft_if_owned(
     let generating = detect_claude_status(&raw) == "active";
     // No retry Enter on a slash command: it would act inside its panel.
     let (submission, retried) =
-        verify_submitted(name, text, sent_at, !generating && !is_slash_command(text)).await;
+        verify_submitted(state, name, text, sent_at, !generating && !is_slash_command(text)).await;
     Some(send_outcome(submission, generating, retried))
 }
 
@@ -13032,6 +13036,67 @@ async fn submit_project_execution_draft_if_owned(
 fn composer_holds_this_delivery(draft: &str, text: &str) -> bool {
     let want: String = text.split_whitespace().collect();
     want.chars().count() >= 8 && draft == want
+}
+
+fn held_composer_delivery_matching(draft: &str, name: &str, rows: &[(String, String)]) -> Option<String> {
+    // Consume whole deliveries in chronological order, once per row. Keep all
+    // reachable offsets: a short prefix must not hide a later complete match.
+    // Never use containment here: even one extra owner character refuses Enter.
+    if draft.len() > 256 * 1024 {
+        return None;
+    }
+    let mut matched = std::collections::BTreeMap::from([(0usize, String::new())]);
+    for (text, origin) in rows.iter().take(32).rev() {
+        if is_slash_command(text) {
+            continue;
+        }
+        let mut next = matched.clone();
+        for sent in std::iter::once(text.clone()).chain(origin_stamped(origin, name, text)) {
+            let want: String = sent.split_whitespace().collect();
+            if want.chars().count() < 8 {
+                continue;
+            }
+            for (&offset, prior) in &matched {
+                let rest = &draft[offset..];
+                let end = if rest.starts_with(&want) {
+                    Some(offset + want.len())
+                } else {
+                    let (prefix, body) = delivery_parts(&sent);
+                    let prefix: String = prefix.split_whitespace().collect();
+                    rest.strip_prefix(&prefix).and_then(|chip| {
+                        let end = chip.find(']')? + 1;
+                        paste_chip_fits(&chip[..end], &body).then_some(offset + prefix.len() + end)
+                    })
+                };
+                if let Some(end) = end {
+                    let delivered = if prior.is_empty() { sent.clone() } else { format!("{prior}\n{sent}") };
+                    if end == draft.len() {
+                        return Some(delivered);
+                    }
+                    next.entry(end).or_insert(delivered);
+                }
+            }
+            if next.len() > 128 {
+                return None; // ambiguous prefix combinations fail closed, bounded
+            }
+        }
+        matched = next;
+    }
+    None
+}
+
+/// Watch recovery uses the same durable history as the owner-draft guard, but
+/// permits a sequence of deliveries. It never authorises Ctrl-U on that sequence.
+fn held_amux_composer(state: &AppState, name: &str, draft: &str) -> Option<String> {
+    let c = state.store.read().ok()?;
+    let mut st = c.prepare(
+        "SELECT text, origin FROM cmd_history WHERE session=?1 AND ts>?2 \
+         AND (submit_verdict IN ('stuck','deferred','unverified') OR (delivery='queued' AND delivered_at IS NULL)) \
+         ORDER BY id DESC LIMIT 32",
+    ).ok()?;
+    let rows = st.query_map(rusqlite::params![name, (now_i64() - DIRECT_DRAFT_MAX_AGE_S) * 1000],
+        |r| Ok((r.get(0)?, r.get(1)?))).ok()?.collect::<rusqlite::Result<Vec<(String, String)>>>().ok()?;
+    held_composer_delivery_matching(draft, name, &rows)
 }
 
 /// Submit the lane's own pasted steering message at an idle boundary. Returns
@@ -13075,7 +13140,7 @@ async fn submit_own_steering_draft(
     let sent_at = now_f64();
     send_key(name, "Enter").await;
     let (submission, retried) =
-        verify_submitted(name, text, sent_at, !is_slash_command(text)).await;
+        verify_submitted(state, name, text, sent_at, !is_slash_command(text)).await;
     Some(send_outcome(submission, false, retried))
 }
 
@@ -14223,7 +14288,7 @@ async fn send_text_inner_bound(
     // /btw panel and the answer is gone, which is what the retry below did to
     // launch-videos at 21:30:36Z. So no retry and no idle watcher for them.
     let is_slash = is_slash_command(&text);
-    let (first, retried) = verify_submitted(name, &text, sent_at, !generating && !is_slash).await;
+    let (first, retried) = verify_submitted(state, name, &text, sent_at, !generating && !is_slash).await;
     if is_slash {
         // The verifier reads "stuck" whenever it never saw the composer come
         // back empty. A panel (/btw, /status) HIDES the composer, so that read
@@ -14247,7 +14312,7 @@ async fn send_text_inner_bound(
         // while the box holds exactly this message and no turn is running,
         // then hand anything still held to the idle watcher instead of
         // abandoning it in the box.
-        let (sub, presses, reason) = retry_held_idle_draft(name, &text, sent_at).await;
+        let (sub, presses, reason) = retry_held_idle_draft(state, name, &text, sent_at).await;
         if sub == Submission::Confirmed {
             tracing::warn!(session = %name, presses, reason, measured = true, n_considered = 1,
                 verdict = "submitted_after_retry",
@@ -14255,7 +14320,7 @@ async fn send_text_inner_bound(
             return send_outcome(Submission::Confirmed, false, true);
         }
         if reason != "human_changed" {
-            spawn_direct_draft_idle_submit(name, &text, sent_at, 10.0);
+            spawn_direct_draft_idle_submit(state, name, &text, sent_at, 10.0);
             tracing::warn!(session = %name, presses, reason, measured = true, n_considered = 1,
                 verdict = "stuck_held_for_idle_submit",
                 "send: still in the composer after backoff retries; the idle watcher keeps pressing Enter while it is exactly this message");
@@ -14290,7 +14355,7 @@ async fn send_text_inner_bound(
             return send_outcome(Submission::Stuck, generating, true);
         }
         send_key(name, "Enter").await;
-        let (second, _) = verify_submitted(name, &text, sent_at, false).await;
+        let (second, _) = verify_submitted(state, name, &text, sent_at, false).await;
         if second == Submission::Stuck {
             // THE ROOT OF "UNSUBMITTED TEXT" (Ethan 2026-09-24: "figure out why
             // we so often have this unsubmitted text status"). Of the stamps in
@@ -14300,7 +14365,7 @@ async fn send_text_inner_bound(
             // (submit_own_steering_draft); the direct path returned "not
             // submitted" and nobody ever pressed Enter, so the text sat until a
             // human noticed. Now it gets the same treatment, bounded and logged.
-            spawn_direct_draft_idle_submit(name, &text, sent_at, 0.0);
+            spawn_direct_draft_idle_submit(state, name, &text, sent_at, 0.0);
             return (
                 true,
                 "queued (held in the input box; submitted automatically when this turn ends)".into(),
@@ -14319,9 +14384,9 @@ fn direct_draft_watches() -> &'static std::sync::Mutex<std::collections::HashSet
 }
 
 /// Press Enter on a direct message amux pasted mid-turn, at the lane's next
-/// idle boundary, if and only if the composer still holds exactly that
-/// message. A human who edited or cleared it wins; the watch stops. Bounded to
-/// 30 minutes; every exit is a counted verdict.
+/// idle boundary, only when its complete contents are known deliveries. Owner
+/// edits stop the watch. Re-arm at idle after 30 minutes, with a six-hour cap;
+/// every exit is a counted verdict.
 /// `grace_s`: for this long an EMPTY box does not end the watch (Claude Code
 /// can clear the box and restore the text a second or more later); only the
 /// transcript recording the message, or the grace running out, does.
@@ -14428,18 +14493,29 @@ pub(crate) enum HeldDraftStep {
 }
 
 pub(crate) fn held_draft_step(raw: &str, text: &str) -> HeldDraftStep {
+    if is_slash_command(text) || detect_claude_status(raw) == "waiting" || is_rate_limit_menu(raw) {
+        return HeldDraftStep::Wait;
+    }
     match composer_state(raw) {
         ComposerState::Typed(draft) => {
-            if !composer_holds_this_delivery(&draft, text) {
+            if held_composer_delivery_matching(&draft, "", &[(text.into(), String::new())]).is_none() {
                 HeldDraftStep::HumanChanged
-            } else if detect_claude_status(raw) == "active" || pane_bar_says_generating(raw) {
-                HeldDraftStep::Generating
             } else {
-                HeldDraftStep::PressEnter
+                owned_draft_readiness(raw)
             }
         }
         ComposerState::Empty | ComposerState::Placeholder(_) => HeldDraftStep::Left,
         ComposerState::NotVisible | ComposerState::BackgroundManager => HeldDraftStep::Wait,
+    }
+}
+
+fn owned_draft_readiness(raw: &str) -> HeldDraftStep {
+    if detect_claude_status(raw) == "waiting" || is_rate_limit_menu(raw) {
+        HeldDraftStep::Wait
+    } else if detect_claude_status(raw) == "active" || pane_bar_says_generating(raw) {
+        HeldDraftStep::Generating
+    } else {
+        HeldDraftStep::PressEnter
     }
 }
 
@@ -14454,7 +14530,7 @@ pub(crate) const HELD_DRAFT_BACKOFF_MS: [u64; 3] = [1500, 3000, 6000];
 /// Retry a stuck idle message with backoff, re-reading the frame before every
 /// press. Returns the outcome, how many Enters it pressed, and why it stopped.
 /// Runs under the send lock the caller already holds.
-async fn retry_held_idle_draft(name: &str, text: &str, sent_at: f64) -> (Submission, u32, &'static str) {
+async fn retry_held_idle_draft(state: &AppState, name: &str, text: &str, sent_at: f64) -> (Submission, u32, &'static str) {
     let mut presses = 0u32;
     for delay in HELD_DRAFT_BACKOFF_MS {
         sleep_ms(delay).await;
@@ -14470,7 +14546,7 @@ async fn retry_held_idle_draft(name: &str, text: &str, sent_at: f64) -> (Submiss
                 presses += 1;
                 let at = now_f64();
                 send_key(name, "Enter").await;
-                let (sub, _) = verify_submitted(name, text, at, false).await;
+                let (sub, _) = verify_submitted(state, name, text, at, false).await;
                 if sub == Submission::Confirmed {
                     return (Submission::Confirmed, presses, "enter_accepted");
                 }
@@ -14479,7 +14555,7 @@ async fn retry_held_idle_draft(name: &str, text: &str, sent_at: f64) -> (Submiss
             // reads could not prove or a restore still on its way: let the
             // verifier's cleared/JSONL logic decide, without pressing anything.
             HeldDraftStep::Left => {
-                let (sub, _) = verify_submitted(name, text, sent_at, false).await;
+                let (sub, _) = verify_submitted(state, name, text, sent_at, false).await;
                 if sub == Submission::Confirmed {
                     return (Submission::Confirmed, presses, "composer_cleared");
                 }
@@ -14492,26 +14568,56 @@ async fn retry_held_idle_draft(name: &str, text: &str, sent_at: f64) -> (Submiss
     (Submission::Stuck, presses, "still_held")
 }
 
-fn spawn_direct_draft_idle_submit(name: &str, text: &str, sent_at: f64, grace_s: f64) {
+const DIRECT_DRAFT_MAX_AGE_S: i64 = 6 * 3600;
+const DIRECT_DRAFT_REARM_S: f64 = 1800.0;
+
+fn direct_draft_watch_budget(started: f64, now: f64) -> bool {
+    now - started < DIRECT_DRAFT_MAX_AGE_S as f64
+}
+
+fn direct_draft_rearm_at_idle(deadline: &mut f64, now: f64, idle: bool) -> bool {
+    if !idle || now < *deadline {
+        return false;
+    }
+    *deadline = now + DIRECT_DRAFT_REARM_S;
+    true
+}
+
+struct DirectDraftWatch(String);
+
+impl Drop for DirectDraftWatch {
+    fn drop(&mut self) {
+        direct_draft_watches().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+    }
+}
+
+fn spawn_direct_draft_idle_submit(state: &AppState, name: &str, text: &str, sent_at: f64, grace_s: f64) {
     if is_slash_command(text) {
         // Never press Enter on a slash command later: its panel or picker may be
         // open, and Enter there selects or closes (see send_text).
         return;
     }
-    let key = format!("{name}\u{0}{}", text.split_whitespace().collect::<String>());
-    if let Ok(mut w) = direct_draft_watches().lock() {
+    // One watcher per lane, not per message: two held relays must not race
+    // each other's confirmation read and Enter.
+    let key = name.to_string();
+    {
+        let mut w = direct_draft_watches().lock().unwrap_or_else(|e| e.into_inner());
         if !w.insert(key.clone()) {
-            return; // already watching this exact message on this lane
+            return;
         }
     }
+    let watch = DirectDraftWatch(key);
     let (name, text) = (name.to_string(), text.to_string());
+    let state = state.clone();
     tokio::spawn(async move {
+        let _watch = watch; // cancellation/panic also releases the lane claim
         let started = now_f64();
-        let deadline = started + 1800.0;
+        let mut deadline = started + DIRECT_DRAFT_REARM_S;
+        let mut last_step = None;
         let verdict: &'static str = loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            if now_f64() > deadline {
-                break "direct_draft_idle_submit_gave_up";
+            if !direct_draft_watch_budget(started, now_f64()) {
+                break "direct_draft_idle_submit_budget_exhausted";
             }
             if sent_at > 0.0
                 && (jsonl_submission_since(&name, &text, sent_at)
@@ -14525,10 +14631,20 @@ fn spawn_direct_draft_idle_submit(name: &str, text: &str, sent_at: f64, grace_s:
             let send_lock = session_send_lock(&name);
             let _guard = send_lock.lock().await;
             let raw = tmux_capture(&name, 25).await;
-            match composer_state(&raw) {
+            let (held, recovered_from_history, collapsed_display) = match composer_state(&raw) {
                 ComposerState::Typed(draft) => {
-                    if !composer_holds_this_delivery(&draft, &text) {
-                        break "direct_draft_changed_by_human";
+                    let history = held_amux_composer(&state, &name, &draft);
+                    let recovered_from_history = history.is_some();
+                    let collapsed_display = is_collapsed_paste(&draft) || draft.to_lowercase().contains("[pastedcontent");
+                    match history.or_else(||
+                        held_composer_delivery_matching(&draft, "", &[(text.clone(), String::new())])) {
+                        Some(held) => (held, recovered_from_history, collapsed_display),
+                        None => {
+                            tracing::warn!(session = %name, composer_chars = draft.chars().count(),
+                                measured = true, n_considered = 1, verdict = "direct_draft_composer_mismatch",
+                                "composer is not a complete ordered sequence of known deliveries; owner text preserved");
+                            break "direct_draft_changed_by_human";
+                        }
                     }
                 }
                 ComposerState::Empty | ComposerState::Placeholder(_) => {
@@ -14539,13 +14655,26 @@ fn spawn_direct_draft_idle_submit(name: &str, text: &str, sent_at: f64, grace_s:
                 }
                 // A full-screen view or the background manager: keep waiting.
                 ComposerState::NotVisible | ComposerState::BackgroundManager => continue,
+            };
+            let step = owned_draft_readiness(&raw);
+            if last_step != Some(step) {
+                tracing::info!(session = %name, ?step, recovered_from_history, collapsed_display,
+                    measured = true, n_considered = 1,
+                    verdict = "direct_draft_idle_submit_observed", "held relay watcher state");
+                last_step = Some(step);
             }
-            if detect_claude_status(&raw) == "active" || pane_bar_says_generating(&raw) {
+            let rearmed = direct_draft_rearm_at_idle(&mut deadline, now_f64(), step == HeldDraftStep::PressEnter);
+            if step != HeldDraftStep::PressEnter {
                 continue;
+            }
+            if rearmed {
+                tracing::warn!(session = %name, measured = true, n_considered = 1,
+                    verdict = "direct_draft_idle_submit_rearmed", "known held relays reached idle after the watch window; re-armed within the six-hour budget");
             }
             let sent_at = now_f64();
             send_key(&name, "Enter").await;
-            let (sub, _) = verify_submitted(&name, &text, sent_at, true).await;
+            // All retries return through the ownership/idle/picker read above.
+            let (sub, _) = verify_submitted(&state, &name, &held, sent_at, false).await;
             if sub == Submission::Confirmed {
                 break "direct_draft_submitted_at_idle";
             }
@@ -14553,9 +14682,6 @@ fn spawn_direct_draft_idle_submit(name: &str, text: &str, sent_at: f64, grace_s:
                 verdict = "direct_draft_idle_enter_not_confirmed",
                 "idle Enter on the held direct message was not confirmed; will retry while it is still there");
         };
-        if let Ok(mut w) = direct_draft_watches().lock() {
-            w.remove(&key);
-        }
         let preview = chars_truncate(&text, 80);
         if matches!(verdict, "direct_draft_submitted_at_idle" | "direct_draft_left_composer" | "direct_draft_confirmed_by_transcript") {
             tracing::info!(session = %name, %preview, measured = true, n_considered = 1, verdict,
@@ -24741,28 +24867,6 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
                 tracing::warn!(session = %name, preview = %preview, via_agents_grace,
                     possible_codex_footer_chrome = possible_codex_footer_drift,
                     "unsubmitted text is stuck in the composer with no live turn or agents — the lane will read `waiting` until it is submitted or cleared");
-                // AMUX-5412: respawn the idle-submit watcher when stuck text
-                // is detected with no active watcher. The original watcher is
-                // a tokio task that dies on server self-adoption (auto-builder
-                // deploy), leaving the message permanently stuck. The dedup
-                // set in spawn_direct_draft_idle_submit prevents duplicates.
-                //
-                // ONLY FOR AMUX'S OWN HELD MESSAGE (2026-10-17). The respawn
-                // used to watch the composer's OWN text, so the watcher's
-                // exact-match guard compared the draft with itself and pressed
-                // Enter on any owner draft left idle: three of Max's unsent
-                // drafts were submitted at 00:41-00:42Z, one of which widened
-                // Cloudflare Access. It now resumes a watch only when the draft
-                // is a message amux recorded for this lane as not yet
-                // submitted, and watches that message's text.
-                if let Some(ref draft) = typed_pending {
-                    match held_amux_delivery(state, name, draft) {
-                        Some(held) => spawn_direct_draft_idle_submit(name, &held, now_f64(), 5.0),
-                        None => tracing::info!(session = %name, measured = true, n_considered = 1,
-                            verdict = "stuck_composer_left_for_owner",
-                            "stuck composer text is not a message amux sent; no idle-submit watcher started"),
-                    }
-                }
                 emit_event(
                     state,
                     name,
@@ -24776,6 +24880,20 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
                     "status",
                 )
                 .await;
+            }
+        }
+
+        // AMUX-5412: respawn the idle-submit watcher on every idle sweep, not
+        // only the first stuck transition. Restarts and expired watches must
+        // recover without a human toggling the composer status. History age,
+        // row count and lane-level watch dedup bound recovery.
+        if let Some(ref draft) = typed_pending {
+            match held_amux_composer(state, name, draft) {
+                Some(held) => spawn_direct_draft_idle_submit(state, name, &held, now_f64(), 5.0),
+                None if !stuck_was => tracing::info!(session = %name, measured = true, n_considered = 1,
+                    verdict = "stuck_composer_left_for_owner",
+                    "stuck composer text is not a message amux sent; no idle-submit watcher started"),
+                None => {}
             }
         }
 
@@ -49787,7 +49905,7 @@ with open(sys.argv[3],'ab',buffering=0) as log:
             );
             sleep_ms(50).await;
         }
-        let (observed, retried) = verify_submitted(&lane, GHOST, 0.0, true).await;
+        let (observed, retried) = verify_submitted(&relay_idle_submit_tests::test_state().1, &lane, GHOST, 0.0, true).await;
         assert_eq!(observed, Submission::Confirmed);
         assert!(retried);
         let delivered = std::fs::read(&keys).unwrap();
@@ -49839,7 +49957,7 @@ with open(sys.argv[3],'ab',buffering=0) as log:
             // Walk the actual asynchronous capture/verification loop, with no
             // key retries or transcript claims. The busy fixture must fail
             // verification; the drawn empty composer is the positive control.
-            let (observed, retried) = verify_submitted(&lane, GHOST, 0.0, false).await;
+            let (observed, retried) = verify_submitted(&relay_idle_submit_tests::test_state().1, &lane, GHOST, 0.0, false).await;
             assert_eq!(observed, expected);
             assert!(!retried);
         }
@@ -50488,9 +50606,9 @@ mod composer_state_tests {
         let src = include_str!("session_verbs.rs");
         let at = src.find("AMUX-5412: respawn the idle-submit watcher").expect("sweep respawn site");
         let site = &src[at..at + 2000];
-        assert!(site.contains("match held_amux_delivery(state, name, draft)"), "respawn is gated on ownership");
-        assert!(site.contains("spawn_direct_draft_idle_submit(name, &held,"), "it watches the held text");
-        assert!(!site.contains("spawn_direct_draft_idle_submit(name, draft"), "never the draft it read");
+        assert!(site.contains("match held_amux_composer(state, name, draft)"), "respawn is gated on ownership");
+        assert!(site.contains("spawn_direct_draft_idle_submit(state, name, &held,"), "it watches the held text");
+        assert!(!site.contains("spawn_direct_draft_idle_submit(state, name, draft"), "never the draft it read");
         assert!(site.contains("\"stuck_composer_left_for_owner\""), "the skip is logged");
     }
 
@@ -50501,8 +50619,8 @@ mod composer_state_tests {
         let src = include_str!("session_verbs.rs");
         let at = src.find("if first == Submission::Stuck && !generating {").expect("idle-stuck branch");
         let branch = &src[at..at + 2400];
-        assert!(branch.contains("retry_held_idle_draft(name, &text, sent_at).await"), "no backoff retry");
-        assert!(branch.contains("spawn_direct_draft_idle_submit(name, &text, sent_at, 10.0)"), "no idle watcher");
+        assert!(branch.contains("retry_held_idle_draft(state, name, &text, sent_at).await"), "no backoff retry");
+        assert!(branch.contains("spawn_direct_draft_idle_submit(state, name, &text, sent_at, 10.0)"), "no idle watcher");
         assert!(branch.contains("\"submitted_after_retry\""), "no success verdict");
         assert!(branch.contains("\"stuck_held_for_idle_submit\""), "no held verdict");
         // A held message is deferred, never "confirmed": the receipt must not
@@ -57263,6 +57381,236 @@ mod composer_guard_tests {
                 Err("yesaddboth".into()), "{label}: the owner's draft must refuse Enter");
             assert_eq!(await_composer_owned(&lane, "", "yes add both", false).await, Ok(()),
                 "{label}: control — text this send typed passes");
+        }
+    }
+}
+
+#[cfg(test)]
+mod relay_idle_submit_tests {
+    use super::*;
+
+    pub(super) fn test_state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("relay.db")).unwrap();
+        let state = AppState {
+            store: std::sync::Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "relay-test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        (dir, state)
+    }
+
+    fn squashed(text: &str) -> String { text.split_whitespace().collect() }
+
+    #[test]
+    fn ordered_relays_fill_the_whole_composer() {
+        let a = "first relay from the dev lead";
+        let b = "second relay from the business lead";
+        let rows = vec![(b.into(), String::new()), (a.into(), String::new())];
+        let joined = format!("{a}\n{b}");
+        assert_eq!(held_composer_delivery_matching(&squashed(&joined), "w", &rows), Some(joined));
+        assert_eq!(held_composer_delivery_matching(&squashed(&format!("{b} {a}")), "w", &rows), None);
+        for draft in [format!("owner {a} {b}"), format!("{a} owner {b}"), format!("{a} {b}x"), format!("{a} {b} owner")] {
+            assert_eq!(held_composer_delivery_matching(&squashed(&draft), "w", &rows), None, "{draft}");
+        }
+    }
+
+    #[test]
+    fn rows_are_consumed_once_and_owner_word_boundaries_are_not_substring_matches() {
+        let relay = "complete relay message";
+        let row = (relay.to_string(), String::new());
+        let twice = format!("{relay}\n{relay}");
+        assert_eq!(held_composer_delivery_matching(&squashed(&twice), "w", std::slice::from_ref(&row)), None);
+        assert_eq!(held_composer_delivery_matching(&squashed(&twice), "w", &[row.clone(), row.clone()]), Some(twice));
+        for owner in [format!("x{relay}"), format!("{relay}x"), format!("前{relay}"),
+            format!("{relay}后"), format!("[{relay}]"), "complete relay messag".into()] {
+            assert_eq!(held_composer_delivery_matching(&squashed(&owner), "w", std::slice::from_ref(&row)), None, "{owner}");
+        }
+        assert_eq!(held_composer_delivery_matching("12345678", "w", &[("12345678".into(), String::new())]), Some("12345678".into()));
+        assert_eq!(held_delivery_matching("[Pastedtext#1+0lines]", "w", &[("yes".into(), String::new())]), None);
+    }
+
+    #[test]
+    fn chips_and_wrapping_match_only_complete_known_deliveries() {
+        let a = "first line\nsecond line\nthird line";
+        let b = "another complete relay message";
+        let rows = vec![(b.into(), "business-lead".into()), (a.into(), "dev-lead".into())];
+        let first = origin_stamped("dev-lead", "w", a).unwrap();
+        let second = origin_stamped("business-lead", "w", b).unwrap();
+        let (prefix, _) = delivery_parts(&first);
+        let shown = format!("{prefix}[Pasted text #7 +2 lines]{second}");
+        let expected = format!("{first}\n{second}");
+        assert_eq!(held_composer_delivery_matching(&squashed(&shown), "w", &rows), Some(expected));
+        for bad in [shown.replace("+2", "+3"), shown.replace(" +2 lines", ""), format!("owner {shown}"), format!("{shown} owner")] {
+            assert_eq!(held_composer_delivery_matching(&squashed(&bad), "w", &rows), None, "{bad}");
+        }
+        let wrapped = first.replace("second", "sec\nond");
+        assert_eq!(held_composer_delivery_matching(&squashed(&wrapped), "w", &rows), Some(first));
+    }
+
+    #[test]
+    fn short_and_slash_deliveries_never_authorise_idle_enter() {
+        for text in ["yes", "1234567", "a b c d e", "/status", "/model change", "/btw explain this"] {
+            let rows = vec![(text.into(), String::new())];
+            assert_eq!(held_composer_delivery_matching(&squashed(text), "w", &rows), None, "{text}");
+        }
+    }
+
+    fn frame(text: &str) -> String { format!("────\n❯ {text}\n────\n⏵⏵ bypass permissions on\n") }
+
+    #[test]
+    fn a_chip_waits_while_busy_and_an_open_picker_never_gets_enter() {
+        let text = "first line\nsecond line\nthird line";
+        for slash in ["/status", "/model change", "/btw explain this"] {
+            assert_ne!(held_draft_step(&frame(slash), slash), HeldDraftStep::PressEnter);
+        }
+        let chip = frame("[Pasted text #7 +2 lines]");
+        assert_eq!(held_draft_step(&chip, text), HeldDraftStep::PressEnter);
+        let busy = format!("✻ Galloping… (12s · ↓ 84 tokens)\n{chip}\nesc to interrupt\n");
+        assert_eq!(held_draft_step(&busy, text), HeldDraftStep::Generating);
+        let picker = format!("{}Choose a model\n❯ 1. Yes\n  2. Cancel\nEnter to select · Esc to cancel\n", frame(text));
+        assert_ne!(held_draft_step(&picker, text), HeldDraftStep::PressEnter);
+    }
+
+    #[test]
+    fn busy_past_the_old_deadline_can_rearm_but_the_total_budget_is_bounded() {
+        assert!(direct_draft_watch_budget(100.0, 100.0 + DIRECT_DRAFT_REARM_S + 1.0));
+        let mut deadline = 100.0 + DIRECT_DRAFT_REARM_S;
+        assert!(!direct_draft_rearm_at_idle(&mut deadline, 2000.0, false));
+        assert_eq!(deadline, 1900.0, "generation does not consume an idle rearm");
+        assert!(direct_draft_rearm_at_idle(&mut deadline, 2001.0, true));
+        assert_eq!(deadline, 3801.0);
+        assert!(!direct_draft_rearm_at_idle(&mut deadline, 2002.0, true));
+        assert!(!direct_draft_watch_budget(100.0, 100.0 + DIRECT_DRAFT_MAX_AGE_S as f64));
+        assert!(!direct_draft_watch_budget(100.0, 100.0 + DIRECT_DRAFT_MAX_AGE_S as f64 + 1.0));
+    }
+
+    #[tokio::test]
+    async fn cancelled_watch_releases_its_lane_for_durable_recovery() {
+        let lane = format!("relay194-cancelled-{}", std::process::id());
+        assert!(direct_draft_watches().lock().unwrap().insert(lane.clone()));
+        let watch = DirectDraftWatch(lane.clone());
+        let task = tokio::spawn(async move {
+            let _watch = watch;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!direct_draft_watches().lock().unwrap().contains(&lane));
+    }
+
+    #[test]
+    fn history_recovery_is_lane_scoped_recent_and_uses_durable_bytes() {
+        let (_dir, state) = test_state();
+        let now = now_i64() * 1000;
+        state.store.write(move |c| {
+            for (id, lane, text, age) in [(1, "relay-test", "first complete relay", 1900),
+                (2, "relay-test", "second complete relay", 1850),
+                (3, "other-test", "foreign lane message", 0),
+                (4, "relay-test", "expired complete relay", DIRECT_DRAFT_MAX_AGE_S + 1)] {
+                c.execute("INSERT INTO cmd_history(id,text,type,session,ts,submit_verdict) VALUES(?1,?2,'user',?3,?4,'stuck')",
+                    rusqlite::params![id, text, lane, now - age * 1000])?;
+            }
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let expected = "first complete relay\nsecond complete relay";
+        assert_eq!(held_amux_composer(&state, "relay-test", &squashed(expected)), Some(expected.into()));
+        for foreign in ["foreign lane message", "expired complete relay", "first complete relay owner"] {
+            assert_eq!(held_amux_composer(&state, "relay-test", &squashed(foreign)), None);
+        }
+    }
+
+    /// Uses only the test-build private socket. The real route parks the new
+    /// send; the real sweep recovers the earlier relays. The first Enter drops.
+    #[tokio::test]
+    #[ignore = "private tmux TUI replay; run explicitly, no model or live worker"]
+    async fn route_and_sweep_recover_held_relays_without_touching_owner_text() {
+        struct Pane(String);
+        impl Drop for Pane {
+            fn drop(&mut self) {
+                let _ = tmux_command().args(["kill-session", "-t", &session_target(&self.0)]).output();
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (_db_dir, state) = test_state();
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        let a = "first relay complete";
+        let b = "second relay complete";
+        for (case, visible, should_submit) in [
+            ("ordered", format!("{a} {b}"), true),
+            ("chip", format!("[Pasted text #7 +2 lines] {b}"), true),
+            ("owner-prefix", format!("owner {a} {b}"), false),
+            ("owner-suffix", format!("{a} {b}x"), false),
+            ("owner-middle", format!("{a} owner {b}"), false),
+            ("short", "yes".into(), false),
+            ("slash", "/status".into(), false),
+            ("picker", format!("{a} {b}"), false),
+        ] {
+            let lane = format!("relay194-{}-{case}", std::process::id());
+            std::fs::write(env_path(&lane), "CC_AUTO_START=0\nCC_PROVIDER=claude\nCC_DIR=/tmp\nCC_AUTO_CONTINUE=0\n").unwrap();
+            let lane_copy = lane.clone();
+            state.store.write(move |c| {
+                for text in ["first line\nsecond line\nthird line", a, b, "yes", "/status"] {
+                    c.execute("INSERT INTO cmd_history(text,type,session,ts,submit_verdict) VALUES(?1,'user',?2,?3,'stuck')",
+                        rusqlite::params![text, lane_copy, (now_i64() - 1900) * 1000])?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            }).unwrap();
+            let initial = home.path().join(format!("{case}-frame"));
+            let empty = home.path().join(format!("{case}-empty"));
+            let keys = home.path().join(format!("{case}-keys"));
+            let shown = if case == "picker" {
+                format!("{}Choose a model\n  1. Fast\n  2. Slow\nEnter to select · Esc to cancel\n", frame(&visible))
+            } else { frame(&visible) };
+            std::fs::write(&initial, shown).unwrap();
+            std::fs::write(&empty, frame("")).unwrap();
+            std::fs::write(&keys, b"").unwrap();
+            let pane = Pane(tmux_name(&lane));
+            let script = r#"import os,pathlib,select,sys,time,tty
+tty.setraw(sys.stdin.fileno())
+def paint(path):
+    sys.stdout.write('\x1b[2J\x1b[H'+pathlib.Path(path).read_text().replace('\n','\r\n'));sys.stdout.flush()
+paint(sys.argv[1]); enters=0; end=time.monotonic()+90
+with open(sys.argv[3],'ab',buffering=0) as log:
+    while time.monotonic()<end:
+        if not select.select([sys.stdin],[],[],0.1)[0]: continue
+        key=os.read(sys.stdin.fileno(),1);log.write(key)
+        if key==b'\r':
+            enters+=1
+            if enters>=2: paint(sys.argv[2])
+"#;
+            let output = tmux_command().args(["new-session", "-d", "-s", &pane.0, "-x", "220", "-y", "24", "python3", "-c", script,
+                initial.to_str().unwrap(), empty.to_str().unwrap(), keys.to_str().unwrap()]).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while composer_state(&tmux_capture(&lane, 25).await).typed().is_none() {
+                assert!(std::time::Instant::now() < deadline, "fixture did not paint");
+                sleep_ms(50).await;
+            }
+            let response = send_post(&state, &lane, &HeaderMap::new(), &json!({"text":"a fresh followup relay"})).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(std::fs::read(&keys).unwrap().is_empty(), "route must park instead of clearing the box");
+            // A previous stuck stamp must not suppress recovery on this sweep.
+            update_meta(&lane, &[("composer_stuck_since", json!(now_i64() - 1900))]);
+            rate_limit_sweep(&state).await;
+            if should_submit {
+                let deadline = std::time::Instant::now() + Duration::from_secs(25);
+                while composer_state(&tmux_capture(&lane, 25).await).typed().is_some() {
+                    assert!(std::time::Instant::now() < deadline, "known held relays never submitted");
+                    sleep_ms(100).await;
+                }
+                sleep_ms(2500).await;
+                assert_eq!(std::fs::read(&keys).unwrap(), b"\r\r", "one dropped Enter, one accepted Enter, no duplicate");
+            } else {
+                sleep_ms(2500).await;
+                assert_eq!(composer_state(&tmux_capture(&lane, 25).await).typed(), Some(squashed(&visible).as_str()));
+                assert!(std::fs::read(&keys).unwrap().is_empty(), "owner/slash text must not receive any key");
+            }
+            drop(pane);
+            std::fs::remove_file(env_path(&lane)).unwrap();
         }
     }
 }
