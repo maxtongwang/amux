@@ -12,8 +12,11 @@
 //!   plugs into): today the owner's Approve button from a NON-LOCAL Remote
 //!   peer, or an owner send from one containing `amux grant <code>`.
 //!
-//! CITATION RESERVATION. One (ask, reply) pair reserves one grant. Its unique
-//! pair, spent timestamp, target incarnation and exact change request are
+//! CITATION RESERVATION. One owner reply reserves one grant globally (all
+//! actors, workers, routes and modes). It answers only the citing actor's
+//! latest unanswered ask in that session and must match max_ref's documented
+//! affirmative phrase allowlist; questions, negations and other text refuse.
+//! Its unique reply, spent timestamp, target incarnation and exact change request are
 //! committed together before handler execution; failed/interrupted grants
 //! keep their evidence spent (`cite_pair_spent`), including after undo. The
 //! files and other handler writes are separate resources, not a SQLite ACID
@@ -22,7 +25,7 @@
 //! failed handler returns `grant_apply_failed`, records `failed`, and emits
 //! WARN `delegation_grant_failed`. Grant lists expose `failure_reason` with
 //! the instruction to re-ask the owner, also shown by `amux grant list
-//! [--json]` and Settings > Delegated changes. The pair stays spent.
+//! [--json]` and Settings > Delegated changes. The reply stays spent.
 //! Worker asks record server-derived CC_INCARNATION bindings at message time;
 //! legacy asks without them need a fresh ask. Rename/name reuse cannot transfer
 //! a grant, including pending apply, internal replay, and undo.
@@ -81,7 +84,7 @@ const CAPTURE_LIMIT: usize = 1 << 20;
 const APPLY_FAILED_REASON: &str = "failed: re-ask the owner; any cited pair remains spent";
 /// The paths whose handlers can make a grant.
 const CAPTURE_PREFIXES: [&str; 8] = [
-    "/api/sessions/", "/api/workers", "/api/scope", "/api/groups/", "/api/settings/", "/api/config/", "/api/env/", "/api/alert/config",
+    "/api/sessions", "/api/workers", "/api/scope", "/api/groups/", "/api/settings/", "/api/config/", "/api/env/", "/api/alert/config",
 ];
 /// Request fields that are delegation metadata, never part of the change.
 const META: [&str; 2] = ["cite", "why"];
@@ -358,11 +361,15 @@ pub async fn capture(State(state): State<AppState>, req: Request<Body>, next: Ne
     }
     // Sends can synchronously approve and replay a grant. Never hold this
     // lock around /send or /report: their replay takes the config lock itself.
-    let serial = path == "/api/scope" || path == "/api/workers"
+    let serial = path == "/api/scope" || path == "/api/workers" || path == "/api/sessions"
         || path.ends_with("/config") || path.ends_with("/rename")
-        || ["/api/groups/", "/api/settings/", "/api/config/"].iter().any(|p| path.starts_with(p))
+        || ["/api/groups/", "/api/settings/", "/api/config/", "/api/env/"].iter().any(|p| path.starts_with(p))
         || path.strip_prefix("/api/workers/").is_some_and(|p| !p.contains('/'));
     let _mutation = if serial { Some(CONFIG_MUTATION.lock().await) } else { None };
+    if serial && (path.starts_with("/api/env/") || path == "/api/sessions") {
+        tracing::info!(path = %path, verdict = "delegation_config_serialized", measured = true, n_considered = 1,
+            "env apply and owner create share serialization through preflight and writes");
+    }
     let (parts, body) = req.into_parts();
     // A body declared larger than any config change (a long prompt to
     // `/send`, whose routes carry no body limit) passes through uncaptured;
@@ -479,10 +486,8 @@ fn insert(state: &AppState, g: &NewGrant, c: &Captured) -> Result<(String, Strin
             // The spent marker and exact immutable request (body/path/method)
             // are reserved by the SAME transaction as the grant, before any
             // handler side effect. A failed/interrupted handler never frees it.
-            if let (Some(ask), Some(reply)) = (row.14, row.11) {
-                let spent: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM _amux_delegation_grants WHERE ask_row=?1 AND evidence_row=?2)",
-                    rusqlite::params![ask, reply], |r| r.get(0))?;
+            if let Some(reply) = row.11 {
+                let spent = super::max_ref::reply_spent(conn, reply)?;
                 if spent {
                     return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
                         std::io::Error::other("cite_pair_spent"),
@@ -499,7 +504,7 @@ fn insert(state: &AppState, g: &NewGrant, c: &Captured) -> Result<(String, Strin
         match inserted {
             Ok(o) if o.applied => return Ok((code, text)),
             Ok(_) => continue,
-            Err(e) if e.to_string().contains("cite_pair_spent") => return Err(forbid("cite_pair_spent", "this citation pair already reserved a grant; ask Max again".into())),
+            Err(e) if e.to_string().contains("cite_pair_spent") => return Err(forbid("cite_pair_spent", "this owner reply already reserved a grant; ask Max again".into())),
             Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": e.to_string()}))).into_response()),
         }
     }
@@ -689,15 +694,47 @@ fn not_applicable(state: &AppState, g: &GrantRow) -> Option<(&'static str, Strin
     (g.status != "pending").then(|| ("grant_not_pending", format!("grant {} is {}, not pending; it applies once", g.code, g.status)))
 }
 
+/// Reserve a typed approval's reply in the status transaction, shared with
+/// cite mode's UNIQUE evidence_row constraint. Button approvals have no row.
+fn claim_pending(state: &AppState, code: &str, by: &str, evidence: Option<i64>) -> Result<(), (&'static str, String)> {
+    let (owned_code, by) = (code.to_string(), by.to_string());
+    let at = now();
+    let result = state.store.write(move |conn| {
+        if let Some(reply) = evidence {
+            let spent = super::max_ref::reply_spent(conn, reply)?;
+            if spent {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    std::io::Error::other("cite_pair_spent"),
+                )));
+            }
+        }
+        let n = conn.execute(
+            "UPDATE _amux_delegation_grants SET status='applying', decided_by=?1, decided_at=?2, evidence_row=?3, \
+             cite_spent_at=CASE WHEN ?3 IS NOT NULL THEN ?2 ELSE cite_spent_at END WHERE code=?4 AND status='pending'",
+            rusqlite::params![by, at, evidence, owned_code],
+        )?;
+        Ok(crate::db::WriteOutcome { applied: n == 1, events: vec![] })
+    });
+    match result {
+        Ok(o) if o.applied => Ok(()),
+        Ok(_) => Err(("grant_not_pending", format!("grant {code} was already taken"))),
+        Err(e) => {
+            let refusal = if e.to_string().contains("cite_pair_spent") { "cite_pair_spent" } else { "grant_claim_failed" };
+            tracing::warn!(grant = code, evidence_row = ?evidence, error = %e, code = refusal,
+                verdict = "delegation_grant_claim_refused", measured = true, n_considered = 1,
+                "pending grant could not reserve owner evidence; no replay occurred");
+            Err((refusal, format!("grant {code} could not reserve owner evidence: {e}")))
+        }
+    }
+}
+
 /// Apply a pending grant: exactly the stored request, once.
 pub(crate) async fn apply(state: &AppState, code: &str, by: &str, evidence: Option<i64>) -> Result<Value, (&'static str, String)> {
     let g = load(state, code).ok_or(("grant_not_found", format!("no grant {code}")))?;
     if let Some(why) = not_applicable(state, &g) {
         return Err(why);
     }
-    if !set_status(state, &g.code, "pending", "applying", by, evidence) {
-        return Err(("grant_not_pending", format!("grant {} was already taken", g.code)));
-    }
+    claim_pending(state, &g.code, by, evidence)?;
     log_transition(state, &g.code, "approved", by, "owner", &g.target, json!({"sentence": g.sentence, "evidence_row": evidence}), None);
     let mut req = Request::builder()
         .method(g.method.as_str())
@@ -1115,13 +1152,14 @@ mod tests {
         let c = context(json!({"toggle_yolo":true}));
         CAPTURED.scope(c, async {
             let code = begin_cited(&state,"mrpopo","mrpopo","set_config:toggle_yolo","test-dev-a",None,&cited).unwrap();
-            let response = begin_cited(&state,"mrpopo","mrpopo","set_config:toggle_yolo","test-dev-a",None,&cited).unwrap_err();
+            let other_ask = super::super::max_ref::Cited { ask_row_id: 3, ..cited.clone() };
+            let response = begin_cited(&state,"test-dev-lead","lead","set_config:toggle_yolo","test-dev-a",None,&other_ask).unwrap_err();
             assert_eq!(response.status(),StatusCode::FORBIDDEN);
             let bytes = axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap();
             let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(body["code"],"cite_pair_spent","insert guard must name spent evidence, not code exhaustion");
             assert_eq!(super::super::max_ref::pair_unspent(&state,&super::super::max_ref::Cite {
-                ask_row_id:Some(1),reply_row_id:Some(2),..Default::default() }),Err(super::super::max_ref::MaxRefRefusal::PairSpent));
+                ask_row_id:Some(3),reply_row_id:Some(2),..Default::default() }),Err(super::super::max_ref::MaxRefRefusal::PairSpent));
             let conn = state.store.read().unwrap();
             let (spent, body): (Option<f64>,String) = conn.query_row(
                 "SELECT cite_spent_at,body FROM _amux_delegation_grants WHERE code=?1",[&code],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
@@ -1138,19 +1176,122 @@ mod tests {
         let conn = state.store.read().unwrap();
         assert!(conn.prepare("SELECT cite_spent_at,target_incarnation FROM _amux_delegation_grants").is_ok());
         drop(conn);
-        let insert = |code: &str| {
+        let insert = |code: &str, ask: Option<i64>, evidence: Option<i64>| {
             let code = code.to_string();
             state.store.write(move |c| {
-                c.execute("INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,status,ask_row,evidence_row,cite_spent_at) VALUES(?1,'mrpopo','mrpopo','x','fleet','PUT','/api/scope','{}','change',1,2,'applying',11,12,1)",[code])?;
+                c.execute("INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,status,ask_row,evidence_row,cite_spent_at) VALUES(?1,'mrpopo','mrpopo','x','fleet','PUT','/api/scope','{}','change',1,2,'applying',?2,?3,1)",rusqlite::params![code, ask, evidence])?;
                 Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
             })
         };
-        insert("ABCD").unwrap();
-        let err = insert("EFGH").err().expect("a second grant must violate citation uniqueness");
-        assert!(err.to_string().contains("UNIQUE constraint failed"),"{err}");
+        insert("ABCD", Some(11), Some(12)).unwrap();
+        for ask in [Some(13), None] {
+            let err = insert("EFGH", ask, Some(12)).err().expect("a different ask or passkey grant must violate reply uniqueness");
+            assert!(err.to_string().contains("UNIQUE constraint failed"),"{err}");
+        }
         let conn = state.store.read().unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM _amux_delegation_grants",[],|r|r.get(0)).unwrap();
         assert_eq!(count,1);
+        drop(conn);
+        insert("IJKM", None, None).unwrap();
+        let err = state.store.write(|c| {
+            c.execute("UPDATE _amux_delegation_grants SET evidence_row=12 WHERE code='IJKM'", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).err().expect("a passkey UPDATE must obey the same unique reply constraint");
+        assert!(err.to_string().contains("UNIQUE constraint failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn delegation_reply_spent_precheck_ignores_ask_actor_and_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        let c = context(json!({"toggle_yolo": true}));
+        let g = NewGrant { actor: "mrpopo", class: "mrpopo", action: "set_config:toggle_yolo", target: "test-dev-a", why: None, status: "pending", cited: None };
+        let (code, _) = insert(&state, &g, &c).unwrap();
+        assert!(set_status(&state, &code, "pending", "applying", "owner", Some(42)));
+        assert!(set_status(&state, &code, "applying", "failed", "owner", None));
+        let cite = super::super::max_ref::Cite { ask_row_id: Some(99), reply_row_id: Some(42), ..Default::default() };
+        assert_eq!(super::super::max_ref::pair_unspent(&state, &cite), Err(super::super::max_ref::MaxRefRefusal::PairSpent));
+    }
+
+    #[tokio::test]
+    async fn delegation_reply_is_single_use_across_pending_and_cite_in_both_orders() {
+        for cite_first in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let _home = crate::api::settings::test_env::set_home(tmp.path());
+            let state = test_state(tmp.path());
+            let c = context(json!({"toggle_yolo": true}));
+            let pending = NewGrant { actor: "mrpopo", class: "mrpopo", action: "set_config:toggle_yolo", target: "test-dev-a", why: None, status: "pending", cited: None };
+            let (code, _) = insert(&state, &pending, &c).unwrap();
+            let cited = super::super::max_ref::Cited { row_id: 42, ask_row_id: 41, session: "test-desk".into(), excerpt: "yes".into(), ask_text: "enable yolo for test-dev-a".into(), reply_text: "yes".into(), target_incarnation: Some("inc-test-dev-a".into()) };
+            let immediate = NewGrant { cited: Some(&cited), status: "applying", ..pending };
+            if cite_first {
+                insert(&state, &immediate, &c).unwrap();
+                let err = apply(&state, &code, "owner", Some(42)).await.unwrap_err();
+                assert_eq!(err.0, "cite_pair_spent");
+                assert_eq!(load(&state, &code).unwrap().status, "pending");
+            } else {
+                // Reserve at the same boundary apply uses, without executing
+                // an unrelated handler: qualification is independently tested.
+                claim_pending(&state, &code, "owner", Some(42)).unwrap();
+                let response = insert(&state, &immediate, &c).unwrap_err();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["code"], "cite_pair_spent");
+                let (other, _) = insert(&state, &NewGrant { cited: None, status: "pending", ..immediate }, &c).unwrap();
+                assert_eq!(claim_pending(&state, &other, "owner", Some(42)).unwrap_err().0, "cite_pair_spent");
+            }
+            let conn = state.store.read().unwrap();
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM _amux_delegation_grants WHERE evidence_row=42", [], |r| r.get(0)).unwrap();
+            assert_eq!(count, 1, "one reply can belong to only one grant in either mode");
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_one_owner_line_naming_two_pending_codes_funds_one_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        let c = context(json!({"toggle_yolo": true}));
+        let g = NewGrant { actor: "mrpopo", class: "mrpopo", action: "set_config:toggle_yolo", target: "test-dev-a", why: None, status: "pending", cited: None };
+        let (first, _) = insert(&state, &g, &c).unwrap();
+        let (second, _) = insert(&state, &g, &c).unwrap();
+        let text = format!("amux grant {first} and amux grant {second}");
+        let row = put_row(&state, "test-phone", &text, "user", "", "direct", Some("remote"), now());
+        on_row(&state, row, &text).await;
+        assert_eq!(load(&state, &first).unwrap().status, "applied");
+        assert_eq!(load(&state, &second).unwrap().status, "pending");
+        assert!(load(&state, &first).unwrap().cite_spent_at.is_some());
+        // Re-observing the delivery cannot allocate its row to the other code.
+        on_row(&state, row, &text).await;
+        assert_eq!(load(&state, &second).unwrap().status, "pending");
+        let conn = state.store.read().unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM _amux_delegation_grants WHERE evidence_row=?1", [row], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn delegation_env_apply_holds_config_lock_across_handler_awaits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        // Probe the actual capture middleware at both create routes. This is
+        // deterministic: try_lock observes ownership, with no sleeps/races.
+        let probe = || async {
+            assert!(CONFIG_MUTATION.try_lock().is_err(), "exists-check must run under CONFIG_MUTATION");
+            tokio::task::yield_now().await;
+            assert!(CONFIG_MUTATION.try_lock().is_err(), "write must retain CONFIG_MUTATION across awaits");
+            Json(json!({"ok": true}))
+        };
+        let app = Router::new()
+            .route("/api/env/apply", post(probe))
+            .route("/api/sessions", post(probe))
+            .route("/api/sessions/test-dev-a/config", post(probe))
+            .layer(axum::middleware::from_fn_with_state(state, capture));
+        for path in ["/api/env/apply", "/api/sessions", "/api/sessions/test-dev-a/config"] {
+            let (status, body, _) = call(&app, "POST", path, None, json!({}), None).await;
+            assert!(status.is_success(), "{body}");
+        }
     }
 
     /// B1 ruling (a): both grant-applicable env entrypoints fail before rename.

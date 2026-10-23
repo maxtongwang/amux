@@ -12,11 +12,13 @@
 -- ADDCOL: _amux_delegation_grants ask_text TEXT
 -- ADDCOL: _amux_delegation_grants reply_text TEXT
 
--- Round 3: one pair reserves one immutable change request, even if applying
--- it fails or the server crashes. Undo never releases evidence.
+-- Dev-lead rulings 2026-10-23 (second B1 in the approval-reuse class):
+-- one reply reserves one immutable change request, regardless of ask, actor,
+-- target, route or mode, even on failure/undo. NULL ask_row (passkey) is NOT
+-- exempt: claiming evidence later must obey the same global uniqueness.
 -- ADDCOL: _amux_delegation_grants cite_spent_at REAL
 -- ADDCOL: _amux_delegation_grants target_incarnation TEXT
 -- ADDCOL: cmd_history cite_worker_ids TEXT
-CREATE UNIQUE INDEX IF NOT EXISTS idx_delegation_cite_pair
-    ON _amux_delegation_grants(ask_row, evidence_row)
-    WHERE ask_row IS NOT NULL AND evidence_row IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delegation_cite_reply
+    ON _amux_delegation_grants(evidence_row)
+    WHERE evidence_row IS NOT NULL;

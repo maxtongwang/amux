@@ -938,7 +938,7 @@ pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, target: &Target, 
     let forbid = |code: &str, error: &str| (StatusCode::FORBIDDEN, Json(refused(&origin, &class, target, action, code, error))).into_response();
     if let Some(cite) = body.and_then(|b| b.get("cite")).and_then(|c| serde_json::from_value::<super::max_ref::Cite>(c.clone()).ok()) {
         if let Err(r) = super::max_ref::pair_unspent(state, &cite) {
-            return Err(forbid(r.code(), "this citation pair already reserved a grant; ask Max again"));
+            return Err(forbid(r.code(), "this owner reply already reserved a grant; ask Max again"));
         }
     }
     if let (Target::Worker(w), Action::SetTags { from, .. }) = (target, action) {
@@ -977,7 +977,7 @@ pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, target: &Target, 
                         let cited = match super::max_ref::cite_pair(state, cite.as_ref(), &origin, &terms) {
                             Ok(c) => c,
                             Err(r) => return Err(forbid(r.code(), &format!(
-                                "{} needs a citation pair: cite {{ask_row_id, reply_row_id}}. The ask is your message into a session that {}; the reply is Max's own first typed message in that session after it, within 2 hours: {}",
+                                "{} needs a citation pair: cite {{ask_row_id, reply_row_id}}. The ask is your latest unanswered message into a session that {}; the reply is Max's own first typed message in that session after it, within 2 hours. It must be an explicit affirmative and can fund only one grant: {}",
                                 action.label(), cite_ask_requirement(&terms), r.code()))),
                         };
                         grant = Some(super::delegation_grants::begin_cited(state, &origin, &class.label(), &action.label(), &target.name(), why.clone(), &cited)?);
