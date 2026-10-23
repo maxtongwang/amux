@@ -96,10 +96,33 @@ case "$_throttle_max" in
   ''|*[!0-9]*|0) echo 'cargo_budget_refused: AMUX_CARGO_MAX_CONCURRENT must be positive' >&2; exit 75 ;;
 esac
 [ "$_throttle_max" -gt 0 ] || { echo 'cargo_budget_refused: concurrency must be positive' >&2; exit 75; }
-_throttle_dir="$HOME/.amux/cargo-throttle"
+# Box-wide on purpose: a scratch AMUX_HOME must not get a private cap. Only an
+# explicit AMUX_CARGO_THROTTLE_DIR (the slot tests) moves it.
+_throttle_dir="${AMUX_CARGO_THROTTLE_DIR:-$HOME/.amux/cargo-throttle}"
 mkdir -p "$_throttle_dir" 2>/dev/null || true
 _throttle_slot=""
 _throttle_announced=0
+_slot_timing_writer="$(cd "$(dirname "$0")" && pwd)/build-slot-timing.py"
+_slot_worktree="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
+_slot_run_id="$$-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM"
+_slot_subcommand="unknown"
+_slot_skip_value=0
+for _arg in "$@"; do
+  if [ "$_slot_skip_value" -eq 1 ]; then _slot_skip_value=0; continue; fi
+  case "$_arg" in
+    --) break ;;
+    --color|--config|-C|-Z) _slot_skip_value=1 ;;
+    +*|-*) ;; # Cargo toolchain selectors and global flags precede the verb.
+    *) _slot_subcommand="$_arg"; break ;;
+  esac
+done
+_slot_event() {
+  python3 "$_slot_timing_writer" "$1" --worktree "$_slot_worktree" \
+    --subcommand="$_slot_subcommand" --pid "$$" --run-id "$_slot_run_id" || \
+    echo 'safe-cargo: warning: slot timing writer failed; cargo continues' >&2
+  return 0
+}
+_slot_event slot_wait_start
 while [ -z "$_throttle_slot" ]; do
   _n=1
   while [ "$_n" -le "$_throttle_max" ]; do
@@ -138,8 +161,36 @@ done
 # silent no-op forever -- confirmed live in testing before this shipped, the
 # exact bug this comment is here to stop someone re-introducing.
 echo $$ > "$_throttle_slot.pid" 2>/dev/null || true
-_throttle_release() { rm -f "${_SC_SOURCE_SNAPSHOT:-}" "${_SC_VERDICT:-}"; rmdir "$_throttle_slot" 2>/dev/null || true; rm -f "$_throttle_slot.pid" 2>/dev/null || true; }
+_throttle_release() {
+  rm -f "${_SC_SOURCE_SNAPSHOT:-}" "${_SC_VERDICT:-}" || true
+  rmdir "$_throttle_slot" 2>/dev/null || true
+  rm -f "$_throttle_slot.pid" 2>/dev/null || true
+  _slot_event slot_released
+}
 trap '_throttle_release' EXIT
+# Forward a wrapper-only interrupt to the supervised child, then wait for it to
+# stop before releasing its slot. Background + wait lets bash service the trap.
+_cargo_child=""
+_slot_interrupt() {
+  trap '' HUP INT TERM
+  if [ -n "$_cargo_child" ]; then
+    kill -TERM "$_cargo_child" 2>/dev/null || true
+    wait "$_cargo_child" 2>/dev/null || true
+  fi
+  exit "$1"
+}
+trap '_slot_interrupt 129' HUP
+trap '_slot_interrupt 130' INT
+trap '_slot_interrupt 143' TERM
+_slot_event slot_acquired
+_run_cargo() {
+  "${CMD[@]}" <&0 &
+  _cargo_child=$!
+  wait "$_cargo_child"
+  local status=$?
+  _cargo_child=""
+  return "$status"
+}
 
 _receipt=""
 if [ "${1:-}" = "test" ] && [ -z "${_TC_RECEIPT:-}" ]; then
@@ -194,7 +245,7 @@ fi
 # releases this invocation's concurrency slot has to actually run, and `exec`
 # would replace this process before it could.
 rc=0
-"${CMD[@]}" || rc=$?
+_run_cargo || rc=$?
 
 # RECLAIM, THEN RETRY ONCE (DMIW-7). The budget used to refuse an over-cap target
 # and stop there: refusing a build never shrinks the cache, so every lane failed
@@ -224,7 +275,7 @@ if [ "$_reason" = target_size ] || [ "$_reason" = disk_reserve ]; then
     : > "$_SC_VERDICT"
     echo "safe-cargo.sh: cargo_reclaimed; retrying the build once" >&2
     rc=0
-    "${CMD[@]}" || rc=$?
+    _run_cargo || rc=$?
   else
     echo "safe-cargo.sh: reclaim deferred or freed too little; the refusal stands (exit 75)" >&2
   fi

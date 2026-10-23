@@ -126,6 +126,18 @@ Tests use a fake real tmux via `AMUX_REAL_TMUX` (`scripts/test-worker-tmux-guard
   inside that scope takes the WHOLE PANE down with it, not just the build (confirmed via
   journalctl, AMUX-70/frustrations.md 2026-09-01). The wrapper runs cargo in its own sibling
   scope so an OOM kill there can't cascade into the session.
+  The wrapper appends `slot_wait_start`, `slot_acquired`, and `slot_released`
+  JSONL events to `${AMUX_HOME:-~/.amux}/logs/build-slots.jsonl` through
+  `scripts/build-slot-timing.py` (one `O_APPEND` write per event). Each has
+  `worktree`, `command` (`cargo <verb>`), `subcommand`, wrapper `pid`, unique
+  `run_id`, and ISO-8601 UTC `ts`; arguments are omitted. `AMUX_HOME` also owns
+  the throttle directory. EXIT cleanup records release after failure and
+  HUP/INT/TERM; interrupts stop and wait for the supervised child first.
+  SIGKILL cannot run traps; stale-slot reclamation is unchanged and the log
+  retains an incomplete attempt. Logging failures warn without changing the
+  cargo exit status. Stub-only coverage: `amux-isolated python3
+  scripts/test-safe-cargo-slots.py`. ai-config's `scripts/timing-summary.py`
+  summarizes weekly slot wait/hold together with review timings.
   **A red suite here is not automatically a regression.** This box builds and tests amux
   continuously, so the auto-builder can rewrite the shared binary while your tests spawn it,
   and the ETXTBSY family surfaces as failures in modules you never touched (AMUX-3853: 8

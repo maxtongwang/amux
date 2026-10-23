@@ -794,6 +794,8 @@ jobs:
       # Its control (nothing cleared above the floor) and its last-resort case
       # (the shared dir must STILL be reachable) are what stop the fix becoming
       # either a no-op or a reintroduction of the disk-full outage.
+      - name: Safe Cargo slot timing events (stub-only)
+        run: python3 scripts/test-safe-cargo-slots.py
       - name: SessionStart freshness + deployment and watchdog recovery
         run: |
           set -uo pipefail
