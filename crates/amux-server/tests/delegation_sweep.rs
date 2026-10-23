@@ -196,7 +196,7 @@ async fn every_config_mutating_route_consults_delegation() {
         // logs the change plus the grant.
         let body = if c.needs_ref {
             // N3: each tag change explicitly names its direction and worker.
-            let row = e.cite(&format!("Max, may I add leads to {DEV_B}, add leads to {OPS_A}, and clear routing for {OPS_A}?"));
+            let row = e.approved_request(c.allowed_as,c.method,&c.path,c.allowed.clone()).await;
             cited(c.allowed.clone(), row)
         } else {
             c.allowed.clone()

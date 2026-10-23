@@ -44,6 +44,7 @@ pub mod crm;
 pub mod deleted_substrate;
 pub(crate) mod delegation_log;
 pub(crate) mod delegation_grants;
+pub(crate) mod delegation_requests;
 pub mod dependency_audit;
 pub mod dictation;
 pub mod email;

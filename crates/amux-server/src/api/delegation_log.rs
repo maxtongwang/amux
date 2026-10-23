@@ -137,7 +137,7 @@ pub(crate) fn feed_text(c: &DelegatedChange) -> String {
     // A grant request carries its exact sentence, so Max sees what he approves.
     if let Some(sentence) = c.after.get("sentence").and_then(Value::as_str) {
         let what = c.action.strip_prefix("grant:").unwrap_or(&c.action);
-        // The citation pair (review B4): what was asked, and Max's reply.
+        // The explicit question and Max's reply; older grants retain their historical citation texts.
         let asked = c.after.get("ask_text").and_then(Value::as_str)
             .map(|x| format!(" (asked: \"{}\")", flat(x, 200))).unwrap_or_default();
         let cited = c.after.get("cited_excerpt").and_then(Value::as_str)

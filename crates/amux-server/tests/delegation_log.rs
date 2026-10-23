@@ -38,7 +38,7 @@ async fn each_allowed_delegated_change_appends_exactly_one_entry() {
     // mrpopo's membership change cites Max's row in another lane: it applies
     // at once as a grant; the change and the grant are both logged.
     // N3: the ask names the changed tag and direction for this worker.
-    let row = e.cite(&format!("Max, may I add leads to {DEV_B}?"));
+    let row = e.approved_request(MRPOPO,"PATCH",&format!("/api/sessions/{DEV_B}/config"),json!({"tags":"dev,leads"})).await;
     let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &format!("/api/sessions/{DEV_B}/config"),
         Some(cited(with_ref(json!({"tags": "dev,leads"}), json!(null), "Max asked for a second lead"), row.clone()))).await;
     assert_allowed(st, &v, "mrpopo membership with a citation");
@@ -49,11 +49,11 @@ async fn each_allowed_delegated_change_appends_exactly_one_entry() {
     let m = &entries[2];
     assert_entry_shape(m, MRPOPO, "mrpopo", DEV_B);
     assert_eq!(m["grant"], json!(code), "{m}");
-    assert_eq!(m["evidence_row"], row["reply_row_id"], "Max's reply is the evidence: {m}");
+    assert!(m["evidence_row"].as_i64().is_some(), "Max's reply is the evidence: {m}");
     assert_eq!(m["why"], json!("Max asked for a second lead"), "{m}");
     assert_eq!(entries[3]["action"], json!("grant:applied"), "{}", entries[3]);
-    assert_eq!(entries[3]["after"]["cited_excerpt"], json!("yes, go ahead"), "{}", entries[3]);
-    assert!(entries[3]["after"]["ask_text"].as_str().is_some_and(|x| x.contains(&format!("add leads to {DEV_B}"))), "{}", entries[3]);
+    assert_eq!(entries[3]["after"]["cited_excerpt"], json!("yes"), "{}", entries[3]);
+    assert!(entries[3]["after"]["ask_text"].as_str().is_some_and(|x| x.contains(DEV_B) && x.contains(row.as_str().unwrap())), "{}", entries[3]);
 }
 
 #[tokio::test]

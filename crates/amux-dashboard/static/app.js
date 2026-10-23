@@ -23447,6 +23447,8 @@ function _msgDeliveryChip(e) {
   // busy->boundary hop and saying "0s" about them is noise.
   const waitTxt = wait > 1500 ? ' ' + _fmtDur(wait) : '';
   let label, color, bg, title;
+  const notices = { approval_request: ['approval request', 'Shown in this session’s Messages. Reply in this session to approve the exact stored change.'] };
+  const notice = Object.hasOwn(notices, rec) ? notices[rec] : null;
   if (e.delivery_receipt?.transport === 'claude_uds_v1') {
     const receipt = e.delivery_receipt;
     const labels = {reserved:'native reserved', written_unconfirmed:'native unconfirmed', held:'held by Claude',
@@ -23457,6 +23459,8 @@ function _msgDeliveryChip(e) {
     color = confirmed ? '#3fb950' : '#d29922'; bg = confirmed ? 'rgba(63,185,80,0.14)' : 'rgba(210,153,34,0.16)';
     title = 'Native Claude delivery: ' + String(receipt.reason || receipt.state).replace(/[&"<>]/g, c => ({'&':'&amp;', '"':'&quot;', '<':'&lt;', '>':'&gt;'}[c])) + '. '
       + (confirmed ? 'Queue admission does not prove model consumption.' : 'No automatic resend or paste is permitted.');
+  } else if (notice) {
+    [label, title] = notice; color = 'var(--accent)'; bg = 'var(--bg)';
   } else if (rec === 'fallback') {
     // The degraded path: no origin stamp, no audit row, arrival unverified.
     // Deliberately the loudest chip on the row — a message that arrived this
@@ -47596,6 +47600,7 @@ async function _delegationGrantsLoad() {
     const btn = (code, verb, label) => '<button class="btn" onclick="_delegationGrantDecide(' + "'" + esc(code) + "'" + ',\'' + verb + '\')">' + label + '</button> ';
     const row = (g, buttons) => '<li><span class="vault-audit-ev">' + esc(g.code) + ' · ' + esc(g.status) + '</span>'
       + '<span class="vault-audit-what">' + esc(g.sentence || '') + (g.cited_excerpt ? ' <span class="ui-help">cited: “' + esc(g.cited_excerpt) + '”</span>' : '')
+      + (g.resolution_note ? ' <span class="ui-help">' + esc((g.resolution_code || 'pending') + ': ' + g.resolution_note) + '</span>' : '')
       + (g.failure_reason ? ' <span class="ui-error">' + esc(g.failure_reason) + '</span>' : '') + '</span>' + buttons + '</li>';
     const pending = all.filter(g => g.status === 'pending');
     const applied = all.filter(g => g.status === 'applied');
@@ -47603,7 +47608,8 @@ async function _delegationGrantsLoad() {
     box.innerHTML = '<p class="ui-help">Mode: ' + esc(d.mode || 'cite') + '.</p>'
       + (pending.length ? '<ol class="vault-audit">' + pending.map(g => row(g, btn(g.code, 'approve', 'Approve') + btn(g.code, 'deny', 'Deny'))).join('') + '</ol>' : '<p class="ui-help">No pending grants.</p>')
       + (applied.length ? '<p class="ui-help">Applied (undo restores the state before):</p><ol class="vault-audit">' + applied.map(g => row(g, btn(g.code, 'undo', 'Undo'))).join('') + '</ol>' : '')
-      + (failed.length ? '<p class="ui-help">Failed grants:</p><ol class="vault-audit">' + failed.map(g => row(g, '')).join('') + '</ol>' : '');
+      + (failed.length ? '<p class="ui-help">Failed grants:</p><ol class="vault-audit">' + failed.map(g => row(g, '')).join('') + '</ol>' : '')
+      + ((d.resolutions || []).filter(r => !r.request_id).map(r => '<p class="ui-help">Reply in ' + esc(r.session) + ': ' + esc(r.code) + ' — ' + esc(r.note) + '</p>').join(''));
   } catch (err) { box.innerHTML = '<p class="ui-error" role="alert">Could not load grants</p>'; }
 }
 async function _delegationGrantDecide(code, verb) {

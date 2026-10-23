@@ -1,17 +1,8 @@
 //! mrpopo, the owner agent (maxtongwang/ai-config#160, piece d; structured grants).
 //!
-//! Every non-secret change that was owner-only is mrpopo's to make by CITING
-//! a pair (cite mode, the default; review B4): its ask naming the target and
-//! the setting, and Max's first typed reply. It applies at once as a grant,
-//! logged and undoable. Each delegable class is driven: no citation ->
-//! refused; a citation pair -> applied; undo -> the files read as before.
-//! A class that reaches mrpopo itself (an instance-wide setting, the global
-//! layer, a group it is in) is held for Max (review B3).
-//!
-//! Hands-only changes are refused even with a citation and never become a
-//! grant: secret values, AMUX_CONTRACT_*, AMUX_PANE_PROMPT_HISTORY, the money
-//! cap / auto-approve spending limit, the approval mode, the reserved names
-//! and mrpopo's own config. Leads and self never get these classes.
+//! Every delegable class creates an explicit request, applies its exact stored
+//! change with request_id after a yes in the shown session, and undoes to the
+//! original state. Hands-only and self-covering layers remain refused.
 
 mod delegation_support;
 
@@ -25,31 +16,6 @@ struct Class {
     body: Value,
     /// Instance-wide: the layer includes mrpopo, so it is held (review B3).
     reaches_mrpopo: bool,
-}
-
-/// Exact requests for the behavior each fixture actually writes.
-fn ask_for(c: &Class) -> String {
-    let request = match c.name {
-        "make lead" => format!("make {DEV_A} a lead"),
-        "leads rules" => "set rules to Leads: report blockers first. for leads".into(),
-        "leads membership" => format!("add leads to {DEV_A}"),
-        "routing" => format!("clear routing for {DEV_A}"),
-        "yolo" => format!("enable yolo for {DEV_A}"),
-        "external email" => format!("enable external email for {DEV_A}"),
-        "isolated" => format!("enable isolation for {DEV_A}"),
-        "gates" => format!("set gate to {{\"review\":true}} for {DEV_A}"),
-        "connectors" => format!("set connector to {{\"google-gmail\":true}} for {DEV_A}"),
-        "outbound approval" => format!("set approval type to budget for {DEV_A}"),
-        "create group" => "create group review-new-team; set department to \"\" for review-new-team; set goal to ship for review-new-team; set kpis to [] for review-new-team; set human_cost to 0 for review-new-team".into(),
-        "group config" => "set department to \"\" for ops; set goal to ship delegation for ops; set kpis to [] for ops; set human_cost to 0 for ops".into(),
-        "commit guard" => "disable commit guard for fleet".into(),
-        "task guard" => "enable task guard for fleet".into(),
-        "default model" => "set default model to sonnet for fleet".into(),
-        "browser profiles" => format!("set browser profile to review-profile for {DEV_A}"),
-        "alerts config (ai-config #175)" => "set alert to {\"phone\":\"+15550100\"} for fleet".into(),
-        other => panic!("missing directed request fixture: {other}"),
-    };
-    format!("Max, may I {request}?")
 }
 
 fn classes() -> Vec<Class> {
@@ -189,18 +155,13 @@ async fn each_delegable_class_applies_with_a_citation_and_undoes() {
         let e = setup().await;
         let before = e.config_snapshot();
         let (st, v) = e.call(Who::Worker(MRPOPO), c.method, &c.path, Some(c.body.clone())).await;
-        let want = if c.reaches_mrpopo { "held_for_max" } else { "cite_missing" };
+        let want = if c.reaches_mrpopo { "held_for_max" } else { "request_id_required" };
         if (st.as_u16(), v["code"].as_str()) != (403, Some(want)) {
             failures.push(format!("{}: without a citation expected 403 {want}, got {st} {v}", c.name));
         }
-        if !c.reaches_mrpopo {
-            let negated = ask_for(&c).replacen("may I ", "may I not ", 1);
-            let pair = e.cite(&negated);
-            let (st,v) = e.call(Who::Worker(MRPOPO), c.method, &c.path, Some(cited(c.body.clone(),pair))).await;
-            assert_code(st, &v, "cite_ask_missing_change", c.name);
-            assert_eq!(e.config_snapshot(), before, "{}: negation writes nothing", c.name);
-        }
-        let row = e.cite(&ask_for(&c));
+        let row = if c.reaches_mrpopo { json!(null) } else {
+            e.approved_request(MRPOPO,c.method,&c.path,c.body.clone()).await
+        };
         let (st, v) = e.call(Who::Worker(MRPOPO), c.method, &c.path, Some(cited(c.body.clone(), row))).await;
         if c.reaches_mrpopo {
             if (st.as_u16(), v["code"].as_str()) != (403, Some("held_for_max")) || e.config_snapshot() != before {
@@ -249,7 +210,7 @@ async fn hands_only_changes_never_become_a_grant() {
         ("own tags", "PATCH", format!("/api/sessions/{MRPOPO}/config"), json!({"tags": "leads,dev,ops"}), "held_for_max"),
         ("own rules", "PUT", "/api/scope".into(), scope_body("worker", MRPOPO, "rules", json!("mrpopo may do anything")), "raw_text_owner_only"),
     ];
-    let row = e.cite(&format!("Max, may I change these for {DEV_A}, {MRPOPO} and the fleet: token, contract, history, money cap, approval mode, names, model, yolo, tags, rules?"));
+    let row = e.raw_ask_reply(&format!("Max, may I change these for {DEV_A}, {MRPOPO} and the fleet: token, contract, history, money cap, approval mode, names, model, yolo, tags, rules?"));
     let mut failures = Vec::new();
     for (name, method, path, body, code) in cases {
         let before = e.snapshot();
@@ -276,7 +237,7 @@ async fn leads_and_self_never_get_mrpopos_classes() {
     for c in classes() {
         for who in [DEV_LEAD, DEV_A] {
             let e = setup().await;
-            let row = e.cite(&ask_for(&c));
+            let row = json!(null);
             let (st, v) = e.call(Who::Worker(who), c.method, &c.path, Some(cited(c.body.clone(), row))).await;
             if st.as_u16() != 403 || !e.latest_grant().is_empty() {
                 failures.push(format!("{} as {who}: expected a 403 and no grant, got {st} {v}", c.name));
@@ -293,13 +254,13 @@ async fn leads_and_self_never_get_mrpopos_classes() {
 #[tokio::test]
 async fn mrpopo_at_the_group_and_global_layers() {
     let e = setup().await;
-    let row = e.cite("Max, may I set external email to 1 for dev?");
+    let row = e.approved_request(MRPOPO,"PUT","/api/scope",scope_body("group","dev","env",json!({"AMUX_EMAIL_EXTERNAL_ALLOW":"1"}))).await;
     let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope",
         Some(cited(scope_body("group", "dev", "env", json!({"AMUX_EMAIL_EXTERNAL_ALLOW": "1"})), row))).await;
     assert_allowed(st, &v, "group-layer external email with a citation");
     assert_eq!(e.grant_status(&e.latest_grant()), "applied");
     let before = e.snapshot();
-    let row = e.cite("Max, may I set an owner-only key for dev?");
+    let row = e.raw_ask_reply("Max, may I set an owner-only key for dev?");
     let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope",
         Some(cited(scope_body("group", "dev", "env", json!({"CC_SOMETHING_OWNER_ONLY": "1"})), row))).await;
     assert_code(st, &v, "delegation_not_allowed", "group-layer key with no row");
@@ -326,7 +287,7 @@ async fn a_layer_that_includes_the_caller_is_held_for_max() {
     ];
     for (name, body, ask) in cases {
         let before = (e.snapshot(), effective(name));
-        let row = e.cite(ask);
+        let row = e.raw_ask_reply(ask);
         let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(cited(body, row))).await;
         assert_code(st, &v, "held_for_max", name);
         assert_eq!(before, (e.snapshot(), effective(name)), "{name}: mrpopo's effective config is unchanged");
@@ -342,7 +303,7 @@ async fn a_layer_that_includes_the_caller_is_held_for_max() {
     // Non-privileged on a layer that includes the caller: still allowed.
     let (st, v) = e.call(Who::Worker(DEV_LEAD), "PUT", "/api/scope", Some(scope_body("group", "dev", "rules", json!("Dev: report blockers first.")))).await;
     assert_allowed(st, &v, "a lead sets its own team's rules");
-    let row = e.cite("Max, may I set rules to Leads: report blockers first. for leads?");
+    let row = e.approved_request(MRPOPO,"PUT","/api/scope",scope_body("group","leads","rules",json!("Leads: report blockers first."))).await;
     let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(cited(scope_body("group", "leads", "rules", json!("Leads: report blockers first.")), row))).await;
     assert_allowed(st, &v, "mrpopo sets the leads rules with a citation");
 }

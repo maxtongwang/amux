@@ -54,27 +54,6 @@ pub const LOG_REL: &str = "audit/delegated-changes.jsonl";
 /// this is the one place to change if it lands under another name.
 pub const ATTRIBUTION_COLUMN: &str = "process_origin";
 
-/// Every max_ref refusal code the spec defines.
-pub const MAX_REF_CODES: [&str; 17] = [
-    "max_ref_missing",
-    "max_ref_no_such_row",
-    "max_ref_not_human_typed",
-    "max_ref_wrong_session",
-    "max_ref_stale",
-    "max_ref_outside_window",
-    "max_ref_does_not_name_target",
-    "max_ref_does_not_name_setting",
-    "max_ref_own_lane",
-    "cite_missing",
-    "cite_pair_required",
-    "cite_ask_not_found",
-    "cite_ask_not_from_actor",
-    "cite_ask_missing_target",
-    "cite_ask_missing_setting",
-    "cite_reply_not_first",
-    "cite_reply_outside_window",
-];
-
 /// Who a request speaks for.
 #[derive(Clone, Copy, Debug)]
 pub enum Who<'a> {
@@ -156,6 +135,7 @@ const FLEET: &[(&str, &str, bool)] = &[
     (DEV_B, "dev", false),
     (OPS_A, "ops", false),
     (MRPOPO, "leads", false),
+    (MAX_PANE, "", false),
 ];
 
 pub async fn setup() -> Env {
@@ -210,15 +190,27 @@ pub fn assert_grant_pending(st: StatusCode, v: &Value, ctx: &str) -> String {
     code
 }
 
-/// `body` plus a citation pair from [`Env::cite`] (cite mode, the default).
+/// Apply by explicit request ID; non-string legacy citations exercise refusals.
 pub fn cited(mut body: Value, cite: Value) -> Value {
-    body["cite"] = cite;
+    if cite.is_string() { body["request_id"] = cite; } else { body["cite"] = cite; }
     body
 }
 
 static PANE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Env {
+    pub async fn request(&self, actor: &str, method: &str, path: &str, body: Value, reply_session: &str) -> String {
+        let (st,v) = self.call(Who::Worker(actor), "POST", "/api/delegation/requests", Some(json!({"method":method,"path":path,"body":body,"reply_session":reply_session}))).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "explicit request: {v}");
+        v["request_id"].as_str().expect("request_id").into()
+    }
+
+    pub async fn approved_request(&self, actor: &str, method: &str, path: &str, body: Value) -> Value {
+        let id=self.request(actor,method,path,body,MAX_PANE).await;
+        self.seed_pane_prompt(MAX_PANE,"yes",now_s());
+        json!(id)
+    }
+
     pub fn home(&self) -> &Path {
         self.home.path()
     }
@@ -330,20 +322,17 @@ impl Env {
     /// Insert one Messages row; `ts_s` is unix seconds (the table stores ms).
     pub fn seed_row(&self, session: &str, text: &str, ty: &str, origin: &str, delivery: Option<&str>, ts_s: f64) -> i64 {
         let (session, text, ty, origin) = (session.to_string(), text.to_string(), ty.to_string(), origin.to_string());
-        let ids: std::collections::BTreeMap<_, _> = FLEET.iter().map(|(name, _, _)| {
-            let env = self.env_text(name);
-            let inc = env.lines().find_map(|l| l.strip_prefix("CC_INCARNATION=")).unwrap().trim_matches('"').to_string();
-            (name.to_string(), inc)
-        }).collect();
-        let ids = serde_json::to_string(&ids).unwrap();
+        let identity = std::fs::read_to_string(self.env_path(&session)).ok().and_then(|text| {
+            text.lines().find_map(|line| line.strip_prefix("CC_INCARNATION=").map(|v|v.trim_matches('"').to_string()))
+        });
         let delivery = delivery.map(str::to_string);
         let id = Arc::new(std::sync::atomic::AtomicI64::new(0));
         let out = id.clone();
         self.store
             .write(move |conn| {
                 conn.execute(
-                    "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, cite_worker_ids) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                    rusqlite::params![text, ty, session, (ts_s * 1000.0) as i64, origin, delivery, ids],
+                    "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, delegation_session_incarnation) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    rusqlite::params![text, ty, session, (ts_s * 1000.0) as i64, origin, delivery, identity],
                 )?;
                 out.store(conn.last_insert_rowid(), std::sync::atomic::Ordering::SeqCst);
                 Ok(WriteOutcome { applied: true, events: vec![] })
@@ -352,10 +341,9 @@ impl Env {
         id.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// A citation pair (review B4 ruling): mrpopo's `ask` sent into Max's
-    /// pane lane (a peer send's row: type 'session', origin mrpopo), then Max's
-    /// own typed reply there. The ask must name the target and the setting.
-    pub fn cite(&self, ask: &str) -> Value {
+    /// Raw free-text ask/reply fixture for negative authorization tests. These
+    /// rows create no request and supply no approval authority.
+    pub fn raw_ask_reply(&self, ask: &str) -> Value {
         let ask = self.seed_row(MAX_PANE, ask, "session", MRPOPO, Some("direct"), now_s() - 60.0);
         let reply = self.seed_pane_prompt(MAX_PANE, "yes, go ahead", now_s() - 30.0);
         json!({"ask_row_id": ask, "reply_row_id": reply})
@@ -511,7 +499,7 @@ pub fn assert_code(st: StatusCode, v: &Value, code: &str, ctx: &str) {
 pub fn assert_refused_regardless_of_max_ref(st: StatusCode, v: &Value, ctx: &str) {
     assert_refused(st, v, ctx);
     let code = v["code"].as_str().unwrap_or("");
-    assert!(!MAX_REF_CODES.contains(&code), "{ctx}: a max_ref cannot lift this, so the refusal is not a max_ref code: {v}");
+    assert!(!["max_ref_", "request_", "grant_", "cite_"].iter().any(|prefix| code.starts_with(*prefix)), "{ctx}: approval evidence cannot lift this; require the permission-table refusal: {v}");
 }
 
 pub fn create_body(dir: &Path, name: &str, tags: Value) -> Value {

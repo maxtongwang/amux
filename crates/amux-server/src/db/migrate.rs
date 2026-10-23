@@ -719,6 +719,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0128_delegation_legacy_duplicate_replies",
         sql: include_str!("../../migrations/0128_delegation_legacy_duplicate_replies.sql"),
     },
+    Migration {
+        version: 129,
+        name: "0129_delegation_explicit_requests",
+        sql: include_str!("../../migrations/0129_delegation_explicit_requests.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
@@ -1319,6 +1324,25 @@ mod registration_guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegation_0129_preserves_legacy_grants_without_inventing_requests() {
+        let mut conn=Connection::open_in_memory().unwrap();
+        apply_history_through(&conn,128);
+        conn.execute("INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,status,evidence_row) VALUES('old','mrpopo','mrpopo','set_tags','worker','PATCH','/old','{}','old request',1,2,'failed',42)",[]).unwrap();
+        conn.execute("INSERT INTO cmd_history(session,text,type,origin,ts) VALUES('desk','rather than enable X, enable Y','session','mrpopo',1000)",[]).unwrap();
+        let before=delegation_audit_snapshot(&conn);
+        apply_all(&mut conn).unwrap();
+        apply_all(&mut conn).unwrap();
+        assert_eq!(delegation_audit_snapshot(&conn),before);
+        let bindings:(Option<String>,Option<String>,Option<i64>,Option<String>)=conn.query_row(
+            "SELECT actor_incarnation,reply_session,shown_row,change_spec FROM _amux_delegation_grants WHERE code='old'",[],
+            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(bindings,(None,None,None,None),"migration must never infer requests from historical prose");
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM _amux_delegation_resolutions",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert!(crate::api::max_ref::reply_spent(&conn,42).unwrap());
+        assert_delegation_reply_schema(&conn);
+    }
 
     fn assert_delegation_reply_schema(conn: &Connection) {
         assert!(column_exists(conn, "_amux_delegation_grants", "legacy_duplicate").unwrap());
