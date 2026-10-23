@@ -416,12 +416,15 @@ impl ChangePhrase {
 /// This is deliberately bounded syntax, not a natural-language consent model.
 pub(crate) fn names_changes(text: &str, changes: &[Vec<ChangePhrase>]) -> bool {
     let clauses = regex::Regex::new(r"[;?!\n]").expect("clause grammar");
-    let negation = regex::Regex::new(r"(?i)\b(?:no|not|never|without|except|unless|leave|avoid|cannot|\w+n['’]?t)\b").expect("negation grammar");
+    let negation = regex::Regex::new(r"(?i)\b(?:no|not|never|without|except|unless|leave|avoid|cannot|(?:do|does|did|ca|could|wo|would|should|is|are|was|were|has|have|had|must|need|sha)n['’]?t)\b").expect("negation grammar");
     !changes.is_empty() && changes.iter().all(|alternatives| {
         if alternatives.is_empty() { return false; }
         let choices = alternatives.iter().map(ChangePhrase::pattern).collect::<Vec<_>>().join("|");
-        let pattern = format!(r"(?i)(?:^|[^\p{{L}}\p{{N}}_.-])(?:{choices})(?:$|[^\p{{L}}\p{{N}}_.-])");
-        regex::Regex::new(&pattern).is_ok_and(|request| request.find_iter(text).any(|matched| {
+        let pattern = format!(r"(?i)(?:^|[^\p{{L}}\p{{N}}_.-])(?P<change>{choices})(?:$|[^\p{{L}}\p{{N}}_.-])");
+        regex::Regex::new(&pattern).is_ok_and(|request| request.captures_iter(text).any(|captures| {
+            // Inspect around the request itself: delimiter characters matched
+            // for whole-name boundaries must remain in the clause slices.
+            let matched = captures.name("change").expect("request capture");
             let before = clauses.split(&text[..matched.start()]).last().unwrap_or("");
             let after = clauses.split(&text[matched.end()..]).next().unwrap_or("");
             !negation.is_match(before) && !negation.is_match(after)
@@ -611,6 +614,28 @@ mod tests {
             "add leads to review-dev-b and leave review-dev-b alone",
         ] {
             assert!(!test_tag_change(ask, "review-dev-b", "leads", "add"), "{ask}");
+        }
+    }
+
+    #[test]
+    fn citation_change_grammar_preserves_negation_clause_boundaries() {
+        let changes = vec![setting_requests(&["yolo".into()], &["test-alpha".into()], &serde_json::json!(true))];
+        for good in [
+            "Max, may I enable yolo for test-alpha? Reply yes or no.",
+            "Do not change the other worker; enable yolo for test-alpha?",
+            "I want to enable yolo for test-alpha?",
+            "May I enable yolo for test-alpha! No other worker should change.",
+        ] {
+            assert!(names_changes(good, &changes), "{good}");
+        }
+        for bad in [
+            "I don't want to enable yolo for test-alpha?",
+            "I can't enable yolo for test-alpha?",
+            "I shouldn't enable yolo for test-alpha?",
+            "enable yolo for test-alpha, no yolo",
+            "don't enable yolo for test-alpha and enable yolo for test-alpha",
+        ] {
+            assert!(!names_changes(bad, &changes), "{bad}");
         }
     }
 
