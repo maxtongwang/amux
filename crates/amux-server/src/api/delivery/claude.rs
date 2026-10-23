@@ -491,8 +491,8 @@ async fn receive_callback(
         let mut frames = Vec::new();
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
             let v = serde_json::from_str::<serde_json::Value>(line).map_err(|_| "callback_json")?;
-            wire::callback(&v)?;
-            frames.push(v);
+            let (_, ids) = wire::callback(&v)?;
+            frames.push((v, ids));
         }
         if frames.is_empty() {
             return Err("callback_empty");
@@ -503,12 +503,20 @@ async fn receive_callback(
         store
             .write_async(move |conn| {
                 let mut n = 0;
-                for frame in frames {
+                let mut ids = Vec::new();
+                for (frame, frame_ids) in frames {
                     n += ledger::callback(conn, &frame, &identity)?;
+                    ids.extend(frame_ids);
                 }
+                ids.sort();
+                ids.dedup();
                 Ok(crate::db::WriteOutcome {
                     applied: n > 0,
-                    events: vec![],
+                    events: if n > 0 {
+                        ledger::message_events(conn, ledger::ReceiptLookup::NativeMessages(&ids))?
+                    } else {
+                        vec![]
+                    },
                 })
             })
             .await

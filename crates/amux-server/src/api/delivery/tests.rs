@@ -786,6 +786,79 @@ async fn concurrent_attempt_reservations_claim_source_once() {
     );
 }
 
+#[tokio::test]
+async fn native_receipt_changes_publish_only_committed_messages_events() {
+    let dir = private_dir();
+    let store = Arc::new(crate::db::Store::open(&dir.path().join("db")).unwrap());
+    let a = attempt(Some("queued"));
+    let insert = a.clone();
+    store
+        .write_async(move |c| {
+            fixture_row(c, &insert);
+            ledger::mark_write_conn(c, &insert.id, now())?;
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
+        })
+        .await
+        .unwrap();
+    let mut events = store.subscribe();
+    ledger::record_state(&store, &a.id, ReceiptState::Held, "verified_callback")
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(IO_TIMEOUT, events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.entity_type, amux_core::revision::EntityType::Message);
+    let c = store.read().unwrap();
+    let row_id: i64 = c
+        .query_row("SELECT id FROM cmd_history", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(event.entity_id, format!("MSG-{row_id}"));
+    assert_eq!(
+        ledger::receipt(&c, &a.session, a.message_id.as_deref().unwrap(), None)
+            .unwrap()
+            .unwrap()["state"],
+        "held"
+    );
+    let batched = ledger::message_events(
+        &c,
+        ledger::ReceiptLookup::NativeMessages(&[a.msg_id.clone(), a.msg_id.clone()]),
+    )
+    .unwrap();
+    assert_eq!(
+        batched.len(),
+        1,
+        "coalesced callback invalidations are distinct"
+    );
+    drop(c);
+    let id = a.id.clone();
+    assert!(store
+        .write_async(move |c| {
+            ledger::transition(c, &id, ReceiptState::Denied, "verified_callback", now())?;
+            let _events = ledger::message_events(c, ledger::ReceiptLookup::Attempts(&[id]))?;
+            Err(rusqlite::Error::InvalidQuery)
+        })
+        .await
+        .is_err());
+    assert!(
+        matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "rolled-back evidence must not refresh Messages"
+    );
+    assert_eq!(
+        ledger::find(&store.read().unwrap(), &a.session, &a.source_key)
+            .unwrap()
+            .unwrap()
+            .state,
+        ReceiptState::Held
+    );
+}
+
 struct FixedClock(f64);
 impl ledger::Clock for FixedClock {
     fn now(&self) -> f64 {

@@ -50,7 +50,7 @@ scripts/test-native-delivery.sh
 node --test e2e/native-delivery-chip.test.mjs e2e/board-delivery-chip.test.mjs
 ```
 
-Pass: all 20 Rust fixture tests and all 14 Messages chip tests pass. The Rust
+Pass: all 21 Rust fixture tests and all 14 Messages chip tests pass. The Rust
 runner creates a private `AMUX_HOME`; its UDS fixtures require socket-bind
 permission. These are targeted tests, not the full server suite. Failed fixture
 directories are retained and printed. No live Claude, tmux, server or user state

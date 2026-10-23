@@ -137,9 +137,14 @@ pub(super) async fn reserve(store: &SharedStore, a: &Attempt) -> anyhow::Result<
     let a = a.clone();
     Ok(store
         .write_async(move |conn| {
+            let applied = insert(conn, &a)?;
             Ok(WriteOutcome {
-                applied: insert(conn, &a)?,
-                events: vec![],
+                applied,
+                events: if applied {
+                    message_events(conn, ReceiptLookup::Attempts(&[a.id]))?
+                } else {
+                    vec![]
+                },
             })
         })
         .await?
@@ -152,9 +157,14 @@ pub(super) async fn mark_write(store: &SharedStore, id: &str) -> anyhow::Result<
     let id = id.to_string();
     Ok(store
         .write_async(move |conn| {
+            let applied = mark_write_conn(conn, &id, now())?;
             Ok(WriteOutcome {
-                applied: mark_write_conn(conn, &id, now())?,
-                events: vec![],
+                applied,
+                events: if applied {
+                    message_events(conn, ReceiptLookup::Attempts(&[id]))?
+                } else {
+                    vec![]
+                },
             })
         })
         .await?
@@ -211,9 +221,14 @@ pub(super) async fn record_state(
     let id = id.to_string();
     store
         .write_async(move |conn| {
+            let applied = transition(conn, &id, state, reason, now())?;
             Ok(WriteOutcome {
-                applied: transition(conn, &id, state, reason, now())?,
-                events: vec![],
+                applied,
+                events: if applied {
+                    message_events(conn, ReceiptLookup::Attempts(&[id]))?
+                } else {
+                    vec![]
+                },
             })
         })
         .await?;
@@ -364,6 +379,40 @@ fn receipt_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "updated_at":r.get::<_,f64>("updated_at")?,"evidence_at":r.get::<_,Option<f64>>("evidence_at")?,
         "write_attempted_at":a.write_attempted_at,"admitted":a.state.admitted(),"consumed":a.state==ReceiptState::Consumed}),
     )
+}
+
+pub(super) enum ReceiptLookup<'a> {
+    Attempts(&'a [String]),
+    NativeMessages(&'a [String]),
+}
+
+/// Publish the same committed Message invalidation used by normal history.
+/// Batch coalesced callbacks; receipt updates must not depend on manual reloads.
+pub(super) fn message_events(
+    conn: &Connection,
+    lookup: ReceiptLookup<'_>,
+) -> rusqlite::Result<Vec<crate::db::PendingEvent>> {
+    let (column, ids) = match lookup {
+        ReceiptLookup::Attempts(ids) => ("attempt_id", ids),
+        ReceiptLookup::NativeMessages(ids) => ("msg_id", ids),
+    };
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!("SELECT DISTINCT h.id FROM cmd_history h JOIN native_delivery_attempts n ON n.session=h.session AND (n.message_id=h.msg_id OR n.queue_id=h.queue_id) WHERE n.{column} IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let events = stmt
+        .query_map(rusqlite::params_from_iter(ids), |r| {
+            Ok(crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Message,
+                entity_id: format!("MSG-{}", r.get::<_, i64>(0)?),
+                mutation: amux_core::revision::MutationKind::Updated,
+                payload: None,
+            })
+        })?
+        .collect();
+    events
 }
 
 pub(crate) fn receipt(
@@ -602,7 +651,7 @@ pub(super) async fn reconcile_with(
             }
             changed|=finalize(conn,&id)?;
             conn.execute("UPDATE native_delivery_attempts SET next_observation_at=?2 WHERE attempt_id=?1",params![id,at+super::RECONCILE_INTERVAL_S])?;
-            Ok(WriteOutcome{applied:changed,events:vec![]})
+            Ok(WriteOutcome{applied:changed,events:if changed {message_events(conn,ReceiptLookup::Attempts(&[id]))?}else{vec![]}})
         }).await;
         if let Err(e) = result {
             tracing::warn!(error=%e,attempt_id=%a.id,measured=false,n_considered=1,verdict="native_reconcile_failed","native attempt retained");

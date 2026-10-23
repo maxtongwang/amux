@@ -63,7 +63,9 @@ remain unconfirmed. No text/time inference advances native receipts.
 
 Send responses, send receipts and history rows expose `delivery_receipt` with
 transport, attempt ID, native IDs, endpoint identity, state and evidence times.
-Messages renders that state ahead of the legacy delivery chip. Acceptance into
+Messages renders that state ahead of the legacy delivery chip. Receipt writes
+publish the existing Message refresh event only after the transaction commits,
+including coalesced callback updates. Acceptance into
 Amux, queue admission and model consumption are separate facts. Logs expose
 countable selection, pre-write unavailability, quarantine, callback rejection,
 state transition and recovery verdicts without tokens or message bodies.
