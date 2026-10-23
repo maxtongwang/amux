@@ -1980,9 +1980,10 @@ mod tests {
         // The walk must succeed: a broken chain or a cycle is refused.
         assert!(matches!(decide(lo(1), &Fake::holders(&[401])), Origin::Unattributed(_)));
         assert!(matches!(decide(lo(1), &Fake::holders(&[601])), Origin::Unattributed(_)));
-        // Any holder needing it makes the whole connection read it.
+        // Any holder needing it makes the whole connection read it; a pane and
+        // an outside process holding one socket name no worker (#10 B5).
         let f = Fake::holders(&[301, 101]);
-        assert_eq!(decide(lo(1), &f), Origin::Worker("dev-a".into()));
+        assert!(matches!(decide(lo(1), &f), Origin::Unattributed(_)));
         assert!(f.reads() >= 1);
     }
 
