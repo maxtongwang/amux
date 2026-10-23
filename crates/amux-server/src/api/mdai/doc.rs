@@ -367,9 +367,7 @@ fn write_atomic(file: &Path, text: &str) -> Result<(), FieldError> {
         std::fs::create_dir_all(dir).map_err(|e| FieldError {
             status: StatusCode::INTERNAL_SERVER_ERROR, field: "path", msg: format!("{}: {e}", dir.display()) })?;
     }
-    let tmp = file.with_extension(format!("{MDAI_EXT}.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, file)).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
+    crate::atomic_write::atomic_write(file, text.as_bytes()).map(|_| ()).map_err(|e| {
         FieldError { status: StatusCode::INTERNAL_SERVER_ERROR, field: "path", msg: format!("{}: {e}", file.display()) }
     })
 }
@@ -515,6 +513,22 @@ fn rename(store: &crate::db::Store, root_canon: &Path, file: &Path, new_name: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PR #48 review B1 class sweep: this site staged into `<file>.mdai.tmp-<pid>`, opened
+    /// following symlinks, so a link planted at that name took the write.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_temp_link_cannot_take_this_sites_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let target = dir.path().join("doc.mdai");
+        std::fs::write(&target, "old").unwrap();
+        crate::atomic_write::plant_links(dir.path(), &[target.with_extension(format!("{MDAI_EXT}.tmp-{}", std::process::id())).file_name().unwrap().to_string_lossy().into_owned()], &victim);
+        write_atomic(&target, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep", "the planted link was not written through");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    }
 
     const FULL: &str = "---\ntitle: Workstreams\nmodel: opus\nrefresh: manual\ntimeout: 900\n\
 fetch:\n  url: https://example.com/x\n  method: post\n  headers: {Accept: application/json}\n  connector: linear\n  select: data.items\n\

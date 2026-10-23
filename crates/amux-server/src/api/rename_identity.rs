@@ -222,14 +222,9 @@ pub(crate) fn record(home: &Path, old: &str, new: &str, inc: &str) -> std::io::R
 }
 
 fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
-    // Keep the full destination name: journal, version and pending files must
-    // not share a temporary path when one publication is damaged.
-    let tmp = path.with_file_name(format!("{}.{}.tmp", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id()));
-    std::fs::write(&tmp, text)
-        .and_then(|_| std::fs::rename(&tmp, path))
-        .inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })
+    // A random temp per publication: journal, version and pending files never
+    // share one, even when one publication is damaged.
+    crate::atomic_write::atomic_write(path, text.as_bytes()).map(|_| ())
 }
 
 /// Release `name` held by incarnation `inc` (None for a worker that was never
@@ -731,6 +726,22 @@ pub async fn resolve_headers(mut req: Request, next: Next) -> Response {
 pub(crate) mod tests {
     use super::*;
 
+    /// PR #48 review B1 class sweep: this site staged into `<name>.<pid>.tmp`, opened
+    /// following symlinks, so a link planted at that name took the write.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_temp_link_cannot_take_this_sites_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let target = dir.path().join("journal.json");
+        std::fs::write(&target, "old").unwrap();
+        crate::atomic_write::plant_links(dir.path(), &[format!("journal.json.{}.tmp", std::process::id())], &victim);
+        write_atomic(&target, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep", "the planted link was not written through");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    }
+
     fn round9_pass(home: &Path, seconds: u64) {
         migrate_at(home, std::time::Instant::now() + std::time::Duration::from_secs(seconds), false).unwrap();
     }
@@ -814,12 +825,12 @@ pub(crate) mod tests {
         let d = home_with(&["w"]);
         let h = d.path();
         std::fs::write(record_path(h), "{\"old\":\"old\",\"new\":\"w\"}\n").unwrap();
-        let tmp = h.join(format!("renames.jsonl.{}.tmp", std::process::id()));
-        std::fs::create_dir(&tmp).unwrap();
+        // The record rewrite fails once; the repair must retry it later.
+        let failing = crate::atomic_write::failing::writes_to(&record_path(h));
         ensure_migrated(h).unwrap();
         assert!(!h.join("renames.version").exists());
         assert!(h.join("renames.pending").is_file());
-        std::fs::remove_dir(tmp).unwrap();
+        drop(failing);
         round9_pass(h, 61);
         assert_eq!(current_name(h, "old").as_deref(), Some("w"));
         assert!(h.join("renames.version").is_file());

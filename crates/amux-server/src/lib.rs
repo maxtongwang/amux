@@ -6,6 +6,7 @@
 
 pub mod highlight;
 pub mod api;
+pub mod atomic_write;
 pub mod backend;
 mod cargo_target_guard;
 pub mod config;

@@ -32,7 +32,6 @@ use axum::Json;
 use base64::Engine as _;
 use serde_json::{json, Value};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Hard cap on input: `say`/Piper both slow to a crawl on huge inputs, and the
 /// read-aloud target is one message, not a transcript. Characters, not bytes,
@@ -124,19 +123,25 @@ fn resolve_engine() -> Result<&'static str, String> {
     }
 }
 
-/// A unique temp path per call — the pid alone is not unique across concurrent
-/// requests, so a monotonic counter is folded in.
-fn tmp_wav() -> std::path::PathBuf {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("amux-tts-{}-{n}.wav", std::process::id()))
+/// A fresh directory per call (random name, made by mkdir, so only its owner
+/// can create names in it) holding the output WAV and the input text. The old `amux-tts-<pid>-<n>.wav` was a predictable
+/// name in the shared temp dir, so a symlink planted there (world-writable
+/// `/tmp` on Linux) took the text write (PR #48 round 3 sweep, ai-config #211).
+/// The directory and anything left in it go when the guard drops.
+fn tmp_wav() -> Result<(tempfile::TempDir, std::path::PathBuf), String> {
+    let dir = tempfile::Builder::new()
+        .prefix("amux-tts-")
+        .tempdir()
+        .map_err(|e| format!("could not make a TTS temp dir: {e}"))?;
+    let path = dir.path().join("out.wav");
+    Ok((dir, path))
 }
 
 /// macOS `say`. Text is a single argv (never a shell string), so no injection
 /// path. WAV/PCM because browsers play it natively — verified `say -o x.wav
 /// --data-format=LEI16@22050` writes a RIFF/WAVE container.
 fn say_synth(bin: &str, text: &str, voice: &str) -> Result<(Vec<u8>, String, String), String> {
-    let path = tmp_wav();
+    let (_tmp, path) = tmp_wav()?;
     // Write text to a temp file and pass it with -f rather than as a positional
     // arg. Positional args hit macOS ARG_MAX for large files and `say` prints
     // its usage string to stderr instead of failing with a useful message.
@@ -186,7 +191,7 @@ fn piper_synth(bin: &str, text: &str, voice: &str) -> Result<(Vec<u8>, String, S
             "piper needs a voice model — set AMUX_TTS_PIPER_VOICE to a .onnx path".to_string(),
         );
     }
-    let path = tmp_wav();
+    let (_tmp, path) = tmp_wav()?;
     use std::io::Write;
     let mut child = Command::new(bin)
         .arg("--model")
@@ -348,6 +353,24 @@ pub async fn voices(State(_state): State<AppState>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    /// PR #48 round 3 sweep: each call gets its own private directory, so no
+    /// name in the shared temp dir is predictable or written through.
+    #[cfg(unix)]
+    #[test]
+    fn each_tts_temp_is_in_its_own_private_directory() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (a_dir, a) = super::tmp_wav().unwrap();
+        let (_b_dir, b) = super::tmp_wav().unwrap();
+        assert_ne!(a.parent(), b.parent());
+        assert_ne!(a.parent().unwrap(), std::env::temp_dir().as_path());
+        let meta = std::fs::metadata(a.parent().unwrap()).unwrap();
+        assert_eq!(meta.uid(), unsafe { libc::geteuid() });
+        assert_eq!(meta.permissions().mode() & 0o022, 0, "only this user can create names in it");
+        let kept = a_dir.path().to_path_buf();
+        drop(a_dir);
+        assert!(!kept.exists(), "the directory goes with its guard");
+    }
+
     #[test]
     fn parses_say_voice_lines_including_spaced_names() {
         // The parser must survive a name with a space (Enhanced/Premium voices)
