@@ -471,7 +471,11 @@ fn insert(state: &AppState, g: &NewGrant, c: &Captured) -> Result<(String, Strin
                 let spent: bool = conn.query_row(
                     "SELECT EXISTS(SELECT 1 FROM _amux_delegation_grants WHERE ask_row=?1 AND evidence_row=?2)",
                     rusqlite::params![ask, reply], |r| r.get(0))?;
-                anyhow::ensure!(!spent, "cite_pair_spent");
+                if spent {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        std::io::Error::other("cite_pair_spent"),
+                    )));
+                }
             }
             let n = conn.execute(
                 "INSERT OR IGNORE INTO _amux_delegation_grants (code, actor, class, action, target, method, path, body, sentence, why, created_at, expires_at, status, evidence_row, cited_excerpt, mode, ask_row, ask_text, reply_text, cite_spent_at, target_incarnation) \
@@ -1110,7 +1114,7 @@ mod tests {
             })
         };
         insert("ABCD").unwrap();
-        let err = insert("EFGH").unwrap_err();
+        let err = insert("EFGH").err().expect("a second grant must violate citation uniqueness");
         assert!(err.to_string().contains("UNIQUE constraint failed"),"{err}");
         let conn = state.store.read().unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM _amux_delegation_grants",[],|r|r.get(0)).unwrap();
