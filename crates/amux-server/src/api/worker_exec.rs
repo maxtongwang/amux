@@ -189,18 +189,53 @@ pub(crate) mod fake_pane {
             .collect()
     }
 
-    static FRAMES: Mutex<Vec<(std::path::PathBuf, String, String)>> = Mutex::new(Vec::new());
+    static FRAMES: Mutex<Vec<(std::path::PathBuf, String, String, &'static str)>> = Mutex::new(Vec::new());
 
     pub(crate) fn set_frame(name: &str, raw: &str) {
         let home = crate::config::amux_home();
         let mut frames = FRAMES.lock().unwrap();
-        frames.retain(|(h, n, _)| h != &home || n != name);
-        frames.push((home, name.into(), raw.into()));
+        let origin = frames.iter().find(|(h, n, _, _)| h == &home && n == name).map_or("owner", |f| f.3);
+        frames.retain(|(h, n, _, _)| h != &home || n != name);
+        frames.push((home, name.into(), raw.into(), origin));
     }
 
     pub(crate) fn frame(name: &str) -> Option<String> {
         let home = crate::config::amux_home();
-        FRAMES.lock().unwrap().iter().find(|(h,n,_)| h == &home && n == name).map(|(_,_,raw)| raw.clone())
+        FRAMES.lock().unwrap().iter().find(|(h,n,_,_)| h == &home && n == name).map(|(_,_,raw,_)| raw.clone())
+    }
+
+    /// Framed panes emulate terminal I/O only. Draft admission and submission
+    /// verification must run through the production terminal send pipeline.
+    pub(crate) fn terminal_output(args: &[&str]) -> Option<std::process::Output> {
+        use std::os::unix::process::ExitStatusExt;
+        let target = args.windows(2).find(|a| a[0] == "-t")?[1];
+        let name = target.strip_prefix("=amux-")?.trim_end_matches(':');
+        let raw = frame(name)?;
+        let stdout = match args[0] {
+            "capture-pane" => raw,
+            "send-keys" => {
+                if args.contains(&"-l") {
+                    let text = args.last().unwrap();
+                    set_frame(name, &format!("Claude Code\n❯ {text}\n────────────────────\n⏵⏵ bypass permissions on (shift+tab to cycle)"));
+                    let home = crate::config::amux_home();
+                    let origin = FRAMES.lock().unwrap().iter().find(|(h,n,_,_)| h == &home && n == name).unwrap().3;
+                    TYPED.lock().unwrap().push((name.into(), (*text).into(), origin));
+                } else {
+                    match *args.last().unwrap() {
+                        "C-u" | "Enter" => set_frame(name, "Claude Code\n❯ \n────────────────────\n⏵⏵ bypass permissions on (shift+tab to cycle)"),
+                        "Escape" => {},
+                        key => panic!("unimplemented framed-pane key: {key}"),
+                    }
+                }
+                String::new()
+            }
+            command => panic!("unimplemented framed-pane command: {command}"),
+        };
+        Some(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.into_bytes(),
+            stderr: vec![],
+        })
     }
 
     #[async_trait::async_trait]
@@ -215,13 +250,15 @@ pub(crate) mod fake_pane {
             Dispatch::Handled((true, "fake pane".into()))
         }
         async fn deliver(&self, _: &AppState, name: &str, text: &str, origin: SendOrigin) -> Dispatch<(bool, String)> {
-            if frame(name).is_some_and(|raw| super::super::session_verbs::composer_state(&raw).typed().is_some()) {
-                return Dispatch::Handled((false, "composer contains a draft; durable message remains queued".into()));
-            }
             let origin = match origin {
                 SendOrigin::Owner => "owner",
                 SendOrigin::Automation => "amux",
             };
+            let home = crate::config::amux_home();
+            if let Some(f) = FRAMES.lock().unwrap().iter_mut().find(|(h,n,_,_)| h == &home && n == name) {
+                f.3 = origin;
+                return Dispatch::Terminal;
+            }
             TYPED
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

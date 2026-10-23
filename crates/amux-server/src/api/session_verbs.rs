@@ -1368,6 +1368,12 @@ pub(crate) async fn run_cmd(
     args: &[&str],
     timeout: Duration,
 ) -> Option<std::process::Output> {
+    #[cfg(test)]
+    if bin == "tmux" {
+        if let Some(output) = super::worker_exec::fake_pane::terminal_output(args) {
+            return Some(output);
+        }
+    }
     let mut cmd = tokio::process::Command::new(bin);
     // A TEST NEVER REACHES A REAL TMUX SERVER (2026-10-17 outage: a test
     // killed the live tmux server). Every tmux call this module makes in a
@@ -10704,6 +10710,15 @@ fn held_amux_delivery(state: &AppState, name: &str, draft: &str) -> Option<Strin
     held_delivery_matching(draft, name, &rows)
 }
 
+/// Shared by direct sends and stuck notices: preserve raw SGR evidence of a
+/// placeholder, and exclude a pending delivery amux itself put in the box.
+fn foreign_composer_draft(state: &AppState, name: &str, raw: &str) -> Option<String> {
+    composer_state(raw)
+        .typed()
+        .filter(|draft| held_amux_delivery(state, name, draft).is_none())
+        .map(str::to_string)
+}
+
 /// Whether `draft` is a message amux itself delivered to this lane in the last
 /// six hours (any path but a prompt typed into the pane).
 fn amux_delivered_text(state: &AppState, name: &str, draft: &str) -> bool {
@@ -14011,10 +14026,8 @@ async fn send_text_inner_bound(
         // It waits in the steering queue, which delivers once the draft is
         // sent or cleared. Only amux's own held message is cleared, as before.
         let draft_frame = tmux_capture(name, 15).await;
-        if let Some(draft) = composer_state(&draft_frame).typed().map(str::to_string) {
-            if held_amux_delivery(state, name, &draft).is_none() {
-                return draft_in_the_way(state, name, &text, from_steering, origin, queue_id).await;
-            }
+        if foreign_composer_draft(state, name, &draft_frame).is_some() {
+            return draft_in_the_way(state, name, &text, from_steering, origin, queue_id).await;
         }
     }
     send_key(name, "C-u").await;
@@ -23250,21 +23263,63 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
     delivered
 }
 
-/// The event idem is the durable once-per-row receipt, including after restart.
-/// A row already claimed for delivery is in flight, not stuck: skipping it keeps an
-/// empty or claimed-only queue from waiting on the store writer.
-/// Persist both audiences together before publishing the dashboard alert; never
-/// type a warning into a blocked composer or recursively enqueue warnings.
+// refs maxtongwang/ai-config#194: a designed hold must not consume the row's
+// durable once-only notice; it may become genuinely stuck after the hold lifts.
+static STEERING_STUCK_WRITE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn steering_stuck_unmeasured(error: impl std::fmt::Display) {
+    if !STEERING_STUCK_WRITE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(%error, measured=false, n_considered=0, verdict="steering_stuck_unmeasured",
+            "could not persist undelivered steering notices; next tick retries");
+    }
+}
+
+/// Only an owner's draft or an idle, undelivered lane needs intervention at
+/// 60s. Reuse the drain's hold and boundary decisions, never an age-based guess
+/// about whether a busy lane ought to be idle. In-flight rows stay unmarked.
+/// Re-select under the serialized writer for durable once-per-row receipts.
 async fn warn_steering_stuck(state: &AppState) -> usize {
     let now = now_f64();
-    let due = state.store.read().and_then(|conn| {
-        Ok(conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM steering_queue WHERE delivering_since IS NULL AND MAX(queued_at,COALESCE(deliver_at,0))<=?1 \
-             AND NOT EXISTS(SELECT 1 FROM session_events WHERE idem='steering-stuck:'||steering_queue.id))",
-            rusqlite::params![now-STEERING_STUCK_SECS], |r| r.get::<_,bool>(0),
-        )?)
+    let lanes = state.store.read().and_then(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT session FROM steering_queue WHERE delivering_since IS NULL AND MAX(queued_at,COALESCE(deliver_at,0))<=?1 \
+             AND NOT EXISTS(SELECT 1 FROM session_events WHERE idem='steering-stuck:'||steering_queue.id)",
+        )?;
+        let lanes = stmt.query_map([now - STEERING_STUCK_SECS], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(lanes)
     });
-    if matches!(due, Ok(false)) { return 0; }
+    let lanes = match lanes {
+        Ok(lanes) => lanes,
+        Err(error) => {
+            steering_stuck_unmeasured(error);
+            return 0;
+        }
+    };
+    let mut reasons = BTreeMap::new();
+    for session in lanes {
+        // AMUX-2238: paused and rate-limited queues are held on purpose. Other
+        // unreachable lanes and permission prompts have their own diagnostics.
+        if lane_block_reason(&session).await.is_some()
+            || crate::api::prompt_block::blocked_now(&session, now)
+        {
+            continue;
+        }
+        let raw = tmux_capture(&session, 15).await;
+        let reason = if foreign_composer_draft(state, &session, &raw).is_some() {
+            "the input box holds text amux did not type"
+        } else if steer_delivery_for(state, &session, 0.0).await == SteerDelivery::AtBoundary {
+            "the lane is idle but the message has not been delivered"
+        } else {
+            continue;
+        };
+        reasons.insert(session, reason);
+    }
+    // Empty, claimed-only and intentionally held queues never wait on a writer.
+    if reasons.is_empty() {
+        return 0;
+    }
     let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let written = notices.clone();
     let result = state.store.write_async(move |conn| {
@@ -23278,7 +23333,8 @@ async fn warn_steering_stuck(state: &AppState) -> usize {
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         for (id, session, sender, age) in rows {
-            let detail = format!("Message {id} to '{session}' is still undelivered after {}s; amux will retry without clearing or submitting someone else's draft.", age as i64);
+            let Some(reason) = reasons.get(&session) else { continue };
+            let detail = format!("Message {id} to '{session}' is still undelivered after {}s: {reason}.", age as i64);
             let payload = json!({"id":id,"lane":session,"sender":sender,"age_s":age as i64,
                 "detail":detail,"verdict":"steering_stuck","measured":true,"n_considered":1});
             let n = conn.execute(
@@ -23297,15 +23353,14 @@ async fn warn_steering_stuck(state: &AppState) -> usize {
         Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
     }).await;
     if let Err(error) = result {
-        tracing::warn!(%error, measured=false, n_considered=0, verdict="steering_stuck_unmeasured",
-            "could not persist undelivered steering notices; next tick retries");
+        steering_stuck_unmeasured(error);
         return 0;
     }
     let notices = std::mem::take(&mut *notices.lock().unwrap());
     let count = notices.len();
     for (id, session, age, detail) in notices {
-        tracing::warn!(session, queue_id=%id, age_s=age as i64, measured=true, n_considered=1,
-            verdict="steering_stuck", "steering message remains undelivered after 60 seconds");
+        tracing::warn!(session, queue_id=%id, age_s=age as i64, detail=%detail, measured=true, n_considered=1,
+            verdict="steering_stuck", "steering message needs intervention");
         super::alerts::publish_dashboard_alert(json!({"type":"steering_stuck","session":session,"message":detail,"id":id}));
     }
     count
@@ -39012,11 +39067,14 @@ mod tests {
         )
     }
 
+    // refs maxtongwang/ai-config#194: fixtures stay entirely inside scratch HOME.
+    const AI194_DRAFT: &str = "Claude Code\n❯ owner draft\n────────────────────";
+    const AI194_BUSY: &str = "Claude Code\nRunning 1 shell command…\n────────────────────\n❯ \n────────────────────\n⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt";
     const AI194_EMPTY: &str = "Claude Code\n❯ \n────────────────────\n⏵⏵ bypass permissions on (shift+tab to cycle)";
     const AI194_GHOST: &str = "Claude Code\n❯ \x1b[2mTry sending a summary\x1b[0m\n────────────────────\n⏵⏵ bypass permissions on (shift+tab to cycle)";
 
     fn ai194_lane(name: &str, raw: &str) {
-        rename_fixture_env(name, "CC_TEST_FAKE_PANE=1\nCC_TAGS=dev\nCC_AUTO_START=0\nAMUX_COMMAND_LIFECYCLE=0\n");
+        rename_fixture_env(name, "CC_TEST_FAKE_PANE=1\nCC_BACKEND=tmux\nCC_PROVIDER=claude\nCC_TAGS=dev\nCC_AUTO_START=0\nAMUX_COMMAND_LIFECYCLE=0\n");
         super::super::worker_exec::fake_pane::set_frame(name, raw);
     }
 
@@ -39040,9 +39098,24 @@ mod tests {
         ai194_lane("ghost-target", AI194_GHOST);
         assert!(matches!(composer_state(AI194_GHOST), ComposerState::Placeholder(_)));
         assert!(composer_state(&strip_ansi(AI194_GHOST)).typed().is_some(), "control: stripping SGR destroys the evidence");
+        ai194_lane("ghost-direct", AI194_GHOST);
+        let (ok, message) = send_text(&st, "ghost-direct", "hello directly", false, SendOrigin::Owner).await;
+        assert!(ok, "{message}");
+        assert_eq!(submission_verdict(ok, &message).0, Some(true), "{message}");
+        assert_eq!(super::super::worker_exec::fake_pane::typed("ghost-direct"), vec![("hello directly".into(), "owner")]);
+        // Both panes fall through the fake adapter into send_text_inner_bound.
+        // The fake only emulates terminal I/O: production must admit the dim
+        // suggestion and preserve this real owner draft in the same tick.
+        ai194_lane("ghost-draft-control", AI194_DRAFT);
         ai194_queue(&st,"ghost-row","ghost-target",1.0).await;
+        ai194_queue(&st,"ghost-draft-row","ghost-draft-control",1.0).await;
         assert_eq!(steer_deliver_tick(&st).await,1);
-        assert_eq!(super::super::worker_exec::fake_pane::typed("ghost-target").len(),1);
+        assert_eq!(super::super::worker_exec::fake_pane::typed("ghost-target"), vec![("hello from the sender".into(), "amux")]);
+        assert!(super::super::worker_exec::fake_pane::typed("ghost-draft-control").is_empty());
+        assert_eq!(super::super::worker_exec::fake_pane::frame("ghost-draft-control").as_deref(), Some(AI194_DRAFT));
+        let conn = st.store.read().unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM steering_history WHERE id='ghost-row'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM steering_queue WHERE id='ghost-draft-row' AND delivering_since IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     }
 
     #[tokio::test]
@@ -39053,7 +39126,7 @@ mod tests {
         let _fleet = super::super::sessions_legacy::suppress_fleet_for_test();
         std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
         ai194_lane("draft-source", AI194_EMPTY);
-        ai194_lane("stuck-target", "Claude Code\n❯ owner draft\n────────────────────");
+        ai194_lane("stuck-target", AI194_DRAFT);
         ai194_queue(&st,"stuck-row","stuck-target",61.0).await;
         let mut dashboard = super::super::alerts::dashboard_alerts().subscribe();
         assert_eq!(steer_deliver_tick(&st).await,0);
@@ -39062,6 +39135,8 @@ mod tests {
         assert_eq!(alert["type"],"alerts");
         assert_eq!(alert["payload"][0]["session"],"stuck-target");
         assert_eq!(alert["payload"][0]["id"],"stuck-row");
+        assert!(alert["payload"][0]["message"].as_str().unwrap().contains("the input box holds text amux did not type"));
+        assert!(String::from_utf8_lossy(&logs.lock().unwrap()).contains("the input box holds text amux did not type"));
         // Reopen the store to prove dedupe is durable, not a process-local set.
         let mut restarted = st.clone();
         restarted.store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
@@ -39073,6 +39148,219 @@ mod tests {
             let n:i64=conn.query_row("SELECT COUNT(*) FROM session_events WHERE session=?1 AND type=?2 AND json_extract(data,'$.id')='stuck-row' AND json_extract(data,'$.measured')=1 AND json_extract(data,'$.n_considered')=1",rusqlite::params![session,kind],|r|r.get(0)).unwrap();
             assert_eq!(n,1,"{session}: {kind}");
         }
+        drop(conn);
+        for (_, _, detail) in ai194_notice_details(&st, "stuck-row") {
+            assert!(detail.contains("the input box holds text amux did not type"), "{detail}");
+        }
+    }
+
+    fn ai194_notice_details(st: &AppState, id: &str) -> Vec<(String, String, String)> {
+        let conn = st.store.read().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session,type,json_extract(data,'$.detail') FROM session_events WHERE json_extract(data,'$.id')=?1 AND type IN ('steering.stalled','steering.undelivered') ORDER BY session"
+        ).unwrap();
+        stmt.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+
+    fn ai194_assert_unmarked(st: &AppState, id: &str) {
+        assert!(ai194_notice_details(st, id).is_empty());
+        let conn = st.store.read().unwrap();
+        assert_eq!(conn.query_row(
+            "SELECT COUNT(*) FROM session_events WHERE idem IN (?1,?2)",
+            rusqlite::params![format!("steering-stuck:{id}"), format!("steering-stuck-sender:{id}")],
+            |r| r.get::<_, i64>(0),
+        ).unwrap(), 0, "a hold must leave the eventual notice unmarked");
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM steering_queue WHERE id=?1 AND delivering_since IS NULL", [id], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    async fn ai194_designed_hold_stays_unmarked(lane: &str, hold: &str) {
+        let (logs, _guard, _peer) = held_capture_logs();
+        let (st, dir) = state();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        let _fleet = super::super::sessions_legacy::suppress_fleet_for_test();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        ai194_lane("draft-source", AI194_EMPTY);
+        // A draft behind the hold proves that designed holds take precedence.
+        ai194_lane(lane, AI194_DRAFT);
+        if hold == "paused" {
+            rename_fixture_env(lane, "CC_TEST_FAKE_PANE=1\nCC_BACKEND=tmux\nCC_PROVIDER=claude\nCC_PAUSED=1\nCC_TAGS=dev\n");
+        } else {
+            assert_eq!(hold, "rate-limited");
+            update_meta(lane, &[("rate_limited_since", json!(now_i64())), ("rate_limited_until", json!(now_i64() + 3600))]);
+        }
+        assert_eq!(lane_block_reason(lane).await, Some(hold));
+        ai194_queue(&st, lane, lane, 61.0).await;
+        let mut dashboard = super::super::alerts::dashboard_alerts().subscribe();
+        for _ in 0..2 {
+            assert_eq!(steer_deliver_tick(&st).await, 0);
+            ai194_assert_unmarked(&st, lane);
+            assert_eq!(held_capture_count(&logs, "steering_stuck"), 0);
+            assert!(dashboard.try_recv().is_err());
+        }
+        // The SAME row must still fire once after the intentional hold lifts.
+        ai194_lane(lane, AI194_DRAFT);
+        update_meta(lane, &[("rate_limited_since", json!(0)), ("rate_limited_until", json!(0))]);
+        assert_eq!(lane_block_reason(lane).await, None);
+        assert_eq!(steer_deliver_tick(&st).await, 0);
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 1);
+        assert_eq!(ai194_notice_details(&st, lane).len(), 2);
+        let alert: Value = serde_json::from_str(&dashboard.try_recv().unwrap()).unwrap();
+        assert!(alert["payload"][0]["message"].as_str().unwrap().contains("the input box holds text amux did not type"));
+        assert_eq!(steer_deliver_tick(&st).await, 0);
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 1);
+        assert!(dashboard.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ai194_paused_lane_does_not_alert_or_mark_the_row() {
+        ai194_designed_hold_stays_unmarked("ai194-paused", "paused").await;
+    }
+
+    #[tokio::test]
+    async fn ai194_rate_limited_lane_does_not_alert_or_mark_the_row() {
+        ai194_designed_hold_stays_unmarked("ai194-rate-limited", "rate-limited").await;
+    }
+
+    #[tokio::test]
+    async fn ai194_busy_mid_turn_does_not_alert_or_mark_the_row() {
+        let (logs, _guard, _peer) = held_capture_logs();
+        let (st, dir) = state();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        let _fleet = super::super::sessions_legacy::suppress_fleet_for_test();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        ai194_lane("draft-source", AI194_EMPTY);
+        ai194_lane("ai194-busy", AI194_BUSY);
+        assert_eq!(steer_delivery_for(&st, "ai194-busy", 0.0).await, SteerDelivery::Hold);
+        ai194_queue(&st, "busy-row", "ai194-busy", 61.0).await;
+        let mut dashboard = super::super::alerts::dashboard_alerts().subscribe();
+        assert_eq!(steer_deliver_tick(&st).await, 0);
+        ai194_assert_unmarked(&st, "busy-row");
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 0);
+        assert!(dashboard.try_recv().is_err());
+        // A normal turn end may deliver the same row without a spurious notice.
+        super::super::worker_exec::fake_pane::set_frame("ai194-busy", AI194_EMPTY);
+        assert_eq!(steer_deliver_tick(&st).await, 1);
+        assert!(ai194_notice_details(&st, "busy-row").is_empty());
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 0);
+        assert!(dashboard.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ai194_amux_owned_busy_draft_is_not_an_owner_draft_stall() {
+        let (logs, _guard, _peer) = held_capture_logs();
+        let (st, dir) = state();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        let raw = AI194_BUSY.replace("❯ \n", "❯ amux pending delivery\n");
+        ai194_lane("ai194-owned", &raw);
+        st.store.write_async(|conn| {
+            conn.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery,submit_verdict) VALUES('amux pending delivery','user','ai194-owned',?1,'','queued','deferred')", [(now_i64() - 10) * 1000])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        assert!(composer_state(&raw).typed().is_some());
+        assert_eq!(steer_delivery_for(&st, "ai194-owned", 0.0).await, SteerDelivery::Hold);
+        ai194_queue(&st, "owned-row", "ai194-owned", 61.0).await;
+        let mut dashboard = super::super::alerts::dashboard_alerts().subscribe();
+        assert_eq!(warn_steering_stuck(&st).await, 0);
+        ai194_assert_unmarked(&st, "owned-row");
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 0);
+        assert!(dashboard.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ai194_idle_undelivered_row_notifies_once_with_idle_reason() {
+        let (logs, _guard, _peer) = held_capture_logs();
+        let (st, dir) = state();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        ai194_lane("ai194-idle", AI194_EMPTY);
+        assert_eq!(steer_delivery_for(&st, "ai194-idle", 0.0).await, SteerDelivery::AtBoundary);
+        ai194_queue(&st, "idle-row", "ai194-idle", 61.0).await;
+        let mut dashboard = super::super::alerts::dashboard_alerts().subscribe();
+        // Simulate a missed delivery while the lane is already at a boundary.
+        assert_eq!(warn_steering_stuck(&st).await, 1);
+        assert_eq!(warn_steering_stuck(&st).await, 0);
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 1);
+        let details = ai194_notice_details(&st, "idle-row");
+        assert_eq!(details.len(), 2);
+        for (_, _, detail) in details {
+            assert!(detail.contains("the lane is idle but the message has not been delivered"), "{detail}");
+            assert!(!detail.contains("draft"), "{detail}");
+        }
+        let alert: Value = serde_json::from_str(&dashboard.try_recv().unwrap()).unwrap();
+        assert!(alert["payload"][0]["message"].as_str().unwrap().contains("the lane is idle but the message has not been delivered"));
+        assert!(dashboard.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ai194_threshold_is_two_sided_and_claimed_rows_are_not_stuck() {
+        let (logs, _guard, _peer) = held_capture_logs();
+        let (st, dir) = state();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        ai194_lane("ai194-threshold", AI194_EMPTY);
+        // Literal ages deliberately do not derive from STEERING_STUCK_SECS:
+        // moving the configured threshold in either direction must fail.
+        ai194_queue(&st, "threshold-row", "ai194-threshold", 59.0).await;
+        ai194_queue(&st, "claimed-row", "ai194-threshold", 120.0).await;
+        st.store.write_async(|conn| {
+            conn.execute("UPDATE steering_queue SET delivering_since=?1 WHERE id='claimed-row'", [now_f64()])?;
+            conn.execute("UPDATE steering_queue SET queued_at=?1 WHERE id='threshold-row'", [now_f64() - 59.0])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        let mut dashboard = super::super::alerts::dashboard_alerts().subscribe();
+        assert_eq!(warn_steering_stuck(&st).await, 0, "59s is below the threshold");
+        ai194_assert_unmarked(&st, "threshold-row");
+        assert!(ai194_notice_details(&st, "claimed-row").is_empty());
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 0);
+        assert!(dashboard.try_recv().is_err());
+        st.store.write_async(|conn| {
+            conn.execute("UPDATE steering_queue SET queued_at=?1 WHERE id='threshold-row'", [now_f64() - 61.0])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        assert_eq!(warn_steering_stuck(&st).await, 1, "61s is above the threshold");
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 1);
+        assert_eq!(ai194_notice_details(&st, "threshold-row").len(), 2);
+        assert!(ai194_notice_details(&st, "claimed-row").is_empty());
+        let alert: Value = serde_json::from_str(&dashboard.try_recv().unwrap()).unwrap();
+        assert_eq!(alert["payload"][0]["id"], "threshold-row");
+        assert!(dashboard.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ai194_notice_write_failure_warns_once_across_two_ticks_and_retries() {
+        let (logs, _guard, _peer) = held_capture_logs();
+        let (st, dir) = state();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        let _fleet = super::super::sessions_legacy::suppress_fleet_for_test();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        ai194_lane("draft-source", AI194_EMPTY);
+        ai194_lane("ai194-write-error", AI194_DRAFT);
+        ai194_queue(&st, "write-error-row", "ai194-write-error", 61.0).await;
+        st.store.write_async(|conn| {
+            conn.execute_batch("CREATE TRIGGER ai194_reject_notice BEFORE INSERT ON session_events WHEN NEW.idem LIKE 'steering-stuck%' BEGIN SELECT RAISE(ABORT,'injected notice write failure'); END;")?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        STEERING_STUCK_WRITE_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut dashboard = super::super::alerts::dashboard_alerts().subscribe();
+        for _ in 0..2 {
+            assert_eq!(steer_deliver_tick(&st).await, 0);
+            ai194_assert_unmarked(&st, "write-error-row");
+            assert_eq!(held_capture_count(&logs, "steering_stuck_unmeasured"), 1);
+            assert_eq!(held_capture_count(&logs, "steering_stuck"), 0);
+            assert!(dashboard.try_recv().is_err());
+        }
+        st.store.write_async(|conn| {
+            conn.execute_batch("DROP TRIGGER ai194_reject_notice")?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        assert_eq!(steer_deliver_tick(&st).await, 0);
+        assert_eq!(held_capture_count(&logs, "steering_stuck_unmeasured"), 1);
+        assert_eq!(held_capture_count(&logs, "steering_stuck"), 1);
+        assert_eq!(ai194_notice_details(&st, "write-error-row").len(), 2);
+        assert!(dashboard.try_recv().is_ok());
+        assert!(dashboard.try_recv().is_err());
     }
 
     #[tokio::test]
