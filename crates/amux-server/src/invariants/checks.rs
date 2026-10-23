@@ -1110,6 +1110,7 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("_amux_delegation_grants", "created_at", false), // delegation_grants.rs: now_f64()
     ("_amux_delegation_grants", "expires_at", false),
     ("_amux_delegation_grants", "decided_at", false),
+    ("_amux_delegation_grants", "cite_spent_at", false), // insert: created from now_f64(), Unix seconds
     ("card_contracts", "deploy_at", false),
     ("land_queue", "done_at", false), // land_queue.rs: now_f64(); live 1791295108.5
     ("land_queue", "queued_at", false),

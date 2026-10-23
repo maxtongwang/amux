@@ -353,11 +353,11 @@ pub(crate) fn worker_bindings(text: &str) -> String {
 }
 
 /// Require a directed tag change about this target, not unrelated mentions.
-/// A deliberately bounded grammar: `add [the] TAG tag to WORKER` or
-/// `remove [the] TAG tag from WORKER`. Multiple changes use multiple clauses.
+/// A deliberately bounded grammar: `add [the] TAG [tag] to WORKER` or
+/// `remove [the] TAG [tag] from WORKER`. Multiple changes use multiple clauses.
 fn names_tag_change(text: &str, target: &str, tag: &str, direction: &str) -> bool {
     let preposition = if direction == "add" { "to" } else { "from" };
-    let pattern = format!(r"(?i)\b{}\s+(?:the\s+)?{}\s+tags?\s+{}\s+(?:worker\s+)?{}(?:$|[^\p{{L}}\p{{N}}_.-])",
+    let pattern = format!(r"(?i)\b{}\s+(?:the\s+)?{}\s+(?:tags?\s+)?{}\s+(?:worker\s+)?{}(?:$|[^\p{{L}}\p{{N}}_.-])",
         regex::escape(direction), regex::escape(tag), preposition, regex::escape(target));
     regex::Regex::new(&pattern).is_ok_and(|r| r.is_match(text))
 }
@@ -465,6 +465,33 @@ fn cite_pair_at(state: &AppState, cite: Option<&Cite>, actor: &str, terms: &Cite
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegation_tag_change_names_target_tag_and_direction_with_optional_tag_noun() {
+        for ask in [
+            "Max, may I add leads to review-dev-b?",
+            "Max, may I add the leads tag to worker review-dev-b?",
+            "Max, may I add leads tags to review-dev-b?",
+        ] {
+            assert!(names_tag_change(ask, "review-dev-b", "leads", "add"), "{ask}");
+        }
+        for ask in [
+            "remove leads from review-dev-b",
+            "remove the leads tag from review-dev-b",
+        ] {
+            assert!(names_tag_change(ask, "review-dev-b", "leads", "remove"), "{ask}");
+        }
+        for ask in [
+            "remove leads from review-dev-b",
+            "add ops to review-dev-b",
+            "review-dev-b is busy; add leads to review-dev-a",
+            "add leads to review-dev-b-other",
+            "review-dev-b has leads",
+            "add review-dev-b to leads",
+        ] {
+            assert!(!names_tag_change(ask, "review-dev-b", "leads", "add"), "{ask}");
+        }
+    }
 
     const NOW: f64 = 1_800_000_000.0;
 

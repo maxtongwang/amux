@@ -331,6 +331,19 @@ pub(crate) fn cite_terms(target: &Target, action: &Action) -> super::max_ref::Ci
         worker: match target { Target::Worker(w) => Some(w.clone()), _ => None }, tag_changes }
 }
 
+fn cite_ask_requirement(terms: &super::max_ref::CiteTerms) -> String {
+    let target = terms.target.join(" or ");
+    if !terms.tag_changes.is_empty() {
+        let changes = terms.tag_changes.iter().map(|(tag, direction)| {
+            let preposition = if direction == "remove" { "from" } else { "to" };
+            format!("'{direction} {tag} {preposition} {target}'")
+        }).collect::<Vec<_>>().join(" and ");
+        return format!("explicitly requests {changes}, naming each changed tag and its add/remove direction for that target");
+    }
+    let settings = terms.settings.iter().map(|alternatives| alternatives.join(" or ")).collect::<Vec<_>>().join("; ");
+    format!("names the target ({target}) and requests each setting in the same clause as that target ({settings})")
+}
+
 /// Env keys a worker may set on itself (H4: an explicit list, not "anything
 /// not privileged"). Display and runtime-choice keys only.
 pub const SELF_ENV_KEYS: &[&str] = &[
@@ -964,8 +977,8 @@ pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, target: &Target, 
                         let cited = match super::max_ref::cite_pair(state, cite.as_ref(), &origin, &terms) {
                             Ok(c) => c,
                             Err(r) => return Err(forbid(r.code(), &format!(
-                                "{} needs a citation pair: cite {{ask_row_id, reply_row_id}}. The ask is your message into a session that names the target (one of {:?}) and the setting (one of {:?} for each); the reply is Max's own first typed message in that session after it, within 2 hours: {}",
-                                action.label(), terms.target, terms.settings, r.code()))),
+                                "{} needs a citation pair: cite {{ask_row_id, reply_row_id}}. The ask is your message into a session that {}; the reply is Max's own first typed message in that session after it, within 2 hours: {}",
+                                action.label(), cite_ask_requirement(&terms), r.code()))),
                         };
                         grant = Some(super::delegation_grants::begin_cited(state, &origin, &class.label(), &action.label(), &target.name(), why.clone(), &cited)?);
                         Some(cited.row_id)
@@ -1470,6 +1483,24 @@ mod tests {
         assert!(t.settings[0].contains(&"yolo".to_string()) && t.settings[0].contains(&"CC_FLAGS".to_string()));
         let t = cite_terms(&Target::Worker("review-dev-a".into()), &tags(&["dev"], &["dev", "ops"]));
         assert_eq!(t.settings, vec![vec!["ops".to_string()]], "a tag change names each changed group");
+    }
+
+    #[test]
+    fn delegation_citation_terms_and_instructions_describe_the_actual_tag_delta() {
+        // Config tags and scope CC_TAGS both produce SetTags. The unchanged
+        // team is not a required setting; adding leads is the whole delta.
+        for (worker, team) in [("review-dev-b", "dev"), ("review-ops-a", "ops")] {
+            let t = cite_terms(&Target::Worker(worker.into()), &tags(&[team], &[team, "leads"]));
+            assert_eq!(t.settings, vec![vec!["leads".to_string()]]);
+            assert_eq!(t.tag_changes, vec![("leads".to_string(), "add".to_string())]);
+            assert!(cite_ask_requirement(&t).contains(&format!("add leads to {worker}")));
+        }
+        let t = cite_terms(&Target::Worker("review-dev-b".into()), &tags(&["dev"], &["ops"]));
+        assert_eq!(t.settings, vec![vec!["dev".to_string()], vec!["ops".to_string()]]);
+        assert_eq!(t.tag_changes, vec![("dev".to_string(), "remove".to_string()), ("ops".to_string(), "add".to_string())]);
+        let instructions = cite_ask_requirement(&t);
+        assert!(instructions.contains("remove dev from review-dev-b"), "{instructions}");
+        assert!(instructions.contains("add ops to review-dev-b"), "{instructions}");
     }
 
     /// Review B1: `tags` (or `rename`) beside any other key is no longer a tag

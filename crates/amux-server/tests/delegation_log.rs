@@ -37,7 +37,8 @@ async fn each_allowed_delegated_change_appends_exactly_one_entry() {
 
     // mrpopo's membership change cites Max's row in another lane: it applies
     // at once as a grant; the change and the grant are both logged.
-    let row = e.cite(&format!("Max, may I add {DEV_B} to leads?"));
+    // N3: the ask names the changed tag and direction for this worker.
+    let row = e.cite(&format!("Max, may I add leads to {DEV_B}?"));
     let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &format!("/api/sessions/{DEV_B}/config"),
         Some(cited(with_ref(json!({"tags": "dev,leads"}), json!(null), "Max asked for a second lead"), row.clone()))).await;
     assert_allowed(st, &v, "mrpopo membership with a citation");
@@ -52,7 +53,7 @@ async fn each_allowed_delegated_change_appends_exactly_one_entry() {
     assert_eq!(m["why"], json!("Max asked for a second lead"), "{m}");
     assert_eq!(entries[3]["action"], json!("grant:applied"), "{}", entries[3]);
     assert_eq!(entries[3]["after"]["cited_excerpt"], json!("yes, go ahead"), "{}", entries[3]);
-    assert!(entries[3]["after"]["ask_text"].as_str().is_some_and(|x| x.contains(&format!("add {DEV_B} to leads"))), "{}", entries[3]);
+    assert!(entries[3]["after"]["ask_text"].as_str().is_some_and(|x| x.contains(&format!("add leads to {DEV_B}"))), "{}", entries[3]);
 }
 
 #[tokio::test]
