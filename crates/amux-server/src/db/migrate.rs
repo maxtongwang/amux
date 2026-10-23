@@ -714,6 +714,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0127_delegation_reply_reservation",
         sql: include_str!("../../migrations/0127_delegation_reply_reservation.sql"),
     },
+    Migration {
+        version: 128,
+        name: "0128_delegation_legacy_duplicate_replies",
+        sql: include_str!("../../migrations/0128_delegation_legacy_duplicate_replies.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
@@ -1060,7 +1065,7 @@ pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Keep historical reply reuse visible on startup after 0127 preserves it.
+/// Keep historical reply reuse visible on startup after 0128 preserves it.
 fn report_legacy_reply_duplicates(conn: &Connection) {
     let counts: rusqlite::Result<(i64, i64)> = conn.query_row(
         "SELECT COUNT(*),COALESCE(SUM(legacy_duplicate=1),0) FROM _amux_delegation_grants",
@@ -1073,8 +1078,8 @@ fn report_legacy_reply_duplicates(conn: &Connection) {
             "historical reply reuse retained for audit; every referenced reply remains spent"
         ),
         Ok(_) => {},
-        // An earlier PR build may already be stamped 127 without this column.
-        // Observability must not turn that into a new startup failure.
+        // A schema probe failure must stay visible without turning
+        // observability into a new startup failure.
         Err(error) => tracing::warn!(
             verdict = "delegation_legacy_reply_duplicates_unmeasured", measured = false,
             n_considered = 0, why_unmeasured = %error,
@@ -1315,8 +1320,80 @@ mod registration_guard {
 mod tests {
     use super::*;
 
+    fn assert_delegation_reply_schema(conn: &Connection) {
+        assert!(column_exists(conn, "_amux_delegation_grants", "legacy_duplicate").unwrap());
+        let (unique, partial): (bool, bool) = conn.query_row(
+            "SELECT \"unique\",partial FROM pragma_index_list('_amux_delegation_grants') WHERE name='idx_delegation_cite_reply'",
+            [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert!(unique && partial, "0128 must replace the shipped full reply index");
+        let sql: String = conn.query_row("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_delegation_cite_reply'", [], |r| r.get(0)).unwrap();
+        assert!(sql.contains("legacy_duplicate = 0"), "0128 must exclude flagged audit duplicates: {sql}");
+        let stamped: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM _amux_migrations WHERE version=128 AND name='0128_delegation_legacy_duplicate_replies'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(stamped, 1);
+    }
+
     #[test]
-    fn delegation_0127_upgrades_populated_original_0126_without_losing_rows() {
+    fn delegation_0128_fresh_db_has_partial_reply_reservations() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_all(&mut conn).unwrap();
+        assert_delegation_reply_schema(&conn);
+        conn.execute("INSERT INTO _amux_delegation_grants
+            (code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,evidence_row)
+            VALUES('fresh','mrpopo','mrpopo','x','fleet','PUT','/api/scope','{}','fresh',1,2,42)", []).unwrap();
+        let duplicate: i64 = conn.query_row("SELECT legacy_duplicate FROM _amux_delegation_grants WHERE code='fresh'", [], |r| r.get(0)).unwrap();
+        assert_eq!(duplicate, 0, "new grants reserve replies by default");
+        assert!(crate::api::max_ref::reply_spent(&conn, 42).unwrap());
+        assert!(!crate::api::max_ref::reply_spent(&conn, 44).unwrap());
+        let err = conn.execute("INSERT INTO _amux_delegation_grants
+            (code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,evidence_row)
+            VALUES('second','other','lead','x','fleet','PUT','/api/scope','{}','second',3,4,42)", []).unwrap_err();
+        assert!(matches!(err, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::ConstraintViolation));
+    }
+
+    #[test]
+    fn delegation_0128_upgrades_shipped_0127_and_replaces_full_index() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_history_through(&conn, 126);
+        // Exact 248c1076 SQL: this DB already ran 0127 and will never rerun it.
+        apply_one(&conn, include_str!("../../tests/fixtures/0127_delegation_reply_reservation_shipped.sql")).unwrap();
+        conn.execute("INSERT INTO _amux_migrations(version,name,applied_at,duration_ms) VALUES(127,'0127_delegation_reply_reservation','test',0)", []).unwrap();
+        assert!(!column_exists(&conn, "_amux_delegation_grants", "legacy_duplicate").unwrap());
+        let sql: String = conn.query_row("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_delegation_cite_reply'", [], |r| r.get(0)).unwrap();
+        assert!(!sql.contains("legacy_duplicate"), "fixture must have the shipped full index");
+        conn.execute("INSERT INTO _amux_delegation_grants
+            (code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,status,evidence_row,cite_spent_at,target_incarnation)
+            VALUES('old','mrpopo','mrpopo','x','fleet','PUT','/api/scope','{}','old',1,2,'failed',42,9,'original'),
+                  ('single','other','lead','x','fleet','PUT','/api/scope','{}','single',3,4,'undone',44,NULL,NULL),
+                  ('uncited','other','lead','x','fleet','PUT','/api/scope','{}','uncited',4,5,'pending',NULL,NULL,NULL)", []).unwrap();
+        let before = delegation_audit_snapshot(&conn);
+        apply_all(&mut conn).unwrap();
+        apply_all(&mut conn).unwrap();
+        assert_delegation_reply_schema(&conn);
+        assert_eq!(delegation_audit_snapshot(&conn), before, "shipped 127 rows and evidence survive");
+        let markers: Vec<(String, i64, Option<f64>, Option<String>)> = conn.prepare(
+            "SELECT code,legacy_duplicate,cite_spent_at,target_incarnation FROM _amux_delegation_grants ORDER BY rowid")
+            .unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(markers, vec![
+            ("old".into(), 0, Some(9.0), Some("original".into())),
+            ("single".into(), 0, Some(3.0), None),
+            ("uncited".into(), 0, None, None),
+        ]);
+        for reply in [42, 44] {
+            assert!(crate::api::max_ref::reply_spent(&conn, reply).unwrap());
+        }
+        assert!(!crate::api::max_ref::reply_spent(&conn, 46).unwrap());
+    }
+
+    fn delegation_audit_snapshot(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT json_array(rowid,code,actor,class,action,target,method,path,body,sentence,why,created_at,expires_at,status,decided_by,decided_at,evidence_row,cited_excerpt,changes,undoable,mode,ask_row,ask_text,reply_text) FROM _amux_delegation_grants ORDER BY rowid")
+            .unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    #[test]
+    fn delegation_0128_upgrades_populated_original_0126_without_losing_rows() {
         let mut conn = Connection::open_in_memory().unwrap();
         apply_history_through(&conn, 126);
         for column in ["cite_spent_at", "target_incarnation", "legacy_duplicate"] {
@@ -1333,36 +1410,37 @@ mod tests {
                   ('tie','other','lead','set_tags','other-worker','PUT','/other','{}','tied request',1,2,'denied',42,43,'tied ask','yes'),
                   ('uncited','mrpopo','mrpopo','set_tags','old-worker','PATCH','/old','{}','pending request',4,5,'pending',NULL,NULL,NULL,NULL)", []).unwrap();
         conn.execute("INSERT INTO cmd_history(session,text,ts) VALUES('old-desk','old ask',1)", []).unwrap();
-        let snapshot = |conn: &Connection| -> Vec<String> {
-            conn.prepare("SELECT json_array(rowid,code,actor,class,action,target,method,path,body,sentence,why,created_at,expires_at,status,decided_by,decided_at,evidence_row,cited_excerpt,changes,undoable,mode,ask_row,ask_text,reply_text) FROM _amux_delegation_grants ORDER BY rowid")
-                .unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
-        };
-        let before = snapshot(&conn);
+        let before = delegation_audit_snapshot(&conn);
         apply_all(&mut conn).unwrap();
         apply_all(&mut conn).unwrap();
-        let after = snapshot(&conn);
+        assert_delegation_reply_schema(&conn);
+        let after = delegation_audit_snapshot(&conn);
         // Exercise the body too: apply_all's version stamp otherwise hides a
         // non-idempotent ADDCOL/backfill on its second invocation.
-        apply_one(&conn, include_str!("../../migrations/0127_delegation_reply_reservation.sql")).unwrap();
+        apply_one(&conn, include_str!("../../migrations/0128_delegation_legacy_duplicate_replies.sql")).unwrap();
         assert_eq!(after, before, "old grants and their evidence survive upgrade");
-        assert_eq!(snapshot(&conn), before, "rerunning the body preserves the audit trail");
-        let stamped: i64 = conn.query_row("SELECT COUNT(*) FROM _amux_migrations WHERE version=127 AND name='0127_delegation_reply_reservation'", [], |r| r.get(0)).unwrap();
+        assert_eq!(delegation_audit_snapshot(&conn), before, "rerunning the body preserves the audit trail");
+        let stamped: i64 = conn.query_row("SELECT COUNT(*) FROM _amux_migrations WHERE version=128 AND name='0128_delegation_legacy_duplicate_replies'", [], |r| r.get(0)).unwrap();
         assert_eq!(stamped, 1, "the upgrade must be a new registered migration");
         let markers: Vec<(String, i64, Option<f64>)> = conn.prepare(
             "SELECT code,legacy_duplicate,cite_spent_at FROM _amux_delegation_grants ORDER BY rowid")
             .unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .unwrap().collect::<rusqlite::Result<_>>().unwrap();
         assert_eq!(markers, vec![
-            ("later".into(), 1, None), ("old".into(), 0, Some(1.0)),
-            ("single".into(), 0, Some(2.0)), ("tie".into(), 1, None),
+            ("later".into(), 1, Some(3.0)), ("old".into(), 0, Some(1.0)),
+            ("single".into(), 0, Some(2.0)), ("tie".into(), 1, Some(1.0)),
             ("uncited".into(), 0, None),
         ], "earliest created_at wins, rowid breaks ties, uncited rows stay unspent");
         let reservations: i64 = conn.query_row(
             "SELECT COUNT(*) FROM (SELECT evidence_row FROM _amux_delegation_grants WHERE evidence_row IS NOT NULL GROUP BY evidence_row HAVING SUM(legacy_duplicate=0)=1)",
             [], |r| r.get(0)).unwrap();
         assert_eq!(reservations, 2, "exactly one reservation per legacy reply");
+        for reply in [42, 44] {
+            assert!(crate::api::max_ref::reply_spent(&conn, reply).unwrap());
+        }
+        assert!(!crate::api::max_ref::reply_spent(&conn, 46).unwrap());
         conn.execute("UPDATE _amux_delegation_grants SET cite_spent_at=9,target_incarnation='original' WHERE code='old'", []).unwrap();
-        apply_one(&conn, include_str!("../../migrations/0127_delegation_reply_reservation.sql")).unwrap();
+        apply_one(&conn, include_str!("../../migrations/0128_delegation_legacy_duplicate_replies.sql")).unwrap();
         let spent: f64 = conn.query_row("SELECT cite_spent_at FROM _amux_delegation_grants WHERE code='old'", [], |r| r.get(0)).unwrap();
         assert_eq!(spent, 9.0, "rerunning the backfill preserves existing spent times");
         conn.execute("UPDATE cmd_history SET cite_worker_ids='{}' WHERE session='old-desk'", []).unwrap();

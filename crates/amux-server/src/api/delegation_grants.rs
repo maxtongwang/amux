@@ -1215,7 +1215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegation_0127_legacy_replies_stay_spent_in_cite_and_pending_modes() {
+    async fn delegation_0128_legacy_replies_stay_spent_in_cite_and_pending_modes() {
         let tmp = tempfile::tempdir().unwrap();
         let _home = crate::api::settings::test_env::set_home(tmp.path());
         let conn = rusqlite::Connection::open(tmp.path().join("t.db")).unwrap();
