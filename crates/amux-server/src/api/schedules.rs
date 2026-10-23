@@ -3032,7 +3032,8 @@ mod tests {
             &app,
             "POST",
             "/api/schedules",
-            Some(json!({ "title": "pf", "schedule_expr": "every 1h", "kind": "shell", "command": "true" })),
+            // A worker-authored shell schedule must target its author (#56 B1).
+            Some(json!({ "title": "pf", "schedule_expr": "every 1h", "kind": "shell", "command": "true", "session": "tester-session" })),
             &SES,
         )
         .await;
