@@ -735,6 +735,7 @@ impl EnvFile {
     pub(crate) fn write(&self, path: &Path) -> std::io::Result<()> {
         let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _file = incarnation_file_lock(path)?;
+        super::delegation_grants::compare_env(path)?;
         let mut latest = if self.dirty.is_empty() {
             self.clone()
         } else {
@@ -749,7 +750,9 @@ impl EnvFile {
         if let Some(id) = worker_incarnation_for_write(path)? {
             latest.set(super::rename_identity::INCARNATION_KEY, &id);
         }
-        latest.write_unlocked(path)
+        latest.write_unlocked(path)?;
+        super::delegation_grants::env_written(path);
+        Ok(())
     }
 
     /// Why `key=value` cannot be written to an env file, or None.
@@ -810,6 +813,7 @@ impl EnvFile {
     pub(crate) fn replace_text(path: &Path, text: &str) -> std::io::Result<()> {
         let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _file = incarnation_file_lock(path)?;
+        super::delegation_grants::compare_env(path)?;
         let text = worker_text_with_incarnation(path, text)?;
         use std::io::Write as _;
         if let Some(dir) = path.parent() {
@@ -826,7 +830,9 @@ impl EnvFile {
             f.write_all(text.as_bytes())?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        super::delegation_grants::env_written(path);
+        Ok(())
     }
 
     /// A value as it must appear in a file bash sources and both env parsers
@@ -866,6 +872,7 @@ impl EnvFile {
         }
         let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _file = incarnation_file_lock(path)?;
+        super::delegation_grants::compare_env(path)?;
         // Read with the worker-file parser: it un-escapes the double-quoted
         // values Self::write produces, which crate::config::parse_env_file
         // does not, so a round trip here cannot grow backslashes.
@@ -901,7 +908,9 @@ impl EnvFile {
             file.write_all(text.as_bytes())?;
             file.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        super::delegation_grants::env_written(path);
+        Ok(())
     }
 }
 
@@ -8016,6 +8025,7 @@ pub(crate) async fn cmd_hist_record_with_id(
                 && amux_core::board::reads_as_qualifier(&text)
                 && !amux_core::board::is_conversational_ack(&text)))
         && !amux_core::board::is_informational_query(&text);
+    let cite_worker_ids = (ctype == "session").then(|| super::max_ref::worker_bindings(&text));
     let msg_row_id_w = msg_row_id.clone();
     let cap_session = session.clone();
     let truth_session = cap_session.clone();
@@ -8034,12 +8044,12 @@ pub(crate) async fn cmd_hist_record_with_id(
                 dup_prior_ts_w.store(pts, std::sync::atomic::Ordering::SeqCst);
             }
             conn.execute(
-                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, repeat_of, process_origin) \
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, repeat_of, process_origin, cite_worker_ids) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rusqlite::params![
                     text, ctype, session, now_ms, origin,
                     delivery, queued_at_ms, delivered_at_ms, submit_verdict, capture_pending,
-                    client_meta, repeat_of, process_origin
+                    client_meta, repeat_of, process_origin, cite_worker_ids
                 ],
             )?;
             let row_id = conn.last_insert_rowid();
@@ -34235,17 +34245,21 @@ pub(crate) fn worker_create_refusal_body(headers: &HeaderMap, req: &CreateReques
 /// Anything else (a number, an object, a non-string array item) is an error:
 /// a check that read it as "no tags" while a writer stored it was review N1.
 pub(crate) fn tags_of(v: Option<&Value>) -> Result<Vec<String>, String> {
-    let keep = |s: &str| Some(norm_label(s)).filter(|t| !t.is_empty());
-    match v {
-        None | Some(Value::Null) => Ok(vec![]),
-        Some(Value::String(s)) => Ok(s.split(',').filter_map(keep).collect()),
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|x| x.as_str().ok_or_else(|| format!("tags must be strings; got {x}")))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|v| v.into_iter().filter_map(keep).collect()),
-        Some(other) => Err(format!("tags must be an array of strings or a comma-separated string; got {other}")),
+    let strings: Vec<&str> = match v {
+        None | Some(Value::Null) => vec![],
+        Some(Value::String(s)) => vec![s],
+        Some(Value::Array(items)) => items.iter().map(|x| x.as_str().ok_or_else(|| format!("tags must be strings; got {x}")))
+            .collect::<Result<_, _>>()?,
+        Some(other) => return Err(format!("tags must be an array of strings or a comma-separated string; got {other}")),
+    };
+    // Array elements and comma strings use ONE grammar at every write surface.
+    let tags: std::collections::BTreeSet<String> = strings.into_iter().flat_map(|s| s.split(','))
+        .map(norm_label).filter(|s| !s.is_empty()).collect();
+    if matches!(v, Some(Value::Array(_))) {
+        tracing::info!(verdict = "tags_array_normalized", measured = true, n_considered = tags.len(),
+            "array tags normalized to canonical comma-separated membership");
     }
+    Ok(tags.into_iter().collect())
 }
 
 /// THE normalizer for every tag and worker-type comparison (review B4): the
@@ -35336,39 +35350,10 @@ async fn config_patch_with_liveness(
     // rule being that destroying data must be requested, never inferred from a
     // type the handler failed to understand.
     if let Some(tv) = body.get("tags") {
-        let joined = match tv {
-            Value::Array(items) => {
-                let mut bad = None;
-                let parts: Vec<String> = items
-                    .iter()
-                    .filter_map(|x| match x.as_str() {
-                        Some(s) => Some(s.trim().to_string()),
-                        None => {
-                            bad = Some(x.clone());
-                            None
-                        }
-                    })
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if let Some(b) = bad {
-                    return jresp(
-                        StatusCode::BAD_REQUEST,
-                        json!({"error": format!("tags must be strings; got {b}"), "wrote": false}),
-                    );
-                }
-                parts.join(",")
-            }
-            Value::String(s) => s.trim().to_string(),
-            Value::Null => String::new(),
-            other => {
-                return jresp(
-                    StatusCode::BAD_REQUEST,
-                    json!({
-                        "error": format!("tags must be an array of strings, a comma-separated string, or null; got {other}"),
-                        "wrote": false,
-                    }),
-                );
-            }
+        let joined = match tags_of(Some(tv)) {
+            Ok(tags) => tags.join(","),
+            Err(error) => return jresp(StatusCode::BAD_REQUEST,
+                json!({"ok": false, "code": "tags_invalid", "error": error, "wrote": false})),
         };
         cfg.set("CC_TAGS", &joined);
         if let Err(e) = cfg.write(&f) {

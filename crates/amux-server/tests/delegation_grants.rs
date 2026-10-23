@@ -170,3 +170,131 @@ async fn alerts_config_goes_through_the_table() {
     let (st, v) = e.call(Who::Owner, "PATCH", "/api/alert/config", Some(body)).await;
     assert_allowed(st, &v, "owner sets alerts config");
 }
+
+
+/// PR #18 R3 B1: an immediate replay, an owner reversal and another target
+/// all preserve the original grant and cannot spend the same pair again.
+#[tokio::test]
+async fn citation_pair_is_spent_after_one_change_including_owner_reversal() {
+    let e = setup().await;
+    let a = e.seed_row(MAX_PANE, &format!("Max, {DEV_A} is busy; may I remove the dev tag from {DEV_B}?"),
+        "session", DEV_LEAD, Some("direct"), now_s() - 60.0);
+    let pair = json!({"ask_row_id": a, "reply_row_id": e.seed_pane_prompt(MAX_PANE, "yes", now_s() - 30.0)});
+    let body = cited(json!({"tags": ""}), pair);
+    let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &cfg(DEV_B), Some(body.clone())).await;
+    assert_allowed(st, &v, "first use");
+    let grant = e.latest_grant();
+    for target in [DEV_B, DEV_A] {
+        let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &cfg(target), Some(body.clone())).await;
+        assert_code(st, &v, "cite_pair_spent", "same pair replay");
+    }
+    let (st, v) = e.call(Who::Owner, "PATCH", &cfg(DEV_B), Some(json!({"tags":"dev"}))).await;
+    assert_allowed(st, &v, "owner restores membership");
+    let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &cfg(DEV_B), Some(body)).await;
+    assert_code(st, &v, "cite_pair_spent", "owner reversal cannot be undone by replay");
+    assert_eq!(e.tags(DEV_B), ["dev".to_string()].into_iter().collect());
+    assert_eq!(e.latest_grant(), grant);
+    let conn = e.store.read().unwrap();
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM _amux_delegation_grants WHERE ask_row=?1 AND cite_spent_at IS NOT NULL", [a], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1, "one persisted spent marker and one grant");
+}
+
+#[tokio::test]
+async fn mrpopo_cannot_reuse_a_pair_on_config_scope_or_after_undo() {
+    let e = setup().await;
+    let pair = e.cite(&format!("Max, may I enable yolo for {DEV_A}?"));
+    let body = cited(json!({"toggle_yolo":true}), pair.clone());
+    let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_A), Some(body.clone())).await;
+    assert_allowed(st, &v, "first mrpopo change");
+    let code = e.latest_grant();
+    let (st, v) = e.call(Who::Owner, "POST", &format!("/api/delegation/grants/{code}/undo"), None).await;
+    assert_allowed(st, &v, "undo");
+    for (method, path, body) in [
+        ("PATCH", cfg(DEV_A), body),
+        ("PUT", "/api/scope".into(), cited(scope_body("worker", DEV_B, "env", json!({"CC_FLAGS":"--dangerously-skip-permissions"})), pair)),
+    ] {
+        let (st, v) = e.call(Who::Worker(MRPOPO), method, &path, Some(body)).await;
+        assert_code(st, &v, "cite_pair_spent", "undo/route change never frees citation");
+    }
+    assert!(!yolo_on(&e));
+}
+
+#[tokio::test]
+async fn citation_requires_the_actual_tag_direction_and_target() {
+    let e = setup().await;
+    for (ask, code) in [
+        (format!("Max, may I change {DEV_B}?"), "cite_ask_missing_setting"),
+        (format!("Max, may I add the dev tag to {DEV_B}?"), "cite_ask_missing_change"),
+        (format!("Max, {DEV_B} is busy; may I remove the dev tag from {DEV_A}?"), "cite_ask_missing_change"),
+        (format!("Max, {DEV_B} has the dev tag."), "cite_ask_missing_change"),
+    ] {
+        let a = e.seed_row(MAX_PANE, &ask, "session", DEV_LEAD, Some("direct"), now_s() - 60.0);
+        let pair = json!({"ask_row_id":a,"reply_row_id":e.seed_pane_prompt(MAX_PANE,"yes",now_s()-30.0)});
+        let before = e.snapshot();
+        let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &cfg(DEV_B), Some(cited(json!({"tags":""}),pair))).await;
+        assert_code(st, &v, code, &ask);
+        assert_eq!(e.snapshot(), before, "refused citation writes nothing");
+    }
+    assert_eq!(e.latest_grant(), "");
+}
+
+/// The same name is insufficient both before first cite use and after a
+/// passkey grant is pending. No tmux rename is needed: move the registry
+/// files (the production identity substrate) preserving their incarnations.
+#[tokio::test]
+async fn citations_and_pending_grants_do_not_follow_reused_worker_names() {
+    for passkey in [false, true] {
+        let e = setup().await;
+        let pair = e.cite(&format!("Max, may I enable yolo for {DEV_A}?"));
+        let mut pending = String::new();
+        if passkey {
+            e.set_mode("passkey");
+            let (st,v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_A), Some(json!({"toggle_yolo":true}))).await;
+            pending = assert_grant_pending(st,&v,"pending for original worker");
+            let conn = e.store.read().unwrap();
+            let inc: String = conn.query_row("SELECT target_incarnation FROM _amux_delegation_grants WHERE code=?1",[&pending],|r|r.get(0)).unwrap();
+            assert_eq!(inc,format!("inc-{DEV_A}"));
+        }
+        let sessions = e.home().join("sessions");
+        std::fs::rename(sessions.join(format!("{DEV_A}.env")), sessions.join("review-renamed.env")).unwrap();
+        std::fs::rename(sessions.join(format!("{DEV_B}.env")), sessions.join(format!("{DEV_A}.env"))).unwrap();
+        if passkey {
+            // The public approval route requires non-local proof. The same
+            // identity guard is checked again by claim_applying; exercised in lib tests.
+            let conn = e.store.read().unwrap();
+            let status: String = conn.query_row("SELECT status FROM _amux_delegation_grants WHERE code=?1",[pending],|r|r.get(0)).unwrap();
+            assert_eq!(status,"pending");
+            e.set_mode("cite");
+        }
+        let before = e.config_snapshot();
+        let (st,v) = e.call(Who::Worker(MRPOPO),"PATCH",&cfg(DEV_A),Some(cited(json!({"toggle_yolo":true}),pair))).await;
+        assert_code(st,&v,"cite_target_identity_changed","old ask cannot approve new holder of the name");
+        assert_eq!(e.config_snapshot(),before);
+        assert!(!yolo_on(&e));
+    }
+}
+
+#[tokio::test]
+async fn tags_arrays_and_strings_store_the_same_canonical_membership_on_both_routes() {
+    let e = setup().await;
+    for tags in [json!([" OPS ","dev, DEV", ""]), json!(" OPS ,dev,DEV,")] {
+        for scope in [false,true] {
+            let (method,path,body) = if scope { ("PUT","/api/scope".to_string(),scope_body("worker",DEV_A,"env",json!({"CC_TAGS":tags}))) }
+                else { ("PATCH",cfg(DEV_A),json!({"tags":tags})) };
+            let (st,v) = e.call(Who::Owner,method,&path,Some(body)).await;
+            assert_allowed(st,&v,"canonical tags");
+            assert!(e.env_text(DEV_A).lines().any(|l| l == "CC_TAGS=dev,ops" || l == "CC_TAGS=\"dev,ops\""), "{}",e.env_text(DEV_A));
+            assert_eq!(e.tags(DEV_A), ["dev".into(),"ops".into()].into_iter().collect());
+        }
+    }
+    for scope in [false,true] {
+        let bad = json!(["dev", 7]);
+        let (method,path,body) = if scope { ("PUT","/api/scope".to_string(),scope_body("worker",DEV_A,"env",json!({"CC_TAGS":bad}))) }
+            else { ("PATCH",cfg(DEV_A),json!({"tags":bad})) };
+        let before = e.snapshot();
+        let (st,v) = e.call(Who::Owner,method,&path,Some(body)).await;
+        assert_eq!(st.as_u16(),400,"{v}");
+        assert_eq!(v["code"],"tags_invalid");
+        assert_eq!(e.snapshot(),before);
+    }
+}

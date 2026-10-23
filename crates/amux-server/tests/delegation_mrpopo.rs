@@ -30,6 +30,9 @@ struct Class {
 /// An ask that names the class, its route and body (so its setting words),
 /// and every target spelling the classes use.
 fn ask_for(c: &Class) -> String {
+    if c.name == "leads membership" {
+        return format!("Max, may I add the leads tag to {DEV_A}?");
+    }
     format!("Max, may I {} ({} {}) for {DEV_A}, ops, leads and the fleet?", c.name, c.path, c.body)
 }
 

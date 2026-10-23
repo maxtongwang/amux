@@ -12,6 +12,20 @@
 //!   plugs into): today the owner's Approve button from a NON-LOCAL Remote
 //!   peer, or an owner send from one containing `amux grant <code>`.
 //!
+//! CITATION RESERVATION. One (ask, reply) pair reserves one grant. Its unique
+//! pair, spent timestamp, target incarnation and exact change request are
+//! committed together before handler execution; failed/interrupted grants
+//! keep their evidence spent (`cite_pair_spent`), including after undo. The
+//! files and other handler writes are separate resources, not a SQLite ACID
+//! transaction; an interrupted `applying` grant is never automatically replayed.
+//! Worker asks record server-derived CC_INCARNATION bindings at message time;
+//! legacy asks without them need a fresh ask. Rename/name reuse cannot transfer
+//! a grant, including pending apply, internal replay, and undo.
+//! Tag asks use `add [the] TAG tag to WORKER` / `remove [the] TAG tag from WORKER`
+//! for each changed tag. Mismatches refuse as `cite_ask_missing_change`.
+//! Env writes compare their checked state under EnvFile's process/file locks;
+//! a mismatch answers 409 `delegation_state_changed` without the stale write.
+//!
 //! EXACTLY ONCE. The handler that applies a grant runs inside the [`capture`]
 //! middleware, which snapshots the files a config change can write before the
 //! handler and records the difference after it: the grant moves `applying`
@@ -283,10 +297,48 @@ pub(crate) struct Captured {
     pub path: String,
     pub body: Value,
     armed: Arc<Mutex<Option<(String, Snapshot)>>>,
+    checked_env: Arc<Mutex<BTreeMap<std::path::PathBuf, BTreeMap<String, String>>>>,
+    compare_failed: Arc<Mutex<bool>>,
 }
+
+// Owner and delegated HTTP config writes share this lock, including across
+// awaits in a handler. EnvFile also compares under its cross-process lock.
+static CONFIG_MUTATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 tokio::task_local! {
     static CAPTURED: Captured;
+}
+
+/// Remember exactly the env state used by authorization.
+pub(crate) fn expect_env(path: &std::path::Path) {
+    if let Some(c) = captured() {
+        let pairs = super::session_verbs::EnvFile::load(path).pairs().iter().cloned().collect();
+        c.checked_env.lock().unwrap_or_else(|e| e.into_inner()).insert(path.to_path_buf(), pairs);
+    }
+}
+
+/// Called WITH EnvFile's process and file locks held, before any write.
+/// Compare every checked key, including tags and incarnation, so a concurrent
+/// owner change cannot be overwritten by an absolute, stale delegated value.
+pub(crate) fn compare_env(path: &std::path::Path) -> std::io::Result<()> {
+    let Some(c) = captured() else { return Ok(()) };
+    let checked = c.checked_env.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(expected) = checked.get(path) else { return Ok(()) };
+    let current: BTreeMap<String, String> = super::session_verbs::EnvFile::load(path).pairs().iter().cloned().collect();
+    if &current != expected {
+        *c.compare_failed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        tracing::warn!(verdict = "delegation_state_changed", measured = true, n_considered = 1,
+            "delegated env compare-and-set refused a concurrent state change");
+        return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "delegation_state_changed"));
+    }
+    Ok(())
+}
+
+/// Advance the comparison after our own successful write, for multi-step handlers.
+pub(crate) fn env_written(path: &std::path::Path) {
+    if captured().is_some_and(|c| c.checked_env.lock().unwrap_or_else(|e| e.into_inner()).contains_key(path)) {
+        expect_env(path);
+    }
 }
 
 /// Middleware: buffer a mutating request to a delegable path so it can be
@@ -297,6 +349,13 @@ pub async fn capture(State(state): State<AppState>, req: Request<Body>, next: Ne
     if !mutating || !CAPTURE_PREFIXES.iter().any(|p| path.starts_with(p)) {
         return next.run(req).await;
     }
+    // Sends can synchronously approve and replay a grant. Never hold this
+    // lock around /send or /report: their replay takes the config lock itself.
+    let serial = path == "/api/scope" || path == "/api/workers"
+        || path.ends_with("/config") || path.ends_with("/rename")
+        || ["/api/groups/", "/api/settings/", "/api/config/"].iter().any(|p| path.starts_with(p))
+        || path.strip_prefix("/api/workers/").is_some_and(|p| !p.contains('/'));
+    let _mutation = if serial { Some(CONFIG_MUTATION.lock().await) } else { None };
     let (parts, body) = req.into_parts();
     // A body declared larger than any config change (a long prompt to
     // `/send`, whose routes carry no body limit) passes through uncaptured;
@@ -316,10 +375,17 @@ pub async fn capture(State(state): State<AppState>, req: Request<Body>, next: Ne
         path: parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or(path),
         body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         armed: Arc::new(Mutex::new(None)),
+        checked_env: Arc::new(Mutex::new(BTreeMap::new())),
+        compare_failed: Arc::new(Mutex::new(false)),
     };
     let armed = captured.armed.clone();
+    let compare_failed = captured.compare_failed.clone();
     let req = Request::from_parts(parts, Body::from(bytes));
     let mut resp = CAPTURED.scope(captured, next.run(req)).await;
+    if *compare_failed.lock().unwrap_or_else(|e| e.into_inner()) {
+        resp = (StatusCode::CONFLICT, Json(super::delegation::refusal_body(
+            "delegation_state_changed", "configuration changed after authorization; read it and ask again"))).into_response();
+    }
     let taken = armed.lock().ok().and_then(|mut a| a.take());
     if let Some((code, before)) = taken {
         finalize(&state, &code, &before, resp.status());
@@ -365,6 +431,7 @@ fn sentence(code: &str, actor: &str, action: &str, target: &str, c: &Captured) -
 }
 
 fn forbid(code: &str, error: String) -> Response {
+    tracing::warn!(code, verdict = "delegation_grant_refused", measured = true, n_considered = 1, "a grant was refused");
     (StatusCode::FORBIDDEN, Json(super::delegation::refusal_body(code, &error))).into_response()
 }
 
@@ -389,17 +456,34 @@ fn insert(state: &AppState, g: &NewGrant, c: &Captured) -> Result<(String, Strin
             c.method.clone(), c.path.clone(), change_body(&c.body).to_string(), text.clone(), g.why.clone(), g.status.to_string(),
             g.cited.map(|x| x.row_id), g.cited.map(|x| x.excerpt.clone()), mode_str(mode()).to_string(),
             g.cited.map(|x| x.ask_row_id), g.cited.map(|x| x.ask_text.clone()), g.cited.map(|x| x.reply_text.clone()));
+        let target_incarnation = match worker_identity(g.target) {
+            Ok(id) => id,
+            Err(e) => return Err(forbid("grant_target_identity_changed", e)),
+        };
+        if g.cited.is_some_and(|c| c.target_incarnation != target_incarnation) {
+            return Err(forbid("cite_target_identity_changed", "the cited worker changed identity".into()));
+        }
         let inserted = state.store.write(move |conn| {
+            // The spent marker and exact immutable request (body/path/method)
+            // are reserved by the SAME transaction as the grant, before any
+            // handler side effect. A failed/interrupted handler never frees it.
+            if let (Some(ask), Some(reply)) = (row.14, row.11) {
+                let spent: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM _amux_delegation_grants WHERE ask_row=?1 AND evidence_row=?2)",
+                    rusqlite::params![ask, reply], |r| r.get(0))?;
+                anyhow::ensure!(!spent, "cite_pair_spent");
+            }
             let n = conn.execute(
-                "INSERT OR IGNORE INTO _amux_delegation_grants (code, actor, class, action, target, method, path, body, sentence, why, created_at, expires_at, status, evidence_row, cited_excerpt, mode, ask_row, ask_text, reply_text) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-                rusqlite::params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, created, created + GRANT_TTL_S, row.10, row.11, row.12, row.13, row.14, row.15, row.16],
+                "INSERT OR IGNORE INTO _amux_delegation_grants (code, actor, class, action, target, method, path, body, sentence, why, created_at, expires_at, status, evidence_row, cited_excerpt, mode, ask_row, ask_text, reply_text, cite_spent_at, target_incarnation) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                rusqlite::params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, created, created + GRANT_TTL_S, row.10, row.11, row.12, row.13, row.14, row.15, row.16, row.14.map(|_| created), target_incarnation],
             )?;
             Ok(crate::db::WriteOutcome { applied: n == 1, events: vec![] })
         });
         match inserted {
             Ok(o) if o.applied => return Ok((code, text)),
             Ok(_) => continue,
+            Err(e) if e.to_string().contains("cite_pair_spent") => return Err(forbid("cite_pair_spent", "this citation pair already reserved a grant; ask Max again".into())),
             Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": e.to_string()}))).into_response()),
         }
     }
@@ -470,15 +554,17 @@ pub(crate) struct GrantRow {
     pub ask_row: Option<i64>,
     pub ask_text: Option<String>,
     pub reply_text: Option<String>,
+    pub target_incarnation: Option<String>,
+    pub cite_spent_at: Option<f64>,
 }
 
-const COLS: &str = "code, actor, class, action, target, method, path, body, sentence, status, expires_at, evidence_row, cited_excerpt, changes, ask_row, ask_text, reply_text";
+const COLS: &str = "code, actor, class, action, target, method, path, body, sentence, status, expires_at, evidence_row, cited_excerpt, changes, ask_row, ask_text, reply_text, target_incarnation, cite_spent_at";
 
 fn map_row(r: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
     Ok(GrantRow {
         code: r.get(0)?, actor: r.get(1)?, class: r.get(2)?, action: r.get(3)?, target: r.get(4)?, method: r.get(5)?,
         path: r.get(6)?, body: r.get(7)?, sentence: r.get(8)?, status: r.get(9)?, expires_at: r.get(10)?, evidence_row: r.get(11)?,
-        cited_excerpt: r.get(12)?, changes: r.get(13)?, ask_row: r.get(14)?, ask_text: r.get(15)?, reply_text: r.get(16)?,
+        cited_excerpt: r.get(12)?, changes: r.get(13)?, ask_row: r.get(14)?, ask_text: r.get(15)?, reply_text: r.get(16)?, target_incarnation: r.get(17)?, cite_spent_at: r.get(18)?,
     })
 }
 
@@ -555,7 +641,23 @@ fn expire_if_due(state: &AppState, g: &GrantRow) -> bool {
     false
 }
 
+/// A worker grant keys on its incarnation. Layer targets have no worker id.
+fn worker_identity(target: &str) -> Result<Option<String>, String> {
+    let home = crate::config::amux_home();
+    if !super::session_verbs::valid_session_name(target) || !home.join("sessions").join(format!("{target}.env")).exists() {
+        return Ok(None);
+    }
+    super::rename_identity::incarnation(&home, target).map(Some).ok_or_else(|| "worker has no stable incarnation; record a fresh ask".into())
+}
+
+fn same_worker(g: &GrantRow) -> bool {
+    worker_identity(&g.target).is_ok_and(|id| id == g.target_incarnation)
+}
+
 fn not_applicable(state: &AppState, g: &GrantRow) -> Option<(&'static str, String)> {
+    if !same_worker(g) {
+        return Some(("grant_target_identity_changed", format!("grant {} belongs to a different worker incarnation", g.code)));
+    }
     if expire_if_due(state, g) {
         return Some(("grant_expired", format!("grant {} expired; ask again", g.code)));
     }
@@ -606,6 +708,7 @@ pub(crate) async fn apply(state: &AppState, code: &str, by: &str, evidence: Opti
 /// Arms the request so its middleware finalizes the grant.
 pub(crate) fn claim_applying(state: &AppState, code: &str, actor: &str, action: &str, target: &str) -> Result<Option<i64>, String> {
     let g = load(state, code).ok_or_else(|| format!("no grant {code}"))?;
+    if !same_worker(&g) { return Err("grant_target_identity_changed".into()); }
     if g.status != "applying" {
         return Err(format!("grant {code} is {}, not being applied", g.status));
     }
@@ -850,6 +953,9 @@ async fn undo(State(state): State<AppState>, uri: Uri, headers: HeaderMap, Path(
     if g.status != "applied" {
         return (StatusCode::CONFLICT, Json(super::delegation::refusal_body("grant_not_applied", &format!("grant {} is {}; only an applied grant is undone", g.code, g.status)))).into_response();
     }
+    if !same_worker(&g) {
+        return forbid("grant_target_identity_changed", "undo target has a different worker incarnation".into());
+    }
     let changes: Value = g.changes.as_deref().and_then(|c| serde_json::from_str(c).ok()).unwrap_or(Value::Null);
     match restore(&state, &changes) {
         // Review B2: an undo that restored nothing is not an undo. The grant
@@ -894,6 +1000,7 @@ async fn list(State(state): State<AppState>, uri: Uri, headers: HeaderMap) -> Re
         let status = if g.status == "pending" && now() > g.expires_at { "expired" } else { g.status.as_str() };
         json!({"code": g.code, "actor": g.actor, "class": g.class, "action": g.action, "target": g.target, "sentence": g.sentence,
             "status": status, "expires_at": g.expires_at, "method": g.method, "path": g.path, "cited_row": g.evidence_row,
+            "target_incarnation": g.target_incarnation, "cite_spent_at": g.cite_spent_at,
             "cited_excerpt": g.cited_excerpt, "ask_row": g.ask_row, "ask_text": g.ask_text, "reply_text": g.reply_text, "body": serde_json::from_str::<Value>(&g.body).unwrap_or(Value::Null)})
     }).collect();
     Json(json!({"grants": rows, "mode": mode_str(mode()), "measured": true, "n_considered": rows.len()})).into_response()
@@ -938,6 +1045,180 @@ mod tests {
         assert!(codes_in("amux grant 7K3QX").is_empty(), "five characters is not a code");
     }
 
+    fn context(body: Value) -> Captured {
+        Captured {
+            method: "PATCH".into(), path: "/api/sessions/test-dev-a/config".into(), body,
+            armed: Arc::new(Mutex::new(None)), checked_env: Arc::new(Mutex::new(BTreeMap::new())),
+            compare_failed: Arc::new(Mutex::new(false)),
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_message_recorder_binds_the_ask_to_worker_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        let row = super::super::session_verbs::cmd_hist_record_with_id(
+            &state,"test-desk","Max, may I enable yolo for test-dev-a?","session","mrpopo",true,
+            super::super::session_verbs::DeliveryMeta { delivery:Some(super::super::session_verbs::Delivery::Direct),..Default::default() }).await;
+        assert!(row > 0);
+        let conn = state.store.read().unwrap();
+        let raw: String = conn.query_row("SELECT cite_worker_ids FROM cmd_history WHERE id=?1",[row],|r|r.get(0)).unwrap();
+        let ids: BTreeMap<String,String> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(ids.get("test-dev-a").map(String::as_str),Some("inc-test-dev-a"));
+    }
+
+    #[tokio::test]
+    async fn delegation_citation_insert_refuses_spent_pair_even_without_precheck() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        let cited = super::super::max_ref::Cited { row_id: 2, ask_row_id: 1, session: "test-desk".into(),
+            excerpt: "yes".into(), ask_text: "Max, may I enable yolo for test-dev-a?".into(), reply_text: "yes".into(),
+            target_incarnation: Some("inc-test-dev-a".into()) };
+        let c = context(json!({"toggle_yolo":true}));
+        CAPTURED.scope(c, async {
+            let code = begin_cited(&state,"mrpopo","mrpopo","set_config:toggle_yolo","test-dev-a",None,&cited).unwrap();
+            let response = begin_cited(&state,"mrpopo","mrpopo","set_config:toggle_yolo","test-dev-a",None,&cited).unwrap_err();
+            assert_eq!(response.status(),StatusCode::FORBIDDEN);
+            let bytes = axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["code"],"cite_pair_spent","insert guard must name spent evidence, not code exhaustion");
+            assert_eq!(super::super::max_ref::pair_unspent(&state,&super::super::max_ref::Cite {
+                ask_row_id:Some(1),reply_row_id:Some(2),..Default::default() }),Err(super::super::max_ref::MaxRefRefusal::PairSpent));
+            let conn = state.store.read().unwrap();
+            let (spent, body): (Option<f64>,String) = conn.query_row(
+                "SELECT cite_spent_at,body FROM _amux_delegation_grants WHERE code=?1",[&code],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert!(spent.is_some());
+            assert_eq!(body,json!({"toggle_yolo":true}).to_string());
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn delegation_citation_unique_constraint_prevents_second_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        let conn = state.store.read().unwrap();
+        assert!(conn.prepare("SELECT cite_spent_at,target_incarnation FROM _amux_delegation_grants").is_ok());
+        drop(conn);
+        let insert = |code: &str| {
+            let code = code.to_string();
+            state.store.write(move |c| {
+                c.execute("INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,status,ask_row,evidence_row,cite_spent_at) VALUES(?1,'mrpopo','mrpopo','x','fleet','PUT','/api/scope','{}','change',1,2,'applying',11,12,1)",[code])?;
+                Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+            })
+        };
+        insert("ABCD").unwrap();
+        let err = insert("EFGH").unwrap_err();
+        assert!(err.to_string().contains("UNIQUE constraint failed"),"{err}");
+        let conn = state.store.read().unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM _amux_delegation_grants",[],|r|r.get(0)).unwrap();
+        assert_eq!(count,1);
+    }
+
+    #[tokio::test]
+    async fn delegation_env_cas_preserves_concurrent_owner_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let path = tmp.path().join("sessions/test-dev-a.env");
+        let _state = test_state(tmp.path());
+        // All EnvFile write entrypoints must share the comparison boundary.
+        for writer in ["write", "merge_plain", "replace_text"] {
+            let mut env = super::super::session_verbs::EnvFile::load(&path);
+            env.set("CC_TAGS","dev,ops");
+            env.write(&path).unwrap();
+            let c = context(json!({"tags":"ops"}));
+            let failed = c.compare_failed.clone();
+            CAPTURED.scope(c, async {
+                expect_env(&path);
+                // Another task has no inherited task-local authorization.
+                // It is a real owner write through the same locked writer.
+                let owner_path = path.clone();
+                tokio::spawn(async move {
+                    let mut owner = super::super::session_verbs::EnvFile::load(&owner_path);
+                    owner.set("CC_TAGS","dev");
+                    owner.write(&owner_path).unwrap();
+                }).await.unwrap();
+                let owner_bytes = std::fs::read(&path).unwrap();
+                let result = match writer {
+                    "write" => { env.set("CC_TAGS","ops"); env.write(&path) },
+                    "merge_plain" => super::super::session_verbs::EnvFile::merge_plain(&path,&[("CC_TAGS".into(),Some("ops".into()))]),
+                    "replace_text" => super::super::session_verbs::EnvFile::replace_text(&path,"CC_TAGS=ops\n"),
+                    _ => unreachable!(),
+                };
+                assert_eq!(result.unwrap_err().to_string(),"delegation_state_changed","{writer}");
+                assert!(*failed.lock().unwrap());
+                assert_eq!(std::fs::read(&path).unwrap(),owner_bytes,"{writer} overwrote concurrent owner state");
+            }).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_env_cas_reports_conflict_at_http_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        let path = tmp.path().join("sessions/test-dev-a.env");
+        let handler_state = state.clone();
+        let owner_path = path.clone();
+        let app = Router::new().route("/api/sessions/test-dev-a/config", axum::routing::patch(move || {
+            let state = handler_state.clone();
+            let path = owner_path.clone();
+            async move {
+                expect_env(&path);
+                tokio::spawn(async move {
+                    let mut env = super::super::session_verbs::EnvFile::load(&path);
+                    env.set("CC_TAGS","dev,owner-choice");
+                    env.write(&path).unwrap();
+                }).await.unwrap();
+                super::super::session_verbs::config_patch(&state,"test-dev-a",&json!({"tags":"ops"})).await
+            }
+        })).layer(axum::middleware::from_fn_with_state(state,capture));
+        let (st,v,_) = call(&app,"PATCH","/api/sessions/test-dev-a/config",None,json!({"tags":"ops"}),None).await;
+        assert_eq!(st,StatusCode::CONFLICT,"{v}");
+        assert_eq!(v["code"],"delegation_state_changed");
+        assert!(std::fs::read_to_string(path).unwrap().contains("dev,owner-choice"));
+    }
+
+    #[tokio::test]
+    async fn delegation_pending_grant_refuses_a_reused_name_on_apply_claim_and_undo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        let c = context(json!({"toggle_yolo":true}));
+        let g = NewGrant { actor:"mrpopo",class:"mrpopo",action:"set_config:toggle_yolo",target:"test-dev-a",why:None,status:"pending",cited:None };
+        let (code,_) = insert(&state,&g,&c).unwrap();
+        let row = load(&state,&code).unwrap();
+        assert_eq!(row.target_incarnation.as_deref(),Some("inc-test-dev-a"));
+        let path = tmp.path().join("sessions/test-dev-a.env");
+        std::fs::rename(&path,tmp.path().join("sessions/renamed.env")).unwrap();
+        // A new worker with the released name has its own incarnation.
+        std::fs::write(&path,"CC_TAGS=dev\nCC_INCARNATION=other-worker\n").unwrap();
+        assert_eq!(not_applicable(&state,&row).unwrap().0,"grant_target_identity_changed");
+        let err = apply(&state,&code,"owner",None).await.unwrap_err();
+        assert_eq!(err.0,"grant_target_identity_changed");
+        assert!(set_status(&state,&code,"pending","applying","owner",None));
+        assert_eq!(claim_applying(&state,&code,"mrpopo","set_config:toggle_yolo","test-dev-a").unwrap_err(),"grant_target_identity_changed");
+        assert!(set_status(&state,&code,"applying","applied","owner",None));
+        let app = super::super::router(state.clone());
+        let (st,v,_) = call(&app,"POST",&format!("/api/delegation/grants/{code}/undo"),None,Value::Null,None).await;
+        assert_eq!(st,StatusCode::FORBIDDEN,"{v}");
+        assert_eq!(v["code"],"grant_target_identity_changed");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("other-worker"));
+    }
+
+    #[test]
+    fn delegation_tags_normalize_array_and_string_with_one_grammar() {
+        let wanted = vec!["dev".to_string(),"ops".to_string()];
+        for value in [json!([" OPS ","dev,DEV",""]),json!(" OPS , dev,DEV,")] {
+            assert_eq!(super::super::session_verbs::tags_of(Some(&value)).unwrap(),wanted);
+        }
+        for invalid in [json!(["dev",7]),json!({"dev":true}),json!(7)] {
+            assert!(super::super::session_verbs::tags_of(Some(&invalid)).is_err(),"{invalid}");
+        }
+    }
+
     #[test]
     fn a_code_uses_only_the_unambiguous_alphabet() {
         for _ in 0..50 {
@@ -949,9 +1230,9 @@ mod tests {
 
     fn test_state(dir: &std::path::Path) -> AppState {
         std::fs::create_dir_all(dir.join("sessions")).unwrap();
-        std::fs::write(dir.join("sessions/test-dev-a.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\n").unwrap();
-        std::fs::write(dir.join("sessions/mrpopo.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads\"\n").unwrap();
-        std::fs::write(dir.join("sessions/test-dev-lead.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads,dev\"\nCC_ORCHESTRATOR=\"1\"\n").unwrap();
+        std::fs::write(dir.join("sessions/test-dev-a.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\nCC_INCARNATION=\"inc-test-dev-a\"\n").unwrap();
+        std::fs::write(dir.join("sessions/mrpopo.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads\"\nCC_INCARNATION=\"inc-mrpopo\"\n").unwrap();
+        std::fs::write(dir.join("sessions/test-dev-lead.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads,dev\"\nCC_ORCHESTRATOR=\"1\"\nCC_INCARNATION=\"inc-test-dev-lead\"\n").unwrap();
         AppState {
             store: std::sync::Arc::new(crate::db::Store::open(&dir.join("t.db")).unwrap()),
             started: std::time::Instant::now(),
@@ -977,13 +1258,14 @@ mod tests {
 
     #[allow(clippy::too_many_arguments)] // test fixture: one cmd_history row's columns
     fn put_row(state: &AppState, session: &str, text: &str, ty: &str, origin: &str, delivery: &str, po: Option<&str>, ts: f64) -> i64 {
+        let ids = super::super::max_ref::worker_bindings(text);
         let (session, text, ty, origin, delivery, po) = (session.to_string(), text.to_string(), ty.to_string(), origin.to_string(), delivery.to_string(), po.map(str::to_string));
         let id = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
         let idw = id.clone();
         state.store.write(move |c| {
             crate::api::session_verbs::ensure_fleet_tables(c)?;
-            c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,process_origin,ts) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                rusqlite::params![session, text, ty, origin, delivery, po, (ts * 1000.0) as i64])?;
+            c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,process_origin,ts,cite_worker_ids) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                rusqlite::params![session, text, ty, origin, delivery, po, (ts * 1000.0) as i64,ids])?;
             idw.store(c.last_insert_rowid(), std::sync::atomic::Ordering::SeqCst);
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         }).unwrap();
@@ -1061,7 +1343,7 @@ mod tests {
             json!({"tags": []}), None).await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert!(env_of(tmp.path()).contains("CC_TAGS=\"dev\""), "uncited: nothing changed");
-        let ask = put_row(&state, "test-desk", "Max, may I take test-dev-a out of the dev team (its tags)?", "session", "test-dev-lead", "direct", None, now() - 60.0);
+        let ask = put_row(&state, "test-desk", "Max, may I remove the dev tag from test-dev-a?", "session", "test-dev-lead", "direct", None, now() - 60.0);
         let reply = put_row(&state, "test-desk", "yes", "user", "pane", "pane", None, now() - 30.0);
         let (st, v, h) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("test-dev-lead"),
             json!({"tags": [], "cite": {"ask_row_id": ask, "reply_row_id": reply}}), None).await;

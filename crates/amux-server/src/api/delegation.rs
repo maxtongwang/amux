@@ -319,7 +319,16 @@ pub(crate) fn cite_terms(target: &Target, action: &Action) -> super::max_ref::Ci
         Action::SetRouting => vec![["routing", "inbound", "cross group"].iter().map(|w| w.to_string()).collect()],
         other => vec![vec![other.label()]],
     };
-    super::max_ref::CiteTerms { target: target_words, settings }
+    let tag_changes = match action {
+        Action::SetTags { from, to } => {
+            let (from, to) = (set(from), set(to));
+            from.difference(&to).map(|tag| (tag.clone(), "remove".into()))
+                .chain(to.difference(&from).map(|tag| (tag.clone(), "add".into()))).collect()
+        }
+        _ => vec![],
+    };
+    super::max_ref::CiteTerms { target: target_words, settings,
+        worker: match target { Target::Worker(w) => Some(w.clone()), _ => None }, tag_changes }
 }
 
 /// Env keys a worker may set on itself (H4: an explicit list, not "anything
@@ -895,11 +904,36 @@ fn request_why(body: Option<&Value>) -> Option<String> {
 /// the change lands. `Err(response)`: refused in the #8 shape.
 #[allow(clippy::result_large_err)] // the refusal IS the handler's response; it is returned as-is
 pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, target: &Target, action: &Action, body: Option<&Value>) -> Result<Option<Grant>, Response> {
+    // Establish the compare baseline BEFORE deriving permission facts.
+    // The write boundary validates it under the same locks as the write.
+    if !verified_origin(headers).is_empty() {
+        let home = crate::config::amux_home();
+        let path = match target {
+            Target::Worker(w) => Some(home.join("sessions").join(format!("{w}.env"))),
+            Target::Group(g) => Some(home.join("env").join(format!("{g}.env"))),
+            Target::Fleet | Target::Settings(_) => Some(home.join("amux.env")),
+            Target::NewWorker => None,
+        };
+        if let Some(path) = path {
+            super::delegation_grants::expect_env(&path);
+        }
+    }
     let (origin, class, decision) = decide_for(headers, target, action);
     if class == Class::Owner {
         return Ok(None);
     }
     let forbid = |code: &str, error: &str| (StatusCode::FORBIDDEN, Json(refused(&origin, &class, target, action, code, error))).into_response();
+    if let Some(cite) = body.and_then(|b| b.get("cite")).and_then(|c| serde_json::from_value::<super::max_ref::Cite>(c.clone()).ok()) {
+        if let Err(r) = super::max_ref::pair_unspent(state, &cite) {
+            return Err(forbid(r.code(), "this citation pair already reserved a grant; ask Max again"));
+        }
+    }
+    if let (Target::Worker(w), Action::SetTags { from, .. }) = (target, action) {
+        let current = super::session_verbs::lane_groups(w);
+        if set(from) != current {
+            return Err(forbid("delegation_state_changed", "tags changed while permission was being checked"));
+        }
+    }
     let why = request_why(body);
     let mut grant = None;
     let evidence_row = match decision {

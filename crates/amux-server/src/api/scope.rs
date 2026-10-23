@@ -1014,6 +1014,14 @@ async fn put_scope(state: AppState, req: Request) -> Response {
     // "may X do Y to Z" (ai-config #160).
     let home = super::groups::amux_home();
     let value = body.get("value").cloned().unwrap_or(Value::Null);
+    if capability == "env" {
+        if let Some(tags) = value.get("CC_TAGS") {
+            if let Err(error) = crate::api::session_verbs::tags_of(Some(tags)) {
+                tracing::warn!(verdict = "scope_tags_invalid", measured = true, n_considered = 1, "scope tags refused");
+                return j(400, json!({"ok": false, "code": "tags_invalid", "error": error}));
+            }
+        }
+    }
     let grant = if is_worker {
         let (target, action) = scope_action(&home, &level, &name, &capability, &value);
         match crate::api::delegation::authorize(&state, &headers, &target, &action, Some(&body)) {
@@ -1319,13 +1327,16 @@ pub(crate) fn owner_only_key_changed(home: &Path, level: &str, name: &str, value
 /// The first key matching `guarded` whose value this write would change.
 /// Handles both write shapes: a full-text replace and a key/value merge.
 /// The value a scope object entry stores, as `write_env` stores it.
-fn scope_env_value(v: &Value) -> Option<String> {
-    match v {
+fn scope_env_value(key: &str, v: &Value) -> Result<Option<String>, String> {
+    if key == "CC_TAGS" {
+        return crate::api::session_verbs::tags_of(Some(v)).map(|tags| Some(tags.join(",")));
+    }
+    Ok(match v {
         Value::Null => None,
         Value::String(s) => Some(s.clone()),
         Value::Bool(b) => Some(if *b { "True".into() } else { "False".into() }),
         other => Some(other.to_string()),
-    }
+    })
 }
 
 /// The first `guarded` key whose value the env READER (`EnvFile`) would see
@@ -1353,9 +1364,10 @@ pub(crate) fn env_keys_changed(home: &Path, level: &str, name: &str, value: &Val
         Value::Object(obj) => {
             let mut merged = current.clone();
             for (k, v) in obj {
-                match scope_env_value(v) {
-                    Some(v) => merged.insert(k.clone(), v),
-                    None => merged.remove(k),
+                match scope_env_value(k, v) {
+                    Ok(Some(v)) => merged.insert(k.clone(), v),
+                    Ok(None) => merged.remove(k),
+                    Err(_) => return vec![NONCANONICAL.into()],
                 };
             }
             merged
@@ -1382,7 +1394,7 @@ fn write_env(home: &Path, level: &str, name: &str, value: &Value) -> Result<(), 
             let mut updates = Vec::new();
             if let Some(obj) = value.as_object() {
                 for (k, v) in obj {
-                    updates.push((k.clone(), scope_env_value(v)));
+                    updates.push((k.clone(), scope_env_value(k, v).map_err(|e| (400, e))?));
                 }
             }
             // A value the env serializer refuses (newline, NUL) is the caller's
