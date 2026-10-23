@@ -390,9 +390,12 @@ impl Env {
             std::fs::write(dir.join("current.json"), json!({"run_id": run, "provider": "claude", "started": now - 100.0}).to_string()).unwrap();
         }
         let seq = PANE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let report = json!({"native_status": true, "event": "UserPromptSubmit", "run_id": run, "provider": "claude",
+        let report = json!({"native_status": true, "event": "UserPromptSubmit", "state": "active", "run_id": run, "provider": "claude",
             "sequence": seq, "event_ts": now - 0.5, "turn_id": format!("t{seq}"), "prompt": text});
-        self.call(Who::Worker(lane), "POST", &format!("/api/sessions/{lane}/report"), Some(report)).await
+        let reply = self.call(Who::Worker(lane), "POST", &format!("/api/sessions/{lane}/report"), Some(report)).await;
+        assert!(reply.0.is_success() && reply.1["applied"] == true,
+            "native hook report must be applied before it can record owner input: {reply:?}");
+        reply
     }
 
     /// A stored grant's status, or "" when there is no such grant.

@@ -98,7 +98,7 @@ pub(crate) fn refusal(code: &str, note: &str) -> Response {
 pub(crate) fn resolve_session(state: &AppState, session: &str) -> Result<(), String> {
     let ids: Vec<i64> = {
         let conn = state.store.read().map_err(|e| e.to_string())?;
-        let mut st = conn.prepare("SELECT id FROM cmd_history WHERE session=?1 AND id >= (SELECT MIN(shown_row) FROM _amux_delegation_grants WHERE reply_session=?1 AND status='pending') AND COALESCE(delegation_message_type,type)='user' AND NOT EXISTS(SELECT 1 FROM _amux_delegation_resolutions dr WHERE dr.reply_row=cmd_history.id) ORDER BY id LIMIT ?2").map_err(|e| e.to_string())?;
+        let mut st = conn.prepare("SELECT id FROM cmd_history WHERE session=?1 AND id >= (SELECT MIN(shown_row) FROM _amux_delegation_grants WHERE reply_session=?1 AND status='pending') AND COALESCE(delegation_message_type,type) IN ('user','chat') AND NOT EXISTS(SELECT 1 FROM _amux_delegation_resolutions dr WHERE dr.reply_row=cmd_history.id) ORDER BY id LIMIT ?2").map_err(|e| e.to_string())?;
         let rows = st.query_map(rusqlite::params![session, (RESOLUTION_SCAN_LIMIT + 1) as i64], |r| r.get(0)).map_err(|e| e.to_string())?;
         rows.collect::<rusqlite::Result<_>>().map_err(|e| e.to_string())?
     };
@@ -155,7 +155,7 @@ pub(crate) fn resolve_observed(state: &AppState, id: i64) -> Result<(), String> 
     if max_ref::typed_by_max(state, &row).is_none() { return Ok(()); }
     let ids: Vec<i64> = {
         let conn = state.store.read().map_err(|e| e.to_string())?;
-        let mut st = conn.prepare("SELECT id FROM cmd_history WHERE session=?1 AND COALESCE(delegation_message_type,type)='user' AND id<?2 ORDER BY id DESC LIMIT ?3").map_err(|e|e.to_string())?;
+        let mut st = conn.prepare("SELECT id FROM cmd_history WHERE session=?1 AND COALESCE(delegation_message_type,type) IN ('user','chat') AND id<?2 ORDER BY id DESC LIMIT ?3").map_err(|e|e.to_string())?;
         let rows = st.query_map(rusqlite::params![row.session,id,(RESOLUTION_SCAN_LIMIT+1) as i64], |r|r.get(0)).map_err(|e|e.to_string())?;
         rows.collect::<rusqlite::Result<_>>().map_err(|e|e.to_string())?
     };

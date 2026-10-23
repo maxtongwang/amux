@@ -6250,3 +6250,25 @@ FIX: The internal config draft no longer inherits the POST interaction ID or
   actual collisions. The regression checks separate receipts and a genuine 409;
   integration fixtures use request IDs and forbidden request creation. Parent
   owns Rust execution; non-cargo syntax, registry and seven Node checks pass.
+
+
+## Owner hook fixture silently ignored submitted replies
+AREA: delegation
+SEVERITY: breaks
+STATUS: fixed
+DATE: 2026-10-23
+SESSION: pr18-r4
+CARD: maxtongwang/ai-config#160
+SYMPTOM: Parent integration tests got HTTP 200 after pane yes/approve but no
+  request resolution. The helper omitted native state=active; the real handler
+  answered applied=false, with native_status_refused reason=invalid_state.
+COST: Two failing integration cases and a misleading missing-wiring diagnosis.
+FIX: Use the complete provider hook payload and require an applied receipt.
+  Assert the committed resolution before GET recovery can conceal an unhooked
+  recorder. The class sweep also preserves verified owner proof for Chat,
+  steering, project sends and forwarded owner input through the same recorder;
+  peer/member exclusion and direct Remote application proof stay enforced.
+  Existing delegation_request_resolution and delegation_request_refused verdicts
+  now announce these replies; the fixture fails at the rejected receipt itself.
+  Native-hook tests (6), SQLite schema/SIGKILL probes and Rust parsing pass.
+  Parent owns Rust regressions and the recorder-unhook mutation; no Cargo ran.

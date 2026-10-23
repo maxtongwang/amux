@@ -17,6 +17,20 @@ async fn apply(e: &Env, actor: &str, id: &str, worker: &str, body: Value) -> (ax
     e.call(Who::Worker(actor),"PATCH",&cfg(worker),Some(with_request(body,json!(id)))).await
 }
 
+// Read the recorder's result directly: GET request/list reconciles missed
+// replies and would hide a disconnected post-recording resolver.
+fn recorded_resolution(e: &Env, code: &str) -> i64 {
+    let conn=e.store.read().unwrap();
+    let row: i64=conn.query_row(
+        "SELECT id FROM cmd_history WHERE session=?1 AND delivery='pane' ORDER BY id DESC LIMIT 1",
+        [MAX_PANE],|r|r.get(0)).expect("applied owner hook must record a pane message");
+    let (count,actual):(i64,Option<String>)=conn.query_row(
+        "SELECT COUNT(*),MIN(code) FROM _amux_delegation_resolutions WHERE reply_row=?1",
+        [row],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!((count,actual),(1,Some(code.into())),"recorder must resolve once before a recovery read");
+    row
+}
+
 #[tokio::test]
 async fn explicit_request_is_shown_with_stable_identities_and_structured_change() {
     let e=setup().await;
@@ -128,6 +142,7 @@ async fn yes_with_no_shown_candidate_funds_nothing_and_is_observable() {
     // Actual hook path invokes the resolver even with no existing requests.
     let (st,v)=e.type_in_pane(MAX_PANE,"yes").await;
     assert_allowed(st,&v,"record human yes");
+    recorded_resolution(&e,"request_no_candidate");
     let (st,v)=e.call(Who::Worker(MRPOPO),"GET","/api/delegation/requests",None).await;
     assert_allowed(st,&v,"list no-candidate outcome");
     assert!(v["resolutions"].as_array().unwrap().iter().any(|r|r["code"]=="request_no_candidate"),"{v}");
@@ -323,7 +338,8 @@ async fn project_steering_projection_preserves_owner_but_never_peer_authorship()
     let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"}),MAX_PANE).await;
     let (st,v)=e.type_in_pane(MAX_PANE,"approve").await;
     assert_allowed(st,&v,"record actual owner reply through the hook");
-    let row=view(&e,&id).await["resolution_row"].as_i64().unwrap();
+    let row=recorded_resolution(&e,"request_resolved");
+    assert_eq!(view(&e,&id).await["resolution_row"],row);
     {
         let conn=e.store.read().unwrap();
         assert_eq!(conn.query_row("SELECT delegation_message_type FROM cmd_history WHERE id=?1",[row],|r|r.get::<_,String>(0)).unwrap(),"user");
@@ -347,6 +363,7 @@ async fn project_steering_projection_preserves_owner_but_never_peer_authorship()
     assert_code(st,&v,"request_unresolved","peer steering is still not owner input");
     let (st,v)=e.type_in_pane(MAX_PANE,"go ahead").await;
     assert_allowed(st,&v,"record the actual owner control");
+    recorded_resolution(&e,"request_resolved");
     let (st,v)=apply(&e,MRPOPO,&next,DEV_B,json!({"worktree_verify":"two"})).await;
     assert_allowed(st,&v,"only the actual owner reply funds the second request");
 }

@@ -171,8 +171,10 @@ pub(crate) async fn companion_route(
     action: &str,
     receipt_msg_id: Option<&str>,
     body: &Value,
-    caller: &str,
+    headers: &axum::http::HeaderMap,
 ) -> Response {
+    let caller = headers.get("x-amux-session").or_else(|| headers.get("x-amux-worker"))
+        .and_then(|v| v.to_str().ok()).unwrap_or("");
     let key = companion_key(worker);
     if !env_path(worker).exists() {
         return (StatusCode::NOT_FOUND, Json(json!({"error": format!("worker '{worker}' not found")}))).into_response();
@@ -235,7 +237,10 @@ pub(crate) async fn companion_route(
         "chat",
         if from_owner { "chat-companion" } else { caller },
         true,
-        super::session_verbs::DeliveryMeta::default(),
+        super::session_verbs::DeliveryMeta {
+            process_origin: super::session_verbs::owner_input_process_origin(headers),
+            ..super::session_verbs::DeliveryMeta::direct()
+        },
     )
     .await;
     tracing::info!(session = %key, worker, verdict = "chat_companion_send", "Chat tab message accepted");

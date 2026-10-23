@@ -50,10 +50,10 @@ pub(crate) struct Row {
 
 /// Which human shape a row has, if any (see the module comment).
 fn human_source(ctype: &str, origin: &str, delivery: &str, process_origin: &str) -> Option<HumanSource> {
-    if ctype != "user" {
+    if !matches!(ctype, "user" | "chat") {
         return None;
     }
-    if delivery == "pane" && origin == "pane" {
+    if ctype == "user" && delivery == "pane" && origin == "pane" {
         return Some(HumanSource::Pane);
     }
     // `origin='pane'` is the recorder's alone (the PANE shape); a direct or

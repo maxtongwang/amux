@@ -1497,6 +1497,62 @@ mod tests {
         assert_eq!(load(&state, request_id).unwrap().status, "pending");
     }
 
+    #[test]
+    fn owner_input_process_proof_excludes_workers_and_invited_members() {
+        use super::super::session_verbs::owner_input_process_origin;
+        let mut headers=HeaderMap::new();
+        headers.insert(super::super::process_identity::PROCESS_ORIGIN_HEADER,"remote".parse().unwrap());
+        assert_eq!(owner_input_process_origin(&headers),Some("remote"));
+        headers.insert("x-amux-session","test-peer".parse().unwrap());
+        assert_eq!(owner_input_process_origin(&headers),None);
+        headers.remove("x-amux-session");
+        headers.insert("x-amux-local-member-verified","1".parse().unwrap());
+        assert_eq!(owner_input_process_origin(&headers),None,"even a missing member actor must fail closed");
+    }
+
+    #[tokio::test]
+    async fn owner_input_recorder_resolves_send_chat_and_queued_replies_once() {
+        use super::super::session_verbs::{cmd_hist_record_with_id, DeliveryMeta};
+        let tmp=tempfile::tempdir().unwrap();
+        let _home=crate::api::settings::test_env::set_home(tmp.path());
+        let state=test_state(tmp.path());
+        let app=super::super::router(state.clone());
+        for (ctype,queued,proof) in [
+            ("user",false,"outside"), ("user",true,"remote"),
+            ("user",true,"outside"), ("user",false,"remote-forwarded"),
+            ("chat",false,"outside"), ("chat",false,"remote"),
+        ] {
+            let id=explicit_request(&app,json!({"worktree_verify":"one"})).await;
+            let meta=DeliveryMeta {
+                process_origin:Some(proof),
+                ..if queued { DeliveryMeta::queued((now()*1000.0) as i64) } else { DeliveryMeta::direct() }
+            };
+            let row=cmd_hist_record_with_id(&state,"test-desk","yes",ctype,"",true,meta).await;
+            // No GET or explicit resolver call before this assertion.
+            assert_eq!(load(&state,&id).unwrap().resolution_row,Some(row),"{ctype}/{queued}/{proof}");
+            on_row(&state,row).await;
+            assert_eq!(state.store.read().unwrap().query_row(
+                "SELECT COUNT(*) FROM _amux_delegation_resolutions WHERE reply_row=?1",[row],|r|r.get::<_,i64>(0)).unwrap(),1);
+            assert!(load(&state,&id).unwrap().evidence_row.is_none(),"correlation must not spend a grant");
+        }
+        let id=explicit_request(&app,json!({"worktree_verify":"two"})).await;
+        for (ctype,proof) in [("session",Some("remote")),("chat",None),("user",Some("worker"))] {
+            let row=cmd_hist_record_with_id(&state,"test-desk","approve",ctype,"peer",true,
+                DeliveryMeta { process_origin:proof, ..DeliveryMeta::direct() }).await;
+            assert!(load(&state,&id).unwrap().resolution_row.is_none(),"{ctype}/{proof:?} cannot supply owner provenance");
+            assert_eq!(state.store.read().unwrap().query_row(
+                "SELECT COUNT(*) FROM _amux_delegation_resolutions WHERE reply_row=?1",[row],|r|r.get::<_,i64>(0)).unwrap(),0);
+        }
+        // A Chat-tab wait closes the old window for a subsequent pane/send yes.
+        cmd_hist_record_with_id(&state,"test-desk","wait","chat","",true,
+            DeliveryMeta { process_origin:Some("outside"), ..DeliveryMeta::direct() }).await;
+        let next=explicit_request(&app,json!({"worktree_verify":"three"})).await;
+        let row=cmd_hist_record_with_id(&state,"test-desk","yes","user","",true,
+            DeliveryMeta { process_origin:Some("outside"), ..DeliveryMeta::direct() }).await;
+        assert_eq!(load(&state,&next).unwrap().resolution_row,Some(row));
+        assert_eq!(load(&state,&id).unwrap().resolution_code.as_deref(),Some("request_reply_not_affirmative"));
+    }
+
     async fn record_reply(state: &AppState, text: &str, source: &str) -> i64 {
         let session="test-desk".to_string();
         let text=text.to_string();
