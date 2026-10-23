@@ -1125,6 +1125,34 @@ fn read_running_file(home: &Path) -> std::collections::HashMap<String, serde_jso
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+mod attribution_record_tests {
+    use super::*;
+
+    #[test]
+    fn attribution_reads_current_and_legacy_launch_records_without_adoption() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = 4_000_001;
+        let path = running_state_path(dir.path());
+        assert!(!is_amux_launched_pid(dir.path(), pid));
+        for record in [
+            serde_json::json!({"default": {"pid": pid, "cdp_ready": false}}),
+            serde_json::json!({"pid": pid, "profile": "legacy"}),
+        ] {
+            std::fs::write(&path, record.to_string()).unwrap();
+            assert!(is_amux_launched_pid(dir.path(), pid));
+            assert!(!is_amux_launched_pid(dir.path(), pid + 1));
+        }
+    }
+}
+
+/// Attribution only denies authority from launch records; it never adopts or
+/// reconciles browsers. Persisted records cover survivors of a server restart.
+pub(crate) fn is_amux_launched_pid(home: &Path, pid: u32) -> bool {
+    RUNNING.lock().expect("browser registry poisoned").values().any(|b| b.pid == pid)
+        || read_running_file(home).values().any(|v| v["pid"].as_u64() == Some(u64::from(pid)))
+}
+
 static RUNNING_FILE_UPDATES: Mutex<()> = Mutex::new(());
 
 fn write_running_file(home: &Path, map: &std::collections::HashMap<String, serde_json::Value>) {

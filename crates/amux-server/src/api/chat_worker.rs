@@ -210,14 +210,13 @@ pub(crate) async fn companion_route(
         super::session_verbs::Sender::Worker(w) => w.as_str(),
         _ => super::worker_identity::UNVERIFIED_IDENTITY,
     };
-    let text = sender.stamp(&text);
     let origin = if from_owner { SendOrigin::Owner } else { SendOrigin::Automation };
     if !from_owner {
         tracing::info!(session = %key, caller, verdict = "chat_companion_send_from_lane",
             "a lane sent to a Chat tab; recorded as that lane, not the owner");
     }
     let id_for_turn = (!msg_id.is_empty()).then(|| msg_id.clone());
-    let Dispatch::Handled((ok, message)) = ChatAdapter.deliver_with_id(state, &key, &text, origin, id_for_turn).await else {
+    let Dispatch::Handled((ok, message)) = ChatAdapter.deliver_with_id(state, &key, ChatMessage { text: &text, sender: Some(sender), msg_id: id_for_turn }, origin).await else {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": "chat adapter did not handle the send"}))).into_response();
     };
     if !ok {
@@ -276,7 +275,7 @@ pub(crate) async fn deliver_delegate_result(state: &AppState, name: &str, text: 
     let lane = lane(name);
     {
         let mut q = lane.queue.lock().unwrap();
-        q.push_back(Queued { text: text.to_string(), origin: "delegate".to_string(), msg_id: None });
+        q.push_back(Queued { text: text.to_string(), origin: "delegate".to_string(), msg_id: None, sender: None });
         persist_queue(name, &q);
     }
     if !lane.busy.swap(true, Ordering::SeqCst) {
@@ -290,6 +289,13 @@ pub(crate) async fn deliver_delegate_result(state: &AppState, name: &str, text: 
 
 pub(crate) struct ChatAdapter;
 
+/// Persist raw input beside provenance; only the model receives the stamp.
+pub(crate) struct ChatMessage<'a> {
+    pub text: &'a str,
+    pub sender: Option<&'a super::session_verbs::Sender>,
+    pub msg_id: Option<String>,
+}
+
 impl ChatAdapter {
     /// `deliver`, carrying the dashboard send's `msg_id` onto the recorded
     /// user message (see `Queued::msg_id`).
@@ -297,10 +303,10 @@ impl ChatAdapter {
         &self,
         state: &AppState,
         name: &str,
-        text: &str,
+        message: ChatMessage<'_>,
         origin: SendOrigin,
-        msg_id: Option<String>,
     ) -> Dispatch<(bool, String)> {
+        let ChatMessage { text, sender, msg_id } = message;
         if !running(name) {
             // An owner typing into a stopped chat starts it (there is no
             // process to boot, so this costs nothing). Automation does not
@@ -320,6 +326,7 @@ impl ChatAdapter {
             let mut q = lane.queue.lock().unwrap();
             q.push_back(Queued {
                 text: text.to_string(),
+                sender: sender.cloned(),
                 origin: match origin {
                     SendOrigin::Owner => "owner",
                     SendOrigin::Automation => "automation",
@@ -354,6 +361,9 @@ impl ChatAdapter {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Queued {
     text: String,
+    /// Older queues already contain delivery bytes; never stamp them twice.
+    #[serde(default)]
+    sender: Option<super::session_verbs::Sender>,
     origin: String,
     /// The dashboard send's `msg_id`, carried onto the recorded user message so
     /// the client reconciles its pending copy BY ID (2026-10-01: the Chat tab
@@ -361,6 +371,12 @@ struct Queued {
     /// Absent on queues persisted before this field existed.
     #[serde(default)]
     msg_id: Option<String>,
+}
+
+impl Queued {
+    fn model_text(&self) -> String {
+        self.sender.as_ref().map_or_else(|| self.text.clone(), |sender| sender.stamp(&self.text))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -631,7 +647,7 @@ impl ExecutionAdapter for ChatAdapter {
         text: &str,
         origin: SendOrigin,
     ) -> Dispatch<(bool, String)> {
-        self.deliver_with_id(state, name, text, origin, None).await
+        self.deliver_with_id(state, name, ChatMessage { text, sender: None, msg_id: None }, origin).await
     }
 
     fn running(&self, name: &str) -> Dispatch<bool> {
@@ -830,14 +846,20 @@ async fn run_turn(state: &AppState, name: &str, lane: &Lane, q: Queued) {
             // Who started this turn, and with what words: a companion's send
             // during an owner turn is delivered as the owner's (owner_relay_quote).
             ("chat_inflight_origin", json!(q.origin)),
-            ("chat_inflight_text", json!(q.text.chars().take(300).collect::<String>())),
+            ("chat_inflight_text", json!(q.text.chars().take(super::session_verbs::OWNER_RELAY_QUOTE_CHARS).collect::<String>())),
             ("chat_inflight_started", json!(crate::config::now_f64())),
         ],
     );
     report_state(state, name, "active", "UserPromptSubmit", &turn_id).await;
     update_meta(name, &[("last_send", json!(crate::config::now_f64() as i64))]);
 
-    let mut out = execute(state, name, &provider, &q.text, lane, &turn_id, false).await;
+    let model_text = q.model_text();
+    if q.origin == "owner" && q.sender.is_some() {
+        tracing::info!(session = name, verdict = "chat_owner_relay_raw_text", measured = true,
+            n_considered = 1, owner_chars = q.text.chars().count(),
+            "owner words retained separately from model delivery stamp");
+    }
+    let mut out = execute(state, name, &provider, &model_text, lane, &turn_id, false).await;
     // A resume id the provider no longer has, or a conversation stuck in a
     // state the headless adapter cannot satisfy (deferred tool, stale marker):
     // start a fresh conversation once rather than failing forever.
@@ -869,7 +891,7 @@ async fn run_turn(state: &AppState, name: &str, lane: &Lane, q: Queued) {
         // The failed attempt's error must not linger in the live view.
         lane.publish(json!({"type": "retry", "turn_id": turn_id}));
         TurnFiles::new(&turn_id, 0).remove();
-        out = execute(state, name, &provider, &q.text, lane, &turn_id, true).await;
+        out = execute(state, name, &provider, &model_text, lane, &turn_id, true).await;
     }
     let duration_ms = started.elapsed().as_millis() as u64;
     finish_turn(state, name, lane, &turn_id, &provider, out, duration_ms).await;
@@ -2338,6 +2360,52 @@ fn interrupt_turn(name: &str) -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn b3_owner_chat_relay_preserves_all_300_characters() {
+        use super::super::session_verbs::{relay_quote_from, Sender};
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        let worker = "relay-300-fixture";
+        std::fs::write(env_path(worker), "CC_PROVIDER=claude\n").unwrap();
+        let key = companion_key(worker);
+        update_meta(&key, &[("chat_running", json!(true))]);
+        let lane = lane(&key);
+        // Hold the consumer: exercise the real route/queue without a provider,
+        // server, browser or pane. All persistent data belongs to this fixture.
+        lane.busy.store(true, Ordering::SeqCst);
+        let state = AppState {
+            store: Arc::new(crate::db::Store::open(&dir.path().join("test.db")).unwrap()),
+            started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let text = "界".repeat(300);
+        let response = companion_route(&state, worker, true, "send", None,
+            &json!({"text": text, "msg_id": "relay-fixture"}), &Sender::Owner).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let queued = lane.queue.lock().unwrap().pop_front().expect("route queued the owner message");
+        lane.busy.store(false, Ordering::SeqCst);
+        assert_eq!(queued.text, text, "the relay stores owner words, not the delivery stamp");
+        let meta = json!({"chat_inflight_turn": "turn-fixture", "chat_inflight_origin": queued.origin,
+            "chat_inflight_text": queued.text});
+        let quote = relay_quote_from(worker, meta.as_object().unwrap(), worker).unwrap();
+        assert_eq!(quote, text);
+        let delivered = Sender::OwnerRelay { via: key, quote }.stamp("relay body");
+        assert!(delivered.contains(&text), "all 300 owner characters survive the rendered relay");
+    }
+
+    #[test]
+    fn queued_chat_stamps_only_model_input_and_preserves_legacy_delivery() {
+        use super::super::session_verbs::Sender;
+        let q = Queued { text: "owner words".into(), sender: Some(Sender::Owner), origin: "owner".into(), msg_id: None };
+        assert_eq!(q.text, "owner words");
+        assert_eq!(q.model_text(), Sender::Owner.stamp("owner words"));
+        let encoded = serde_json::to_string(&q).unwrap();
+        assert_eq!(serde_json::from_str::<Queued>(&encoded).unwrap().model_text(), q.model_text());
+        let old: Queued = serde_json::from_value(json!({"text": q.model_text(), "origin": "owner"})).unwrap();
+        assert_eq!(old.model_text(), q.model_text(), "an old queued stamp is not duplicated");
+    }
 
     #[test]
     fn chat_tab_key_belongs_to_its_worker_and_no_worker_can_own_it() {

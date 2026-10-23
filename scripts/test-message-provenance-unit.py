@@ -93,6 +93,10 @@ mod tests {
     stamp_policy = "#![allow(dead_code)]\n#[derive(Debug, Clone, PartialEq, Eq)]\n"
     stamp_policy += item(session, "pub(crate) enum Sender {", "/// The sender of a send request,")
     stamp_policy = stamp_policy[:stamp_policy.index("    /// The `steering_queue.stamp` value.")] + "}\n"
+    stamp_policy += "\n" + item(session, "    #[test]\n    fn body_origin_stamps_are_quoted_case_insensitively()", "    #[test]\n    fn boot_receipt_identity_includes_sender_target_and_stamp()")
+    # The historical formatter is pure too; the casing regression exercises both.
+    stamp_policy += "\n" + item(session, "pub(crate) fn origin_stamped(", "/// WHO A DELIVERY IS FROM")
+    stamp_policy += "\n" + item(session, "pub(crate) fn is_slash_command(", "\n}\n") + "\n}\n"
     schedule = (api / "schedules.rs").read_text()
     chat = (api.parent.parent / "tests/worker_types_e2e.rs").read_text()
     schedule_stamp = re.search(r'const TESTER_STAMP: &str = (".*");', schedule).group(1)

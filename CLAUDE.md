@@ -35,6 +35,7 @@ command decomposition, injected prompts, automated schedule/steering, or Amux
 routing, behavioral hooks or MCP. Passive provider lifecycle observation is allowed
 for status only: it must not add context, change permissions, send prompts, or
 trigger boards. Preserve owner input, delivery receipts and message history.
+Every Amux-delivered message, including isolated-worker deliveries, carries a server provenance stamp; direct terminal typing is unchanged.
 Explicit owner queuing is transport only. Isolation overrides stale project
 metadata; a restarted raw CLI must not inherit harness routing.
 Two owner-configured exceptions reach isolated workers as owner input: their

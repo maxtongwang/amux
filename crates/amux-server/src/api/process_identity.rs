@@ -323,6 +323,8 @@ pub(crate) trait Lookups {
     fn holds_pty(&self, pid: u32) -> bool;
     /// The process's executable, or None when it cannot be read.
     fn exe_of(&self, pid: u32) -> Option<Exe>;
+    /// Reject managed/debugging browsers; an unreadable argv fails closed.
+    fn interactive_browser(&self, pid: u32) -> Result<(), String>;
     /// The code-signature reader (codesign in production, a fake in tests).
     fn verifier(&self) -> &dyn SignatureVerifier;
 }
@@ -456,7 +458,7 @@ fn browser_or(origin: Origin, holders: &[u32], l: &dyn Lookups) -> Origin {
     match browser_chain(holders, l) {
         Ok(name) => Origin::Browser(name),
         Err(why) => {
-            tracing::debug!(why = %why, verdict = "browser_connection_unverified", measured = true,
+            tracing::info!(why = %why, verdict = "browser_connection_unverified", measured = true,
                 n_considered = holders.len(), "an outside connection is not a verified GUI browser; it cannot be owner input");
             Origin::Outside
         }
@@ -477,6 +479,7 @@ fn browser_chain(holders: &[u32], l: &dyn Lookups) -> Result<&'static str, Strin
             }
             let exe = l.exe_of(cur).ok_or_else(|| format!("pid {cur}: executable unreadable"))?;
             let browser = verify_browser(&exe, l.verifier()).map_err(|e| format!("pid {cur}: {e}"))?;
+            l.interactive_browser(cur)?;
             if let Some(v) = vendor.filter(|v| *v != browser.name) {
                 return Err(format!("pid {cur} is {}, not {v}", browser.name));
             }
@@ -559,6 +562,15 @@ impl Lookups for OsLookups {
     }
     fn exe_of(&self, pid: u32) -> Option<Exe> {
         os::exe_of(pid)
+    }
+    fn interactive_browser(&self, pid: u32) -> Result<(), String> {
+        let argv = os::argv_of(pid).map_err(|why| format!("pid {pid}: {why}"))?;
+        let home = crate::config::amux_home();
+        super::browser_identity::verify_interactive_browser(
+            &argv,
+            crate::integrations::browser::is_amux_launched_pid(&home, pid),
+            |dir| crate::integrations::browser::is_amux_owned(&home, dir),
+        ).map_err(|why| format!("pid {pid}: {why}"))
     }
     fn verifier(&self) -> &dyn SignatureVerifier {
         static CODESIGN: OnceLock<Codesign> = OnceLock::new();
@@ -1106,9 +1118,9 @@ pub(crate) mod os {
     }
 
     #[cfg(target_os = "macos")]
-    pub(super) use super::macos::{comm_of, exe_of, holds_pty, ppid_of, root_tailscaled, scan, tty_of};
+    pub(super) use super::macos::{argv_of, comm_of, exe_of, holds_pty, ppid_of, root_tailscaled, scan, tty_of};
     #[cfg(target_os = "linux")]
-    pub(super) use super::linux::{comm_of, exe_of, holds_pty, ppid_of, root_tailscaled, scan, tty_of};
+    pub(super) use super::linux::{argv_of, comm_of, exe_of, holds_pty, ppid_of, root_tailscaled, scan, tty_of};
 
     #[cfg(all(test, target_os = "macos"))]
     pub(super) use super::macos::holds;
@@ -1147,6 +1159,10 @@ pub(crate) mod os {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub(super) fn exe_of(_pid: u32) -> Option<super::Exe> {
         None
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(super) fn argv_of(_pid: u32) -> Result<Vec<String>, String> {
+        Err("no process argv lookup on this platform".into())
     }
 }
 
@@ -1405,6 +1421,28 @@ mod macos {
         (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    pub(crate) fn argv_of(pid: u32) -> Result<Vec<String>, String> {
+        // ARG_MAX bounds the kernel's process-argument buffer, not a guessed cap.
+        let capacity = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
+        if capacity <= 0 {
+            return Err("process argument limit unavailable".into());
+        }
+        let mut bytes = vec![0u8; capacity as usize];
+        let mut size = bytes.len();
+        let pid = i32::try_from(pid).map_err(|_| "invalid browser pid")?;
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        // SAFETY: mib and the output buffer have their declared lengths.
+        let rc = unsafe {
+            libc::sysctl(mib.as_mut_ptr(), mib.len() as u32, bytes.as_mut_ptr().cast(),
+                &mut size, std::ptr::null_mut(), 0)
+        };
+        if rc != 0 {
+            return Err(format!("process argv unreadable: {}", std::io::Error::last_os_error()));
+        }
+        bytes.truncate(size);
+        super::super::browser_identity::parse_procargs(&bytes)
+    }
+
     /// The process's executable path (libproc) and that file's inode.
     pub(crate) fn exe_of(pid: u32) -> Option<super::Exe> {
         use std::os::unix::ffi::OsStringExt;
@@ -1586,6 +1624,17 @@ mod linux {
         std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|c| c.trim().to_string()).filter(|c| !c.is_empty())
     }
 
+    pub(crate) fn argv_of(pid: u32) -> Result<Vec<String>, String> {
+        let bytes = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map_err(|e| format!("process argv unreadable: {e}"))?;
+        if bytes.last() != Some(&0) || bytes.len() < 2 {
+            return Err("malformed browser process argv".into());
+        }
+        bytes[..bytes.len() - 1].split(|b| *b == 0)
+            .map(|s| String::from_utf8(s.to_vec()).map_err(|_| "invalid process argv encoding".into()))
+            .collect()
+    }
+
     pub(crate) fn exe_of(pid: u32) -> Option<super::Exe> {
         use std::os::unix::fs::MetadataExt;
         let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
@@ -1665,7 +1714,7 @@ mod tests {
         match pid {
             101 => Some(100),
             100 | 200 => Some(50),
-            50 | 300 | 501 | 700 | 720 => Some(1),
+            50 | 300 | 501 | 700 | 720 | 730 => Some(1),
             201 => Some(200),
             301 => Some(300),
             601 => Some(602),
@@ -1684,6 +1733,7 @@ mod tests {
         Some(match pid {
             700 | 710 | 721 => CHROME,
             701 | 711 => HELPER,
+            730 => "/fixture/WebKit.Networking",
             720 => "/bin/sh",
             301 => "/usr/bin/curl",
             300 => "/bin/zsh",
@@ -1695,6 +1745,7 @@ mod tests {
         FakeSignatures::default()
             .signed(CHROME, "com.google.Chrome", Some("EQHXZ8M8AV"), GOOGLE)
             .signed(HELPER, "com.google.Chrome.helper", Some("EQHXZ8M8AV"), GOOGLE)
+            .signed("/fixture/WebKit.Networking", "com.apple.WebKit.Networking", None, "Software Signing")
             .signed("/bin/sh", "com.apple.sh", None, "Software Signing")
             .signed("/usr/bin/curl", "com.apple.curl", None, "Software Signing")
             .signed("/bin/zsh", "com.apple.zsh", None, "Software Signing")
@@ -1832,6 +1883,8 @@ mod tests {
         nameless: Vec<u32>,
         /// Pane inventory reads (each is a tmux spawn in production).
         reads: Arc<std::sync::atomic::AtomicU32>,
+        argv: HashMap<u32, Result<Vec<String>, String>>,
+        launched: Vec<u32>,
         /// The fake codesign.
         sigs: FakeSignatures,
     }
@@ -1847,6 +1900,8 @@ mod tests {
                 pty: vec![],
                 nameless: vec![],
                 reads: Arc::default(),
+                argv: HashMap::new(),
+                launched: vec![],
                 sigs: signatures(),
             }
         }
@@ -1862,6 +1917,8 @@ mod tests {
                 pty: vec![],
                 nameless: vec![],
                 reads: Arc::default(),
+                argv: HashMap::new(),
+                launched: vec![],
                 sigs: signatures(),
             }
         }
@@ -1909,6 +1966,11 @@ mod tests {
         }
         fn exe_of(&self, pid: u32) -> Option<Exe> {
             exe_path(pid).map(|p| Exe { path: p.into(), inode: u64::from(pid) })
+        }
+        fn interactive_browser(&self, pid: u32) -> Result<(), String> {
+            let argv = self.argv.get(&pid).cloned().unwrap_or_else(|| Ok(vec!["browser".into()]))?;
+            super::super::browser_identity::verify_interactive_browser(&argv, self.launched.contains(&pid),
+                |dir| crate::integrations::browser::is_amux_owned(std::path::Path::new("/fixture/amux"), dir))
         }
         fn verifier(&self) -> &dyn SignatureVerifier {
             &self.sigs
@@ -2013,6 +2075,45 @@ mod tests {
         let (origin, sender) = sender_with_ui_token(lo(1), &Fake::holders(&[701]));
         assert_eq!(origin, Origin::Browser("Google Chrome"));
         assert_eq!(sender, Sender::Owner);
+    }
+
+    #[test]
+    fn b1_webkit_networking_for_a_non_safari_app_is_not_owner() {
+        // A worker's WKWebView app delegates networking to this Apple-signed
+        // launchd child. Its responsible app is not in the parent chain.
+        use crate::api::session_verbs::Sender;
+        let (origin, sender) = sender_with_ui_token(lo(1), &Fake::holders(&[730]));
+        assert_eq!(origin, Origin::Outside);
+        assert_eq!(sender, Sender::Unverified);
+    }
+
+    #[test]
+    fn b2_automation_chrome_surviving_restart_is_not_owner() {
+        use crate::api::session_verbs::Sender;
+        let mut launched = Fake::holders(&[701]);
+        launched.launched.push(700); // Main Chrome is now a launchd child.
+        let (origin, sender) = sender_with_ui_token(lo(1), &launched);
+        assert_eq!(origin, Origin::Outside);
+        assert_eq!(sender, Sender::Unverified);
+        for args in [
+            vec![CHROME, "--remote-debugging-port=9333"],
+            vec![CHROME, "--remote-debugging-port", "0"],
+            vec![CHROME, "--remote-debugging-pipe"],
+            vec![CHROME, "--remote-debugging-pipe=true"],
+            vec![CHROME, "--user-data-dir=/fixture/amux/playwright-auth/profile"],
+            vec![CHROME, "--user-data-dir", "/fixture/amux/playwright-auth/profiles/work lane"],
+        ] {
+            let mut f = Fake::holders(&[701]);
+            f.argv.insert(700, Ok(args.iter().map(|s| s.to_string()).collect()));
+            let (origin, sender) = sender_with_ui_token(lo(1), &f);
+            assert_eq!(origin, Origin::Outside, "automation argv {args:?}");
+            assert_eq!(sender, Sender::Unverified, "automation argv {args:?}");
+        }
+        let mut unreadable = Fake::holders(&[701]);
+        unreadable.argv.insert(700, Err("process exited during lookup".into()));
+        assert_eq!(sender_with_ui_token(lo(1), &unreadable).1, Sender::Unverified);
+        // Positive control: ordinary signed Chrome retains owner authority.
+        assert_eq!(sender_with_ui_token(lo(1), &Fake::holders(&[701])).1, Sender::Owner);
     }
 
     #[test]

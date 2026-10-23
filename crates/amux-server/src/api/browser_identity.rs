@@ -46,8 +46,10 @@ pub(crate) struct Browser {
     pub name: &'static str,
     /// The signing team; None means Apple platform code (no team, Apple anchor).
     pub team: Option<&'static str>,
-    /// Code identifiers: each matches itself and its `.`-suffixed helpers.
+    /// Code identifiers, with optional dot-suffixed helpers.
     pub identifiers: &'static [&'static str],
+    /// Whether dot-suffixed helper identifiers are accepted.
+    pub helpers: bool,
     /// The requirement the signature must strictly satisfy.
     pub requirement: &'static str,
 }
@@ -57,23 +59,80 @@ pub(crate) const BROWSERS: &[Browser] = &[
         name: "Google Chrome",
         team: Some("EQHXZ8M8AV"),
         identifiers: &["com.google.Chrome"],
+        helpers: true,
         requirement: "anchor apple generic and certificate leaf[subject.OU] = \"EQHXZ8M8AV\"",
     },
     Browser {
         name: "Microsoft Edge",
         team: Some("UBF8T346G9"),
         identifiers: &["com.microsoft.edgemac"],
+        helpers: true,
         requirement: "anchor apple generic and certificate leaf[subject.OU] = \"UBF8T346G9\"",
     },
-    // Safari's sockets are held by WebKit's networking XPC service, a launchd
-    // child signed by Apple like Safari itself.
+    // Only Safari's own bundle qualifies. WebKit.Networking serves arbitrary
+    // WKWebView apps; its launchd ancestry cannot establish the responsible app.
     Browser {
         name: "Apple Safari",
         team: None,
-        identifiers: &["com.apple.Safari", "com.apple.WebKit.Networking"],
+        identifiers: &["com.apple.Safari"],
+        helpers: false,
         requirement: "anchor apple",
     },
 ];
+
+/// Automation is never owner input, even after launchd adopts it on restart.
+/// `owns_profile` uses the launcher's authoritative profile ownership predicate.
+pub(crate) fn verify_interactive_browser(
+    argv: &[String],
+    launched_by_amux: bool,
+    owns_profile: impl Fn(&std::path::Path) -> bool,
+) -> Result<(), String> {
+    if launched_by_amux {
+        return Err("amux-launched browser is automation".into());
+    }
+    if argv.is_empty() {
+        return Err("browser argv is empty".into());
+    }
+    for (i, arg) in argv.iter().enumerate().skip(1) {
+        let flag = arg.split('=').next().unwrap_or(arg);
+        if matches!(flag, "--remote-debugging-port" | "--remote-debugging-pipe") {
+            return Err("remote-debugging browser is automation".into());
+        }
+        if flag == "--user-data-dir" {
+            let dir = arg.strip_prefix("--user-data-dir=")
+                .or_else(|| argv.get(i + 1).map(String::as_str))
+                .filter(|s| !s.is_empty() && !s.starts_with("--"))
+                .ok_or("browser profile argument is unreadable")?;
+            if owns_profile(std::path::Path::new(dir)) {
+                return Err("amux-owned browser profile is automation".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decode macOS KERN_PROCARGS2: argc, executable, padding, exactly argc argv.
+/// Environment bytes are never interpreted as arguments or logged.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn parse_procargs(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let malformed = || "malformed browser process argv".to_string();
+    let count = i32::from_ne_bytes(bytes.get(..4).ok_or_else(malformed)?.try_into().map_err(|_| malformed())?);
+    if count <= 0 || count as usize > bytes.len() {
+        return Err(malformed());
+    }
+    let rest = &bytes[4..];
+    let exe_end = rest.iter().position(|b| *b == 0).ok_or_else(malformed)?;
+    let rest = &rest[exe_end..];
+    let start = rest.iter().position(|b| *b != 0).ok_or_else(malformed)?;
+    let mut rest = &rest[start..];
+    let mut argv = Vec::new();
+    for _ in 0..count {
+        let end = rest.iter().position(|b| *b == 0).ok_or_else(malformed)?;
+        argv.push(std::str::from_utf8(&rest[..end]).map_err(|_| malformed())?.to_string());
+        rest = &rest[end + 1..];
+    }
+    Ok(argv)
+}
 
 /// Parse `codesign -dv --verbose=2` output (codesign writes it to stderr).
 pub(crate) fn parse_codesign_display(text: &str) -> Result<CodeFacts, String> {
@@ -105,7 +164,7 @@ pub(crate) fn verify_browser(exe: &Exe, v: &dyn SignatureVerifier) -> Result<&'s
     let facts = v.describe(exe)?;
     let browser = BROWSERS
         .iter()
-        .find(|b| b.identifiers.iter().any(|id| identifier_matches(id, &facts.identifier)))
+        .find(|b| b.identifiers.iter().any(|id| *id == facts.identifier || (b.helpers && identifier_matches(id, &facts.identifier))))
         .ok_or_else(|| format!("{} is not an allow-listed browser", facts.identifier))?;
     match browser.team {
         Some(team) if facts.team.as_deref() != Some(team) => {
@@ -176,6 +235,29 @@ mod tests {
     const CHROME: &str = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
     #[test]
+    fn browser_automation_arguments_are_never_interactive_owner_input() {
+        let owned = |dir: &std::path::Path| dir.starts_with("/fixture/amux/playwright-auth");
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(verify_interactive_browser(&args(&[CHROME]), false, owned).is_ok());
+        assert!(verify_interactive_browser(&args(&[CHROME]), true, owned).is_err());
+        assert!(verify_interactive_browser(&args(&[CHROME, "--user-data-dir=/fixture/human chrome"]), false, owned).is_ok());
+        for option in ["--remote-debugging-port=0", "--remote-debugging-pipe", "--user-data-dir=/fixture/amux/playwright-auth/profile", "--user-data-dir"] {
+            assert!(verify_interactive_browser(&args(&[CHROME, option]), false, owned).is_err(), "{option}");
+        }
+        assert!(verify_interactive_browser(&[], false, owned).is_err());
+    }
+
+    #[test]
+    fn procargs_preserves_spaces_and_stops_before_environment() {
+        let mut bytes = 3_i32.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(b"/Applications/Google Chrome\0\0/Applications/Google Chrome\0--user-data-dir\0/fixture/human chrome\0TOKEN=private\0");
+        assert_eq!(parse_procargs(&bytes).unwrap(), ["/Applications/Google Chrome", "--user-data-dir", "/fixture/human chrome"]);
+        for malformed in [&bytes[..3], &bytes[..bytes.len() - 40], &0_i32.to_ne_bytes()] {
+            assert!(parse_procargs(malformed).is_err());
+        }
+    }
+
+    #[test]
     fn the_codesign_display_is_parsed_for_identifier_team_and_chain() {
         let chrome = "Executable=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n\
             Identifier=com.google.Chrome\nFormat=app bundle with Mach-O universal (x86_64 arm64)\n\
@@ -196,10 +278,14 @@ mod tests {
         let good = FakeSignatures::default()
             .signed(CHROME, "com.google.Chrome", Some("EQHXZ8M8AV"), "Developer ID Application: Google LLC (EQHXZ8M8AV)")
             .signed("/helper", "com.google.Chrome.helper", Some("EQHXZ8M8AV"), "Developer ID Application: Google LLC (EQHXZ8M8AV)")
+            .signed("/safari", "com.apple.Safari", None, "Software Signing")
+            .signed("/safari-helper", "com.apple.Safari.helper", None, "Software Signing")
             .signed("/safari-net", "com.apple.WebKit.Networking", None, "Software Signing");
         assert_eq!(verify_browser(&exe(CHROME), &good).unwrap().name, "Google Chrome");
         assert_eq!(verify_browser(&exe("/helper"), &good).unwrap().name, "Google Chrome", "a helper of the same vendor");
-        assert_eq!(verify_browser(&exe("/safari-net"), &good).unwrap().name, "Apple Safari");
+        assert_eq!(verify_browser(&exe("/safari"), &good).unwrap().name, "Apple Safari");
+        assert!(verify_browser(&exe("/safari-helper"), &good).is_err());
+        assert!(verify_browser(&exe("/safari-net"), &good).is_err());
 
         let wrong_team = FakeSignatures::default().signed(CHROME, "com.google.Chrome", Some("ABCDE12345"), "Developer ID Application: Someone (ABCDE12345)");
         assert!(verify_browser(&exe(CHROME), &wrong_team).unwrap_err().contains("not Google Chrome's EQHXZ8M8AV"));

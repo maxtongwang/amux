@@ -40,7 +40,7 @@ token AND an owner connection, decided by the resolver and checked in
 
 | Owner connection | Proof |
 | --- | --- |
-| `Origin::Browser` | Every process from each socket holder up to launchd (pid 1) is one allow-listed browser vendor whose code signature verifies: Google Chrome (team `EQHXZ8M8AV`), Microsoft Edge (team `UBF8T346G9`) or Apple Safari (Apple platform signing, including WebKit's networking service). Name and path are never consulted |
+| `Origin::Browser` | Every process from each socket holder up to launchd (pid 1) is one allow-listed browser vendor whose code signature verifies: Google Chrome (team `EQHXZ8M8AV`), Microsoft Edge (team `UBF8T346G9`) or Safari's exact `com.apple.Safari` identifier (Apple platform signing). Browser names and executable paths do not establish authority |
 | `Origin::Remote` | A tailnet peer no local process holds, or the proven `tailscale serve` forward (`process_identity::forwarded`) |
 
 The signature check (`browser_identity.rs`) reads the identifier, team and
@@ -52,6 +52,31 @@ never shows UI); completed answers are cached per executable path and inode.
 On Linux no signature can be verified, so only a tailnet peer is an owner
 connection there. The verifier is a trait; tests use a fake and never run
 codesign.
+
+Shared `com.apple.WebKit.Networking` connections stay unverified: that XPC
+service also serves arbitrary WKWebView apps and its launchd parent does not
+identify the responsible app. Safari owner identification therefore works only
+when the socket's process chain reaches Safari's own signed executable; Safari
+traffic held only by the shared service has no owner authority. Refusals log
+`browser_connection_unverified` and, when a UI token is presented,
+`owner_ui_token_without_owner_connection`.
+
+Every accepted browser process must also have readable argv and pass the
+interactive-browser check. Amux's live registry and persisted launch records
+exclude managed browser PIDs after restarts; `--remote-debugging-port`,
+`--remote-debugging-pipe` (split or equals forms), and an amux-owned
+`--user-data-dir` independently exclude automation. The profile predicate is
+the launcher's `is_amux_owned`, not a second profile-root definition. Argument
+lookup failures deny owner authority; neither argv nor environment is logged.
+
+Chat-tab queues retain the raw input beside a serialized `Sender`; the model
+receives the stamp at execution, including a retry after conversation reset.
+Transcripts, command history and `chat_inflight_text` retain the owner's words.
+Relay stamps preserve up to 300 owner characters; identity labels retain their
+160-character cap. Older queues without `sender` retain their delivery bytes
+without receiving a second stamp. Boot receipt IDs include the target, recorded
+sender and serialized stamp as well as the text. Body stamp prefixes are quoted
+case-insensitively in current and historical formatters.
 
 The ancestry rule excludes a browser under a worker pane (it is that worker),
 and a browser started by a launchd job's script, shell or terminal (that
