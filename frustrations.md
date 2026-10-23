@@ -6173,3 +6173,14 @@ FIX: Withhold completion while scans or entries fail, persist pending paths, and
   retry at startup or once per minute on identity operations. Successful entries
   leave the pending list; WARN identity_migration_pending reports counts and
   identity_migration_attempt records each bounded pass.
+
+## Earlier amux relays need a human Enter
+AREA: cli
+SEVERITY: slows
+STATUS: open
+DATE: 2026-10-23
+SESSION: mrpopo (reported 2026-10-22/23)
+CARD: #194
+SYMPTOM: Earlier relay text remained in dev-lead, business-lead and mrpopo input boxes until a human pressed Enter; the watcher only recognised one expanded delivery, expired after 30 minutes and could not recover from an already-stamped stuck composer.
+COST: Repeated manual Enter presses to resume ordinary relay delivery; elapsed time not recorded.
+FIX: This branch adds ordered whole-composer ownership, sized-chip matching and bounded idle rearming. See docs/incidents/2026-10-23-held-relay-submit.md; Cargo and private-tmux execution remain blocked by the verification target lock, so validation is pending.
