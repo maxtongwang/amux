@@ -180,7 +180,7 @@ async fn get_history_item(
     let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<Option<Value>> {
         let conn = store.read()?;
         let sql = format!("SELECT id, text, type, session, ts, origin, {} AS sender, card_id, \
-                   delivery, queued_at, delivered_at, submit_verdict, capture_pending, queue_id, repeat_of, \
+                   delivery, queued_at, delivered_at, submit_verdict, capture_pending, queue_id, msg_id, repeat_of, \
                    (SELECT title FROM issues WHERE issues.id=cmd_history.card_id) AS card_title, \
                    (SELECT status FROM issues WHERE issues.id=cmd_history.card_id) AS card_status, \
                    (SELECT archived FROM issues WHERE issues.id=cmd_history.card_id) AS card_archived, \
@@ -264,6 +264,7 @@ async fn get_history_item(
             }
             }
         }
+        super::delivery::ledger::attach_receipts(&conn, &mut rows)?;
         attach_linked_cards(&conn, &mut rows)?;
         Ok(rows.into_iter().next())
     })
@@ -1009,7 +1010,7 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
                 // NULL — the UI distinguishes "not recorded" from "direct", and
                 // coalescing here would assert a delivery path nobody observed.
                 &format!("SELECT id, text, type, session, ts, origin, {} AS sender, card_id, \
-             delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, repeat_of, \
+             delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, queue_id, msg_id, repeat_of, \
              (SELECT title FROM issues WHERE issues.id=cmd_history.card_id) AS card_title, \
              (SELECT status FROM issues WHERE issues.id=cmd_history.card_id) AS card_status, \
              (SELECT archived FROM issues WHERE issues.id=cmd_history.card_id) AS card_archived, \
@@ -1045,6 +1046,7 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
                 .map(|p| p as &dyn rusqlite::types::ToSql)
                 .collect();
             let mut rows = super::calendar::query_rows_json(&conn, &sql, &refs)?;
+            super::delivery::ledger::attach_receipts(&conn, &mut rows)?;
             for d in &mut rows {
                 let mtype = d
                     .get("type")
