@@ -1,6 +1,6 @@
 // chat-read-aloud.spec — Read aloud beside Copy; the fixture conversation is served through the app's own chat
 // endpoints, so the peek poller's reloads re-render the same replies instead of a 404 (refs e2e control 7ca1c0d3).
-import {test,expect} from './fixtures';
+import {test,expect,allowUnusedRoute} from './fixtures';
 import {cleanup} from './teardown';
 import {stubChat} from './chat-fixture';
 
@@ -26,6 +26,27 @@ const MSGS=[
  {role:'assistant',text:'First **bold** reply.\n\n```js\nconst secret = 1;\n```\n\nAfter the code.',turn_id:'t1',ts:1760000001,duration_ms:2300,usage:{output_tokens:12}},
  {role:'assistant',text:'Second reply, plain.',turn_id:'t2',ts:1760000002},
 ];
+
+test('Chat reload accounting includes GETs answered by a later route',async({page})=>{
+ // An image document has the test origin without starting the app's pollers.
+ await page.goto('/icon-192.png');
+ const fixture=await stubChat(page,()=>({messages:MSGS}));
+ // This accounting-only check does not mount a Chat stream.
+ allowUnusedRoute(page,/\/api\/sessions\/[^/?]+\/chat\/stream/);
+ let counts:{spec:number;app:number};
+ try{
+  await page.evaluate(()=>fetch('/api/sessions/chat-count-fixture/chat'));
+  await page.route(/\/api\/sessions\/chat-count-fixture\/chat(?:\/extra)?(?:\?.*)?$/,r=>r.fulfill({json:{messages:MSGS}}));
+  await page.evaluate(async()=>{
+   await fetch('/api/sessions/chat-count-fixture/chat?limit=200');
+   await fetch('/api/sessions/chat-count-fixture/chat',{method:'POST'});
+   await fetch('/api/sessions/chat-count-fixture/chat/extra');
+  });
+ }finally{
+  counts=fixture.finish();
+ }
+ expect(counts,'both chat GET loads count, regardless of route; POST and subpaths do not').toEqual({spec:0,app:2});
+});
 
 for(const variant of [{name:'dashboard Chat tab',q:null},{name:'embedded chat',q:''},{name:'split-pane chat',q:'&peekSplitChild=1'}]){
 test(`Read aloud sits beside Copy and speaks one reply at a time (${variant.name})`,async({page},info)=>{
