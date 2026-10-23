@@ -1,6 +1,7 @@
 //! Files API (RR-0093): browse / download / upload rooted at `$HOME`
 //! (override: `AMUX_FILES_ROOT`, which is also how tests pin a temp root).
-//! Uploads refuse dotfiles, sensitive paths, code-execution targets and existing executables (refs maxtongwang/ai-config#218).
+//! Uploads refuse dotfiles, sensitive paths, code-execution targets, symlinks,
+//! existing executables and files with other hard links (refs maxtongwang/ai-config#218).
 //!
 //! Routes (nested at `/api/files`):
 //! - `GET  /api/files?path=<rel>`            — directory listing
@@ -312,7 +313,7 @@ impl std::fmt::Display for UploadRefused {
 impl std::error::Error for UploadRefused {}
 
 /// What may sit at an upload's target when it is written: nothing, or a
-/// regular file with no execute bit. Never a symlink, which would be followed
+/// regular file with one hard link and no execute bit. Never a symlink, which would be followed
 /// or replaced on the caller's say-so (ai-config #227).
 fn upload_target_check(at: Option<&std::fs::Metadata>) -> std::io::Result<()> {
     let refused = |code, error| Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, UploadRefused(code, error)));
@@ -325,7 +326,10 @@ fn upload_target_check(at: Option<&std::fs::Metadata>) -> std::io::Result<()> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if m.nlink() > 1 {
+            return refused("upload_hardlink_refused", "Uploads may not overwrite a file that has other hard links.");
+        }
         if m.permissions().mode() & 0o111 != 0 {
             return refused("upload_executable_refused", "Uploads may not overwrite existing executable files.");
         }
@@ -479,6 +483,21 @@ mod tests {
         assert!(std::fs::symlink_metadata(dir.path().join("a.txt")).unwrap().file_type().is_symlink());
     }
 
+    /// PR #48 B1: a hard link shares the outside file's inode even though
+    /// the upload path stays inside the root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_upload_never_writes_through_a_hard_link_pointing_outside_the_root() {
+        let dir = root();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, "outside").unwrap();
+        std::fs::hard_link(&victim, dir.path().join("safe.txt")).unwrap();
+        let (status, v) = put(dir.path(), "safe.txt", b"evil").await;
+        assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("upload_hardlink_refused")), "{v}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "outside", "nothing outside the root was written");
+    }
+
     /// ai-config #227 case 1: a link inside the root to a dotfile got 200 and
     /// overwrote the dotfile.
     #[cfg(unix)]
@@ -546,6 +565,11 @@ mod tests {
         assert_eq!(code(&dir.path().join("l")), Some("upload_symlink_refused"));
         std::fs::create_dir(dir.path().join("d")).unwrap();
         assert_eq!(code(&dir.path().join("d")), Some("upload_not_a_file_refused"));
+        let linked = dir.path().join("linked.txt");
+        std::fs::write(&linked, "keep").unwrap();
+        std::fs::hard_link(&linked, dir.path().join("other.txt")).unwrap();
+        assert_eq!(code(&linked), Some("upload_hardlink_refused"));
+        assert_eq!(std::fs::read_to_string(&linked).unwrap(), "keep");
         crate::atomic_write::atomic_write_checked(&dir.path().join("ok.txt"), b"x", &upload_target_check).unwrap();
     }
 
