@@ -6,7 +6,7 @@
 //! - spawn      -> `new-session -d -s <ref> -x 220 -y 50 -c <cwd> [-e K=V..]`,
 //!   `set-option remain-on-exit on`, then `send-keys -l` + Enter
 //! - terminate  -> `kill-session -t '=<ref>'`
-//! - status     -> `has-session` then `list-panes #{pane_dead}...`
+//! - status     -> `has-session` then active-pane `display-message #{pane_dead}...`
 //! - reconcile  -> ONE `list-panes -a` census, `amux-` prefix only (MO-3622)
 //! - capture    -> `capture-pane -p -S -<lines>`
 //!
@@ -365,10 +365,10 @@ impl TmuxBackend {
         let out = self
             .run(
                 &[
-                    "list-panes",
+                    "display-message",
+                    "-p",
                     "-t",
                     &pt,
-                    "-F",
                     // ':' not '\t': in a LANG-less launchd env tmux sanitizes
                     // non-printable chars to '_' (2026-08-09 fleet incident),
                     // and none of these three fields can contain ':'.
@@ -382,7 +382,7 @@ impl TmuxBackend {
             return Ok(BackendStatus::NotFound);
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let status = parse_pane_dead(stdout.lines().next().unwrap_or(""));
+        let status = parse_pane_dead(stdout.trim());
         if status != (BackendStatus::Crashed { signal: None }) {
             return Ok(status);
         }
@@ -392,12 +392,12 @@ impl TmuxBackend {
         // report. The kernel still holds that zombie's exit status.
         let pids = self
             .run(
-                &["list-panes", "-t", &pt, "-F", "#{pane_pid}:#{pid}"],
+                &["display-message", "-p", "-t", &pt, "#{pane_pid}:#{pid}"],
                 OP_TIMEOUT,
             )
             .await?;
         let line = String::from_utf8_lossy(&pids.stdout);
-        if let Some((pane_pid, server_pid)) = parse_pid_pair(line.lines().next().unwrap_or("")) {
+        if let Some((pane_pid, server_pid)) = parse_pid_pair(line.trim()) {
             if let Some(measured) =
                 zombie_exit_status(std::path::Path::new("/proc"), &pane_pid, &server_pid)
             {
@@ -651,12 +651,12 @@ impl SessionBackend for TmuxBackend {
 
             // Shell pid now; the command inherits it via exec.
             let out = self
-                .run_ok(&["list-panes", "-t", &pt, "-F", "#{pane_pid}"], OP_TIMEOUT)
+                .run_ok(&["display-message", "-p", "-t", &pt, "#{pane_pid}"], OP_TIMEOUT)
                 .await?;
             Ok(String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .next()
-                .and_then(|l| l.trim().parse::<u32>().ok()))
+                .trim()
+                .parse::<u32>()
+                .ok())
         }
         .await;
 
@@ -849,17 +849,16 @@ fn parse_pane_dead(line: &str) -> BackendStatus {
 /// `list-panes -a` format for `reconcile`. `:`-separated for the reason
 /// `status_by_ref` gives (a LANG-less launchd env turns tabs into `_`); tmux
 /// never lets a session name contain `:`, so the name is whatever is left when
-/// the four trailing fields are split off the right.
+/// the five trailing fields are split off the right.
 const RECONCILE_CENSUS_FORMAT: &str =
-    "#{session_name}:#{window_active}:#{pane_dead}:#{pane_dead_status}:#{pane_dead_signal}";
+    "#{session_name}:#{window_active}:#{pane_active}:#{pane_dead}:#{pane_dead_status}:#{pane_dead_signal}";
 
 /// Parse a `RECONCILE_CENSUS_FORMAT` census into one entry per `amux-` session,
 /// in first-seen order.
 ///
-/// The status is that of the FIRST pane of the session's ACTIVE window, which
-/// is the line `list-panes -t =<name>:` printed first and the one
-/// `parse_pane_dead(stdout.lines().next())` read in `status_by_ref`. `None`
-/// means the census showed no active-window pane for the session.
+/// The status is that of the ACTIVE pane of the session's ACTIVE window,
+/// matching display-message on pane_target in status_by_ref and capture/send.
+/// `None` means the census showed no active worker pane for the session.
 ///
 /// Foreign (non-`amux-`) sessions are skipped before they are parsed, as
 /// `reconcile` always did. A malformed `amux-` line is an error rather than a
@@ -867,16 +866,17 @@ const RECONCILE_CENSUS_FORMAT: &str =
 /// as "gone" to the sweep that reaps and interrupts.
 fn parse_reconcile_census(output: &str) -> Result<Vec<(String, Option<BackendStatus>)>> {
     let mut order: Vec<String> = Vec::new();
-    let mut first_active: std::collections::BTreeMap<String, Option<BackendStatus>> =
+    let mut active_status: std::collections::BTreeMap<String, Option<BackendStatus>> =
         Default::default();
     for line in output.lines() {
         if !line.starts_with("amux-") {
             continue;
         }
-        // Right to left: signal, status, dead, window_active, then the name.
-        let fields: Vec<_> = line.rsplitn(5, ':').collect();
-        if fields.len() != 5
-            || fields[4].is_empty()
+        // Right to left: signal, status, dead, pane_active, window_active, name.
+        let fields: Vec<_> = line.rsplitn(6, ':').collect();
+        if fields.len() != 6
+            || fields[5].is_empty()
+            || !matches!(fields[4], "0" | "1")
             || !matches!(fields[3], "0" | "1")
             || !matches!(fields[2], "0" | "1")
         {
@@ -884,13 +884,13 @@ fn parse_reconcile_census(output: &str) -> Result<Vec<(String, Option<BackendSta
                 "malformed tmux reconcile census line: {line:?}"
             )));
         }
-        let name = fields[4];
-        if !first_active.contains_key(name) {
+        let name = fields[5];
+        if !active_status.contains_key(name) {
             order.push(name.to_string());
-            first_active.insert(name.to_string(), None);
+            active_status.insert(name.to_string(), None);
         }
-        if fields[3] == "1" {
-            let slot = first_active.get_mut(name).expect("inserted above");
+        if fields[4] == "1" && fields[3] == "1" {
+            let slot = active_status.get_mut(name).expect("inserted above");
             if slot.is_none() {
                 *slot = Some(parse_pane_dead(&format!(
                     "{}:{}:{}",
@@ -902,7 +902,7 @@ fn parse_reconcile_census(output: &str) -> Result<Vec<(String, Option<BackendSta
     Ok(order
         .into_iter()
         .map(|name| {
-            let status = first_active.remove(&name).flatten();
+            let status = active_status.remove(&name).flatten();
             (name, status)
         })
         .collect())
@@ -1271,15 +1271,17 @@ mod tests {
     #[test]
     fn reconcile_census_reads_the_first_pane_of_the_active_window() {
         let census = parse_reconcile_census(
-            "amux-live:1:0::\n\
-             amux-done:1:1:3:\n\
-             amux-sig:1:1::9\n\
-             amux-bare:1:1::\n\
-             amux-multi:0:1:7:\n\
-             amux-multi:1:0::\n\
-             amux-multi:1:1:5:\n\
-             amux-inactive-only:0:0::\n\
-             foreign:1:1:1:\n",
+            "amux-live:1:1:0::\n\
+             amux-done:1:1:1:3:\n\
+             amux-sig:1:1:1::9\n\
+             amux-bare:1:1:1::\n\
+             amux-multi:0:1:1:7:\n\
+             amux-multi:1:0:1:5:\n\
+             amux-multi:1:1:0::\n\
+             amux-dead-active:1:0:0::\n\
+             amux-dead-active:1:1:1:4:\n\
+             amux-inactive-only:0:1:0::\n\
+             foreign:1:1:1:1:\n",
         )
         .unwrap();
         let by_name: std::collections::BTreeMap<_, _> = census.iter().cloned().collect();
@@ -1296,21 +1298,23 @@ mod tests {
             by_name["amux-bare"],
             Some(BackendStatus::Crashed { signal: None })
         );
-        // The dead pane in the INACTIVE window must not speak for the session,
-        // and only the first pane of the active window counts, exactly as
-        // `list-panes -t =name:` + `lines().next()` did.
+        // Neither an inactive window nor its first, inactive pane speaks for
+        // the worker. Preserve this test's name for case-by-case CI comparison.
         assert_eq!(by_name["amux-multi"], Some(BackendStatus::Running));
+        assert_eq!(by_name["amux-dead-active"],
+            Some(BackendStatus::Completed { exit_code: 4 }));
         // No active-window pane in the census: unknown, never guessed.
         assert_eq!(by_name["amux-inactive-only"], None);
         assert!(!by_name.contains_key("foreign"));
-        assert_eq!(census.len(), 6, "one entry per amux- session");
+        assert_eq!(census.len(), 7, "one entry per amux- session");
         // First-seen order is kept, so the census is deterministic.
         assert_eq!(census[0].0, "amux-live");
     }
 
     #[test]
     fn reconcile_census_fails_loudly_on_a_malformed_amux_line() {
-        for bad in ["amux-x:1:0:", "amux-x:2:0::", "amux-x:1:9::", "amux-x"] {
+        for bad in ["amux-x:1:1:0:", "amux-x:2:1:0::", "amux-x:1:2:0::",
+            "amux-x:1:1:9::", "amux-x"] {
             assert!(
                 parse_reconcile_census(bad).is_err(),
                 "{bad:?} must be an error, not a session that quietly vanished"
@@ -1334,7 +1338,7 @@ mod tests {
         let log = dir.join("calls.log");
         let script = dir.join("tmux");
         let probes = if probe {
-            "  \"has-session\"*) exit 0 ;;\n  \"list-panes -t\"*\"pane_pid\"*) echo 1:1 ;;\n  \"list-panes -t\"*) echo 1:: ;;\n"
+            "  \"has-session\"*) exit 0 ;;\n  \"display-message -p -t\"*\"pane_pid\"*) echo 1:1 ;;\n  \"display-message -p -t\"*) echo 1:: ;;\n"
         } else {
             ""
         };
@@ -1383,9 +1387,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut census = String::new();
         for i in 0..40 {
-            census.push_str(&format!("amux-lane{i}:1:0::\n"));
+            census.push_str(&format!("amux-lane{i}:1:1:0::\n"));
         }
-        census.push_str("amux-done:1:1:0:\nforeign:1:0::\n");
+        census.push_str("amux-done:1:1:1:0:\nforeign:1:1:0::\n");
         let (backend, log) = fake_tmux(dir.path(), &census, false);
 
         let hosted = reconcile_retrying(&backend).await;
@@ -1393,6 +1397,8 @@ mod tests {
         let seen = calls(&log);
         assert_eq!(seen.len(), 1, "one spawn for 41 sessions, got: {seen:?}");
         assert!(seen[0].starts_with("list-panes -a"), "{seen:?}");
+        assert!(seen[0].contains("#{window_active}:#{pane_active}"),
+            "the actual census must identify the active worker pane: {seen:?}");
         assert_eq!(hosted.len(), 41, "every amux- session, no foreign one");
         assert!(hosted.iter().any(|s| s.backend_ref == "amux-done"
             && s.status == BackendStatus::Completed { exit_code: 0 }));
@@ -1410,7 +1416,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_probes_only_the_session_the_census_cannot_settle() {
         let dir = tempfile::tempdir().unwrap();
-        let census = "amux-a:1:0::\namux-b:1:0::\namux-bare:1:1::\namux-c:1:0::\n";
+        let census = "amux-a:1:1:0::\namux-b:1:1:0::\namux-bare:1:1:1::\namux-c:1:1:0::\n";
         let (backend, log) = fake_tmux(dir.path(), census, true);
 
         let hosted = reconcile_retrying(&backend).await;

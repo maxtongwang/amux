@@ -129,7 +129,7 @@ fn pane_size_startup_and_periodic_work_share_isolation() {
                 "boot must restore even with a fresh lease: {first}"
             );
             assert!(lines[0].starts_with("list-windows -a -F "));
-            assert_eq!(lines[1], "set-option -t =amux-af789 default-size 220x50");
+            assert_eq!(lines[1], "set-option -t =amux-af789: default-size 220x50");
             assert_eq!(lines[2], "resize-window -t =amux-af789: -x 220 -y 50");
             assert_eq!(lines[3], "set-option -w -t =amux-af789: window-size latest");
             assert!(row().disabled_reason.is_none());

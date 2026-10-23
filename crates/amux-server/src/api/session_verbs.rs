@@ -1423,6 +1423,41 @@ async fn tmux(args: &[&str]) -> Option<std::process::Output> {
     run_cmd("tmux", args, OP_TIMEOUT).await
 }
 
+/// The active worker pane has exited (remain-on-exit keeps it observable).
+/// Use the same target as capture, send and respawn; a live sibling pane
+/// does not make the active worker pane live (#52 review B3).
+/// False when tmux cannot answer: a probe failure is never a death notice.
+pub(crate) async fn pane_dead(name: &str) -> bool {
+    let ptq = pt(name);
+    match tmux(&["display-message", "-p", "-t", &ptq, "#{pane_dead}"]).await {
+        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "1",
+        _ => false,
+    }
+}
+
+/// Window options every worker pane gets at spawn: `remain-on-exit` keeps a
+/// dead pane observable (AMUX-2644 reads it), and the two rename locks keep
+/// the window named after the worker. Pane form: `set-option -t =amux-<n>`
+/// answers "no such session" on tmux 3.6a and sets nothing, which is how
+/// these three silently never applied on this path (tmux_target_audit now
+/// refuses the session form for set-option). A failure is logged.
+async fn lock_worker_window(ptq: &str, name: &str) {
+    for (verb, opt, val) in [
+        ("set-option", "remain-on-exit", "on"),
+        ("set-option", "allow-rename", "off"),
+        ("set-window-option", "automatic-rename", "off"),
+    ] {
+        let out = tmux(&[verb, "-t", ptq, opt, val]).await;
+        if !matches!(out, Some(ref o) if o.status.success()) {
+            tracing::warn!(
+                verdict = "worker_window_option_unset", option = opt, worker = %name,
+                measured = true, n_considered = 1,
+                "could not set a worker window option at spawn"
+            );
+        }
+    }
+}
+
 /// The status bar shows the plain worker name, not `amux-<name>`
 /// (backend::tmux::WORKER_STATUS_LEFT). Display only: a failure is logged.
 /// `ptq` is the pane form (`=amux-<n>:`): set-option given the bare session
@@ -10012,9 +10047,7 @@ fn any_non_zombie(stat_output: &str) -> bool {
 /// from `~/.claude/sessions/<pid>.json`, which Claude Code writes for every
 /// live process. None when no pane, no child, or no such file.
 async fn live_claude_conversation(name: &str) -> Option<String> {
-    let stq = st(name);
-    let out = tmux(&["list-panes", "-t", &stq, "-F", "#{pane_pid}"]).await?;
-    let pane = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().to_string();
+    let pane = active_pane_pid(name).await?;
     let kids = run_cmd("pgrep", &["-P", &pane], OP_TIMEOUT).await?;
     String::from_utf8_lossy(&kids.stdout)
         .split_whitespace()
@@ -10027,21 +10060,26 @@ fn claude_session_file_id(path: &std::path::Path) -> Option<String> {
     v["sessionId"].as_str().map(str::to_string).filter(|s| !s.is_empty())
 }
 
+/// Resolve the same active pane that capture/send/respawn address. list-panes
+/// enumerates siblings even with pt(name); its first row is not the worker.
+async fn active_pane_pid(name: &str) -> Option<String> {
+    let ptq = pt(name);
+    let pid = tmux(&["display-message", "-p", "-t", &ptq, "#{pane_pid}"])
+        .await
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8_lossy(&out.stdout).trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 1)
+        .map(|pid| pid.to_string());
+    if pid.is_none() {
+        tracing::warn!(session = name, measured = false, n_considered = 1,
+            verdict = "active_worker_pane_pid_unavailable",
+            "could not resolve the active worker pane process");
+    }
+    pid
+}
+
 async fn pane_has_live_child(name: &str) -> Option<bool> {
-    let stq = st(name);
-    let out = tmux(&["list-panes", "-t", &stq, "-F", "#{pane_pid}"]).await?;
-    if !out.status.success() {
-        return None;
-    }
-    let pid = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if pid.is_empty() {
-        return None;
-    }
+    let pid = active_pane_pid(name).await?;
     let ch = run_cmd("pgrep", &["-P", &pid], OP_TIMEOUT).await?;
     let listed = String::from_utf8_lossy(&ch.stdout).to_string();
     let kids: Vec<&str> = listed.split_whitespace().collect();
@@ -10081,6 +10119,11 @@ pub(crate) async fn is_running(name: &str) -> bool {
     }
     let tmux_sess = tmux_name(name);
     if !tmux_sessions_set().await.contains(&tmux_sess) {
+        return false;
+    }
+    // A corpse is not a worker: with remain-on-exit on, a pane whose process
+    // exited keeps its last screen, which can still look like a running agent.
+    if pane_dead(name).await {
         return false;
     }
     let output = tmux_capture(name, 10).await;
@@ -16703,7 +16746,20 @@ pub(crate) async fn start_session(
             }
         };
     }
-    if tmux_exists {
+    if tmux_exists && pane_dead(name).await {
+        // remain-on-exit keeps a pane whose shell exited (Ctrl-D, `exit`). Its
+        // last screen can be a prompt, so the prompt check below would type
+        // into a corpse and every later Start would time out on its receipt
+        // (#52 reviews B2/B3). Check and respawn that active pane even when
+        // another pane in the window is alive, then set its shell up afresh.
+        let ptq = pt(name);
+        let sh = user_shell();
+        let ok = matches!(tmux(&["respawn-pane", "-k", "-t", &ptq, &sh]).await, Some(ref o) if o.status.success());
+        tracing::warn!(session = %name, respawned = ok, verdict = "dead_pane_respawned",
+            measured = true, n_considered = 1, "worker pane was dead at start; respawned its shell");
+        sleep_ms(1000).await;
+        shell_step!(&shell_rc, false);
+    } else if tmux_exists {
         // Reuse the surviving tmux session (py:24589).
         let output = tmux_capture(name, 10).await;
         if at_shell_prompt(&strip_ansi(&output)) {
@@ -16832,9 +16888,7 @@ pub(crate) async fn start_session(
             None => return (false, "tmux not found or timed out".into()),
         }
         let stq = st(name);
-        let _ = tmux(&["set-option", "-t", &stq, "remain-on-exit", "on"]).await;
-        let _ = tmux(&["set-option", "-t", &stq, "allow-rename", "off"]).await;
-        let _ = tmux(&["set-window-option", "-t", &stq, "automatic-rename", "off"]).await;
+        lock_worker_window(&pt(name), name).await;
         set_worker_status_name(&pt(name), name).await;
         let _ = tmux(&["rename-window", "-t", &stq, name]).await;
         // The secrets kept out of argv above, handed over the tmux control
@@ -18123,8 +18177,8 @@ async fn stop_session_process(name: &str) -> (bool, String) {
     meta.insert("cc_session_name".into(), json!(name));
     save_meta(name, &meta);
     // Detach pipe-pane before shell-visible commands (py:24995).
-    let stq = st(name);
-    let _ = tmux(&["pipe-pane", "-t", &stq]).await;
+    let ptq = pt(name);
+    let _ = tmux(&["pipe-pane", "-t", &ptq]).await;
     send_key(name, "C-u").await;
     sleep_ms(100).await;
     let _ = send_literal(name, "/exit").await;
@@ -18138,18 +18192,8 @@ async fn stop_session_process(name: &str) -> (bool, String) {
         }
     }
     // Hard kill: the pane shell's children (py:25028).
-    if let Some(out) = tmux(&["list-panes", "-t", &stq, "-F", "#{pane_pid}"]).await {
-        if out.status.success() {
-            let pid = String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if !pid.is_empty() {
-                let _ = run_cmd("pkill", &["-9", "-P", &pid], OP_TIMEOUT).await;
-            }
-        }
+    if let Some(pid) = active_pane_pid(name).await {
+        let _ = run_cmd("pkill", &["-9", "-P", &pid], OP_TIMEOUT).await;
     }
     type_line(name, "stty sane").await;
     sleep_ms(1000).await;
@@ -18441,6 +18485,7 @@ pub(crate) async fn stop_for_pause(state: &AppState, name: &str) -> anyhow::Resu
         anyhow::ensure!(ok, "{detail}");
     } else {
         let pt = pt(name);
+        // Pause owns the whole window's process trees, including side panes.
         let pane = tmux(&["list-panes", "-t", &pt, "-F", "#{pane_pid}"]).await;
         if let Some(out) = pane.filter(|o| o.status.success()) {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -18918,7 +18963,7 @@ pub async fn debug_logs(RawQuery(q): RawQuery) -> Response {
         // dormant — the verdict would have answered, plausibly, and wrongly.
         // `|`, not a tab: in the server's C locale tmux prints a tab as `_`
         // (see runtime_jobs::pane_size), which left this list empty.
-        "#{session_name}|#{pane_pipe}|#{window_activity}",
+        "#{session_name}|#{pane_pipe}|#{window_activity}|#{window_active}|#{pane_active}",
     ])
     .await
     {
@@ -18927,6 +18972,10 @@ pub async fn debug_logs(RawQuery(q): RawQuery) -> Response {
             let (Some(sess), Some(pipe), Some(act)) = (it.next(), it.next(), it.next()) else {
                 continue;
             };
+            // Logging targets the active worker pane, not a piped sibling.
+            if it.next() != Some("1") || it.next() != Some("1") {
+                continue;
+            }
             let Some(name) = sess.strip_prefix("amux-") else {
                 continue;
             };
@@ -18942,9 +18991,9 @@ pub async fn debug_logs(RawQuery(q): RawQuery) -> Response {
                 unmanaged += 1;
                 continue;
             }
-            let e = panes.entry(name.to_string()).or_insert((false, 0));
-            e.0 |= pipe.trim() == "1";
-            e.1 = e.1.max(act.trim().parse::<i64>().unwrap_or(0));
+            panes.insert(name.to_string(), (
+                pipe.trim() == "1", act.trim().parse::<i64>().unwrap_or(0),
+            ));
         }
     }
 
@@ -24291,7 +24340,7 @@ pub async fn pipe_reconcile_tick() -> usize {
         "list-panes",
         "-a",
         "-F",
-        "#{session_name} #{pane_pipe} #{pane_pid}",
+        "#{session_name} #{pane_pipe} #{pane_pid} #{window_active} #{pane_active}",
     ])
     .await
     else {
@@ -24314,6 +24363,11 @@ pub async fn pipe_reconcile_tick() -> usize {
         let (Some(sess), Some(pipe), Some(pid)) = (f.next(), f.next(), f.next()) else {
             continue;
         };
+        // The pipe-pane below targets the active pane. Its eligibility must
+        // come from that same pane, never a sibling's pipe or child process.
+        if f.next() != Some("1") || f.next() != Some("1") {
+            continue;
+        }
         let Some(name) = sess.strip_prefix("amux-") else {
             continue;
         };
@@ -45615,6 +45669,208 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             !any_non_zombie("   \n  \n"),
             "whitespace is not a live child"
         );
+    }
+
+    /// #52 review B2: with remain-on-exit on, a shell that exits at its prompt
+    /// leaves a dead pane. It must read as dead (so is_running says no) and a
+    /// respawn must bring back a live shell. Private test socket.
+    #[tokio::test]
+    async fn a_dead_worker_pane_is_detected_and_respawned() {
+        struct Pane(String);
+        impl Drop for Pane {
+            fn drop(&mut self) {
+                let st = session_target(&self.0);
+                let _ = tmux_command().args(["kill-session", "-t", &st]).output();
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let name = format!("dead-pane-{}", std::process::id());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join(format!("sessions/{name}.env")), "CC_PROVIDER=claude\n").unwrap();
+        let _pane = Pane(tmux_name(&name));
+        let created = tmux(&["new-session", "-d", "-s", &tmux_name(&name), "/bin/sh"]).await.expect("tmux");
+        assert!(created.status.success());
+        lock_worker_window(&pt(&name), &name).await;
+        assert!(!pane_dead(&name).await, "a live shell is not dead");
+        let ptq = pt(&name);
+        tmux(&["send-keys", "-t", &ptq, "exit", "Enter"]).await;
+        let mut dead = false;
+        for _ in 0..50 {
+            if pane_dead(&name).await { dead = true; break; }
+            sleep_ms(100).await;
+        }
+        assert!(dead, "the exited shell's pane must read as dead (remain-on-exit kept it)");
+        assert!(!is_running(&name).await, "a dead pane is not a running worker");
+        let sh = user_shell();
+        let r = tmux(&["respawn-pane", "-k", "-t", &ptq, &sh]).await.unwrap();
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+        assert!(!pane_dead(&name).await, "respawn brings the pane back");
+    }
+
+    /// #52: Start must respawn a worker that exited at its shell prompt and
+    /// launch its provider, not type startup scripts into a retained dead pane.
+    /// Exercises the real start_session with a stub on the private test socket.
+    #[tokio::test]
+    async fn a_worker_that_exited_at_its_prompt_starts_again_through_start_session() {
+        assert_exited_worker_starts_again_through_start_session(false).await;
+    }
+
+    /// #52 review B3: a live sibling must not hide the active worker's death
+    /// or receive its setup/provider launch. Only the active pane is respawned.
+    #[tokio::test]
+    async fn a_worker_with_a_dead_active_pane_and_live_sibling_starts_again_through_start_session() {
+        assert_exited_worker_starts_again_through_start_session(true).await;
+    }
+
+    async fn assert_exited_worker_starts_again_through_start_session(with_live_sibling: bool) {
+        struct Pane(String);
+        impl Drop for Pane {
+            fn drop(&mut self) {
+                let st = session_target(&self.0);
+                let _ = tmux_command().args(["kill-session", "-t", &st]).output();
+            }
+        }
+        struct Env(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Env {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let _env = Env(["AMUX_CLAUDE_CMD", "AMUX_ALLOW_TMUX_SPAWN_FROM_TEST_HOME", "HOME", "SHELL"]
+            .into_iter().map(|key| (key, std::env::var_os(key))).collect());
+        let stub = home.path().join("stub-provider.sh");
+        let launches = home.path().join("stub-launches");
+        std::fs::write(&stub, format!(
+            "#!/bin/sh\nprintf 'launch\\n' >> {}\nprintf 'STUB-PROVIDER-RAN\\n'\nexec /bin/sleep 120\n",
+            sh_quote(&launches.to_string_lossy())
+        )).unwrap();
+        // Use the supported Claude command override; no real provider or user
+        // shell profiles should run. All process env changes restore on panic.
+        std::env::set_var("AMUX_CLAUDE_CMD", format!("/bin/sh {}", sh_quote(&stub.to_string_lossy())));
+        std::env::set_var("AMUX_ALLOW_TMUX_SPAWN_FROM_TEST_HOME", "1");
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("SHELL", "/bin/bash --noprofile --norc");
+        let name = format!("start-dead-pane-{}-{with_live_sibling}", std::process::id());
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        std::fs::write(env_path(&name), format!(
+            "CC_PROVIDER=claude\nCC_ISOLATED=1\nCC_DIR={}\n", home.path().display()
+        )).unwrap();
+        let _pane = Pane(tmux_name(&name));
+        let ptq = pt(&name);
+        let created = tmux(&["new-session", "-d", "-s", &tmux_name(&name), "PS1='$ ' /bin/sh -i"])
+            .await.expect("tmux required for start-after-exit proof");
+        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+        lock_worker_window(&ptq, &name).await;
+        let active = tmux(&["display-message", "-p", "-t", &ptq, "#{pane_id}"]).await.unwrap();
+        assert!(active.status.success(), "{}", String::from_utf8_lossy(&active.stderr));
+        let worker_pane = String::from_utf8_lossy(&active.stdout).trim().to_string();
+        assert!(!worker_pane.is_empty(), "fixture must identify the worker pane");
+        let sibling = if with_live_sibling {
+            // -d keeps the worker active; -b puts its live sibling first so
+            // selecting the first pane cannot accidentally pass this test.
+            // Record the sibling's ID and PID to detect a wrong respawn.
+            let split = tmux(&["split-window", "-b", "-d", "-t", &ptq, "-P", "-F",
+                "#{pane_id}|#{pane_pid}|#{pane_dead}", "/bin/sleep 120"]).await.unwrap();
+            assert!(split.status.success(), "{}", String::from_utf8_lossy(&split.stderr));
+            let snapshot = String::from_utf8_lossy(&split.stdout).trim().to_string();
+            let sibling_pane = snapshot.split('|').next().unwrap().to_string();
+            assert!(!sibling_pane.is_empty() && snapshot.ends_with("|0"),
+                "fixture must create a live sibling: {snapshot}");
+            Some((sibling_pane, snapshot))
+        } else {
+            None
+        };
+        // A tmux-returned %pane ID is exact. Keep the audit's pane-target
+        // binding convention while pinning observations to this fixture.
+        let pt = worker_pane.as_str();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if at_shell_prompt(&strip_ansi(&tmux_capture(&name, 10).await)) { break; }
+            assert!(std::time::Instant::now() < deadline, "fixture shell never reached its prompt");
+            sleep_ms(50).await;
+        }
+        // Leave a bare prompt in scrollback: main mistakes that stale frame
+        // for a shell that can still acknowledge startup commands.
+        let exited = tmux(&["send-keys", "-t", &ptq, "Enter", "exit", "Enter"]).await.unwrap();
+        assert!(exited.status.success(), "{}", String::from_utf8_lossy(&exited.stderr));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            // Read the pinned pane directly so the fixture does not depend
+            // on the pane_dead predicate this regression is meant to test.
+            let dead = tmux(&["display-message", "-p", "-t", pt, "#{pane_dead}"]).await.unwrap();
+            assert!(dead.status.success(), "{}", String::from_utf8_lossy(&dead.stderr));
+            if String::from_utf8_lossy(&dead.stdout).trim() == "1" { break; }
+            assert!(std::time::Instant::now() < deadline, "remain-on-exit did not retain a dead pane");
+            sleep_ms(50).await;
+        }
+        let active = tmux(&["display-message", "-p", "-t", &ptq, "#{pane_id}"]).await.unwrap();
+        assert!(active.status.success(), "{}", String::from_utf8_lossy(&active.stderr));
+        assert_eq!(String::from_utf8_lossy(&active.stdout).trim(), worker_pane,
+            "the retained dead worker pane must remain active");
+        assert!(at_shell_prompt(&strip_ansi(&tmux_capture(&name, 10).await)),
+            "the retained dead pane must reproduce the stale-prompt reuse path");
+        let (state, _dir) = state();
+        let (ok, detail) = start_session(&state, &name, "", false).await;
+        assert!(ok, "start_session must restart the exited worker: {detail}");
+        assert!(!pane_dead(&name).await, "dead_pane_respawned must leave a live pane");
+        let active = tmux(&["display-message", "-p", "-t", &ptq, "#{pane_id}|#{pane_dead}"]).await.unwrap();
+        assert!(active.status.success(), "{}", String::from_utf8_lossy(&active.stderr));
+        assert_eq!(String::from_utf8_lossy(&active.stdout).trim(), format!("{worker_pane}|0"),
+            "Start must revive the original active worker pane");
+        if let Some((sibling_pane, snapshot)) = sibling {
+            let pt = sibling_pane.as_str();
+            let unchanged = tmux(&["display-message", "-p", "-t", pt,
+                "#{pane_id}|#{pane_pid}|#{pane_dead}"]).await.unwrap();
+            assert!(unchanged.status.success(), "{}", String::from_utf8_lossy(&unchanged.stderr));
+            assert_eq!(String::from_utf8_lossy(&unchanged.stdout).trim(), snapshot,
+                "Start must leave the sibling process alive and untouched");
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let captured = tmux(&["capture-pane", "-p", "-t", pt]).await.unwrap();
+            assert!(captured.status.success(), "{}", String::from_utf8_lossy(&captured.stderr));
+            let output = String::from_utf8_lossy(&captured.stdout);
+            if output.lines().any(|line| line.trim() == "STUB-PROVIDER-RAN") { break; }
+            assert!(std::time::Instant::now() < deadline, "provider stub never ran:\n{output}");
+            sleep_ms(50).await;
+        }
+        assert_eq!(std::fs::read_to_string(&launches).unwrap(), "launch\n",
+            "Start must launch the stub once, without interrupting and retyping it");
+        assert_eq!(pane_has_live_child(&name).await, Some(true),
+            "liveness must inspect the active provider pane, not its childless sibling");
+    }
+
+    /// The spawn-time window options must actually land: on the session form
+    /// they never did. Read back with show-options on a private socket.
+    #[tokio::test]
+    async fn worker_window_options_apply_at_spawn() {
+        struct Pane(String);
+        impl Drop for Pane {
+            fn drop(&mut self) {
+                let st = session_target(&self.0);
+                let _ = tmux_command().args(["kill-session", "-t", &st]).output();
+            }
+        }
+        let name = format!("window-opts-{}", std::process::id());
+        let pane = Pane(tmux_name(&name));
+        let created = tmux(&["new-session", "-d", "-s", &pane.0, "/bin/sh"])
+            .await
+            .expect("tmux required for window-options proof");
+        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+        lock_worker_window(&pt(&name), &name).await;
+        let ptq = pt(&name);
+        for (opt, want) in [("remain-on-exit", "on"), ("allow-rename", "off"), ("automatic-rename", "off")] {
+            let o = tmux(&["show-options", "-wv", "-t", &ptq, opt]).await.expect("show-options");
+            assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), want, "{opt} not set on the window");
+        }
     }
 
     /// Max saw "amux-" in every worker's status bar: tmux's default

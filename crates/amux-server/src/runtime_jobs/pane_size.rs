@@ -193,16 +193,22 @@ async fn restore(session: &str, cols: u32, rows: u32) {
     // Targets come from the L2 helpers, never hand-spelled: tmux resolves a
     // bare `-t foo` by PREFIX, and `amux-amux` is a prefix of eight live
     // sessions — so a hand-written target is correct until the exact session
-    // is briefly absent and then silently resizes a SIBLING. `stq` is the
-    // session form (`=<ref>`) for the session option; `ptq` is the
-    // window/pane form (`=<ref>:`) for the two window-level commands.
-    let stq = crate::backend::tmux::session_target(session);
+    // is briefly absent and then silently resizes a SIBLING. All three take
+    // the pane form (`=<ref>:`): set-option given the session form `=<ref>`
+    // answers "no such session" on tmux 3.6a, so default-size never applied.
     let ptq = crate::backend::tmux::pane_target(session);
     let size = format!("{cols}x{rows}");
     let c = cols.to_string();
     let r = rows.to_string();
     // Order matters — see the module docs.
-    let _ = tmux(&["set-option", "-t", &stq, "default-size", &size]).await;
+    let out = tmux(&["set-option", "-t", &ptq, "default-size", &size]).await;
+    if !matches!(out, Some(ref o) if o.status.success()) {
+        tracing::warn!(
+            verdict = "pane_default_size_unset", session = %session,
+            measured = true, n_considered = 1,
+            "could not set the session default-size; a later attach can shrink the pane again"
+        );
+    }
     let _ = tmux(&["resize-window", "-t", &ptq, "-x", &c, "-y", &r]).await;
     let _ = tmux(&["set-option", "-w", "-t", &ptq, "window-size", "latest"]).await;
 }
