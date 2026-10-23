@@ -1708,7 +1708,7 @@ mod tests {
         let _home = crate::api::settings::test_env::set_home(tmp.path());
         let state = test_state(tmp.path());
         let app = super::super::router(state.clone());
-        let cite = pair(&state, "test-desk", "Max: make test-dev-a isolated?", "yes");
+        let cite = pair(&state, "test-desk", "Max, set isolated to true for test-dev-a", "yes");
         let (st, v, h) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("mrpopo"), json!({"isolated": true, "cite": cite}), None).await;
         assert!(st.is_success(), "{st} {v}");
         let code = h.get(GRANT_CODE_HEADER).and_then(|v| v.to_str().ok()).unwrap().to_string();

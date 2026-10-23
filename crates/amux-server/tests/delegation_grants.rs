@@ -386,6 +386,13 @@ async fn tags_arrays_and_strings_store_the_same_canonical_membership_on_both_rou
 #[tokio::test]
 async fn citation_settings_reject_passing_target_mentions_values_and_negations() {
     let e = setup().await;
+    // Seed the citing actor's latest unanswered ask, immediately followed by
+    // the owner reply, so identity/ordering cannot mask the change guard.
+    let cite = |actor: &str, ask: &str| {
+        let ask = e.seed_row(MAX_PANE, ask, "session", actor, Some("direct"), now_s() - 60.0);
+        let reply = e.seed_pane_prompt(MAX_PANE, "yes, go ahead", now_s() - 30.0);
+        json!({"ask_row_id": ask, "reply_row_id": reply})
+    };
     for ask in [
         format!("Max, may I enable yolo for {DEV_B} and leave {DEV_A} alone?"),
         format!("Max, may I disable yolo for {DEV_A}?"),
@@ -394,19 +401,30 @@ async fn citation_settings_reject_passing_target_mentions_values_and_negations()
         format!("Max, no yolo for {DEV_A}?"),
         format!("Max, may I enable yolo for not {DEV_A}?"),
     ] {
-        let pair = e.cite(&ask);
+        let pair = cite(MRPOPO, &ask);
         let before = e.snapshot();
         let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_A), Some(cited(json!({"toggle_yolo":true}),pair))).await;
         assert_code(st, &v, "cite_ask_missing_change", &ask);
         assert_eq!(e.snapshot(), before, "refusal writes nothing");
     }
-    for ask in [format!("Max, don't remove dev from {DEV_B}?"), format!("Max, do not remove dev from {DEV_B}?"), format!("Max, remove dev from {DEV_B}, not {DEV_B}?")] {
-        let pair = e.cite(&ask);
-        let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &cfg(DEV_B), Some(cited(json!({"tags":""}),pair))).await;
-        assert_code(st, &v, "cite_ask_missing_change", &ask);
-        assert!(e.tags(DEV_B).contains("dev"));
+    for request in [format!("Max, don't remove dev from {DEV_B}"), format!("Max, do not remove dev from {DEV_B}"), format!("Max, remove dev from {DEV_B}, not {DEV_B}")] {
+        for suffix in ["", "?"] {
+            let ask = format!("{request}{suffix}");
+            let pair = cite(DEV_LEAD, &ask);
+            let before = e.snapshot();
+            let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &cfg(DEV_B), Some(cited(json!({"tags":""}),pair))).await;
+            assert_code(st, &v, "cite_ask_missing_change", &ask);
+            assert_eq!(e.snapshot(), before, "{ask}: refusal writes nothing");
+            assert!(e.tags(DEV_B).contains("dev"));
+        }
     }
-    let pair = e.cite(&format!("Max, may I enable yolo for {DEV_A}?"));
+    // The same actor/target/direction with a question mark is valid once the
+    // negation is removed: question form alone does not refuse an ask.
+    let pair = cite(DEV_LEAD, &format!("Max, remove dev from {DEV_B}?"));
+    let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &cfg(DEV_B), Some(cited(json!({"tags":""}),pair))).await;
+    assert_allowed(st, &v, "unnegated tag question");
+    assert!(!e.tags(DEV_B).contains("dev"));
+    let pair = cite(MRPOPO, &format!("Max, may I enable yolo for {DEV_A}?"));
     let (st,v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_A), Some(cited(json!({"toggle_yolo":true}),pair))).await;
     assert_allowed(st, &v, "explicit direction on the actual target");
 }
