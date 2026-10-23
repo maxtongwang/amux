@@ -23,11 +23,13 @@ pub(super) struct Attempt {
     pub endpoint: String,
     pub endpoint_pid: u32,
     pub endpoint_uid: u32,
+    /// Amux-only kernel instance token, compared only to ProcessIdentity.instance.
     pub endpoint_start: String,
     pub endpoint_session: String,
     pub executable_sha256: String,
     pub registry_sha256: String,
     pub relay_pid: u32,
+    /// Claude's C-locale UTC lstart, including captured provenance after restart.
     pub relay_start: String,
     pub body_sha256: String,
     pub state: ReceiptState,

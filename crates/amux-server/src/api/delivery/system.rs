@@ -13,8 +13,9 @@ use std::path::{Component, Path, PathBuf};
 pub(super) struct ProcessIdentity {
     pub pid: u32,
     pub uid: u32,
-    /// Native registry lstart, plus a stronger kernel process-instance token.
+    /// Claude procStart / verifiedPeerProcStart: trimmed C-locale UTC ps lstart.
     pub registry_start: String,
+    /// Kernel sec:usec token for Amux-only PID reuse checks, never Claude fields.
     pub instance: String,
     pub executable: PathBuf,
     pub executable_sha256: String,
@@ -105,6 +106,15 @@ pub(super) fn discover(
             || v["pid"].as_u64() != Some(pid as u64)
             || v["procStart"].as_str() != Some(process.registry_start.as_str())
         {
+            tracing::warn!(
+                pid_matches = v["pid"].as_u64() == Some(pid as u64),
+                uid_matches = process.uid == host.uid(),
+                lstart_matches = v["procStart"].as_str() == Some(process.registry_start.as_str()),
+                measured = true,
+                n_considered = 1,
+                verdict = "native_registry_process_mismatch",
+                "registry identity rejected before socket discovery"
+            );
             return Err(Q("registry_process_mismatch"));
         }
         let session = v["sessionId"]

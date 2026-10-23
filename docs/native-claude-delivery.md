@@ -31,6 +31,13 @@ paste adapter before writing. Unsafe paths, identity mismatches and protocol
 anomalies stop delivery. Quarantine is tied to the process instance and executable
 hash; registry heartbeats cannot clear it. A new instance never replays an old attempt.
 
+Claude's registry/auth `procStart`, the ledger's `relay_start`, and artifact
+`verifiedPeerProcStart` all use trimmed `ps -o lstart=` output with `LC_ALL=C`
+and `TZ=UTC`. The separate kernel `sec:usec` instance token is retained for
+Amux-only receiver/callback PID-reuse checks (`endpoint_start`); it is never
+compared to a Claude start field. Registry identity rejections log
+`native_registry_process_mismatch` with separate PID, UID and lstart match flags.
+
 The relay has an Amux-owned callback socket in the same vetted private directory
 as Claude's inbox. It publishes no Claude session record. Callback credentials
 must identify the intended Claude PID, UID and process instance. Sender names
@@ -137,6 +144,13 @@ fixture registry records, a fake UDS server, fixture databases and recording
 terminal adapters. Crash tests SIGKILL a subprocess against a fixture WAL database.
 They do not invoke Claude, live tmux, the default Claude socket namespace, the
 live server or the user's Amux state.
+
+One registry fixture constructor supplies the required PID and a literal
+Claude-format lstart independent of FakeHost and the ledger. Discovery, socket
+and SIGKILL fixtures share it. A socket-free regression checks that complete
+identity reaches socket validation while missing PID/start fields and a kernel
+token in `procStart` are rejected. Restart artifact reconciliation also rejects
+a captured kernel token before accepting Claude's literal lstart.
 
 The synchronous SIGKILL peer polls a non-blocking listener, then explicitly
 clears inherited non-blocking mode on accepted streams before buffered reads.

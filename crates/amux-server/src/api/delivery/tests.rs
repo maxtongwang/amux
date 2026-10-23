@@ -80,6 +80,63 @@ impl Host for FakeHost {
         self.0.uid
     }
 }
+
+/// Claude's registry is external input: do not derive procStart from FakeHost
+/// or the ledger, which would hide a kernel-token/lstart representation mixup.
+fn registry_record(pid: u32, session: &str, socket: &Path) -> Value {
+    json!({"pid":pid,"procStart":"Thu Oct 22 01:02:03 2026","sessionId":session,"peerProtocol":1,
+        "peerFeatures":["notify_idle","artifact_yield"],"messagingSocketPath":socket})
+}
+
+#[test]
+fn registry_fixture_requires_claudes_pid_and_lstart_before_socket_validation() {
+    let dir = private_dir();
+    let host = FakeHost(identity());
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let registry = sessions.join(format!("{}.json", host.0.pid));
+    // No socket bind is needed to verify the identity boundary. A valid record
+    // must reach socket validation; malformed identity must stop before it.
+    let record = registry_record(host.0.pid, "s", &dir.path().join("absent.sock"));
+    private_file(&registry, record.to_string().as_bytes());
+    assert!(
+        matches!(
+            system::discover(&host, dir.path(), &[host.0.pid], Some("s")),
+            Err(system::DiscoveryError::Quarantined("missing"))
+        ),
+        "complete Claude identity must reach socket validation"
+    );
+    assert_eq!(record["procStart"], "Thu Oct 22 01:02:03 2026");
+    assert_ne!(record["procStart"], host.0.instance);
+    for field in ["pid", "procStart"] {
+        let mut bad = record.clone();
+        bad.as_object_mut().unwrap().remove(field);
+        private_file(&registry, bad.to_string().as_bytes());
+        assert!(
+            matches!(
+                system::discover(&host, dir.path(), &[host.0.pid], Some("s")),
+                Err(system::DiscoveryError::Quarantined(
+                    "registry_process_mismatch"
+                ))
+            ),
+            "missing {field} must fail identity validation"
+        );
+    }
+    let mut bad = record;
+    bad["procStart"] = json!(host.0.instance);
+    private_file(&registry, bad.to_string().as_bytes());
+    assert!(
+        matches!(
+            system::discover(&host, dir.path(), &[host.0.pid], Some("s")),
+            Err(system::DiscoveryError::Quarantined(
+                "registry_process_mismatch"
+            ))
+        ),
+        "a kernel token cannot stand in for Claude's lstart"
+    );
+}
+
 fn attempt(queue: Option<&str>) -> Attempt {
     Attempt {
         id: uuid(),
@@ -256,8 +313,7 @@ async fn registry_uses_explicit_or_moved_aside_path_and_rejects_stale_identity()
         .path()
         .join("sessions")
         .join(format!("{}.json", host.0.pid));
-    let good = json!({"pid":host.0.pid,"procStart":host.0.registry_start,"sessionId":"s","peerProtocol":1,
-        "peerFeatures":["notify_idle","artifact_yield"],"messagingSocketPath":socket});
+    let good = registry_record(host.0.pid, "s", &socket);
     private_file(&registry, good.to_string().as_bytes());
     let t = system::discover(&host, dir.path(), &[host.0.pid], Some("s")).unwrap();
     assert_eq!(t.socket, socket);
@@ -720,8 +776,7 @@ async fn socket_fixture() -> (
     let registry = config
         .join("sessions")
         .join(format!("{}.json", process.pid));
-    let record = json!({"procStart":process.registry_start,"sessionId":"receiver-conversation","peerProtocol":1,
-        "peerFeatures":["notify_idle","artifact_yield"],"messagingSocketPath":socket});
+    let record = registry_record(process.pid, "receiver-conversation", &socket);
     private_file(&registry, record.to_string().as_bytes());
     let host = Arc::new(FakeHost(process));
     let target = system::discover(host.as_ref(), &config, &[host.0.pid], None).unwrap();
@@ -1000,6 +1055,33 @@ async fn observation_timeout_is_unknown_and_exact_artifacts_reconcile_without_re
         "PID reuse is not artifact proof"
     );
     let later = FixedClock(later.0 + 2.0 * RECONCILE_INTERVAL_S + 1.0);
+    let observations = ledger::find(&store.read().unwrap(), &a.session, &a.source_key)
+        .unwrap()
+        .unwrap()
+        .observation_count;
+    let mut wrong_start = record.clone();
+    wrong_start["origin"]["verifiedPeerProcStart"] = json!(identity().instance);
+    ledger::reconcile_with(
+        &st,
+        host.clone(),
+        &later,
+        Arc::new(Records(vec![wrong_start])),
+    )
+    .await;
+    assert_eq!(
+        counts(&store.read().unwrap()),
+        (1, 1, 0),
+        "a captured kernel token cannot prove Claude's lstart after relay exit"
+    );
+    assert_eq!(
+        ledger::find(&store.read().unwrap(), &a.session, &a.source_key)
+            .unwrap()
+            .unwrap()
+            .observation_count,
+        observations + 1,
+        "the malformed provenance must actually be observed, not skipped by backoff"
+    );
+    let later = FixedClock(later.0 + 4.0 * RECONCILE_INTERVAL_S + 1.0);
     ledger::reconcile_with(&st, host, &later, Arc::new(Records(vec![record]))).await;
     let c = store.read().unwrap();
     assert_eq!(counts(&c), (0, 1, 1));
@@ -1208,8 +1290,8 @@ async fn auth_key_is_private_process_bound_and_never_logged_or_trusted_when_stal
         wire::sha256(target.socket.as_os_str().as_encoded_bytes())
     ));
     assert_eq!(system::auth_token(host.as_ref(), &target).unwrap(), None);
-    let v =
-        json!({"peerToken":"0123456789abcdef0123456789abcdef","procStart":host.0.registry_start});
+    let v = json!({"peerToken":"0123456789abcdef0123456789abcdef",
+        "procStart":"Thu Oct 22 01:02:03 2026"});
     private_file(&key, v.to_string().as_bytes());
     assert!(system::auth_token(host.as_ref(), &target)
         .unwrap()
@@ -1561,9 +1643,12 @@ fn sigkill_native_wire_and_reverse_receipts_recover_without_replaying() {
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let peer = identity();
-        private_file(&config.join("sessions").join(format!("{}.json",peer.pid)),
-            json!({"procStart":peer.registry_start,"sessionId":"receiver-conversation","peerProtocol":1,
-                "peerFeatures":["notify_idle","artifact_yield"],"messagingSocketPath":socket}).to_string().as_bytes());
+        private_file(
+            &config.join("sessions").join(format!("{}.json", peer.pid)),
+            registry_record(peer.pid, "receiver-conversation", &socket)
+                .to_string()
+                .as_bytes(),
+        );
         let peer_root = root.to_path_buf();
         let peer_phase = phase.to_string();
         let server = std::thread::spawn(move || {
