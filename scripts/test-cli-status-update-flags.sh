@@ -29,6 +29,9 @@
 # real board.
 set -eeuo pipefail
 cd "$(dirname "$0")/.."
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source scripts/lib/test-isolation.sh; amux_test_isolate "$(mktemp -d)" || exit 1
 AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0
 ok(){ echo "  ok   $1"; PASS=$((PASS+1)); }
@@ -75,7 +78,7 @@ run_su() {  # run_su <args...>  -> sets RC, leaves POST bodies in $CAP
   # RC IS THE ASSERTION for several cells (a refused flag must exit non-zero),
   # so the status is captured through `if` rather than lost to `set -e`.
   # `|| true` would set RC=0 and silently pass every refusal cell (AF-562).
-  if timeout 20 env AMUX_API="http://127.0.0.1:$PORT" AMUX_SESSION=su-flag-test \
+  if timeout 20 env AMUX_API="http://127.0.0.1:$PORT" AMUX_URL="http://127.0.0.1:$PORT" AMUX_SESSION=su-flag-test \
       bash "$AMUX_BIN" board status-update "$@" >/dev/null 2>&1; then RC=0; else RC=$?; fi
 }
 posted_text() {
@@ -122,7 +125,7 @@ run_su TEST-1 --file /tmp/su-flag-test-file.txt
   || bad "--file sends the file's bytes" "got: $(posted_text)"
 
 : > "$CAP"
-printf '%s' "$PAYLOAD" | timeout 20 env AMUX_API="http://127.0.0.1:$PORT" AMUX_SESSION=su-flag-test \
+printf '%s' "$PAYLOAD" | timeout 20 env AMUX_API="http://127.0.0.1:$PORT" AMUX_URL="http://127.0.0.1:$PORT" AMUX_SESSION=su-flag-test \
   bash "$AMUX_BIN" board status-update TEST-1 --stdin >/dev/null 2>&1
 [ "$(posted_text)" = "$PAYLOAD" ] \
   && ok "--stdin carries bytes literally" \

@@ -1685,6 +1685,9 @@ async fn golden_backend_interchangeability() {
         return;
     };
 
+    // A private tmux server, never the host fleet's (amux_server::tmux_guard).
+    let tmux_home = tempfile::tempdir().expect("private tmux dir");
+    let _private_tmux = amux_server::tmux_guard::isolate_tests(tmux_home.path());
     // The SAME lifecycle, once per backend.
     let tmux_trace = traced_live_backend_lifecycle(Arc::new(TmuxBackend::new()), "tmux").await;
     let herdr_trace =

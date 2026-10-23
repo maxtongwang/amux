@@ -190,7 +190,7 @@ ${CTA}`
 <h2>What you get with DIY scripts</h2>
 <ul>
 <li><code>tmux new-session -d -s agent1 "claude"</code> — starts a session</li>
-<li><code>tmux send-keys -t agent1 "fix the login bug" Enter</code> — sends a prompt</li>
+<li><code>tmux send-keys -t agent1 "fix the login bug" Enter</code> — sends a prompt</li><!-- tmux-lint: allow(documentation text on the site, not a call) -->
 <li><code>tmux capture-pane -t agent1 -p</code> — reads output</li>
 </ul>
 <h2>What you're missing</h2>

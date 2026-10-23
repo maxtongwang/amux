@@ -31,6 +31,9 @@
 # stub tmux on PATH, so a run can neither reach a real worker nor touch the real tmux
 # server. No network, no fleet state, deterministic.
 set -euo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 cd "$(dirname "$0")/.." || exit 1
 AMUX_BIN="${AMUX_BIN:-./amux}"   # override to run against a fixture
 PASS=0; FAIL=0
@@ -95,6 +98,8 @@ marker="${TMUX_STUB_STATE:-}/spawned"
 # `-N` and fell through to the catch-all — the marker was never written and the
 # post-launch liveness check read every launch as a dead pane. Skip leading
 # flags and switch on the first real word, the way tmux itself parses.
+# Under the test guard the CLI names its private socket first (-S <path>).
+[ "${1:-}" = "-S" ] && shift 2
 verb=""
 for a in "$@"; do
   case "$a" in -*) continue ;; *) verb="$a"; break ;; esac

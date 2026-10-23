@@ -240,7 +240,7 @@ pub(crate) fn footer_goal_active(name: &str) -> Option<bool> {
     // Exact-match target: a bare `amux-x` resolves to a sibling `amux-x-2`
     // pane while `amux-x` is briefly absent.
     let pt = crate::backend::tmux::pane_target(&format!("amux-{name}"));
-    let v = std::process::Command::new("tmux")
+    let v = crate::tmux_guard::std_tmux()
         .args(["capture-pane", "-p", "-t", &pt, "-S", "-12"])
         .output()
         .ok()

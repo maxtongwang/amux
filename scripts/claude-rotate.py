@@ -473,6 +473,7 @@ def probe():
                 # folder already trusted (CLAUDE_ROTATE_PROBE_CWD).
                 break
             if not sent and "❯" in screen:
+                # tmux-lint: allow(production tool: its throwaway /usage probe session lives on the user's own server by design; never run by a test)
                 tmux("send-keys", "-t", name, "/usage", "Enter")
                 sent = True
                 continue
@@ -481,6 +482,7 @@ def probe():
                 break
         windows = parse_usage(screen)
     finally:
+        # tmux-lint: allow(production tool: removes only its own throwaway probe session; never run by a test)
         tmux("kill-session", "-t", name)
     elapsed = round(time.time() - started, 1)
     if not email or "seven_day" not in windows:

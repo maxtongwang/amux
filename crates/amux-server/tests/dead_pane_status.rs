@@ -133,16 +133,15 @@ async fn retained_dead_pane_cannot_remain_idle_in_worker_api() {
             .env_remove("BASH_ENV")
             .env("TMUX_TMPDIR", socket_dir.path())
             .env("AMUX_DEAD_PANE_TEST_CHILD", "1")
+            .env(amux_server::tmux_guard::TEST_ISOLATED_ENV, "1")
             .env("AMUX_REQUIRE_TMUX", "1")
             .output()
             .unwrap();
         // This server belongs exclusively to the newly minted private dir,
         // including when an assertion in the child failed before cleanup.
-        let _ = std::process::Command::new("tmux")
-            .arg("kill-server")
-            .env_remove("TMUX")
-            .env("TMUX_TMPDIR", socket_dir.path())
-            .output();
+        // Named with an explicit -S (tmux_guard::kill_server_in): TMUX_TMPDIR
+        // alone loses to an inherited TMUX and once killed the live server.
+        amux_server::tmux_guard::kill_server_in(socket_dir.path());
         eprintln!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
@@ -158,7 +157,7 @@ async fn retained_dead_pane_cannot_remain_idle_in_worker_api() {
     // profile. Slow host startup can leave the typed fixture command unexecuted
     // for the entire observation window. This specimen tests exit detection,
     // not the developer's shell initialization; use a private minimal server.
-    let bootstrap = std::process::Command::new("tmux")
+    let bootstrap = amux_server::tmux_guard::std_tmux()
         .args([
             "-f",
             "/dev/null",
@@ -175,7 +174,7 @@ async fn retained_dead_pane_cannot_remain_idle_in_worker_api() {
         ("default-shell", "/bin/sh"),
         ("default-command", "exec /bin/sh"),
     ] {
-        assert!(std::process::Command::new("tmux")
+        assert!(amux_server::tmux_guard::std_tmux()
             .args(["set-option", "-g", key, value])
             .status()
             .unwrap()
@@ -205,7 +204,7 @@ async fn retained_dead_pane_cannot_remain_idle_in_worker_api() {
         let cwd = dir.path().to_string_lossy().into_owned();
         async move {
             assert_eq!(backend.status(&proc).await.unwrap(), BackendStatus::Running);
-            let socket = std::process::Command::new("tmux")
+            let socket = amux_server::tmux_guard::std_tmux()
                 .args(["display-message", "-p", "-t", &format!("={}:", proc.backend_ref), "#{socket_path}"])
                 .output().unwrap();
             assert!(socket.status.success());
@@ -255,7 +254,7 @@ async fn retained_dead_pane_cannot_remain_idle_in_worker_api() {
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            assert!(std::process::Command::new("tmux").args(["has-session", "-t", &format!("={}", proc.backend_ref)]).status().unwrap().success(), "positive control: dead pane's session must still exist");
+            assert!(amux_server::tmux_guard::std_tmux().args(["has-session", "-t", &format!("={}", proc.backend_ref)]).status().unwrap().success(), "positive control: dead pane's session must still exist");
             let captured = backend.capture(&proc, 60).await.unwrap();
             let adapter = amux_server::backend::adapter::TerminalAdapter::new(ProviderId::new("claude"));
             let inferred = adapter.scan(&captured);

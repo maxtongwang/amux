@@ -12,6 +12,9 @@
 # `set -e` is the guard against a cell that never ran (AF-561's ratchet applies to
 # this file as much as to any other).
 set -euo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 cd "$(dirname "$0")/.."
 
 HOOKS="$(pwd)/scripts/git-hooks"

@@ -19,6 +19,9 @@
 # Exit 0 = all pass, 1 = a failure.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source scripts/lib/test-isolation.sh; amux_test_isolate "$(mktemp -d)" || exit 1
 AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0
 

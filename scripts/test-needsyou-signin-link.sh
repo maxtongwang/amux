@@ -6,7 +6,7 @@
 #
 # This is a CLI-side write (the desc_append PATCH body is built in the shell), so
 # NO server log could catch a regression — this test is the guard, same as
-# test-register-merge.sh. It runs the REAL shipped verb against a MOCK curl that
+# test-cli-register-through-server.sh. It runs the REAL shipped verb against a MOCK curl that
 # captures the PATCH bodies, so it needs no live server and mutates no board.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -18,6 +18,9 @@ count(){ if [ "$2" = "$(grep -oF -- "$3" "$1" | wc -l | tr -d ' ')" ]; then PASS
 firstline(){ head -1 "$1" > "$1.l1"; printf '%s' "$1.l1"; }
 
 TMP=$(mktemp -d)
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source scripts/lib/test-isolation.sh; amux_test_isolate "$TMP" || exit 1
 # Mock curl: capture every PATCH -d body; canned JSON for the tag-fetch GET.
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/curl" <<'MOCK'

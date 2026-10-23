@@ -508,7 +508,7 @@ fn parse_swap_pct(text: &str) -> Option<f64> {
 /// somebody's work in progress and is not this job's to end.
 fn stale_test_panes(grace_s: u64) -> Vec<String> {
     const HARNESS: [&str; 3] = ["e2e-", "board-reviewer-", "callback-b-"];
-    let out = std::process::Command::new("tmux")
+    let out = crate::tmux_guard::std_tmux()
         .args(["list-sessions", "-F", "#{session_name} #{session_created}"])
         .output();
     let Ok(out) = out else { return Vec::new() };
@@ -945,7 +945,7 @@ fn one_pass() {
     if swap_pct.is_some_and(|p| p >= mem_reap_swap_pct()) {
         for name in stale_test_panes(test_pane_grace_s()) {
             let st = crate::backend::tmux::session_target(&name);
-            if std::process::Command::new("tmux")
+            if crate::tmux_guard::std_tmux()
                 .args(["kill-session", "-t", &st])
                 .status()
                 .is_ok_and(|st| st.success())

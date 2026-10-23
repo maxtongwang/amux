@@ -82,8 +82,9 @@ test('system jobs render with real data, separated from user schedules', async (
     expect(j.purpose, `${id} has no purpose text`).toBeTruthy();
   }
 
-  // This harness has a throwaway AMUX_HOME but shares the host's tmux socket,
-  // process table and hook files. Every internal loop is therefore registered
+  // This harness has a throwaway AMUX_HOME and a private tmux server
+  // (playwright.config.ts TMUX_TMPDIR), but shares the host's process table
+  // and hook files. Every internal loop is therefore registered
   // inert under the process-wide isolation switch. Visibility is preserved;
   // host-wide effects are not.
   const isolated = jobs.jobs.filter((x: any) => x.disabled_reason === 'AMUX_ISOLATED=1');

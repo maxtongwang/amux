@@ -14,9 +14,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {chromium} from 'playwright';
+import {testBase} from './lib/live-base.mjs';
 
 const root = path.resolve(import.meta.dirname, '..');
-const base = process.env.AMUX_TEST_URL || 'https://localhost:8824';
+const base = testBase('AMUX_TEST_URL', 'https://localhost:8824');
 const source = await fs.readFile(path.join(root, 'crates/amux-dashboard/static/app.js'), 'utf8');
 const css = await fs.readFile(path.join(root, 'crates/amux-dashboard/static/app.css'), 'utf8');
 

@@ -131,7 +131,7 @@ fn lease_is_fresh(session: &str) -> bool {
 async fn tmux(args: &[&str]) -> Option<std::process::Output> {
     tokio::time::timeout(
         Duration::from_secs(5),
-        tokio::process::Command::new("tmux").args(args).output(),
+        crate::tmux_guard::tokio_tmux().args(args).output(),
     )
     .await
     .ok()?

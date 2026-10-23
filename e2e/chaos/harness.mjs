@@ -46,6 +46,8 @@ export async function startAmux({ binary, env: extra = {}, root } = {}) {
   Object.assign(env, {
     HOME: userHome, AMUX_HOME: home, AMUX_BIND: '127.0.0.1', AMUX_RS_PORT: String(port), TMUX_TMPDIR: tmuxDir,
     AMUX_ISOLATED: '1', AMUX_NO_SELF_ADOPT: '1',
+    // The server's tmux_guard names this private socket with an explicit -S.
+    AMUX_TEST_ISOLATED: '1',
     // AMUX-4724 refuses spawns from a temp AMUX_HOME because a test usually
     // shares the REAL tmux server. This one does not: TMUX_TMPDIR above is a
     // fresh private socket dir, and the agent is the fake on PATH. So the
@@ -86,9 +88,15 @@ export async function startAmux({ binary, env: extra = {}, root } = {}) {
       await new Promise(r => setTimeout(r, 100));
     }
   };
-  const tmux = (...args) => execFileSync('tmux', args, { env, encoding: 'utf8' });
+  // The private socket named explicitly (the path TMUX_TMPDIR resolves to), so
+  // no call can land on another server even if TMUX leaked back in (2026-10-16:
+  // a TMUX_TMPDIR-only kill-server inside a pane killed the live server).
+  const tmuxSock = path.join(tmuxDir, `tmux-${process.getuid()}`, 'default');
+  fs.mkdirSync(path.dirname(tmuxSock), { recursive: true, mode: 0o700 });
+  const tmux = (...args) => execFileSync('tmux', ['-S', tmuxSock, ...args], { env, encoding: 'utf8' });
   const fakeLog = () => fs.existsSync(log)
     ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) : [];
+  // tmux-lint: allow(the tmux() wrapper above names the private socket with -S)
   const stop = async () => { await down(); try { tmux('kill-server'); } catch {} };
   // The free-port probe races every other process on a busy box: a port can
   // be taken between probe and bind (seen: AddrInUse). Retry the FIRST boot on
