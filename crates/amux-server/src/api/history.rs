@@ -165,9 +165,11 @@ fn contained_delivery_start(text: &str, delivered: &str) -> Option<usize> {
     }
     let first = delivered.chars().next()?;
     let last = delivered.chars().next_back()?;
-    // CJK letters are word characters: adjacent CJK text needs a separator,
-    // like Latin text, to avoid treating word fragments as relay evidence.
-    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    // Use the same Unicode word class as regex \b, including marks, connector
+    // punctuation and join controls, on both sides of each relay edge.
+    static WORD: OnceLock<Regex> = OnceLock::new();
+    let word = WORD.get_or_init(|| Regex::new(r"^\w$").expect("relay word character regex"));
+    let is_word = |c: char| word.is_match(c.encode_utf8(&mut [0; 4]));
     let joins_word = |left: Option<char>, right: Option<char>| {
         left.is_some_and(is_word) && right.is_some_and(is_word)
     };
@@ -230,7 +232,7 @@ fn attach_owner_provenance(conn: &rusqlite::Connection, rows: &mut [Value]) -> r
                 if delivered.chars().filter(|c| !c.is_whitespace()).count() < MIN_DELIVERY_MATCH_CHARS {
                     continue;
                 }
-                if text == delivered {
+                if text.trim() == delivered.trim() {
                     spans.push((0, text.len(), origin.clone()));
                 } else if let Some(start) = contained_delivery_start(text, delivered) {
                     spans.push((start, start + delivered.len(), origin.clone()));
@@ -1686,6 +1688,20 @@ mod tests {
             ("underscore-suffix", RELAY.into(), format!("yes {RELAY}_"), false),
             ("unicode-prefix", RELAY.into(), format!("yes é{RELAY}"), false),
             ("unicode-suffix", RELAY.into(), format!("yes {RELAY}é"), false),
+            ("combining-mark-prefix", RELAY.into(), format!("yes e\u{0301}{RELAY}"), false),
+            ("combining-mark-suffix", RELAY.into(), format!("yes {RELAY}\u{0301} owner"), false),
+            ("relay-combining-mark-prefix", format!("\u{0301}{RELAY}"), format!("yes e\u{0301}{RELAY}"), false),
+            ("relay-combining-mark-suffix", format!("{RELAY}\u{0301}"), format!("yes {RELAY}\u{0301}x"), false),
+            ("fullwidth-underscore-prefix", RELAY.into(), format!("yes x\u{FF3F}{RELAY}"), false),
+            ("fullwidth-underscore-suffix", RELAY.into(), format!("yes {RELAY}\u{FF3F}x"), false),
+            ("undertie-prefix", RELAY.into(), format!("yes x\u{203F}{RELAY}"), false),
+            ("undertie-suffix", RELAY.into(), format!("yes {RELAY}\u{203F}x"), false),
+            ("zwj-prefix", RELAY.into(), format!("yes x\u{200D}{RELAY}"), false),
+            ("zwj-suffix", RELAY.into(), format!("yes {RELAY}\u{200D}x"), false),
+            ("zwnj-prefix", RELAY.into(), format!("yes x\u{200C}{RELAY}"), false),
+            ("zwnj-suffix", RELAY.into(), format!("yes {RELAY}\u{200C}x"), false),
+            ("review-nfd-cafe", "the lease was signed by cafe".into(), "ok the lease was signed by cafe\u{0301} owner".into(), false),
+            ("review-fullwidth-underscore", "Katella lease countersigned".into(), "ok Katella lease countersigned\u{FF3F}x".into(), false),
             ("digit-prefix", RELAY.into(), format!("yes 7{RELAY}"), false),
             ("digit-suffix", RELAY.into(), format!("yes {RELAY}7"), false),
             ("continue", "continue".into(), "please continue with the plan you drafted".into(), false),
@@ -1703,6 +1719,9 @@ mod tests {
             ("overlapping-bounded-occurrence", "go go go go go go".into(), "xgo go go go go go go".into(), true),
             ("newline-boundaries", RELAY.into(), format!("yes\n{RELAY}\nthanks"), true),
             ("whole-eight", "abcdefgh".into(), "abcdefgh".into(), true),
+            ("whole-owner-whitespace", "approved".into(), " \napproved\n ".into(), true),
+            ("whole-relay-whitespace", " \napproved\n ".into(), "approved".into(), true),
+            ("whole-both-whitespace", "\napproved it ".into(), " \napproved it\n ".into(), true),
             ("whole-seven", "abcdefg".into(), "abcdefg".into(), false),
             ("whole-eight-cjk", "一二三四五六七八".into(), "一二三四五六七八".into(), true),
             ("whole-seven-cjk", "一二三四五六七".into(), "一二三四五六七".into(), false),
