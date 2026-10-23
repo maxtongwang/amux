@@ -664,18 +664,19 @@ pub(super) async fn reconcile_with(
             tracing::info!(attempt_id=%a.id,reason,measured=false,n_considered=1,verdict="native_artifact_unmeasured","absence cannot confirm or cancel native delivery");
         }
         let id = a.id.clone();
+        let attempt = a.clone();
         let result=store.write_async(move |conn| {
             let mut changed=false;
-            if a.state == ReceiptState::Unknown && a.unknown_since.is_some_and(|since| at >= since + super::UNKNOWN_HOLD_S) {
+            if attempt.state == ReceiptState::Unknown && attempt.unknown_since.is_some_and(|since| at >= since + super::UNKNOWN_HOLD_S) {
                 changed|=transition(conn,&id,ReceiptState::Uncertain,"unknown_hold_deadline",at)?;
             }
             else if positive {changed|=transition(conn,&id,ReceiptState::Consumed,"exact_receiver_artifact",at)?;}
             else if receiver_lost {changed|=transition(conn,&id,ReceiptState::Unknown,"receiver_instance_changed",at)?;}
-            else if at-a.created_at>OBSERVATION_TIMEOUT_S && matches!(a.state,ReceiptState::Reserved|ReceiptState::WrittenUnconfirmed) {
+            else if at-attempt.created_at>OBSERVATION_TIMEOUT_S && matches!(attempt.state,ReceiptState::Reserved|ReceiptState::WrittenUnconfirmed) {
                 changed|=transition(conn,&id,ReceiptState::Unknown,"observation_deadline",at)?;
             }
             changed|=finalize(conn,&id)?;
-            conn.execute("UPDATE native_delivery_attempts SET next_observation_at=?2,observation_count=observation_count+1 WHERE attempt_id=?1",params![id,next_observation(&a,at)])?;
+            conn.execute("UPDATE native_delivery_attempts SET next_observation_at=?2,observation_count=observation_count+1 WHERE attempt_id=?1",params![id,next_observation(&attempt,at)])?;
             Ok(WriteOutcome{applied:changed,events:if changed {message_events(conn,ReceiptLookup::Attempts(&[id]))?}else{vec![]}})
         }).await;
         if let Err(e) = result {
