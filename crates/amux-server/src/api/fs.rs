@@ -1063,9 +1063,15 @@ pub fn is_dangerous_write(p: &Path) -> bool {
 /// Shared mutation policy. `path` is the requested/resolved name within
 /// the API's namespace (absolute for /api/fs and /api/file, relative to the
 /// configured root for /api/files); `target` is its filesystem location.
-/// Callers judge BOTH requested and resolved names before any mutation.
+/// Callers judge BOTH requested and resolved names before any mutation,
+/// retaining the requested filesystem location as `target` for both checks.
 pub(crate) fn write_refusal(path: &Path, target: &Path) -> Option<(&'static str, &'static str)> {
-    if path.components().any(|component| {
+    let resolved = resolve_nonstrict(target);
+    let draw_root = resolve_nonstrict(&crate::config::amux_home().join("draw"));
+    // Draw alone may live under a hidden data directory. Judge the original
+    // request too: neither an outside alias nor an escaping link earns a waiver.
+    let draw_target = target.starts_with(&draw_root) && resolved.starts_with(&draw_root);
+    if !draw_target && path.components().any(|component| {
         matches!(component, Component::Normal(name) if name.as_encoded_bytes().starts_with(b"."))
     }) {
         return Some((
@@ -1089,7 +1095,7 @@ pub(crate) fn write_refusal(path: &Path, target: &Path) -> Option<(&'static str,
     {
         use std::os::unix::fs::PermissionsExt;
 
-        if let Ok(metadata) = std::fs::symlink_metadata(target) {
+        if let Ok(metadata) = std::fs::symlink_metadata(&resolved) {
             if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
                 return Some((
                     "write_executable_refused",
@@ -1106,7 +1112,7 @@ pub(crate) fn write_refusal(path: &Path, target: &Path) -> Option<(&'static str,
 pub(crate) fn write_refusal_response(path: &Path, operation: &str) -> Option<Response> {
     let resolved = resolve_nonstrict(path);
     for candidate in [path, resolved.as_path()] {
-        if let Some((code, error)) = write_refusal(candidate, candidate) {
+        if let Some((code, error)) = write_refusal(candidate, path) {
             tracing::warn!(target: "amux::fs", path = ?path, resolved = ?resolved,
                 operation, verdict = code, measured = true, n_considered = 1,
                 "filesystem mutation refused: {error}");

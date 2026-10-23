@@ -3077,6 +3077,148 @@ pub(crate) mod tests {
         }
     }
 
+    // Use the existing env guard: viewer PUT must exercise the real home resolver.
+    fn draw_test_home() -> (tempfile::TempDir, crate::api::settings::test_env::HomeGuard) {
+        let dir = tempfile::Builder::new().prefix("amux-draw-").tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap().join(".amux");
+        std::fs::create_dir(&home).unwrap();
+        let guard = crate::api::settings::test_env::set_home(&home);
+        (dir, guard)
+    }
+
+    async fn draw_test_put(app: &axum::Router, path: &Path) -> (StatusCode, Value) {
+        let (status, _, bytes) = send(app, HttpRequest::builder().method("PUT").uri("/api/file")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"path": path, "content": "new"}).to_string())).unwrap()).await;
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn write_refusal_draw_save_library_and_recents() {
+        let (_dir, _guard) = draw_test_home();
+        let app = app();
+        let root = crate::config::amux_home().join("draw");
+        // The entire Draw root initially does not exist: resolve its existing prefix.
+        for name in ["drawings/x.excalidraw", "library.excalidrawlib", "recents.json"] {
+            let path = root.join(name);
+            let (status, body) = draw_test_put(&app, &path).await;
+            assert_eq!(status, StatusCode::OK, "{name}: {body}");
+            assert_eq!(body["ok"], true);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_refusal_draw_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let (dir, _guard) = draw_test_home();
+        let app = app();
+        let root = crate::config::amux_home().join("draw");
+        let outside = std::fs::canonicalize(dir.path()).unwrap().join(".ssh");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+        // notes.txt isolates containment from the independent authorized_keys rule.
+        for name in ["notes.txt", "authorized_keys"] {
+            let (status, body) = draw_test_put(&app, &root.join("link").join(name)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{name}: {body}");
+            assert_eq!(body["code"], "write_dotfile_refused", "{body}");
+            assert!(!outside.join(name).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn write_refusal_draw_keeps_repo_gitignore_hidden() {
+        let (dir, _guard) = draw_test_home();
+        let app = app();
+        let repo = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let path = repo.join(".gitignore");
+        std::fs::write(&path, "keep").unwrap();
+        let (status, body) = draw_test_put(&app, &path).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "write_dotfile_refused");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "keep");
+    }
+
+    #[tokio::test]
+    async fn write_refusal_draw_rejects_siblings_and_prefix_tricks() {
+        let (_dir, _guard) = draw_test_home();
+        let app = app();
+        let home = crate::config::amux_home();
+        for path in [home.join("notdraw/x"), home.join("drawx/x"), home.join("x"),
+            home.with_file_name(".amuxdraw").join("x"), home.join("draw/../notdraw/x")] {
+            let (status, body) = draw_test_put(&app, &path).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{}: {body}", path.display());
+            assert_eq!(body["code"], "write_dotfile_refused");
+            assert!(!path.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_refusal_draw_requires_requested_path_inside_root() {
+        use std::os::unix::fs::symlink;
+        let (dir, _guard) = draw_test_home();
+        let app = app();
+        let root = crate::config::amux_home().join("draw");
+        std::fs::create_dir_all(root.join("drawings")).unwrap();
+        symlink(root.join("drawings"), root.join("internal")).unwrap();
+        let (status, body) = draw_test_put(&app, &root.join("internal/ok.excalidraw")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(std::fs::read_to_string(root.join("drawings/ok.excalidraw")).unwrap(), "new");
+        // A visible alias outside Draw must not borrow its hidden-directory waiver.
+        let alias = std::fs::canonicalize(dir.path()).unwrap().join("alias");
+        symlink(&root, &alias).unwrap();
+        let (status, body) = draw_test_put(&app, &alias.join("outside.excalidraw")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "write_dotfile_refused");
+        assert!(!root.join("outside.excalidraw").exists());
+    }
+
+    #[tokio::test]
+    async fn write_refusal_draw_keeps_dangerous_and_executable_guards() {
+        let (_dir, _guard) = draw_test_home();
+        let app = app();
+        let root = crate::config::amux_home().join("draw");
+        for name in ["authorized_keys", ".zshrc", "evil.plist", "bin/notes.txt"] {
+            let path = root.join(name);
+            let (status, body) = draw_test_put(&app, &path).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{name}: {body}");
+            assert_eq!(body["code"], "write_dangerous_write_refused", "{body}");
+            assert!(!path.exists());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            std::fs::create_dir_all(&root).unwrap();
+            let executable = root.join("tool.txt");
+            std::fs::write(&executable, "keep").unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            symlink(&executable, root.join("alias.txt")).unwrap();
+            for path in [&executable, &root.join("alias.txt")] {
+                let (status, body) = draw_test_put(&app, path).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+                assert_eq!(body["code"], "write_executable_refused");
+                assert_eq!(std::fs::read_to_string(&executable).unwrap(), "keep");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn write_refusal_draw_keeps_sensitive_home_guard() {
+        // No real home: the task's test process has a private scratch HOME.
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let sensitive = crate::api::fs::resolve_nonstrict(&home).join(".ssh");
+        let _guard = crate::api::settings::test_env::set_home(&sensitive);
+        let path = sensitive.join("draw/notes.txt");
+        let (status, body) = draw_test_put(&app(), &path).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "write_path_not_allowed");
+        assert!(!path.exists());
+    }
+
     /// The spreadsheet viewer's save: bytes for .xlsx only, refused when the
     /// file changed on disk since it was opened, never half-written.
     #[tokio::test]

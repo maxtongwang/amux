@@ -17,22 +17,30 @@ control characters.
 | `POST /api/fs/mkdir` | Requested and resolved directory |
 
 The rooted Files API retains its namespace boundary: the configured root itself
-may be hidden (`AMUX_FILES_ROOT` overrides the default `$HOME`), but hidden components underneath it
-are refused. The general filesystem APIs accept absolute paths and check all
-components. No project-root or dashboard-only exemption exists.
+may be hidden (`AMUX_FILES_ROOT` overrides the default `$HOME`), but hidden
+components underneath it are refused except for the Draw rule below. The general
+filesystem APIs accept absolute paths and check all components. No project-root
+or dashboard-only exemption exists; repo `.gitignore` edits remain refused.
 
-## Dashboard Compatibility Decision
+## Draw Storage Exception
 
-The viewer saves text, spreadsheets, and Draw data through `PUT /api/file`.
-Its text allowlist and extensionless branch previously allowed names such as
-`.gitignore`. The absolute-path API has no project-root restriction. The shared
-rule now refuses those edits, including ordinary files inside hidden folders.
+Only amux's own Draw root, `$AMUX_HOME/draw`, waives the hidden-component rule.
+The server uses `config::amux_home()` (`AMUX_HOME`, legacy `CC_HOME`, else
+`$HOME/.amux`) and resolves the root with `resolve_nonstrict`. Both the requested
+filesystem path and its fully resolved target must be inside that canonical
+root, using component containment rather than string prefixes. Existing path
+prefixes are resolved even when the destination has not been created yet.
 
-Draw defaults to `_drawDataDir()` (`_AMUX_DATA_DIR`, else
-`_AMUX_HOME + '/.amux'`). Its `draw/library.excalidrawlib`, `draw/recents.json`,
-and default `draw/drawings` paths therefore encounter the hidden-directory
-rule under the normal `.amux` root. A lead must decide how to scope legitimate
-hidden-path editing and Draw storage; this change introduces no exception.
+The exemption does not waive sensitive home/system path, dangerous-write, or
+existing executable-file checks. A symlink inside Draw pointing outside the root
+is refused. The data directory itself, siblings such as `.amux/notdraw`, prefix
+tricks such as `.amux/drawx` or `.amuxdraw`, and all other hidden paths remain
+refused.
+
+The dashboard's `_drawDataDir()` uses the injected `_AMUX_DATA_DIR` (the server's
+amux home), falling back to `_AMUX_HOME + '/.amux'` (the bootstrap's user home).
+Its `draw/library.excalidrawlib`, `draw/recents.json`, and default
+`draw/drawings` saves use `PUT /api/file` and qualify for this exception.
 
 ## Regression Verification
 
@@ -42,3 +50,8 @@ including an ordinary sibling that still succeeds. The existing
 resolved hidden directories and write-time executable/symlink refusals.
 Run server tests through the isolated private-HOME command from the task
 handoff, always including `-- --skip process_identity`.
+
+The `write_refusal_draw_` viewer tests cover Draw saves, symlink escapes, repo
+`.gitignore`, and sibling/prefix refusals. Containment mutation proofs also use
+an ordinary filename outside Draw so the independent `authorized_keys` refusal
+cannot hide a broken containment check.

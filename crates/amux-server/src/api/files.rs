@@ -355,8 +355,8 @@ async fn upload_into(root: PathBuf, headers: &axum::http::HeaderMap, q: &PathPar
             json!({ "error": "upload path resolves outside the files root (symlink)" }),
         );
     };
-    for (r, t) in [(&rel, &target), (&real_rel, &real_target)] {
-        if let Some((code, error)) = crate::api::fs::write_refusal(r, t) {
+    for r in [&rel, &real_rel] {
+        if let Some((code, error)) = crate::api::fs::write_refusal(r, &target) {
             return refuse(code, error);
         }
     }
@@ -427,6 +427,23 @@ mod tests {
         let status = r.status();
         let bytes = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_refusal_draw_rooted_upload_requires_both_paths_inside_draw() {
+        let dir = root();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join(".amux");
+        let _guard = crate::api::settings::test_env::set_home(&home);
+        let (status, body) = put(&root, ".amux/draw/drawings/x.excalidraw", b"new").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(std::fs::read(home.join("draw/drawings/x.excalidraw")).unwrap(), b"new");
+        std::os::unix::fs::symlink(home.join("draw"), root.join("alias")).unwrap();
+        let (status, body) = put(&root, "alias/outside.txt", b"bad").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "write_dotfile_refused");
+        assert!(!home.join("draw/outside.txt").exists());
     }
 
     /// PR #48 round-2 B2 and ai-config #227 case 4: only the parent was checked
