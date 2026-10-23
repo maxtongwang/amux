@@ -1346,16 +1346,77 @@ fn wire_crash_child() {
     });
 }
 
+// Allow subprocess startup/SQLite coordination while keeping fixture waits bounded.
+const FIXTURE_TIMEOUT: Duration = Duration::from_secs(20);
+const FIXTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 fn wait_fixture(path: &Path, ready: impl Fn() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + FIXTURE_TIMEOUT;
     while !ready() {
         assert!(
             std::time::Instant::now() < deadline,
             "fixture deadline: {}",
             path.display()
         );
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(FIXTURE_POLL_INTERVAL);
     }
+}
+
+fn configure_blocking_fixture_stream(stream: &std::os::unix::net::UnixStream) {
+    // macOS accept inherits O_NONBLOCK from the polling listener. Socket
+    // timeouts alone do not clear it: read_line can race the child's first write.
+    stream.set_nonblocking(false).unwrap();
+    let timeout = Some(FIXTURE_TIMEOUT);
+    stream.set_read_timeout(timeout).unwrap();
+    stream.set_write_timeout(timeout).unwrap();
+    eprintln!(
+        "verdict=native_fixture_stream_blocking measured=true n_considered=1 read_write_deadlines=true"
+    );
+}
+
+#[test]
+fn blocking_fixture_stream_clears_inherited_nonblocking_before_io() {
+    use std::io::{BufRead, Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream as BlockingStream;
+
+    // Force the macOS accept inheritance on every OS, without a bind or a race.
+    let (mut reader, mut writer) = BlockingStream::pair().unwrap();
+    reader.set_nonblocking(true).unwrap();
+    let mut byte = [0];
+    assert_eq!(
+        reader.read(&mut byte).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    configure_blocking_fixture_stream(&reader);
+    // Check the actual descriptor mode before any writer can mask the defect.
+    let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+    assert_ne!(flags, -1);
+    assert_eq!(
+        flags & libc::O_NONBLOCK,
+        0,
+        "fixture stream must block until data or its deadline"
+    );
+    assert_eq!(reader.read_timeout().unwrap(), Some(FIXTURE_TIMEOUT));
+    assert_eq!(reader.write_timeout().unwrap(), Some(FIXTURE_TIMEOUT));
+    writer.set_nonblocking(true).unwrap();
+    configure_blocking_fixture_stream(&writer);
+    let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+    assert_ne!(flags, -1);
+    assert_eq!(flags & libc::O_NONBLOCK, 0);
+    let producer = std::thread::spawn(move || {
+        writer.write_all(b"one native frame\n").unwrap();
+    });
+    let mut reader = std::io::BufReader::new(reader);
+    let mut line = String::new();
+    assert_eq!(
+        reader.read_line(&mut line).unwrap(),
+        b"one native frame\n".len()
+    );
+    assert_eq!(line, "one native frame\n");
+    line.clear();
+    assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+    producer.join().unwrap();
 }
 
 #[test]
@@ -1397,7 +1458,7 @@ fn sigkill_native_wire_and_reverse_receipts_recover_without_replaying() {
         let peer_root = root.to_path_buf();
         let peer_phase = phase.to_string();
         let server = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let deadline = std::time::Instant::now() + FIXTURE_TIMEOUT;
             let (stream, _) = loop {
                 match listener.accept() {
                     Ok(s) => break s,
@@ -1406,17 +1467,15 @@ fn sigkill_native_wire_and_reverse_receipts_recover_without_replaying() {
                             std::time::Instant::now() < deadline,
                             "fixture accept deadline"
                         );
-                        std::thread::sleep(Duration::from_millis(10));
+                        std::thread::sleep(FIXTURE_POLL_INTERVAL);
                     }
                     Err(e) => panic!("fixture accept: {e}"),
                 }
             };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(20)))
-                .unwrap();
+            configure_blocking_fixture_stream(&stream);
             let mut reader = std::io::BufReader::new(stream);
             let mut line = String::new();
-            let n = reader.read_line(&mut line).unwrap();
+            let n = reader.read_line(&mut line).expect("fixture native frame read");
             if peer_phase == "before_write" {
                 assert_eq!(n, 0);
                 return 0;
@@ -1432,6 +1491,7 @@ fn sigkill_native_wire_and_reverse_receipts_recover_without_replaying() {
                     .strip_prefix("uds:")
                     .unwrap();
                 let mut callback = BlockingStream::connect(reply).unwrap();
+                configure_blocking_fixture_stream(&callback);
                 for state in ["held", "delivered"] {
                     writeln!(callback,"{}",json!({"type":"control","action":"peer_message_status","msgV":1,"msg_id":uuid(),
                         "orig_msg_id":frame["msg_id"],"status":state,"from":wire::address(&peer_root.join("receiver.sock")).unwrap()})).unwrap();
@@ -1441,8 +1501,12 @@ fn sigkill_native_wire_and_reverse_receipts_recover_without_replaying() {
             }
             // No second native user frame is allowed before the child dies.
             let mut rest = String::new();
-            let _ = reader.read_line(&mut rest);
-            assert!(rest.trim().is_empty());
+            assert_eq!(
+                reader.read_line(&mut rest).expect("fixture EOF read"),
+                0,
+                "unexpected second native frame"
+            );
+            assert!(rest.is_empty());
             1
         });
         let mut child = FixtureChild(

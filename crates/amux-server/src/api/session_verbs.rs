@@ -10043,7 +10043,8 @@ async fn live_claude_conversation(name: &str) -> Option<String> {
 /// Bind native registry discovery to descendants of this worker's actual pane.
 /// Tests inject the process inventory instead of inspecting the live tmux.
 pub(super) async fn native_target_pids(name: &str) -> Option<Vec<u32>> {
-    let pane = tmux(&["display-message", "-p", "-t", &pt(name), "#{pane_pid}"]).await?;
+    let pt = pt(name);
+    let pane = tmux(&["display-message", "-p", "-t", &pt, "#{pane_pid}"]).await?;
     if !pane.status.success() { return None; }
     let root: i32 = String::from_utf8_lossy(&pane.stdout).lines().next()?.trim().parse().ok()?;
     let out = run_cmd("ps", &["-A", "-o", "pid=,ppid="], OP_TIMEOUT).await?;

@@ -112,6 +112,12 @@ terminal adapters. Crash tests SIGKILL a subprocess against a fixture WAL databa
 They do not invoke Claude, live tmux, the default Claude socket namespace, the
 live server or the user's Amux state.
 
+The synchronous SIGKILL peer polls a non-blocking listener, then explicitly
+clears inherited non-blocking mode on accepted streams before buffered reads.
+Both its read and callback write operations have fixture deadlines; read errors
+cannot count as EOF. A socket-pair regression forces non-blocking mode before
+configuration so this contract is tested without an accept/scheduling race.
+
 ```sh
 CARGO_TARGET_DIR="$HOME/.amux/rust-build-target/verification" scripts/safe-cargo.sh check --workspace
 scripts/test-native-delivery.sh
