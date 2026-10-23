@@ -645,13 +645,13 @@ fn tmux_session_pids() -> std::collections::HashMap<String, u64> {
         if !name.starts_with("amux-") {
             continue;
         }
-        // Get pane PID for this session.
+        // Get the active pane PID for this session, matching capture/send.
         //
         // pane_target(), not a hand-spelled `={name}`: this is a PANE-level
         // command, and the helper's trailing colon is load-bearing — `={name}`
-        // names the session, `={name}:` names its ACTIVE WINDOW. Without it
-        // `list-panes` can report a different window's pane, so the pid we
-        // cache here would belong to the wrong process.
+        // names the session, `={name}:` names its ACTIVE WINDOW.
+        // `display-message` resolves that window's active pane; list-panes
+        // enumerates siblings and its first row can be a different process.
         //
         // Caught by tests/tmux_target_audit.rs, which exists precisely because
         // a non-exact or wrong-level `-t` lands in a sibling session's pane
@@ -661,12 +661,10 @@ fn tmux_session_pids() -> std::collections::HashMap<String, u64> {
         // even the correct one — reads as hand-spelled. Keeping the convention
         // is what lets a grep-shaped check stay reliable.
         let pt = crate::backend::tmux::pane_target(&name);
-        if let Some(pane_out) = cmd_output("tmux", &["list-panes", "-t", &pt, "-F", "#{pane_pid}"])
+        if let Some(pane_out) = cmd_output("tmux", &["display-message", "-p", "-t", &pt, "#{pane_pid}"])
         {
-            if let Some(pid_s) = pane_out.lines().next() {
-                if let Ok(pid) = pid_s.trim().parse::<u64>() {
-                    map.insert(name, pid);
-                }
+            if let Ok(pid) = pane_out.trim().parse::<u64>() {
+                map.insert(name, pid);
             }
         }
     }
