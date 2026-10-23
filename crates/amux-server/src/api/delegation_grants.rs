@@ -1048,6 +1048,29 @@ mod tests {
         (tables, files)
     }
 
+    /// dev-lead 2026-10-19: a lead changes membership only through a cited
+    /// grant (its direct own-team-tag removal row is gone). Uncited: refused;
+    /// cited by the lead's own ask and Max's reply: applied, as a grant.
+    #[tokio::test]
+    async fn a_lead_changes_membership_only_through_a_cited_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        let app = super::super::router(state.clone());
+        let (st, v, _) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("test-dev-lead"),
+            json!({"tags": []}), None).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(env_of(tmp.path()).contains("CC_TAGS=\"dev\""), "uncited: nothing changed");
+        let ask = put_row(&state, "test-desk", "Max, may I take test-dev-a out of the dev team (its tags)?", "session", "test-dev-lead", "direct", None, now() - 60.0);
+        let reply = put_row(&state, "test-desk", "yes", "user", "pane", "pane", None, now() - 30.0);
+        let (st, v, h) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("test-dev-lead"),
+            json!({"tags": [], "cite": {"ask_row_id": ask, "reply_row_id": reply}}), None).await;
+        assert!(st.is_success(), "{st} {v}");
+        let code = h.get(GRANT_CODE_HEADER).and_then(|v| v.to_str().ok()).unwrap().to_string();
+        assert_eq!(load(&state, &code).unwrap().status, "applied");
+        assert!(!env_of(tmp.path()).contains("CC_TAGS=\"dev\""), "cited: the tag change applied: {}", env_of(tmp.path()));
+    }
+
     /// Cite mode (the default): a valid citation pair applies the change at
     /// once as a grant, stores BOTH texts, is logged and fed to the leads, and
     /// undo restores the files exactly.
