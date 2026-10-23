@@ -9,7 +9,8 @@
 //! - lead of team T (CC_ORCHESTRATOR=1 AND `leads`): create in T (never
 //!   untagged; never with yolo, flags, isolated or creator); rename and stop
 //!   a T worker that is not a peer lead; tag changes on non-lead T workers
-//!   only through a cited grant (no-ops refused; other targets owner-only);
+//!   only through a cited grant, adding or removing only the lead's own groups
+//!   (no-ops refused; other targets or changed groups owner-only);
 //!   team rules for T; model/effort on a T worker.
 //!   Adding or removing `leads` is refused even with a cited pair. Any other
 //!   config field, group config, settings and guards are refused.
@@ -214,13 +215,13 @@ async fn lead_changes_tags_only_through_a_cited_grant_and_never_makes_a_lead() {
     assert_eq!(e.grant_status(&grant), "applied", "cited tag removal is an applied grant");
     assert!(e.tags(DEV_B).is_empty(), "{:?}", e.tags(DEV_B));
 
-    // Eligibility follows the current target: DEV_A may gain ops via a grant,
-    // but other-team/privileged targets stay owner-only. Changing `leads`
-    // takes precedence over that target refusal; no-op wins over it too.
+    // Both the target and changed tags must belong to the lead's teams.
+    // Other-team tags and other-team/privileged targets stay owner-only.
+    // Changing `leads` wins over these boundaries; no-op wins over them too.
     let t = now_s() - 60.0;
     for (target, tags, ctx, code) in [
         (DEV_A, "dev,leads", "adds leads", "worker_group_membership_refused"),
-        (DEV_A, "dev,ops", "adds another team's tag", "cite_missing"),
+        (DEV_A, "dev,ops", "adds another team's tag", "peer_config_owner_only"),
         (OPS_A, "ops,dev", "pulls another team's worker into T", "peer_config_owner_only"),
         (MRPOPO, "leads,dev", "touches mrpopo", "peer_config_owner_only"),
         (DEV_LEAD2, "dev,leads,ops", "touches a peer lead", "peer_config_owner_only"),
@@ -264,16 +265,15 @@ async fn lead_changes_tags_only_through_a_cited_grant_and_never_makes_a_lead() {
     assert_eq!(e.tags(DEV_A), before, "cited lead promotion changed tags");
     assert_eq!(e.latest_grant(), grant, "refused lead promotion records no new grant");
 
-    // The target is an own-team worker even when the requested tag is ops.
+    // A citation cannot add another team's tag even on an own-team worker.
     let t = cited_at + 115.0;
     let a = e.seed_row(MAX_PANE, &format!("Max, may I set {DEV_A}'s tags to dev,ops?"), "session", DEV_LEAD, Some("direct"), t);
     let r = e.seed_pane_prompt(MAX_PANE, "yes", t + 1.0);
+    let before = e.tags(DEV_A);
     let (st, v) = e.call(lead, "PATCH", &cfg(DEV_A), Some(json!({"tags": "dev,ops", "cite": {"ask_row_id": a, "reply_row_id": r}}))).await;
-    assert_allowed(st, &v, "lead adds ops on its own team's worker through a cited grant");
-    assert_eq!(e.tags(DEV_A), e.set(&["dev", "ops"]));
-    let widening_grant = e.latest_grant();
-    assert_ne!(widening_grant, grant, "cited own-team widening records a new grant");
-    assert_eq!(e.grant_status(&widening_grant), "applied", "cited own-team widening is an applied grant");
+    assert_code(st, &v, "peer_config_owner_only", "lead adds another team's tag with a citation");
+    assert_eq!(e.tags(DEV_A), before, "cited cross-team refusal changed tags");
+    assert_eq!(e.latest_grant(), grant, "cited cross-team refusal recorded a new grant");
 }
 
 // ---- lead of team T: rules, config ------------------------------------------
