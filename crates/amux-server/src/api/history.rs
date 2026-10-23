@@ -157,6 +157,21 @@ fn attach_linked_cards(conn: &rusqlite::Connection, rows: &mut [Value]) -> rusql
 const PROVENANCE_WINDOW_MS: i64 = 6 * 3600 * 1000;
 const PROVENANCE_DELIVERIES: usize = 64;
 const PROVENANCE_STAMP_PATTERN: &str = r"\[(?:quoted )?amux-origin:\s*([^\]\r\n]+)\]";
+const MIN_CONTAINED_MATCH_CHARS: usize = 16;
+
+fn contained_delivery_start(text: &str, delivered: &str) -> Option<usize> {
+    if delivered.chars().count() < MIN_CONTAINED_MATCH_CHARS {
+        return None;
+    }
+    static WORD_BOUNDARY: OnceLock<Regex> = OnceLock::new();
+    let boundary = WORD_BOUNDARY.get_or_init(|| Regex::new(r"\b").expect("word boundary regex"));
+    // Search every occurrence: an embedded fragment can precede a real quote.
+    text.match_indices(delivered).map(|(start, _)| start).find(|start| {
+        [*start, *start + delivered.len()].into_iter().all(|offset| {
+            boundary.find_at(text, offset).is_some_and(|m| m.start() == offset)
+        })
+    })
+}
 
 /// Owner attribution describes the input channel, not every word in a turn.
 /// Keep the original text and expose embedded relay evidence separately.
@@ -205,7 +220,9 @@ fn attach_owner_provenance(conn: &rusqlite::Connection, rows: &mut [Value]) -> r
                 if delivered.chars().filter(|c| !c.is_whitespace()).count() < MIN_DELIVERY_MATCH_CHARS {
                     continue;
                 }
-                if let Some(start) = text.find(delivered) {
+                if text == delivered {
+                    spans.push((0, text.len(), origin.clone()));
+                } else if let Some(start) = contained_delivery_start(text, delivered) {
                     spans.push((start, start + delivered.len(), origin.clone()));
                 } else if super::session_verbs::held_delivery_matching(text, session, &[(delivered.clone(), origin.clone())]).is_some() {
                     spans.push((0, text.len(), origin.clone()));
@@ -1608,13 +1625,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ai194b_owner_history_short_peer_words_in_owner_sentences_are_not_relayed() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, state, _db) = app_with_state();
+        for (lane, relay, owner) in [
+            ("peer-continue", "continue", "please continue with the plan you drafted"),
+            ("peer-approved", "approved", "not approved yet, wait for Max"),
+        ] {
+            state.store.write(move |c| {
+                c.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery) VALUES (?1,'session',?2,1000,'dev-lead','direct')",
+                    rusqlite::params![relay, lane])?;
+                c.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery) VALUES (?1,'user',?2,2000,'','pane')",
+                    rusqlite::params![owner, lane])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            }).unwrap();
+            let (status, rows) = send(&app, "GET", &format!("/api/history?session={lane}"), None).await;
+            assert_eq!(status, StatusCode::OK, "{rows}");
+            let owners: Vec<_> = rows.as_array().unwrap().iter().filter(|r| r["sender"] == "owner").collect();
+            assert_eq!(owners.len(), 1);
+            let (status, item) = send(&app, "GET", &format!("/api/history/{}", owners[0]["id"]), None).await;
+            assert_eq!(status, StatusCode::OK, "{item}");
+            for row in [owners[0], &item] {
+                assert_eq!(row["mixed_provenance"], false, "a short shared word is not relay evidence: {row}");
+                assert!(row.get("provenance_matches").is_none(), "{row}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ai194b_owner_history_contained_relay_requires_word_boundaries() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, state, _db) = app_with_state();
+        const RELAY: &str = "abcdefghijklmnop";
+        state.store.write(|c| {
+            c.execute("INSERT INTO cmd_history(id,text,type,session,ts,origin,delivery) VALUES (1,?1,'session','relay-boundaries',1000,'dev-lead','direct')", [RELAY])?;
+            for (id, text) in [
+                (2, format!("Owner draft x{RELAY}")),
+                (3, format!("Owner draft {RELAY}x")),
+                (4, format!("Owner draft _{RELAY}_")),
+                (5, format!("Owner draft é{RELAY}é")),
+                (6, format!("Owner draft x{RELAY} then \"{RELAY}\"")),
+            ] {
+                c.execute("INSERT INTO cmd_history(id,text,type,session,ts,origin,delivery) VALUES (?1,?2,'user','relay-boundaries',2000,'','pane')",
+                    rusqlite::params![id, text])?;
+            }
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        for id in 2..=5 {
+            let (status, row) = send(&app, "GET", &format!("/api/history/{id}"), None).await;
+            assert_eq!(status, StatusCode::OK, "{row}");
+            assert_eq!(row["mixed_provenance"], false, "embedded word fragments are not relay evidence: {row}");
+        }
+        let (status, row) = send(&app, "GET", "/api/history/6", None).await;
+        assert_eq!(status, StatusCode::OK, "{row}");
+        assert_eq!(row["mixed_provenance"], true, "a later bounded occurrence must still match: {row}");
+        assert_eq!(row["provenance_matches"][0]["start"], row["text"].as_str().unwrap().rfind(RELAY).unwrap());
+    }
+
+    #[tokio::test]
+    async fn ai194b_owner_history_eight_character_whole_text_relay_matches() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, state, _db) = app_with_state();
+        state.store.write(|c| {
+            for (id, relay) in [(1, "abcdefgh"), (3, "the plan x")] {
+                c.execute("INSERT INTO cmd_history(id,text,type,session,ts,origin,delivery) VALUES (?1,?2,'session','relay-whole',1000,'dev-lead','direct')",
+                    rusqlite::params![id, relay])?;
+                c.execute("INSERT INTO cmd_history(id,text,type,session,ts,origin,delivery) VALUES (?1,?2,'user','relay-whole',2000,'','pane')",
+                    rusqlite::params![id + 1, relay])?;
+            }
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        for id in [2, 4] {
+            let (status, row) = send(&app, "GET", &format!("/api/history/{id}"), None).await;
+            assert_eq!(status, StatusCode::OK, "{row}");
+            assert_eq!(row["mixed_provenance"], true, "eight non-whitespace characters still match the whole text: {row}");
+            assert_eq!(row["provenance_matches"][0]["sender"], "dev-lead");
+            assert_eq!(row["provenance_segments"][0]["text"], row["text"]);
+        }
+    }
+
+    #[tokio::test]
     async fn ai194b_owner_history_long_nonempty_origin_relay_matches() {
         let home = tempfile::tempdir().unwrap();
         let _home = crate::api::settings::test_env::set_home(home.path());
         let (app, state, _db) = app_with_state();
-        // The eight-character boundary applies to both exact and contained
-        // matches; peer attribution must survive either delivery mode.
-        const RELAY: &str = "abcdefgh";
+        // A long peer report appended to an owner draft remains relay evidence
+        // for both confirmed direct and completed queued deliveries.
+        const RELAY: &str = "Status update from re-ops: Katella lease countersigned today";
         state.store.write(|c| {
             for (lane, delivery, delivered_at) in [("relay-direct", "direct", None), ("relay-queued", "queued", Some(1000_i64))] {
                 c.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery,delivered_at) VALUES (?1,'session',?2,1000,'re-ops-lead',?3,?4)",
