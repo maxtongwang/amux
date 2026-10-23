@@ -1,4 +1,4 @@
-//! Resume pending board consequences, never the commands that produced them.
+//! Resume durable message consequences, including no-plan held-message releases.
 use crate::api::{session_verbs, AppState};
 const JOB: &str = super::registry::ids::MESSAGE_CAPTURE;
 // The registry's health budget must exceed one permitted recovery attempt.
@@ -11,7 +11,47 @@ pub(crate) async fn tick(state: &AppState) {
     tick_after(state, 0).await;
 }
 
+/// A no-plan capture can die after clearing pending but before releasing its
+/// held message. Its timestamp is a lease, not proof that the claimant died:
+/// a slow live claimant may still finish, so release uses the stable outbox id.
+async fn recover_held_claims(state: &AppState) {
+    let claims = (|| -> anyhow::Result<Vec<(i64, String)>> {
+        let conn = state.store.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT id,session FROM cmd_history WHERE delivery='board' AND card_id IS NULL AND capture_pending=0 \
+             AND CASE WHEN json_valid(intake_result) THEN json_extract(intake_result,'$.state') END IN (?2,?3) \
+             AND CASE WHEN json_valid(intake_result) THEN json_type(intake_result,'$.claimed_at_ms') END='integer' \
+             AND CASE WHEN json_valid(intake_result) THEN json_extract(intake_result,'$.claimed_at_ms') END<?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![chrono::Utc::now().timestamp_millis() - 60_000, "board_capture_off", "isolated"],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })();
+    let claims = match claims {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, measured=false, n_considered=0,
+                verdict="held_message_release_unmeasured", "ledger: held capture claims unavailable");
+            return;
+        }
+    };
+    let considered = claims.len();
+    let mut recovered = 0;
+    for (id, session) in claims {
+        if session_verbs::release_held_message(state, id, &session, "claim_recovery").await {
+            recovered += 1;
+        }
+    }
+    if recovered > 0 {
+        tracing::warn!(verdict="held_message_release_recovered", n=recovered, measured=true,
+            n_considered=considered, "ledger: recovered held messages after interrupted capture claims");
+    }
+}
+
 async fn tick_after(state: &AppState, after: i64) -> i64 {
+    recover_held_claims(state).await;
     let pending = (|| -> anyhow::Result<Vec<i64>> {
         let conn = state.store.read()?;
         let mut stmt = conn.prepare(
@@ -145,6 +185,49 @@ mod tests {
             reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         (state, dir)
+    }
+
+    #[tokio::test]
+    async fn held_claim_sweep_requires_every_recovery_predicate() {
+        let (state, dir) = fixture();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(dir.path().join("sessions/held-matrix.env"), "AMUX_COMMAND_LIFECYCLE=0\n").unwrap();
+        state.store.write(|c| {
+            session_verbs::ensure_fleet_tables(c)?;
+            let old = chrono::Utc::now().timestamp_millis() - 61_000;
+            let receipt = |state: &str, at: serde_json::Value| serde_json::json!({"state":state,"claimed_at_ms":at}).to_string();
+            for (delivery, card, pending, intake) in [
+                ("board", None, 0, receipt("board_capture_off", old.into())),
+                ("board", None, 0, receipt("isolated", old.into())),
+                ("direct", None, 0, receipt("board_capture_off", old.into())),
+                ("board", Some("linked"), 0, receipt("board_capture_off", old.into())),
+                ("board", None, 1, receipt("board_capture_off", old.into())),
+                ("board", None, 0, receipt("other", old.into())),
+                ("board", None, 0, receipt("board_capture_off", chrono::Utc::now().timestamp_millis().into())),
+                ("board", None, 0, "{malformed".into()),
+                ("board", None, 0, "{\"state\":\"board_capture_off\"}".into()),
+                ("board", None, 0, receipt("board_capture_off", true.into())),
+                ("board", None, 0, receipt("board_capture_off", "0".into())),
+            ] {
+                // Exclude the deliberately pending control from the ordinary
+                // pending-capture pass; this matrix exercises the claim sweep.
+                c.execute("INSERT INTO cmd_history(text,type,session,ts,delivery,card_id,capture_pending,intake_result,project_group) VALUES (?1,'user',?2,?3,?4,?5,?6,?7,?8)",
+                    rusqlite::params!["held matrix", "held-matrix", old, delivery, card, pending, intake, "deferred-fixture"])?;
+            }
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        tick(&state).with_subscriber(subscriber(bytes.clone())).await;
+        let c = state.store.read().unwrap();
+        let queued: Vec<i64> = c.prepare("SELECT id FROM cmd_history WHERE delivery='queued' ORDER BY id").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(queued, vec![1, 2], "only both expired no-plan claims may be released");
+        assert_eq!(c.query_row("SELECT COUNT(*) FROM steering_queue", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let recovered: Vec<_> = log.lines().filter(|line| line.contains("held_message_release_recovered")).collect();
+        assert_eq!(recovered.len(), 1, "one aggregate tracing event: {log}");
+        assert!(recovered[0].contains("n=2") && recovered[0].contains("measured=true"), "{log}");
     }
 
     // Record emitted event fields directly. This subscriber is always
