@@ -11371,6 +11371,7 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
     //     these names the state and a way out, and every one becomes deliverable
     //     on its own without anybody fixing amux.
     let conflict: &[(&str, &str)] = &[
+        (HELD_RELAY_ENTER_CAP_REACHED, "inspect the worker's held composer and delivery history before submitting or clearing it deliberately; automatic Enter recovery has stopped, so do not resend the held message"),
         ("project pause, identity or budget holds automatic delivery", "message remains queued; inspect the current project task, pause and usage coverage, and resolve the hold before automatic delivery"),
         ("boot readiness not freshly observed", "message remains queued; wait for the new provider's idle empty composer, inspect startup if it does not become ready; do not send a duplicate"),
         ("worker is not ready; durable message remains queued", "message remains queued; start or recover the worker and wait for its idle empty composer; do not send a duplicate"),
@@ -12216,7 +12217,7 @@ async fn verify_submitted(
                 "the composer holds text this send did not type; retry Enter not pressed");
             return (Submission::Stuck, retried);
         }
-        if !reserve_held_relay_enter(name, text) {
+        if reserve_held_relay_enter(name, text).is_err() {
             return (Submission::Stuck, retried);
         }
         send_key(name, "Enter").await;
@@ -13006,8 +13007,8 @@ async fn submit_project_execution_draft_if_owned(
     if let Some(reason) = project_send_hold(state, name, delivery) {
         return Some((false, reason));
     }
-    if !reserve_held_relay_enter(name, text) {
-        return Some((false, "held relay Enter cap reached or attempt could not be persisted".into()));
+    if let Err(reason) = reserve_held_relay_enter(name, text) {
+        return Some((false, reason.into()));
     }
     tracing::warn!(
         session = %name,
@@ -13140,8 +13141,8 @@ async fn submit_own_steering_draft(
             "this message is already pasted in the composer; the lane is mid-turn, so it is submitted at the next idle boundary".into(),
         ));
     }
-    if !reserve_held_relay_enter(name, text) {
-        return Some((false, "held relay Enter cap reached or attempt could not be persisted".into()));
+    if let Err(reason) = reserve_held_relay_enter(name, text) {
+        return Some((false, reason.into()));
     }
     let preview = chars_truncate(&draft, 120);
     tracing::warn!(
@@ -14567,7 +14568,7 @@ async fn retry_held_idle_draft(state: &AppState, name: &str, text: &str, sent_at
             verdict = "held_draft_retry_look", "stuck idle message: re-read before retrying Enter");
         match step {
             HeldDraftStep::PressEnter => {
-                if !reserve_held_relay_enter(name, text) {
+                if reserve_held_relay_enter(name, text).is_err() {
                     return (Submission::Stuck, presses, "enter_cap_stopped");
                 }
                 presses += 1;
@@ -14601,6 +14602,8 @@ const HELD_RELAY_WINDOW_S: i64 = 30 * 60;
 // Three recovery Enters cover dropped keys without an unbounded idle loop.
 const HELD_RELAY_MAX_ENTER_ATTEMPTS: u64 = 3;
 const HELD_RELAY_ATTEMPTS_KEY: &str = "held_relay_enter_attempts";
+const HELD_RELAY_ENTER_CAP_REACHED: &str = "held relay Enter cap reached";
+const HELD_RELAY_ATTEMPT_WRITE_FAILED: &str = "held relay Enter attempt could not be persisted";
 
 fn direct_draft_watch_budget(started: f64, now: f64) -> bool {
     now - started < HELD_RELAY_WINDOW_S as f64
@@ -14608,7 +14611,7 @@ fn direct_draft_watch_budget(started: f64, now: f64) -> bool {
 
 /// Reserve before pressing, under the send lock. Persist across sweep respawns
 /// and restarts; a failed write refuses Enter. Hashes retain no message bodies.
-fn reserve_held_relay_enter(name: &str, text: &str) -> bool {
+fn reserve_held_relay_enter(name: &str, text: &str) -> Result<(), &'static str> {
     use sha2::Digest;
     let key = hex::encode(sha2::Sha256::digest(text.as_bytes()));
     let mut meta = load_meta(name);
@@ -14625,7 +14628,7 @@ fn reserve_held_relay_enter(name: &str, text: &str) -> bool {
             tracing::warn!(session = name, presses, measured = true, n_considered = 1,
                 verdict = "held_relay_enter_cap_reached", "held sequence recovery stopped after its Enter cap");
         }
-        return false;
+        return Err(HELD_RELAY_ENTER_CAP_REACHED);
     }
     row["presses"] = json!(presses + 1);
     meta.insert(HELD_RELAY_ATTEMPTS_KEY.into(), json!(attempts));
@@ -14633,9 +14636,9 @@ fn reserve_held_relay_enter(name: &str, text: &str) -> bool {
     if load_meta(name).get(HELD_RELAY_ATTEMPTS_KEY) != meta.get(HELD_RELAY_ATTEMPTS_KEY) {
         tracing::warn!(session = name, measured = false, n_considered = 1,
             verdict = "held_relay_attempt_write_failed", "Enter refused: could not persist recovery attempt");
-        return false;
+        return Err(HELD_RELAY_ATTEMPT_WRITE_FAILED);
     }
-    true
+    Ok(())
 }
 
 struct DirectDraftWatch(String);
@@ -14724,7 +14727,7 @@ fn spawn_direct_draft_idle_submit(state: &AppState, name: &str, text: &str, sent
             if step != HeldDraftStep::PressEnter {
                 continue;
             }
-            if !reserve_held_relay_enter(&name, &held) {
+            if reserve_held_relay_enter(&name, &held).is_err() {
                 break "direct_draft_idle_enter_cap_stopped";
             }
             let sent_at = now_f64();
@@ -53209,6 +53212,23 @@ mod refusal_status_tests {
         }
     }
 
+    #[test]
+    fn held_relay_enter_cap_is_a_conflict_but_persistence_failure_is_500() {
+        let cap = "held relay Enter cap reached";
+        for msg in [cap.to_string(), format!("auto-wake failed: {cap}")] {
+            let (code, hint) = send_failure_status(&msg);
+            assert_eq!(code, StatusCode::CONFLICT, "{msg}");
+            let hint = hint.expect("cap refusal must explain the next step");
+            assert!(hint.contains("inspect"), "{hint}");
+            assert!(hint.contains("do not resend"), "{hint}");
+        }
+        assert_eq!(
+            send_failure_status("held relay Enter attempt could not be persisted"),
+            (StatusCode::INTERNAL_SERVER_ERROR, None),
+            "a failed durable attempt write is a storage fault"
+        );
+    }
+
     /// AMUX-5241: an isolation refusal from the SEND PATH answers 403 with
     /// `code: isolated_target`, the same pair the peer gate returns. The pre-fix
     /// shape was 409 with no code, which a caller reads as "retry later".
@@ -53392,6 +53412,8 @@ mod refusal_status_tests {
             "tmux not found or timed out",
             "Claude failed to start",
             "could not write session env",
+            // Enter must be durably reserved; a failed write is a storage fault.
+            HELD_RELAY_ATTEMPT_WRITE_FAILED,
             // The queue cannot be measured or its retirement transaction failed.
             // These retain input and report real storage faults, not policy refusals.
             "could not measure queued input authority; retained",
@@ -57641,7 +57663,7 @@ mod relay_idle_submit_tests {
         let _home = crate::api::settings::test_env::set_home(home.path());
         std::fs::write(sessions_dir(), "a file prevents the attempt directory").unwrap();
         let sent = origin_stamped("dev-lead", "w", "complete held relay").unwrap();
-        assert!(!reserve_held_relay_enter("w", &sent));
+        assert_eq!(reserve_held_relay_enter("w", &sent), Err(HELD_RELAY_ATTEMPT_WRITE_FAILED));
     }
 
     #[test]
@@ -57668,8 +57690,8 @@ mod relay_idle_submit_tests {
         let _home = crate::api::settings::test_env::set_home(home.path());
         let sent = origin_stamped("dev-lead", "w", "complete held relay").unwrap();
         assert_eq!(HELD_RELAY_MAX_ENTER_ATTEMPTS, 3);
-        for _ in 0..3 { assert!(reserve_held_relay_enter("w", &sent)); }
-        for _ in 0..3 { assert!(!reserve_held_relay_enter("w", &sent)); }
+        for _ in 0..3 { assert_eq!(reserve_held_relay_enter("w", &sent), Ok(())); }
+        for _ in 0..3 { assert_eq!(reserve_held_relay_enter("w", &sent), Err(HELD_RELAY_ENTER_CAP_REACHED)); }
         let meta = load_meta("w");
         let attempts = meta[HELD_RELAY_ATTEMPTS_KEY].as_object().unwrap();
         assert_eq!(attempts.len(), 1);
@@ -57677,9 +57699,9 @@ mod relay_idle_submit_tests {
         assert_eq!(row["presses"], 3);
         assert_eq!(row["warned"], true);
         let before = std::fs::read(meta_path("w")).unwrap();
-        assert!(!reserve_held_relay_enter("w", &sent));
+        assert_eq!(reserve_held_relay_enter("w", &sent), Err(HELD_RELAY_ENTER_CAP_REACHED));
         assert_eq!(std::fs::read(meta_path("w")).unwrap(), before, "an exhausted sweep does not re-arm or log again");
-        assert!(reserve_held_relay_enter("w", &origin_stamped("dev-lead", "w", "a different held sequence").unwrap()));
+        assert_eq!(reserve_held_relay_enter("w", &origin_stamped("dev-lead", "w", "a different held sequence").unwrap()), Ok(()));
         assert_eq!(warnings.load(std::sync::atomic::Ordering::SeqCst), 1, "one actual cap WARN across replacement watches");
     }
 

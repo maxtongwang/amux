@@ -21,9 +21,11 @@ FUNCTIONS = [
     "composer_holds_this_delivery", "stamped_held_delivery", "held_composer_delivery_matching",
     "transcript_unwrap", "stuck_rows_matching", "held_amux_composer", "held_amux_delivery",
     "amux_delivered_text", "reconcile_stuck_on_submit", "direct_draft_watch_budget",
-    "load_meta", "save_meta", "reserve_held_relay_enter",
+    "load_meta", "save_meta", "reserve_held_relay_enter", "send_failure_status",
 ]
 TESTS = [
+    "held_relay_enter_cap_is_a_conflict_but_persistence_failure_is_500",
+    "every_send_failure_literal_is_classified",
     "owner_chip_matching_a_relay_line_count_never_authorises_keys",
     "owner_plain_copy_never_authorises_keys_and_stamps_must_be_in_position",
     "combined_receipt_consumes_only_the_submitted_sequence",
@@ -41,6 +43,7 @@ TESTS = [
 SUPPORT = r'''
 #![allow(dead_code)]
 use serde_json::{json, Map, Value};
+use http::StatusCode;
 use std::path::{Path, PathBuf};
 #[derive(Clone)]
 struct AppState {
@@ -100,11 +103,13 @@ def function(source, name):
 def mutations():
     sequence = "if let Some(sent) = stamped_held_delivery(text, origin, name) {"
     changes = [
-        ("owner-chip", "let prefix: String = prefix.split_whitespace().collect();", "let prefix: String = String::new();", TESTS[0]),
-        ("owner-copy", sequence, "if let Some(sent) = Some(text.clone()) {", TESTS[1]),
+        ("cap-http-status", '(HELD_RELAY_ENTER_CAP_REACHED, "inspect', '(HELD_RELAY_ATTEMPT_WRITE_FAILED, "inspect', "held_relay_enter_cap_is_a_conflict_but_persistence_failure_is_500"),
+        ("persistence-outcome", "return Err(HELD_RELAY_ATTEMPT_WRITE_FAILED);", "return Err(HELD_RELAY_ENTER_CAP_REACHED); // mutated persistence cause", "attempt_persistence_failure_refuses_enter"),
+        ("owner-chip", "let prefix: String = prefix.split_whitespace().collect();", "let prefix: String = String::new();", "owner_chip_matching_a_relay_line_count_never_authorises_keys"),
+        ("owner-copy", sequence, "if let Some(sent) = Some(text.clone()) {", "owner_plain_copy_never_authorises_keys_and_stamps_must_be_in_position"),
         ("stamped-relay", sequence, "if let Some(sent) = None::<String> {", "chips_and_wrapping_match_only_complete_known_deliveries"),
         ("enter-cap", "if presses >= HELD_RELAY_MAX_ENTER_ATTEMPTS {", "if presses > HELD_RELAY_MAX_ENTER_ATTEMPTS {", "enter_cap_survives_watch_respawn_and_logs_exhaustion_once"),
-        ("watcher-cap-wiring", "if !reserve_held_relay_enter(&name, &held) {", "if held.is_empty() {", "every_recovery_enter_reserves_the_shared_sequence_budget"),
+        ("watcher-cap-wiring", "if reserve_held_relay_enter(&name, &held).is_err() {", "if held.is_empty() {", "every_recovery_enter_reserves_the_shared_sequence_budget"),
         ("combined-receipt", "return ids;", "return ids.into_iter().take(1).collect();", "combined_receipt_consumes_only_the_submitted_sequence"),
         ("deferred-unverified-select", "SELECT id, text, origin FROM cmd_history WHERE session=?1 \\\n                     AND (submit_verdict IN ('stuck','deferred','unverified')", "SELECT id, text, origin FROM cmd_history WHERE session=?1 \\\n                     AND (submit_verdict IN ('stuck')", "combined_enter_reconciles_each_held_verdict_and_excludes_other_rows"),
         ("deferred-unverified-update", "reconciled_at=?2 WHERE id=?1 AND (submit_verdict IN ('stuck','deferred','unverified')", "reconciled_at=?2 WHERE id=?1 AND (submit_verdict IN ('stuck')", "combined_enter_reconciles_each_held_verdict_and_excludes_other_rows"),
@@ -146,6 +151,7 @@ def main():
         assert len(constants) >= 3, "missing shipped relay bounds"
     if args.source_ref:
         constants += [c for c in re.findall(r"^const HELD_RELAY_[A-Z_]+:[^\n]+", current, re.M)]
+    constants += re.findall(r"^pub\(crate\) const (?:BG_VIEW_REFUSAL_PREFIX|HERDR_NOT_ADDRESSABLE|ISOLATED_REFUSAL_PREFIX):[^\n]+", source, re.M)
     pane = (REPO / "crates/amux-server/src/api/pane_prompts.rs").read_text()
     helpers = 'mod pane_prompts { const CONTAINS_MIN_CHARS: usize = 16;\n' + function(pane, "normalize") + '\n' + function(pane, "same_text") + '\n}\n'
     cases = args.case or TESTS
@@ -158,7 +164,7 @@ def main():
         file.write_text(body)
         (root / "session_verbs.rs").write_text(source)
         command = ["rustc", "--edition=2021", "--test", str(file), "-L", f"dependency={deps}", "-o", str(root / "tests")]
-        for name in ["regex", "serde_json", "rusqlite", "tokio", "sha2", "hex", "tempfile", "tracing", "ulid"]:
+        for name in ["regex", "serde_json", "rusqlite", "tokio", "sha2", "hex", "tempfile", "tracing", "ulid", "http"]:
             libraries = sorted(deps.glob(f"lib{name}-*.rlib"))
             if not libraries:
                 raise RuntimeError(f"cached {name} unavailable; run Cargo in a permitted environment")
