@@ -19,7 +19,12 @@
 //!   2026-10-19, PR #18 review B4): a widening change cites a PAIR. (1) The
 //!   ask: a message the requesting agent sent into a session (a `session` row
 //!   whose origin is the agent) that names the target worker or layer AND
-//!   each setting in plain words (a tag also names add/remove and its target). (2) The reply: Max's own FIRST typed row in
+//!   each exact directed change, including its value and target, through
+//!   [`names_changes`]. Examples: `enable yolo for worker-a`, `set flags to
+//!   --dangerously-skip-permissions for worker-a`, `remove dev from worker-a`.
+//!   Separate changes use separate clauses. Negated request clauses refuse;
+//!   values containing negation are literal operands, never request verbs.
+//!   (2) The reply: Max's own FIRST typed row in
 //!   that session after the ask (human-typed, not an amux delivery), within
 //!   [`ASK_REPLY_WINDOW_S`] of it and at most a day old. In the agent's own
 //!   lane only a non-local Remote owner send counts as the reply
@@ -274,6 +279,8 @@ pub(crate) struct CiteTerms {
     pub worker: Option<String>,
     /// Each changed tag with its required direction (add/remove).
     pub tag_changes: Vec<(String, String)>,
+    /// Each exact directed request; any spelling per request, all requests required.
+    pub changes: Vec<Vec<ChangePhrase>>,
 }
 
 /// The reply must come within this long after the ask.
@@ -364,27 +371,107 @@ pub(crate) fn names_phrase(text: &str, phrase: &str) -> bool {
 pub(crate) fn worker_bindings(text: &str) -> String {
     let home = crate::config::amux_home();
     let mut ids = std::collections::BTreeMap::new();
-    for entry in std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("env") { continue; }
-        let Some(name) = path.file_stem().and_then(|n| n.to_str()) else { continue };
-        if names_exactly(text, name) {
-            if let Ok(id) = super::rename_identity::ensure_incarnation(&home, name) {
-                ids.insert(name.to_string(), id);
-            }
+    // Look up only names in this message, never scan the fleet or mint an id.
+    // Creation/legacy migration owns identity assignment. Missing ids fail closed.
+    let text = text.to_lowercase();
+    for name in text.split(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))) {
+        let name = name.trim_end_matches('.');
+        if !super::session_verbs::valid_session_name(name) { continue; }
+        if let Some(id) = super::rename_identity::incarnation(&home, name) {
+            ids.insert(name.to_string(), id);
         }
     }
     serde_json::to_string(&ids).expect("string map serializes")
 }
 
-/// Require a directed tag change about this target, not unrelated mentions.
-/// A deliberately bounded grammar: `add [the] TAG [tag] to WORKER` or
-/// `remove [the] TAG [tag] from WORKER`. Multiple changes use multiple clauses.
-fn names_tag_change(text: &str, target: &str, tag: &str, direction: &str) -> bool {
+/// A readable request plus its literal operand. Grammar/name casing is flexible;
+/// the value's bytes (including whitespace and case) must match exactly.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ChangePhrase {
+    pub text: String,
+    literal: Option<String>,
+}
+
+impl From<String> for ChangePhrase {
+    fn from(text: String) -> Self { Self { text, literal: None } }
+}
+
+impl ChangePhrase {
+    fn with_value(text: String, literal: String) -> Self { Self { text, literal: Some(literal) } }
+
+    fn pattern(&self) -> String {
+        let grammar = |s: &str| regex::escape(s).replace(' ', r"\s+");
+        match self.literal.as_deref().filter(|value| !value.is_empty()) {
+            Some(value) => self.text.split(value).map(grammar).collect::<Vec<_>>()
+                .join(&format!("(?-i:{})", regex::escape(value))),
+            None => grammar(&self.text),
+        }
+    }
+}
+
+/// One grammar for EVERY cite action. Each alternative is an entire directed
+/// request including its target and exact value, never independent keywords.
+/// Semicolons/newlines/punctuation bound negation scope; conjunctions do not
+/// erase a negation. Negated clauses cannot authorize a change.
+/// This is deliberately bounded syntax, not a natural-language consent model.
+pub(crate) fn names_changes(text: &str, changes: &[Vec<ChangePhrase>]) -> bool {
+    let clauses = regex::Regex::new(r"[;?!\n]").expect("clause grammar");
+    let negation = regex::Regex::new(r"(?i)\b(?:no|not|never|without|except|unless|leave|avoid|cannot|\w+n['’]?t)\b").expect("negation grammar");
+    !changes.is_empty() && changes.iter().all(|alternatives| {
+        if alternatives.is_empty() { return false; }
+        let choices = alternatives.iter().map(ChangePhrase::pattern).collect::<Vec<_>>().join("|");
+        let pattern = format!(r"(?i)(?:^|[^\p{{L}}\p{{N}}_.-])(?:{choices})(?:$|[^\p{{L}}\p{{N}}_.-])");
+        regex::Regex::new(&pattern).is_ok_and(|request| request.find_iter(text).any(|matched| {
+            let before = clauses.split(&text[..matched.start()]).last().unwrap_or("");
+            let after = clauses.split(&text[matched.end()..]).next().unwrap_or("");
+            !negation.is_match(before) && !negation.is_match(after)
+        }))
+    })
+}
+
+/// All action builders use the same directed setting/value forms. Strings
+/// accept literal text or JSON quoting; objects/arrays use compact JSON.
+pub(crate) fn setting_requests(settings: &[String], targets: &[String], value: &serde_json::Value) -> Vec<ChangePhrase> {
+    let literal = value.as_str().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| value.to_string());
+    let mut forms = Vec::new();
+    for setting in settings {
+        for target in targets {
+            for setting in [setting.clone(), format!("the {setting}")] {
+                for (relation, prefix) in ["for", "on"].into_iter().flat_map(|relation|
+                    ["", "the ", "worker ", "group "].into_iter().map(move |prefix| (relation, prefix))) {
+                    let tail = format!("{relation} {prefix}{target}");
+                    forms.push(ChangePhrase::with_value(format!("set {setting} to {literal} {tail}"), literal.clone()));
+                    forms.push(ChangePhrase::with_value(format!("set {setting} {tail} to {literal}"), literal.clone()));
+                    if value.is_string() {
+                        forms.push(ChangePhrase::with_value(format!("set {setting} to {value} {tail}"), value.to_string()));
+                        forms.push(ChangePhrase::with_value(format!("set {setting} {tail} to {value}"), value.to_string()));
+                    }
+                    if let Some(enabled) = value.as_bool() {
+                        for verb in if enabled { ["enable", "turn on", "allow"] } else { ["disable", "turn off", "disallow"] } {
+                            forms.push(format!("{verb} {setting} {tail}").into());
+                        }
+                    }
+                    if value.is_null() { forms.push(format!("remove {setting} {tail}").into()); }
+                    if value.as_str() == Some("") { forms.push(format!("clear {setting} {tail}").into()); }
+                }
+            }
+        }
+    }
+    forms
+}
+
+fn tag_requests(targets: &[String], tag: &str, direction: &str) -> Vec<ChangePhrase> {
     let preposition = if direction == "add" { "to" } else { "from" };
-    let pattern = format!(r"(?i)\b{}\s+(?:the\s+)?{}\s+(?:tags?\s+)?{}\s+(?:worker\s+)?{}(?:$|[^\p{{L}}\p{{N}}_.-])",
-        regex::escape(direction), regex::escape(tag), preposition, regex::escape(target));
-    regex::Regex::new(&pattern).is_ok_and(|r| r.is_match(text))
+    targets.iter().flat_map(|target| ["", "the "].into_iter().flat_map(move |article| {
+        ["", " tag", " tags"].into_iter().flat_map(move |noun| {
+            ["", "worker "].into_iter().map(move |worker| format!("{direction} {article}{tag}{noun} {preposition} {worker}{target}").into())
+        })
+    })).collect()
+}
+
+/// Tags use the same shared matcher and negation rule as every setting.
+pub(crate) fn tag_change_requests(targets: &[String], changes: &[(String, String)]) -> Vec<Vec<ChangePhrase>> {
+    changes.iter().map(|(tag, direction)| tag_requests(targets, tag, direction)).collect()
 }
 
 /// Resolve and verify a citation pair for `actor` asking for `terms`.
@@ -433,16 +520,7 @@ fn cite_pair_at(state: &AppState, cite: Option<&Cite>, actor: &str, terms: &Cite
     if !terms.settings.iter().all(|alts| alts.iter().any(|p| names_phrase(&settings_text, p))) {
         return Err(MaxRefRefusal::AskMissingSetting);
     }
-    if !terms.tag_changes.iter().all(|(tag, direction)| terms.target.iter().any(|target| names_tag_change(&ask.text, target, tag, direction))) {
-        return Err(MaxRefRefusal::AskMissingChange);
-    }
-    if terms.tag_changes.is_empty() && !terms.settings.iter().all(|alts| {
-        ask.text.split([';', '\n', '?', '!']).any(|clause| {
-            terms.target.iter().any(|target| names_exactly(clause, target))
-                && alts.iter().any(|setting| names_phrase(&setting_text(clause, &terms.target), setting))
-                && ["may I", "can I", "please", "turn on", "turn off", "enable", "disable", "set", "change", "update", "allow", "remove", "add", "make"].iter().any(|word| names_phrase(clause, word))
-        })
-    }) {
+    if !names_changes(&ask.text, &terms.changes) {
         return Err(MaxRefRefusal::AskMissingChange);
     }
     let target_incarnation = if let Some(worker) = &terms.worker {
@@ -498,6 +576,11 @@ fn cite_pair_at(state: &AppState, cite: Option<&Cite>, actor: &str, terms: &Cite
 }
 
 #[cfg(test)]
+fn test_tag_change(text: &str, target: &str, tag: &str, direction: &str) -> bool {
+    names_changes(text, &tag_change_requests(&[target.into()], &[(tag.into(), direction.into())]))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -508,13 +591,13 @@ mod tests {
             "Max, may I add the leads tag to worker review-dev-b?",
             "Max, may I add leads tags to review-dev-b?",
         ] {
-            assert!(names_tag_change(ask, "review-dev-b", "leads", "add"), "{ask}");
+            assert!(test_tag_change(ask, "review-dev-b", "leads", "add"), "{ask}");
         }
         for ask in [
             "remove leads from review-dev-b",
             "remove the leads tag from review-dev-b",
         ] {
-            assert!(names_tag_change(ask, "review-dev-b", "leads", "remove"), "{ask}");
+            assert!(test_tag_change(ask, "review-dev-b", "leads", "remove"), "{ask}");
         }
         for ask in [
             "remove leads from review-dev-b",
@@ -523,8 +606,11 @@ mod tests {
             "add leads to review-dev-b-other",
             "review-dev-b has leads",
             "add review-dev-b to leads",
+            "don't add leads to review-dev-b",
+            "do not add leads to review-dev-b and add leads to review-dev-b",
+            "add leads to review-dev-b and leave review-dev-b alone",
         ] {
-            assert!(!names_tag_change(ask, "review-dev-b", "leads", "add"), "{ask}");
+            assert!(!test_tag_change(ask, "review-dev-b", "leads", "add"), "{ask}");
         }
     }
 
@@ -690,7 +776,7 @@ mod tests {
     const YOLO_ASK: &str = "Max, may I turn on yolo for test-alpha? Reply yes or no.";
 
     fn terms() -> CiteTerms {
-        CiteTerms { target: vec!["test-alpha".into()], settings: vec![vec!["yolo".into(), "CC_FLAGS".into()]], ..Default::default() }
+        CiteTerms { target: vec!["test-alpha".into()], settings: vec![vec!["yolo".into(), "CC_FLAGS".into()]], changes: vec![setting_requests(&["yolo".into(), "CC_FLAGS".into()], &["test-alpha".into()], &serde_json::json!(true))], ..Default::default() }
     }
 
     /// The ask: a message `from` sent into `session` (a peer send's row shape).
@@ -760,6 +846,25 @@ mod tests {
         let a2 = ask(&st, "test-desk2", ACTOR, "turn on CC_FLAGS for test-alpha?", NOW - 100.0);
         let r2 = put(&st, R("test-desk2", "go ahead", "user", "", "direct", Some("outside"), NOW - 50.0));
         assert!(check(&st, &pair(a2, r2)).is_ok());
+    }
+
+    #[test]
+    fn citation_bindings_only_read_existing_identities_without_minting_on_mentions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        let path = tmp.path().join("sessions/test-alpha.env");
+        let legacy = b"CC_TAGS=dev\n";
+        std::fs::write(&path,legacy).unwrap();
+        assert_eq!(worker_bindings("test-alpha is busy"), "{}");
+        assert_eq!(std::fs::read(&path).unwrap(), legacy);
+        assert_eq!(worker_bindings(YOLO_ASK), "{}", "legacy identity is never minted by ask capture");
+        assert_eq!(std::fs::read(&path).unwrap(), legacy);
+        std::fs::write(&path,"CC_TAGS=dev\nCC_INCARNATION=existing-worker\n").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let ids: std::collections::BTreeMap<String,String> = serde_json::from_str(&worker_bindings("May I enable yolo for Test-Alpha?")).unwrap();
+        assert_eq!(ids.get("test-alpha").map(String::as_str), Some("existing-worker"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]

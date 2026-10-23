@@ -1282,17 +1282,17 @@ fn write_memory(
     if let Some(parent) = f.parent() {
         std::fs::create_dir_all(parent).map_err(|e| (500, e.to_string()))?;
     }
+    std::fs::write(&f, scope_memory_text(value)).map_err(|e| (500, e.to_string()))
+}
+
+/// The text operand both authorization and memory/rules writers consume.
+pub(crate) fn scope_memory_text(value: &Value) -> String {
     // Python: value if str else (value or {}).get("text", "")
-    let text = match value {
+    match value {
         Value::String(s) => s.clone(),
-        Value::Object(o) => o
-            .get("text")
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .to_string(),
+        Value::Object(o) => o.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
         _ => String::new(),
-    };
-    std::fs::write(&f, text).map_err(|e| (500, e.to_string()))
+    }
 }
 
 /// env: whole-file replace for a string value; merge-by-key for an object
@@ -1327,7 +1327,7 @@ pub(crate) fn owner_only_key_changed(home: &Path, level: &str, name: &str, value
 /// The first key matching `guarded` whose value this write would change.
 /// Handles both write shapes: a full-text replace and a key/value merge.
 /// The value a scope object entry stores, as `write_env` stores it.
-fn scope_env_value(key: &str, v: &Value) -> Result<Option<String>, String> {
+pub(crate) fn scope_env_value(key: &str, v: &Value) -> Result<Option<String>, String> {
     if key == "CC_TAGS" {
         return crate::api::session_verbs::tags_of(Some(v)).map(|tags| Some(tags.join(",")));
     }
