@@ -64,7 +64,7 @@ fn human_source(ctype: &str, origin: &str, delivery: &str, process_origin: &str)
     None
 }
 
-const ROW_COLS: &str = "id, session, text, COALESCE(type,''), COALESCE(origin,''), COALESCE(delivery,''), COALESCE(process_origin,''), ts, delegation_session_incarnation";
+const ROW_COLS: &str = "id, session, text, COALESCE(delegation_message_type,type,''), COALESCE(origin,''), COALESCE(delivery,''), COALESCE(process_origin,''), ts, delegation_session_incarnation";
 
 fn rows(state: &AppState, sql_where: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<Row>, String> {
     let conn = state.store.read().map_err(|e| e.to_string())?;

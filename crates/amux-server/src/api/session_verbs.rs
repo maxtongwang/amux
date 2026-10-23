@@ -8076,12 +8076,12 @@ pub(crate) async fn cmd_hist_record_with_id(
                 dup_prior_ts_w.store(pts, std::sync::atomic::Ordering::SeqCst);
             }
             conn.execute(
-                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, repeat_of, process_origin, delegation_session_incarnation) \
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, repeat_of, process_origin, delegation_session_incarnation, delegation_message_type) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rusqlite::params![
                     text, ctype, session, now_ms, origin,
                     delivery, queued_at_ms, delivered_at_ms, submit_verdict, capture_pending,
-                    client_meta, repeat_of, process_origin, delegation_session_incarnation
+                    client_meta, repeat_of, process_origin, delegation_session_incarnation, ctype
                 ],
             )?;
             let row_id = conn.last_insert_rowid();
