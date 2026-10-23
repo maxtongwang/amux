@@ -1687,7 +1687,9 @@ async fn held_claim_recovers_after_process_sigkill() {
     let bin = rig._tmp.path().join("fake-bin");
     std::fs::create_dir_all(&bin).unwrap();
     let tmux = bin.join("tmux");
-    std::fs::write(&tmux, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nexit 1\n").unwrap();
+    // An exit 1 with no "no server running" text reads as a failed lookup,
+    // and the server's owner check then refuses the owner request (403).
+    std::fs::write(&tmux, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\necho 'no server running on /nonexistent' >&2\nexit 1\n").unwrap();
     std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
     rig.fake_tmux_dir = Some(bin);
     rig.spawn();
