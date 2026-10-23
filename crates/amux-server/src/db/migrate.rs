@@ -689,12 +689,17 @@ const MIGRATIONS: &[Migration] = &[
         name: "0125_delegation_grants",
         sql: include_str!("../../migrations/0125_delegation_grants.sql"),
     },
-    // Unmerged PR #18: pair uniqueness, spent marker and stable worker binding.
     Migration {
         version: 126,
         name: "0126_delegation_grant_citation_pair",
         sql: include_str!("../../migrations/0126_delegation_grant_citation_pair.sql"),
-    },];
+    },
+    Migration {
+        version: 127,
+        name: "0127_delegation_reply_reservation",
+        sql: include_str!("../../migrations/0127_delegation_reply_reservation.sql"),
+    },
+];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
 ///
@@ -1268,6 +1273,39 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn delegation_0127_upgrades_populated_original_0126_without_losing_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_history_through(&conn, 126);
+        for column in ["cite_spent_at", "target_incarnation"] {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('_amux_delegation_grants') WHERE name=?1",
+                [column], |r| r.get(0)).unwrap();
+            assert_eq!(count, 0, "0126 must remain the original schema");
+        }
+        conn.execute("INSERT INTO _amux_delegation_grants
+            (code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,status,evidence_row,ask_row,ask_text,reply_text)
+            VALUES('old','mrpopo','mrpopo','set_tags','old-worker','PATCH','/old','{}','old request',1,2,'failed',42,41,'old ask','yes')", []).unwrap();
+        conn.execute("INSERT INTO cmd_history(session,text,ts) VALUES('old-desk','old ask',1)", []).unwrap();
+        let before: String = conn.query_row("SELECT json_array(code,actor,action,status,evidence_row,ask_row,ask_text,reply_text) FROM _amux_delegation_grants", [], |r| r.get(0)).unwrap();
+        apply_all(&mut conn).unwrap();
+        apply_all(&mut conn).unwrap();
+        let after: String = conn.query_row("SELECT json_array(code,actor,action,status,evidence_row,ask_row,ask_text,reply_text) FROM _amux_delegation_grants", [], |r| r.get(0)).unwrap();
+        assert_eq!(after, before, "old grants and their evidence survive upgrade");
+        let stamped: i64 = conn.query_row("SELECT COUNT(*) FROM _amux_migrations WHERE version=127 AND name='0127_delegation_reply_reservation'", [], |r| r.get(0)).unwrap();
+        assert_eq!(stamped, 1, "the upgrade must be a new registered migration");
+        conn.execute("UPDATE _amux_delegation_grants SET cite_spent_at=1,target_incarnation='original' WHERE code='old'", []).unwrap();
+        conn.execute("UPDATE cmd_history SET cite_worker_ids='{}' WHERE session='old-desk'", []).unwrap();
+        let old_cmd: String = conn.query_row("SELECT text FROM cmd_history WHERE session='old-desk'", [], |r| r.get(0)).unwrap();
+        assert_eq!(old_cmd, "old ask");
+        let duplicate = conn.execute("INSERT INTO _amux_delegation_grants
+            (code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,evidence_row)
+            VALUES('new','other','lead','other','other-worker','PUT','/other','{}','other',3,4,42)", []).unwrap_err();
+        assert!(matches!(duplicate, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::ConstraintViolation));
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM _amux_delegation_grants", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
     }
 
     fn assert_reconciled_project_schema(conn: &Connection) {
