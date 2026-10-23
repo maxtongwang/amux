@@ -18,9 +18,10 @@ export type ChatSnapshot = { messages: any[]; streaming?: { turn_id: string; tex
  * through the app's _chatLoad; every other /chat request is the app reloading.
  */
 export async function stubChat(page: Page, snapshot: () => ChatSnapshot) {
-  let total = 0, spec = 0, release = () => {};
+  let total = 0, spec = 0, observed = 0, release = () => {};
   // A later route may answer a load before this fixture's handler sees it.
   const countLoad = (request: Request) => {
+    observed++;
     if (request.method() === 'GET' && /^\/api\/sessions\/[^/]+\/chat$/.test(new URL(request.url()).pathname)) total++;
   };
   page.on('request', countLoad);
@@ -49,7 +50,7 @@ export async function stubChat(page: Page, snapshot: () => ChatSnapshot) {
       release();
       page.off('request', countLoad);
       const counts = { spec, app: total - spec };
-      console.log(`[CHAT-RELOADS] spec=${counts.spec} app=${counts.app} measured=true`);
+      console.log(`[CHAT-RELOADS] spec=${counts.spec} app=${counts.app} observed=${observed} measured=${observed > 0}`);
       return counts;
     },
   };
