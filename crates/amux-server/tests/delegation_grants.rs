@@ -57,7 +57,11 @@ async fn approval_yes_is_bound_to_the_shown_session_and_requesting_actor() {
 async fn newer_unanswered_request_gets_yes_and_older_window_never_does() {
     let e=setup().await;
     let old=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""}),MAX_PANE).await;
-    e.seed_pane_prompt(MAX_PANE,"wait",now_s());
+    let wait=e.seed_pane_prompt(MAX_PANE,"wait",now_s());
+    e.store.write(move|c| {
+        c.execute("UPDATE cmd_history SET type='steering',delegation_message_type='user' WHERE id=?1",[wait])?;
+        Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
+    }).unwrap();
     let new=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"toggle_yolo":true}),MAX_PANE).await;
     e.seed_pane_prompt(MAX_PANE,"yes",now_s());
     let (st,v)=apply(&e,DEV_LEAD,&old,DEV_B,json!({"tags":""})).await;
@@ -309,4 +313,39 @@ async fn owner_undo_is_not_stranded_when_the_asking_worker_retires() {
     let (st,v)=e.call(Who::Owner,"POST",&format!("/api/delegation/grants/{id}/undo"),None).await;
     assert_allowed(st,&v,"owner can undo the stored target after actor retirement");
     assert_eq!(e.grant_status(id),"undone");
+}
+
+
+#[tokio::test]
+async fn project_steering_projection_preserves_owner_but_never_peer_authorship() {
+    let e=setup().await;
+    let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"}),MAX_PANE).await;
+    let (st,v)=e.type_in_pane(MAX_PANE,"approve").await;
+    assert_allowed(st,&v,"record actual owner reply through the hook");
+    let row=view(&e,&id).await["resolution_row"].as_i64().unwrap();
+    {
+        let conn=e.store.read().unwrap();
+        assert_eq!(conn.query_row("SELECT delegation_message_type FROM cmd_history WHERE id=?1",[row],|r|r.get::<_,String>(0)).unwrap(),"user");
+    }
+    // Project execution's existing type projection must not rewrite the
+    // recorder's original authorship fact or erase an eligible prior reply.
+    e.store.write(move|c| {
+        c.execute("UPDATE cmd_history SET type='steering' WHERE id=?1",[row])?;
+        Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
+    }).unwrap();
+    let (st,v)=apply(&e,MRPOPO,&id,DEV_A,json!({"worktree_verify":"one"})).await;
+    assert_allowed(st,&v,"owner authorship survives the project projection");
+
+    let next=e.request(MRPOPO,"PATCH",&cfg(DEV_B),json!({"worktree_verify":"two"}),MAX_PANE).await;
+    let peer=e.seed_row(MAX_PANE,"yes","session",MRPOPO,Some("direct"),now_s());
+    e.store.write(move|c| {
+        c.execute("UPDATE cmd_history SET type='steering',delegation_message_type='session',process_origin='remote' WHERE id=?1",[peer])?;
+        Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
+    }).unwrap();
+    let (st,v)=apply(&e,MRPOPO,&next,DEV_B,json!({"worktree_verify":"two"})).await;
+    assert_code(st,&v,"request_unresolved","peer steering is still not owner input");
+    let (st,v)=e.type_in_pane(MAX_PANE,"go ahead").await;
+    assert_allowed(st,&v,"record the actual owner control");
+    let (st,v)=apply(&e,MRPOPO,&next,DEV_B,json!({"worktree_verify":"two"})).await;
+    assert_allowed(st,&v,"only the actual owner reply funds the second request");
 }

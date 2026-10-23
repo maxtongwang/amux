@@ -75,7 +75,9 @@ seconds. `cmd_history.ts` uses Unix milliseconds; row IDs establish ordering
 without depending on subsecond timestamp precision.
 
 `cmd_history.delegation_session_incarnation` records the receiving incarnation at
-message creation. `_amux_delegation_resolutions` records every owner reply's
+message creation. `delegation_message_type` retains the original message type
+when project execution projects an owner row to `steering`; peer steering rows
+retain their original session-message provenance and cannot become approvals. `_amux_delegation_resolutions` records every owner reply's
 outcome: `reply_row` primary key, unique nullable `request_id`, session, code,
 note and creation time. Unique indexes reserve shown rows and resolved replies.
 The existing 0127/0128 evidence-row reservation remains the final grant-spending

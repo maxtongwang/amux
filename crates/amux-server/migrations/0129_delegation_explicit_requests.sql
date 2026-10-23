@@ -10,6 +10,8 @@
 -- ADDCOL: _amux_delegation_grants resolution_code TEXT
 -- ADDCOL: _amux_delegation_grants resolution_note TEXT
 -- ADDCOL: cmd_history delegation_session_incarnation TEXT
+-- Preserve authorship when project execution projects type=user to steering.
+-- ADDCOL: cmd_history delegation_message_type TEXT
 CREATE INDEX IF NOT EXISTS idx_delegation_request_session
     ON _amux_delegation_grants(reply_session, shown_row) WHERE status='pending';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_delegation_request_shown
