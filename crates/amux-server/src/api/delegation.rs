@@ -319,7 +319,7 @@ pub(crate) fn cite_terms(target: &Target, action: &Action) -> super::max_ref::Ci
         Action::SetRouting => vec![["routing", "inbound", "cross group"].iter().map(|w| w.to_string()).collect()],
         other => vec![vec![other.label()]],
     };
-    let tag_changes = match action {
+    let tag_changes: Vec<(String, String)> = match action {
         Action::SetTags { from, to } => {
             let (from, to) = (set(from), set(to));
             from.difference(&to).map(|tag| (tag.clone(), "remove".into()))
@@ -327,8 +327,78 @@ pub(crate) fn cite_terms(target: &Target, action: &Action) -> super::max_ref::Ci
         }
         _ => vec![],
     };
+    let changes = super::max_ref::tag_change_requests(&target_words, &tag_changes);
     super::max_ref::CiteTerms { target: target_words, settings,
-        worker: match target { Target::Worker(w) => Some(w.clone()), _ => None }, tag_changes }
+        worker: match target { Target::Worker(w) => Some(w.clone()), _ => None }, tag_changes, changes }
+}
+
+/// Bind the common grammar to the exact values written by this request. No
+/// NeedsGrant action may fall back to a mere setting/target word co-occurrence.
+pub(crate) fn cite_request_terms(target: &Target, action: &Action, body: Option<&Value>) -> super::max_ref::CiteTerms {
+    use super::max_ref::setting_requests;
+    let mut terms = cite_terms(target, action);
+    let empty = serde_json::json!({});
+    let body = body.unwrap_or(&empty);
+    let clean_body = || {
+        let mut value = body.clone();
+        if let Some(map) = value.as_object_mut() { for key in META_FIELDS { map.remove(key); } }
+        value
+    };
+    let config_value = |key: &str| -> Option<Value> {
+        let key = key.trim_start_matches("group:").trim_start_matches("global:");
+        if let Some(key) = key.strip_prefix("env:") {
+            return Some(super::scope::scope_env_value(key,body.get("value")?.get(key)?).ok()?.map(Value::String).unwrap_or(Value::Null));
+        }
+        if key.starts_with("scope:") { return body.get("value").cloned(); }
+        if let Some(key) = key.strip_prefix("settings:") {
+            return Some(match key {
+                "commit-guard" => Value::Bool(body.get("enabled").map(super::py_truthy).unwrap_or(true)),
+                "task-guard" => Value::Bool(body.get("enabled").map(super::py_truthy).unwrap_or(false)),
+                "default-model" => body.get("model").cloned().unwrap_or(Value::String(String::new())),
+                _ => clean_body(),
+            });
+        }
+        if key == "instance:apply" { return Some(clean_body()); }
+        if matches!(key, "toggle_yolo" | "toggle_auto_continue") {
+            let Target::Worker(worker) = target else { return None };
+            let cfg = super::session_verbs::EnvFile::load(&crate::config::amux_home().join("sessions").join(format!("{worker}.env")));
+            return Some(Value::Bool(!super::session_verbs::yolo_enabled(cfg.get_or("CC_FLAGS", ""), cfg.get("CC_AUTO_CONTINUE"))));
+        }
+        let field = key.strip_prefix("row:").or_else(|| key.strip_prefix("create:")).unwrap_or(key);
+        let value = body.get(field)?;
+        if matches!(key, "isolated" | "external_email_allowed" | "spans_groups") && !value.is_null() {
+            return Some(Value::Bool(super::py_truthy(value)));
+        }
+        Some(value.clone())
+    };
+    let group_fields = || [
+        ("department", Value::String(String::new())),
+        ("goal", Value::String(String::new())),
+        ("kpis", serde_json::json!([])),
+        ("human_cost", serde_json::json!(0)),
+    ].into_iter().map(|(key, default)| {
+        setting_requests(&[key.into()], &terms.target, body.get(key).unwrap_or(&default))
+    }).collect::<Vec<_>>();
+    terms.changes = match action {
+        Action::SetTags { .. } => terms.changes.clone(),
+        Action::SetConfig { keys } => keys.iter().map(|key| config_value(key)
+            .map(|value| setting_requests(&setting_words(key), &terms.target, &value)).unwrap_or_default()).collect(),
+        Action::SetGroupRules { .. } => vec![body.get("value")
+            .map(|value| setting_requests(&["rules".into(), "rule".into()], &terms.target, &Value::String(super::scope::scope_memory_text(value)))).unwrap_or_default()],
+        Action::SetGroupConfig { .. } => group_fields(),
+        Action::CreateGroup { .. } => {
+            let mut changes = group_fields();
+            changes.push(terms.target.iter().map(|target| format!("create group {target}").into()).collect());
+            changes
+        }
+        Action::SetRouting => vec![body.get("value").and_then(|v| v.get(super::worker_messaging::OPEN_INBOUND_KEY))
+            .and_then(|value| super::scope::scope_env_value(super::worker_messaging::OPEN_INBOUND_KEY,value).ok())
+            .map(|value| setting_requests(&["routing".into(), "inbound".into()], &terms.target, &value.map(Value::String).unwrap_or(Value::Null))).unwrap_or_default()],
+        Action::MakeLead => vec![terms.target.iter().flat_map(|target|
+            [format!("make {target} a lead").into(), format!("make {target} lead").into()]).collect()],
+        _ => vec![], // A future grant action fails closed until its operands are defined.
+    };
+    terms
 }
 
 fn cite_ask_requirement(terms: &super::max_ref::CiteTerms) -> String {
@@ -340,8 +410,9 @@ fn cite_ask_requirement(terms: &super::max_ref::CiteTerms) -> String {
         }).collect::<Vec<_>>().join(" and ");
         return format!("explicitly requests {changes}, naming each changed tag and its add/remove direction for that target");
     }
-    let settings = terms.settings.iter().map(|alternatives| alternatives.join(" or ")).collect::<Vec<_>>().join("; ");
-    format!("names the target ({target}) and requests each setting in the same clause as that target ({settings})")
+    let changes = terms.changes.iter().map(|forms| forms.first().map(|phrase| phrase.text.as_str()).unwrap_or("missing request value"))
+        .collect::<Vec<_>>().join("; ");
+    format!("requests each exact change in a separate affirmative clause, for example: {changes}")
 }
 
 /// Env keys a worker may set on itself (H4: an explicit list, not "anything
@@ -973,7 +1044,7 @@ pub(crate) fn authorize(state: &AppState, headers: &HeaderMap, target: &Target, 
                     super::delegation_grants::Mode::Cite => {
                         let cite: Option<super::max_ref::Cite> = body.and_then(|b| b.get("cite")).filter(|c| !c.is_null())
                             .and_then(|c| serde_json::from_value(c.clone()).ok());
-                        let terms = cite_terms(target, action);
+                        let terms = cite_request_terms(target, action, body);
                         let cited = match super::max_ref::cite_pair(state, cite.as_ref(), &origin, &terms) {
                             Ok(c) => c,
                             Err(r) => return Err(forbid(r.code(), &format!(
@@ -1483,6 +1554,131 @@ mod tests {
         assert!(t.settings[0].contains(&"yolo".to_string()) && t.settings[0].contains(&"CC_FLAGS".to_string()));
         let t = cite_terms(&Target::Worker("review-dev-a".into()), &tags(&["dev"], &["dev", "ops"]));
         assert_eq!(t.settings, vec![vec!["ops".to_string()]], "a tag change names each changed group");
+    }
+
+    #[test]
+    fn delegation_all_grant_rows_require_target_value_and_direction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        // Handwritten expected requests: each grant key class, including keys
+        // whose current route is owner-only. A new row must add a case here.
+        let cases = [
+            ("toggle_yolo", "enable yolo for review-dev-a"),
+            ("env:CC_FLAGS", "set flags to approved-value for review-dev-a"),
+            ("create:yolo", "set yolo to approved-value for review-dev-a"),
+            ("create:flags", "set flags to approved-value for review-dev-a"),
+            ("external_email_allowed", "enable external email for review-dev-a"),
+            ("env:AMUX_EMAIL_EXTERNAL_ALLOW", "set external email to approved-value for review-dev-a"),
+            ("isolated", "enable isolation for review-dev-a"),
+            ("env:CC_ISOLATED", "set isolation to approved-value for review-dev-a"),
+            ("create:isolated", "set isolated to approved-value for review-dev-a"),
+            ("toggle_auto_continue", "enable auto continue for review-dev-a"),
+            ("env:CC_AUTO_CONTINUE", "set auto continue to approved-value for review-dev-a"),
+            ("env:AMUX_NEEDS_INPUT_AUTO*", "set auto approve to approved-value for review-dev-a"),
+            ("env:AMUX_BROWSER_PROFILES_*", "set browser profile to approved-value for review-dev-a"),
+            ("env:AMUX_APPROVAL_TYPES", "set approval type to approved-value for review-dev-a"),
+            ("scope:gates", "set gate to approved-value for review-dev-a"),
+            ("scope:connectors", "set connector to approved-value for review-dev-a"),
+            ("row:permissions", "set permission to approved-value for review-dev-a"),
+            ("env:CC_ORCHESTRATOR", "set lead to approved-value for review-dev-a"),
+            ("send_allow", "set routing to approved-value for review-dev-a"),
+            ("spans_groups", "enable cross group for review-dev-a"),
+            ("env:CC_SEND_ALLOW", "set routing to approved-value for review-dev-a"),
+            ("settings:commit-guard", "enable commit guard for review-dev-a"),
+            ("settings:task-guard", "enable task guard for review-dev-a"),
+            ("settings:default-model", "set default model to approved-value for review-dev-a"),
+            ("instance:apply", "set instance config to {} for review-dev-a"),
+            ("worktree_verify", "set verify to approved-value for review-dev-a"),
+            ("env:CC_WORKTREE_VERIFY", "set verify to approved-value for review-dev-a"),
+            ("env:CC_VERIFY", "set verify to approved-value for review-dev-a"),
+            ("env:CC_DEPLOY_CHECK", "set deploy check to approved-value for review-dev-a"),
+            ("env:CC_WORKTREE_AUTO_MERGE", "set auto merge to approved-value for review-dev-a"),
+            ("env:AMUX_YOLO_AUTO_YES", "set auto yes to approved-value for review-dev-a"),
+            ("env:CC_PROJECT_LEAD", "set project lead to approved-value for review-dev-a"),
+            ("env:CC_RECEIVE_DENY", "set receive deny to approved-value for review-dev-a"),
+            ("create:creator", "set creator to approved-value for review-dev-a"),
+            ("settings:alerts", "set alert to {} for review-dev-a"),
+        ];
+        assert_eq!(cases.iter().map(|(key,_)| *key).collect::<BTreeSet<_>>(), GRANT_ROWS.iter().copied().collect::<BTreeSet<_>>(), "every grant row must be exercised");
+        for (key, good) in cases {
+            let field = key.split(':').next_back().unwrap();
+            let mut body = serde_json::json!({});
+            if key.starts_with("env:") { body["value"] = serde_json::json!({}); body["value"][field] = serde_json::json!("approved-value"); }
+            else if key.starts_with("scope:") { body["value"] = serde_json::json!("approved-value"); }
+            else if key == "settings:default-model" { body["model"] = serde_json::json!("approved-value"); }
+            else if matches!(key, "settings:commit-guard" | "settings:task-guard") { body["enabled"] = Value::Bool(true); }
+            else if !matches!(key, "instance:apply" | "settings:alerts") {
+                body[field] = if matches!(key, "isolated" | "external_email_allowed" | "spans_groups") { Value::Bool(true) } else { serde_json::json!("approved-value") };
+            }
+            let terms = cite_request_terms(&Target::Worker("review-dev-a".into()), &cfg(&[key]), Some(&body));
+            assert!(super::super::max_ref::names_changes(good, &terms.changes), "{key}: {good}");
+            for bad in [good.replace("review-dev-a", "review-dev-b"), good.replace("approved-value", "different-value").replace("enable", "disable").replace("{}", "[]"),
+                format!("do not {good}"), format!("don't {good}"), format!("{good} but not review-dev-a"),
+                format!("review-dev-a is busy; {}", good.replace("review-dev-a", "review-dev-b"))] {
+                assert!(!super::super::max_ref::names_changes(&bad, &terms.changes), "{key} accepted {bad}");
+            }
+        }
+    }
+
+    #[test]
+    fn delegation_non_config_grants_require_every_operand_through_shared_matcher() {
+        let cases = [
+            (tags(&["dev"], &[]), serde_json::json!({"tags":""}), "remove dev from review-dev-a"),
+            (tags(&[], &["dev"]), serde_json::json!({"tags":"dev"}), "add dev to review-dev-a"),
+            (Action::MakeLead, serde_json::json!({}), "make review-dev-a a lead"),
+            (Action::SetGroupRules {group:"review-dev-a".into()}, serde_json::json!({"value":"report and do not hide blockers"}), "set rules to report and do not hide blockers for review-dev-a"),
+            (Action::SetGroupConfig {group:"review-dev-a".into()}, serde_json::json!({"goal":"ship"}), "set department to \"\" for review-dev-a; set goal to ship for review-dev-a; set kpis to [] for review-dev-a; set human_cost to 0 for review-dev-a"),
+            (Action::CreateGroup {group:"review-dev-a".into()}, serde_json::json!({"goal":"ship"}), "create group review-dev-a; set department to \"\" for review-dev-a; set goal to ship for review-dev-a; set kpis to [] for review-dev-a; set human_cost to 0 for review-dev-a"),
+            (Action::SetRouting, serde_json::json!({"value":{"AMUX_GROUP_OPEN_INBOUND":"1"}}), "set routing to 1 for review-dev-a"),
+        ];
+        for (action, body, good) in cases {
+            let target = if matches!(&action, Action::SetTags{..} | Action::MakeLead) { Target::Worker("review-dev-a".into()) } else { Target::Group("review-dev-a".into()) };
+            let terms = cite_request_terms(&target,&action,Some(&body));
+            assert!(super::super::max_ref::names_changes(good, &terms.changes), "{}: {good}",action.label());
+            for bad in [good.replace("review-dev-a", "review-dev-b"), format!("not {good}"), good.replace("set goal to ship", "set goal to other").replace("set routing to 1", "set routing to 0").replace("add dev", "remove dev").replace("remove dev", "add ops").replace("make review-dev-a a lead", "leave review-dev-a alone").replace("create group", "delete group").replace("report and do not hide blockers", "other rules")] {
+                assert!(!super::super::max_ref::names_changes(&bad, &terms.changes), "{} accepted {bad}",action.label());
+            }
+        }
+    }
+
+    #[test]
+    fn delegation_request_values_preserve_case_whitespace_and_structured_operands() {
+        let target = Target::Worker("review-dev-a".into());
+        let terms = cite_request_terms(&target,&cfg(&["worktree_verify"]),Some(&serde_json::json!({"worktree_verify":"echo Ok  Done"})));
+        assert!(super::super::max_ref::names_changes("set verify to echo Ok  Done for review-dev-a", &terms.changes));
+        for bad in ["set verify to echo ok  Done for review-dev-a", "set verify to echo Ok Done for review-dev-a", "set verify to echo Ok  Done for review-dev-b; review-dev-a is busy"] {
+            assert!(!super::super::max_ref::names_changes(bad, &terms.changes), "{bad}");
+        }
+        let terms = cite_request_terms(&target,&cfg(&["scope:gates"]),Some(&serde_json::json!({"value":{"review":true,"test":false}})));
+        assert!(super::super::max_ref::names_changes(r#"set gate to {"review":true,"test":false} for review-dev-a"#, &terms.changes));
+        assert!(!super::super::max_ref::names_changes(r#"set gate to {"review":false,"test":false} for review-dev-a"#, &terms.changes));
+        assert!(!super::super::max_ref::names_changes("enable gate for review-dev-a", &terms.changes));
+        let env_bool = cite_request_terms(&target,&cfg(&["env:CC_FLAGS"]),Some(&serde_json::json!({"value":{"CC_FLAGS":true}})));
+        assert!(super::super::max_ref::names_changes("set flags to True for review-dev-a", &env_bool.changes));
+        assert!(!super::super::max_ref::names_changes("enable yolo for review-dev-a", &env_bool.changes), "env boolean stores text, it does not enable yolo");
+        let rules = cite_request_terms(&Target::Group("dev".into()),&Action::SetGroupRules{group:"dev".into()},Some(&serde_json::json!({"value":{"text":"report blockers"}})));
+        assert!(super::super::max_ref::names_changes("set rules to report blockers for dev", &rules.changes));
+        assert!(!super::super::max_ref::names_changes("set rules to other text for dev", &rules.changes));
+        let clear = cite_request_terms(&target,&cfg(&["send_allow"]),Some(&serde_json::json!({"send_allow":""})));
+        assert!(super::super::max_ref::names_changes("clear routing for review-dev-a", &clear.changes));
+        assert!(!super::super::max_ref::names_changes("set routing to * for review-dev-a", &clear.changes));
+        let remove = cite_request_terms(&target,&cfg(&["external_email_allowed"]),Some(&serde_json::json!({"external_email_allowed":null})));
+        assert!(super::super::max_ref::names_changes("remove external email for review-dev-a", &remove.changes));
+        assert!(!super::super::max_ref::names_changes("disable external email for review-dev-a", &remove.changes), "remove override and disable are different changes");
+        assert!(!super::super::max_ref::names_changes("enable yolo for review-dev-a", &[]), "undefined future grant action fails closed");
+        let missing = cite_request_terms(&target,&cfg(&["env:CC_FLAGS"]),None);
+        assert!(!super::super::max_ref::names_changes("enable yolo for review-dev-a", &missing.changes), "missing values fail closed");
+    }
+
+    #[test]
+    fn delegation_toggle_direction_follows_current_yolo_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        std::fs::write(tmp.path().join("sessions/review-dev-a.env"), "CC_AUTO_CONTINUE=1\n").unwrap();
+        let terms = cite_request_terms(&Target::Worker("review-dev-a".into()), &cfg(&["toggle_yolo"]), Some(&serde_json::json!({"toggle_yolo":true})));
+        assert!(super::super::max_ref::names_changes("disable yolo for review-dev-a", &terms.changes));
+        assert!(!super::super::max_ref::names_changes("enable yolo for review-dev-a", &terms.changes));
     }
 
     #[test]

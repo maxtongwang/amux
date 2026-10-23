@@ -750,12 +750,15 @@ impl EnvFile {
     pub(crate) fn write(&self, path: &Path) -> std::io::Result<()> {
         let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _file = incarnation_file_lock(path)?;
-        super::delegation_grants::compare_env(path)?;
-        let mut latest = if self.dirty.is_empty() {
-            self.clone()
+        let mut latest = Self::load(path);
+        let keys: Vec<&str> = if self.dirty.is_empty() {
+            // A whole snapshot also removes keys absent from that snapshot.
+            self.pairs.iter().chain(latest.pairs.iter()).map(|(key, _)| key.as_str()).collect()
         } else {
-            Self::load(path)
+            self.dirty.iter().map(|(key, _)| key.as_str()).collect()
         };
+        super::delegation_grants::compare_env(path, &keys)?;
+        if self.dirty.is_empty() { latest = self.clone(); }
         for (key, value) in &self.dirty {
             match value {
                 Some(value) => latest.set(key, value),
@@ -838,7 +841,11 @@ impl EnvFile {
     pub(crate) fn replace_text(path: &Path, text: &str) -> std::io::Result<()> {
         let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _file = incarnation_file_lock(path)?;
-        super::delegation_grants::compare_env(path)?;
+        // A raw replacement touches every existing and supplied key.
+        let current = Self::load(path);
+        let replacement = Self::from_text(text);
+        let keys: Vec<&str> = current.pairs.iter().chain(replacement.pairs.iter()).map(|(key, _)| key.as_str()).collect();
+        super::delegation_grants::compare_env(path, &keys)?;
         let text = worker_text_with_incarnation(path, text)?;
         use std::io::Write as _;
         if let Some(dir) = path.parent() {
@@ -897,7 +904,8 @@ impl EnvFile {
         }
         let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _file = incarnation_file_lock(path)?;
-        super::delegation_grants::compare_env(path)?;
+        let keys: Vec<&str> = updates.iter().map(|(key, _)| key.as_str()).collect();
+        super::delegation_grants::compare_env(path, &keys)?;
         // Read with the worker-file parser: it un-escapes the double-quoted
         // values Self::write produces, which crate::config::parse_env_file
         // does not, so a round trip here cannot grow backslashes.

@@ -328,14 +328,14 @@ pub(crate) fn expect_env(path: &std::path::Path) {
 }
 
 /// Called WITH EnvFile's process and file locks held, before any write.
-/// Compare every checked key, including tags and incarnation, so a concurrent
-/// owner change cannot be overwritten by an absolute, stale delegated value.
-pub(crate) fn compare_env(path: &std::path::Path) -> std::io::Result<()> {
+/// Compare the keys this write touches plus stable identity. Unrelated writes
+/// merge normally; a changed operand or incarnation refuses the stale write.
+pub(crate) fn compare_env(path: &std::path::Path, keys: &[&str]) -> std::io::Result<()> {
     let Some(c) = captured() else { return Ok(()) };
     let checked = c.checked_env.lock().unwrap_or_else(|e| e.into_inner());
     let Some(expected) = checked.get(path) else { return Ok(()) };
     let current: BTreeMap<String, String> = super::session_verbs::EnvFile::load(path).pairs().iter().cloned().collect();
-    if &current != expected {
+    if keys.iter().copied().chain(std::iter::once(super::rename_identity::INCARNATION_KEY)).any(|key| current.get(key) != expected.get(key)) {
         *c.compare_failed.lock().unwrap_or_else(|e| e.into_inner()) = true;
         tracing::warn!(verdict = "delegation_state_changed", measured = true, n_considered = 1,
             "delegated env compare-and-set refused a concurrent state change");
@@ -1404,6 +1404,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegation_env_cas_merges_unrelated_keys_but_refuses_touched_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        for touched in [false, true] {
+            let path = tmp.path().join("sessions/test-dev-a.env");
+            let handler_state = state.clone();
+            let owner_path = path.clone();
+            let app = Router::new().route("/api/sessions/test-dev-a/config", axum::routing::patch(move || {
+                let state = handler_state.clone();
+                let path = owner_path.clone();
+                async move {
+                    expect_env(&path);
+                    let owner_path = path.clone();
+                    tokio::spawn(async move {
+                        let mut env = super::super::session_verbs::EnvFile::load(&owner_path);
+                        env.set(if touched { "CC_TAGS" } else { "CC_DESC" }, if touched { "dev,owner" } else { "owner description" });
+                        env.write(&owner_path).unwrap();
+                    }).await.unwrap();
+                    super::super::session_verbs::config_patch(&state,"test-dev-a",&json!({"tags":"ops"})).await
+                }
+            })).layer(axum::middleware::from_fn_with_state(state.clone(),capture));
+            let (st,v,_) = call(&app,"PATCH","/api/sessions/test-dev-a/config",None,json!({"tags":"ops"}),None).await;
+            let env = super::super::session_verbs::EnvFile::load(&path);
+            if touched {
+                assert_eq!(st, StatusCode::CONFLICT, "{v}");
+                assert_eq!(v["code"], "delegation_state_changed");
+                assert_eq!(env.get("CC_TAGS"), Some("dev,owner"));
+            } else {
+                assert!(st.is_success(), "unrelated write must merge: {v}");
+                assert_eq!(env.get("CC_TAGS"), Some("ops"));
+                assert_eq!(env.get("CC_DESC"), Some("owner description"));
+            }
+        }
+        // Scope's merge_plain has the same touched-key comparison and reload.
+        let path = tmp.path().join("sessions/test-dev-a.env");
+        CAPTURED.scope(context(json!({})), async {
+            expect_env(&path);
+            let owner_path = path.clone();
+            tokio::spawn(async move {
+                let mut env = super::super::session_verbs::EnvFile::load(&owner_path);
+                env.set("CC_DESC", "second owner description");
+                env.write(&owner_path).unwrap();
+            }).await.unwrap();
+            super::super::session_verbs::EnvFile::merge_plain(&path, &[("CC_TAGS".into(),Some("ops".into()))]).unwrap();
+            let env = super::super::session_verbs::EnvFile::load(&path);
+            assert_eq!(env.get("CC_DESC"), Some("second owner description"));
+            assert_eq!(env.get("CC_TAGS"), Some("ops"));
+        }).await;
+        // Re-creating the worker changes identity even if the touched value
+        // has not changed. The baseline must still refuse that new holder.
+        CAPTURED.scope(context(json!({})), async {
+            expect_env(&path);
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(raw.contains("inc-test-dev-a"));
+            std::fs::write(&path,raw.replace("inc-test-dev-a","replacement-worker")).unwrap();
+            let mut stale = super::super::session_verbs::EnvFile::load(&path);
+            stale.set("CC_TAGS","ops");
+            assert_eq!(stale.write(&path).unwrap_err().to_string(),"delegation_state_changed");
+        }).await;
+    }
+
+    #[tokio::test]
     async fn delegation_env_cas_reports_conflict_at_http_boundary() {
         let tmp = tempfile::tempdir().unwrap();
         let _home = crate::api::settings::test_env::set_home(tmp.path());
@@ -1692,15 +1755,15 @@ mod tests {
         let kinds: Vec<(&str, &str, &str, Value, &str)> = vec![
             ("env (yolo)", "PATCH", "/api/sessions/test-dev-a/config", json!({"toggle_yolo": true}), "turn on yolo for test-dev-a"),
             ("connectors (prefs)", "PUT", "/api/scope", json!({"level": "worker", "name": "test-dev-a", "capability": "connectors",
-                "value": {"gmail": {"enabled": true}}}), "enable the gmail connector for test-dev-a"),
+                "value": {"gmail": {"enabled": true}}}), r#"set connector to {"gmail":{"enabled":true}} for test-dev-a"#),
             ("gates (session_gates)", "PUT", "/api/scope", json!({"level": "worker", "name": "test-dev-a", "capability": "gates",
-                "value": {"review": true}}), "add a review gate for test-dev-a"),
+                "value": {"review": true}}), r#"set gate to {"review":true} for test-dev-a"#),
             ("group gates (session_gates)", "PUT", "/api/scope", json!({"level": "group", "name": "dev", "capability": "gates",
-                "value": {"review": true}}), "add a review gate for dev"),
+                "value": {"review": true}}), r#"set gate to {"review":true} for dev"#),
             ("group config (group_config)", "PATCH", "/api/groups/dev/config", json!({"department": "eng", "goal": "ship it"}),
-                "set the goal for dev"),
+                r#"set department to eng for dev; set goal to ship it for dev; set kpis to [] for dev; set human_cost to 0 for dev"#),
             ("group rules (text)", "PUT", "/api/scope", json!({"level": "group", "name": "dev", "capability": "rules",
-                "value": "Dev: report blockers first."}), "update the rules for dev"),
+                "value": "Dev: report blockers first."}), "set rules to Dev: report blockers first. for dev"),
         ];
         let mut failures = Vec::new();
         for (name, method, path, body, ask) in kinds {

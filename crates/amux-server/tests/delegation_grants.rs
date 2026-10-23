@@ -79,7 +79,7 @@ async fn non_affirmative_owner_replies_refuse_without_effects() {
 #[tokio::test]
 async fn multiple_settings_in_one_body_reserve_one_immutable_grant() {
     let e = setup().await;
-    let pair = e.cite(&format!("Max, may I enable yolo and auto continue for {DEV_A}?"));
+    let pair = e.cite(&format!("Max, may I enable yolo for {DEV_A} and enable auto continue for {DEV_A}?"));
     let body = json!({"toggle_yolo": true, "toggle_auto_continue": true});
     let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_A), Some(cited(body.clone(), pair.clone()))).await;
     assert_allowed(st, &v, "one body with two settings");
@@ -381,4 +381,32 @@ async fn tags_arrays_and_strings_store_the_same_canonical_membership_on_both_rou
         assert_eq!(v["code"],"tags_invalid");
         assert_eq!(e.snapshot(),before);
     }
+}
+
+#[tokio::test]
+async fn citation_settings_reject_passing_target_mentions_values_and_negations() {
+    let e = setup().await;
+    for ask in [
+        format!("Max, may I enable yolo for {DEV_B} and leave {DEV_A} alone?"),
+        format!("Max, may I disable yolo for {DEV_A}?"),
+        format!("Max, do not enable yolo for {DEV_A}?"),
+        format!("Max, don't enable yolo for {DEV_A}?"),
+        format!("Max, no yolo for {DEV_A}?"),
+        format!("Max, may I enable yolo for not {DEV_A}?"),
+    ] {
+        let pair = e.cite(&ask);
+        let before = e.snapshot();
+        let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_A), Some(cited(json!({"toggle_yolo":true}),pair))).await;
+        assert_code(st, &v, "cite_ask_missing_change", &ask);
+        assert_eq!(e.snapshot(), before, "refusal writes nothing");
+    }
+    for ask in [format!("Max, don't remove dev from {DEV_B}?"), format!("Max, do not remove dev from {DEV_B}?"), format!("Max, remove dev from {DEV_B}, not {DEV_B}?")] {
+        let pair = e.cite(&ask);
+        let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &cfg(DEV_B), Some(cited(json!({"tags":""}),pair))).await;
+        assert_code(st, &v, "cite_ask_missing_change", &ask);
+        assert!(e.tags(DEV_B).contains("dev"));
+    }
+    let pair = e.cite(&format!("Max, may I enable yolo for {DEV_A}?"));
+    let (st,v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_A), Some(cited(json!({"toggle_yolo":true}),pair))).await;
+    assert_allowed(st, &v, "explicit direction on the actual target");
 }

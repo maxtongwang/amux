@@ -6200,3 +6200,12 @@ FIX: Reserve one pair with its spent timestamp and exact request in the grant
   failure_reason, amux grant list [--json], and the existing dashboard audit
   rows instruct a fresh owner ask. Failure-injection tests and exact mutations
   are supplied for the parent's runtime verification.
+
+  Opus delta review of edc942b2 follow-up: all citation actions now use one
+  target/value/direction matcher, including negation refusal; passing mentions
+  cannot fund YOLO on another worker. Restored the original 0126 and moved all
+  later schema additions to 0127 so an already-stamped DB upgrades. Env CAS
+  compares touched keys plus identity and merges unrelated writes. Ask binding
+  reads existing incarnations on demand without fleet scans or env writes.
+  The populated-old-0126 SQLite probe passed, its reply-index mutation failed
+  and reverted; the parent still owns Cargo and Rust regression verification.

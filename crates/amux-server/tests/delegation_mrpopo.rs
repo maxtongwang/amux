@@ -27,13 +27,29 @@ struct Class {
     reaches_mrpopo: bool,
 }
 
-/// An ask that names the class, its route and body (so its setting words),
-/// and every target spelling the classes use.
+/// Exact requests for the behavior each fixture actually writes.
 fn ask_for(c: &Class) -> String {
-    if c.name == "leads membership" {
-        return format!("Max, may I add the leads tag to {DEV_A}?");
-    }
-    format!("Max, may I {} ({} {}) for {DEV_A}, ops, leads and the fleet?", c.name, c.path, c.body)
+    let request = match c.name {
+        "make lead" => format!("make {DEV_A} a lead"),
+        "leads rules" => "set rules to Leads: report blockers first. for leads".into(),
+        "leads membership" => format!("add leads to {DEV_A}"),
+        "routing" => format!("clear routing for {DEV_A}"),
+        "yolo" => format!("enable yolo for {DEV_A}"),
+        "external email" => format!("enable external email for {DEV_A}"),
+        "isolated" => format!("enable isolation for {DEV_A}"),
+        "gates" => format!("set gate to {{\"review\":true}} for {DEV_A}"),
+        "connectors" => format!("set connector to {{\"google-gmail\":true}} for {DEV_A}"),
+        "outbound approval" => format!("set approval type to budget for {DEV_A}"),
+        "create group" => "create group review-new-team; set department to \"\" for review-new-team; set goal to ship for review-new-team; set kpis to [] for review-new-team; set human_cost to 0 for review-new-team".into(),
+        "group config" => "set department to \"\" for ops; set goal to ship delegation for ops; set kpis to [] for ops; set human_cost to 0 for ops".into(),
+        "commit guard" => "disable commit guard for fleet".into(),
+        "task guard" => "enable task guard for fleet".into(),
+        "default model" => "set default model to sonnet for fleet".into(),
+        "browser profiles" => format!("set browser profile to review-profile for {DEV_A}"),
+        "alerts config (ai-config #175)" => "set alert to {\"phone\":\"+15550100\"} for fleet".into(),
+        other => panic!("missing directed request fixture: {other}"),
+    };
+    format!("Max, may I {request}?")
 }
 
 fn classes() -> Vec<Class> {
@@ -110,6 +126,13 @@ fn classes() -> Vec<Class> {
             body: scope_body("worker", DEV_A, "env", json!({"AMUX_APPROVAL_TYPES": "budget"})),
         },
         Class {
+            name: "create group",
+            method: "PATCH",
+            path: "/api/groups/review-new-team/config".into(),
+            reaches_mrpopo: false,
+            body: json!({"goal":"ship"}),
+        },
+        Class {
             name: "group config",
             method: "PATCH",
             // `ops`: a lead's own team's group config is the lead's (decide_lead).
@@ -169,6 +192,13 @@ async fn each_delegable_class_applies_with_a_citation_and_undoes() {
         let want = if c.reaches_mrpopo { "held_for_max" } else { "cite_missing" };
         if (st.as_u16(), v["code"].as_str()) != (403, Some(want)) {
             failures.push(format!("{}: without a citation expected 403 {want}, got {st} {v}", c.name));
+        }
+        if !c.reaches_mrpopo {
+            let negated = ask_for(&c).replacen("may I ", "may I not ", 1);
+            let pair = e.cite(&negated);
+            let (st,v) = e.call(Who::Worker(MRPOPO), c.method, &c.path, Some(cited(c.body.clone(),pair))).await;
+            assert_code(st, &v, "cite_ask_missing_change", c.name);
+            assert_eq!(e.config_snapshot(), before, "{}: negation writes nothing", c.name);
         }
         let row = e.cite(&ask_for(&c));
         let (st, v) = e.call(Who::Worker(MRPOPO), c.method, &c.path, Some(cited(c.body.clone(), row))).await;
@@ -263,7 +293,7 @@ async fn leads_and_self_never_get_mrpopos_classes() {
 #[tokio::test]
 async fn mrpopo_at_the_group_and_global_layers() {
     let e = setup().await;
-    let row = e.cite("Max, may I allow external email for dev?");
+    let row = e.cite("Max, may I set external email to 1 for dev?");
     let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope",
         Some(cited(scope_body("group", "dev", "env", json!({"AMUX_EMAIL_EXTERNAL_ALLOW": "1"})), row))).await;
     assert_allowed(st, &v, "group-layer external email with a citation");
@@ -312,7 +342,7 @@ async fn a_layer_that_includes_the_caller_is_held_for_max() {
     // Non-privileged on a layer that includes the caller: still allowed.
     let (st, v) = e.call(Who::Worker(DEV_LEAD), "PUT", "/api/scope", Some(scope_body("group", "dev", "rules", json!("Dev: report blockers first.")))).await;
     assert_allowed(st, &v, "a lead sets its own team's rules");
-    let row = e.cite("Max, may I update the rules for leads?");
+    let row = e.cite("Max, may I set rules to Leads: report blockers first. for leads?");
     let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(cited(scope_body("group", "leads", "rules", json!("Leads: report blockers first.")), row))).await;
     assert_allowed(st, &v, "mrpopo sets the leads rules with a citation");
 }
