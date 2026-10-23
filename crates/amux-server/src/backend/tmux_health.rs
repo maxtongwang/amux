@@ -148,20 +148,29 @@ fn socket_ownership_failure(verdict: &str) -> bool {
 }
 
 pub async fn observe() -> Observation {
-    observe_with_evidence(true).await
+    observe_with_evidence(true, None).await
 }
 
-async fn observe_with_evidence(capture: bool) -> Observation {
+/// Watch probes must not inherit a pane's TMUX address. Tests supply only their private socket.
+pub(crate) async fn observe_socket(socket: Option<&std::path::Path>) -> Observation {
+    let path = socket.map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| {
+        let root = std::env::var("TMUX_TMPDIR").unwrap_or_else(|_| "/tmp".into());
+        normalized_path(&format!("{root}/tmux-{}/default", euid()))
+    });
+    observe_with_evidence(false, Some(&path)).await
+}
+
+async fn observe_with_evidence(capture: bool, socket: Option<&str>) -> Observation {
     let uid = euid().to_string();
     let lsof_args = ["-nP", "-a", "-U", "-u", &uid, "-c", "tmux", "-Fpcn"];
+    let mut args = vec!["-N"];
+    if let Some(path) = socket { args.extend(["-S", path]); }
+    args.extend(["display-message", "-p", "#{pid}|#{socket_path}"]);
     let (identity, sockets) = tokio::join!(
-        output(
-            "tmux",
-            &["-N", "display-message", "-p", "#{pid}|#{socket_path}"]
-        ),
+        output("tmux", &args),
         output_any(&["lsof", "/usr/sbin/lsof", "/usr/bin/lsof"], &lsof_args)
     );
-    let mut path = default_socket();
+    let mut path = socket.map(normalized_path).unwrap_or_else(default_socket);
     let mut pid = None;
     let probe_error = match identity {
         Ok(o) if o.status.success() => {
@@ -232,7 +241,7 @@ pub(crate) fn capture_after_probe_timeout(probe: serde_json::Value) {
                     .build()
                 {
                     Ok(runtime) => runtime.block_on(async {
-                        let observation = observe_with_evidence(false).await;
+                        let observation = observe_with_evidence(false, None).await;
                         capture_stall_evidence(&observation, "fleet_probe_timeout", Some(probe))
                             .await;
                     }),

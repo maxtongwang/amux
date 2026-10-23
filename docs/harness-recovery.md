@@ -305,3 +305,49 @@ amux-isolated scripts/safe-cargo.sh test -p amux-server --lib round9_ -- --skip 
 ```
 
 Never run the migration against a real home during verification.
+
+## Tmux fleet recovery
+
+The watch persists live agents from the shared `FleetSignals::agent_running`
+census, rather than treating retained tmux shells as workers. An API stop,
+provider exit or dead pane therefore stays stopped after a server loss.
+Unreadable discovery preserves the last good running set.
+
+A failed discovery is corroborated by the shared AMUX-4203 socket-owner probe.
+Only its measured `no_server` verdict may begin confirmation. Two agreeing
+readings at least five seconds apart establish loss; an intervening successful
+or unreadable reading clears confirmation. Neither a single refusal nor a live
+unreachable owner can start recovery.
+
+Loss history survives successful restores and amux restarts. Restore passes
+wait at least 600 seconds between starts; repeated losses without a quiet hour
+increase the delay exponentially (600, then 1200 seconds). The fourth loss in
+that episode halts automatic starts, including the keeper, and retains pending
+work. One loss push and one halt escalation are claimed durably per episode.
+A new loss after a quiet hour starts a new episode. An interrupted pass resumes
+its existing slot and adopts surviving starts.
+
+`tmux_watch_process_recovery` ports the SIGKILL proof from `5fd4e6128`: it
+API-stops a fixture worker with a retained shell, kills only its guarded private
+tmux PID, interrupts amux between worker starts, and restarts the same binary
+and state. Provider invocation counts prove surviving starts are adopted once
+and the API-stopped worker stays stopped. The fixture binds `127.0.0.1` on an
+ephemeral port, clears the server environment, uses a private home/socket, and
+keeps its evidence directory on failure. It never queries the live default
+socket. Rust CI discovers this integration binary through its workspace
+nextest archive and installs both tmux and lsof in targeted and full test jobs.
+
+Parent verification (run inside the parent's isolated test environment):
+
+```bash
+scripts/test-contended.sh -p amux-server --lib -- tmux_watch --skip the_census_reads_a_private_tmux_server
+scripts/test-contended.sh -p amux-server --lib -- tmux_health
+scripts/test-contended.sh -p amux-server --test tmux_watch_process_recovery -- --nocapture
+scripts/test-contended.sh -p amux-server --test tmux_test_socket_audit --test server_launch_bind_audit
+```
+
+The first command exercises the pure census, confirmation, storm and restart
+assertions. The process proof requires real tmux on its private socket, lsof
+and the compiled server binary; it must not be replaced with a serialization
+round-trip. Also run the full server suite and workspace shipping gates before
+publication. The builder handoff does not claim these commands ran.

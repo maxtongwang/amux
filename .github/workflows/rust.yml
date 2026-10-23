@@ -351,7 +351,7 @@ jobs:
           KEY: ${{ steps.key.outputs.key }}
         run: |
           set -uo pipefail
-          command -v tmux >/dev/null || { sudo apt-get update && sudo apt-get install -y tmux; } || exit 1
+          (command -v tmux >/dev/null && command -v lsof >/dev/null) || { sudo apt-get update && sudo apt-get install -y tmux lsof; } || exit 1
           bash scripts/test-tree-clean.sh --self-test || exit 1
           echo "targeted: running only the tests that read the changed files: $RUST_FILTER"
           if [ "$HIT" = true ]; then
@@ -451,7 +451,7 @@ jobs:
           RUST_FILTER: ${{ needs.affected.outputs.rust_filter }}
         run: |
           set -uo pipefail
-          command -v tmux >/dev/null || { sudo apt-get update && sudo apt-get install -y tmux; } || exit 1
+          (command -v tmux >/dev/null && command -v lsof >/dev/null) || { sudo apt-get update && sudo apt-get install -y tmux lsof; } || exit 1
           # Extracting into the workspace puts the binaries back at the target/
           # path env!("CARGO_BIN_EXE_*") baked in at compile time (target/ is
           # gitignored, so the residue guard does not see it). --no-fail-fast

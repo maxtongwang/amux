@@ -12,9 +12,9 @@
 //!
 //! # What it does
 //!
-//! Every tick it asks tmux for its sessions. The first "no server" after the server was up is
-//! the loss: ONE `verdict=tmux_server_lost` event with the time and the worker count, a push to
-//! the owner, then a restore of every worker that was running (non-archived, not paused), each
+//! Every tick it joins session discovery to amux's agent census. Two socket-owner-confirmed
+//! down readings at least five seconds apart establish a loss: ONE `verdict=tmux_server_lost`
+//! event with the time and worker count, a push to the owner, then a restore of every worker that was running (non-archived, not paused), each
 //! resuming its recorded conversation exactly as `amux start --detach` does, and one
 //! `verdict=fleet_restored` with counts and failures. Leads get a message once they are back.
 //!
@@ -30,6 +30,9 @@ const JOB: &str = super::registry::ids::TMUX_WATCH;
 const TICK_SECS: u64 = 15;
 /// At most one restore per ten minutes, however often the server is lost.
 pub(crate) const RESTORE_GAP_SECS: f64 = 600.0;
+const LOSS_CONFIRM_SECS: f64 = 5.0;
+const LOSS_EPISODE_SECS: f64 = 3600.0;
+const MAX_EPISODE_LOSSES: u32 = 4;
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -47,7 +50,18 @@ pub(crate) struct WatchState {
     pub pending_attempts: u32,
     pub pending_next_at: Option<f64>,
     pub pending_alerted_at: Option<f64>,
-    /// amux workers whose tmux session existed at the last reading while the server was up.
+    /// Loss history survives successful starts; four losses without a quiet hour halt recovery.
+    pub episode_losses: u32,
+    pub last_loss_at: Option<f64>,
+    pub episode_alerted_at: Option<f64>,
+    pub loss_notice_pending: bool,
+    pub storm_alerted_at: Option<f64>,
+    pub restore_halted: bool,
+    /// An interrupted pass may adopt completed starts without consuming a second restore slot.
+    pub pending_in_progress: bool,
+    /// First corroborated down reading; an intervening unreadable/up reading clears it.
+    pub down_since: Option<f64>,
+    /// amux workers with a live agent at the last good fleet census.
     pub workers: Vec<String>,
     pub lost_at: Option<f64>,
     pub last_restore_at: Option<f64>,
@@ -55,7 +69,7 @@ pub(crate) struct WatchState {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Census {
-    /// The server answered; these are the amux worker names (session `amux-<name>`).
+    /// The server answered; tick filters discovery to live agents before persisting it.
     Up(Vec<String>),
     /// No tmux server is running on this socket.
     NoServer,
@@ -97,17 +111,24 @@ pub(crate) fn observe(st: &mut WatchState, census: &Census, now: f64, boot_at: O
     if !matches!(census, Census::Up(_)) {
         st.lost_at = Some(now);
     }
-    // Storm safety: a loss soon after the last one keeps the retry backoff growing instead of
-    // restarting it, so a tmux that keeps dying is alarmed about, not restarted in a loop.
-    let restore = st.last_restore_at.is_none_or(|t| now - t >= RESTORE_GAP_SECS);
-    st.last_restore_at = Some(now);
-    if restore {
-        st.pending_attempts = 0;
-        st.pending_next_at = None;
-    } else {
-        st.pending_attempts += 1;
-        st.pending_next_at = Some(now + keeper_backoff(st.pending_attempts));
+    // Success is not evidence that the server stopped crashing. Only a quiet hour closes
+    // the episode; the fourth loss latches recovery off and produces one escalation.
+    if st.last_loss_at.is_none_or(|t| now - t >= LOSS_EPISODE_SECS) {
+        st.episode_losses = 0;
+        st.episode_alerted_at = None;
+        st.storm_alerted_at = None;
+        st.restore_halted = false;
     }
+    st.episode_losses = st.episode_losses.saturating_add(1);
+    st.last_loss_at = Some(now);
+    st.loss_notice_pending |= !rebooted && st.episode_alerted_at.is_none();
+    st.restore_halted |= st.episode_losses >= MAX_EPISODE_LOSSES;
+    st.pending_in_progress = false;
+    st.pending_attempts = 0;
+    st.pending_alerted_at = None;
+    let delay = RESTORE_GAP_SECS * 2f64.powi(st.episode_losses.saturating_sub(2).min(10) as i32);
+    st.pending_next_at = st.last_restore_at.map(|t| (t + delay).max(now));
+    let restore = !st.restore_halted && st.pending_next_at.is_none_or(|t| now >= t);
     // Restore what was running before and is not running now.
     let running: &[String] = if let Census::Up(w) = census { w } else { &[] };
     let workers: Vec<String> = before.iter().filter(|w| !running.contains(w)).cloned().collect();
@@ -119,8 +140,7 @@ pub(crate) fn observe(st: &mut WatchState, census: &Census, now: f64, boot_at: O
     Decision::Lost { workers, before, restore, rebooted }
 }
 
-/// Read tmux's answer to `list-sessions`. "no server running" and a missing socket
-/// ("error connecting to …") both mean no server; anything else non-zero is unreadable.
+/// Parse session discovery. NoServer is only a candidate until socket ownership corroborates it.
 pub(crate) fn parse_census(success: bool, stdout: &str, stderr: &str) -> Census {
     if success {
         let mut names: Vec<String> = stdout
@@ -134,7 +154,7 @@ pub(crate) fn parse_census(success: bool, stdout: &str, stderr: &str) -> Census 
         return Census::Up(names);
     }
     let err = stderr.trim();
-    // A socket file left with nothing listening ("Connection refused") is no server too.
+    // Refusal alone is insufficient: read_census corroborates with tmux_health.
     if err.starts_with("no server running")
         || (err.starts_with("error connecting to") && (err.contains("No such file or directory") || err.contains("Connection refused")))
     {
@@ -159,9 +179,81 @@ pub(crate) async fn read_census(socket: Option<&Path>) -> Census {
         .kill_on_drop(true);
     let out = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output()).await;
     match out {
-        Ok(Ok(o)) => parse_census(o.status.success(), &String::from_utf8_lossy(&o.stdout), &String::from_utf8_lossy(&o.stderr)),
+        Ok(Ok(o)) => {
+            let census = parse_census(o.status.success(), &String::from_utf8_lossy(&o.stdout), &String::from_utf8_lossy(&o.stderr));
+            if census == Census::NoServer {
+                corroborate_down(crate::backend::tmux_health::observe_socket(socket).await)
+            } else {
+                census
+            }
+        },
         Ok(Err(e)) => Census::Unreadable(format!("tmux did not run: {e}")),
         Err(_) => Census::Unreadable("tmux list-sessions timed out".into()),
+    }
+}
+
+/// Reuse AMUX-4203's kernel-owner verdict, including its fail-closed unmeasured case.
+fn corroborate_down(health: crate::backend::tmux_health::Observation) -> Census {
+    if health.measured && health.verdict == "no_server" {
+        Census::NoServer
+    } else {
+        Census::Unreadable(format!("socket ownership: {}", health.verdict))
+    }
+}
+
+/// The shared fleet census knows whether an agent is alive; a session at a shell prompt
+/// after API stop, /exit or a crash must never enter the durable was-running set.
+fn worker_census(census: Census, signals: &crate::api::sessions_legacy::FleetSignals) -> Census {
+    match census {
+        Census::Up(workers) => {
+            let n_considered = workers.len();
+            let running: Vec<String> = workers.into_iter()
+                .filter(|name| signals.agent_running(&format!("amux-{name}"))).collect();
+            let excluded = n_considered - running.len();
+            if excluded > 0 && crate::log_dedupe::first_this_bucket("tmux-watch-shells", crate::log_dedupe::hour_bucket(now_secs())) {
+                tracing::info!(target: "tmux_watch", verdict = "tmux_watch_nonagents_excluded",
+                    measured = true, n_considered, excluded, "retained sessions without agents excluded from recovery census");
+            }
+            Census::Up(running)
+        },
+        other => other,
+    }
+}
+
+fn confirm_census(st: &mut WatchState, census: &Census, now: f64) -> Census {
+    if matches!(census, Census::NoServer) {
+        let first = *st.down_since.get_or_insert(now);
+        if now - first < LOSS_CONFIRM_SECS {
+            return Census::Unreadable("awaiting a second corroborated down reading".into());
+        }
+    } else {
+        st.down_since = None;
+    }
+    census.clone()
+}
+
+fn claim_loss_notice(st: &mut WatchState, now: f64) -> bool {
+    if !st.loss_notice_pending || st.episode_alerted_at.is_some() {
+        return false;
+    }
+    st.loss_notice_pending = false;
+    st.episode_alerted_at = Some(now);
+    true
+}
+
+fn claim_storm_notice(st: &mut WatchState, now: f64) -> bool {
+    if !st.restore_halted || st.storm_alerted_at.is_some() {
+        return false;
+    }
+    st.storm_alerted_at = Some(now);
+    true
+}
+
+/// Start one restore pass. A restart adopts this same pass; a new pass takes a new slot.
+fn begin_restore(st: &mut WatchState, now: f64) {
+    if !st.pending_in_progress {
+        st.last_restore_at = Some(now);
+        st.pending_in_progress = true;
     }
 }
 
@@ -248,25 +340,27 @@ pub(crate) fn record_keeper(st: &mut WatchState, started: bool, now: f64) {
 
 /// Is a pending-restore pass due now?
 pub(crate) fn pending_due(st: &WatchState, now: f64) -> bool {
-    !st.pending.is_empty() && st.pending_next_at.is_none_or(|t| now >= t)
+    !st.restore_halted && !st.pending.is_empty() && st.pending_next_at.is_none_or(|t| now >= t)
 }
 
 /// Settle one pending pass: started and no-longer-eligible workers leave the set; failures stay
-/// and the next pass backs off (same 30s..10m curve as the keeper). Returns true when done.
+/// and retries wait at least ten minutes. Episode history survives success. Returns true when done.
 pub(crate) fn settle_pending(st: &mut WatchState, r: &Restore, now: f64) -> bool {
+    st.pending_in_progress = false;
     st.pending.retain(|w| !r.restored.contains(w) && !r.skipped.iter().any(|(n, _)| n == w));
     if st.pending.is_empty() {
         st.pending_attempts = 0;
         st.pending_next_at = None;
+        st.pending_alerted_at = None;
         return true;
     }
     st.pending_attempts += 1;
-    st.pending_next_at = Some(now + keeper_backoff(st.pending_attempts));
+    st.pending_next_at = Some(now + RESTORE_GAP_SECS.max(keeper_backoff(st.pending_attempts)));
     false
 }
 
 /// The running set shared with boot recovery (#141): `~/.amux/running-set.json`,
-/// {"updated_at", "workers":[{"name","tags"}]}, rewritten from tmux while the server is up.
+/// {"updated_at", "workers":[{"name","tags"}]}, rewritten from the agent census while up.
 fn worker_rows(home: &Path, workers: &[String]) -> Vec<serde_json::Value> {
     workers
         .iter()
@@ -396,6 +490,9 @@ async fn push_owner(state: &AppState, title: &str, body: &str, tag: &str) {
 /// not start them twice.
 async fn keep_alive(state: &AppState, home: &Path, st: &mut WatchState, census: &Census, now: f64) -> Vec<String> {
     let mut started = Vec::new();
+    if st.restore_halted || (!st.pending.is_empty() && !pending_due(st, now)) {
+        return started;
+    }
     let running: &[String] = match census {
         Census::Up(w) => w,
         Census::NoServer => &[],
@@ -439,28 +536,57 @@ async fn keep_alive(state: &AppState, home: &Path, st: &mut WatchState, census: 
 }
 
 /// Observe and persist the pre-start state before any worker start can change tmux's census.
-fn begin_tick(home: &Path, census: &Census, now: f64, boot_at: Option<f64>) -> (WatchState, Decision, WatchState) {
+fn begin_tick(home: &Path, census: &Census, now: f64, boot_at: Option<f64>) -> (WatchState, Decision, WatchState, Census) {
     let mut st = load_state(home);
     let before = st.clone();
-    let decision = observe(&mut st, census, now, boot_at);
-    if let Census::Up(workers) = census {
+    let census = confirm_census(&mut st, census, now);
+    let decision = observe(&mut st, &census, now, boot_at);
+    if let Census::Up(workers) = &census {
         write_running_set(home, workers, now);
     }
     // A failed save is logged by save_state; the pending set is only durable on success.
     if st != before {
         save_state(home, &st);
     }
-    (st, decision, before)
+    (st, decision, before, census)
 }
 
 async fn tick(state: AppState) {
     let home = crate::config::amux_home();
-    let census = read_census(None).await;
+    let mut census = read_census(None).await;
+    if matches!(census, Census::Up(_)) {
+        let discovery = census.clone();
+        let store = state.store.clone();
+        census = tokio::task::spawn_blocking(move || {
+            match store.read() {
+                Ok(conn) => worker_census(census, &crate::api::sessions_legacy::FleetSignals::load(&conn)),
+                Err(error) => Census::Unreadable(format!("worker census unavailable: {error}")),
+            }
+        }).await.unwrap_or_else(|error| Census::Unreadable(format!("worker census failed: {error}")));
+        // Do not replace the last good running set with an empty/partial census if tmux
+        // disappeared between discovery and the shared agent-process probe.
+        if matches!(census, Census::Up(_)) && read_census(None).await != discovery {
+            census = Census::Unreadable("session discovery changed during the agent census".into());
+        }
+    }
     let now = now_secs();
     // Persist the loss (its pending set) BEFORE any start can change what tmux shows, so an
     // interruption after the keeper's start can never consume it.
-    let (mut st, decision, before) = begin_tick(&home, &census, now, crate::runtime_jobs::heartbeat::machine_boot_at());
-    // Mr Popo first, before anything else, whatever stopped him.
+    let (mut st, decision, before, census) = begin_tick(&home, &census, now, crate::runtime_jobs::heartbeat::machine_boot_at());
+    if matches!(census, Census::Unreadable(_)) {
+        if let Census::Unreadable(ref why) = census {
+            if crate::log_dedupe::first_this_bucket("tmux-watch-unreadable", crate::log_dedupe::hour_bucket(now)) {
+                tracing::warn!(target: "tmux_watch", verdict = "tmux_watch_census_unreadable", %why,
+                    "tmux watch has no confirmed reading; preserving the last good census");
+            }
+        }
+        return;
+    }
+    if pending_due(&st, now) {
+        begin_restore(&mut st, now);
+        if !save_state(&home, &st) { return; }
+    }
+    // Mr Popo first, before anything else, subject to the same storm gate.
     let kept = keep_alive(&state, &home, &mut st, &census, now).await;
     if st != before {
         save_state(&home, &st);
@@ -476,19 +602,26 @@ async fn tick(state: AppState) {
         tracing::error!(target: "tmux_watch", measured = true, n_considered = workers.len(), verdict,
             lost_at = %at, workers = workers.len(), restore,
             "the tmux server is gone ({verdict}): {} worker(s) were running in it", workers.len());
-        if !rebooted {
-            let body = if restore {
-                format!("The tmux server was lost at {at} with {} worker(s) running. amux is restarting them now.", workers.len())
-            } else {
-                format!("The tmux server was lost again at {at} with {} worker(s) running, the second loss within 10 minutes. amux is restoring them with backoff, not in a loop.", workers.len())
-            };
-            push_owner(&state, "amux: every worker stopped", &body, "tmux-server-lost").await;
-        }
         if !restore {
             tracing::warn!(target: "tmux_watch", measured = true, n_considered = workers.len(), verdict = "fleet_restore_rate_limited",
-                attempts = st.pending_attempts, "a loss within {RESTORE_GAP_SECS}s of the last one; restoring with backoff, not in a loop");
+                losses = st.episode_losses, next_at = ?st.pending_next_at, halted = st.restore_halted,
+                "fleet restore delayed or halted by the loss episode policy");
         }
         loss = Some((at, rebooted, workers.len()));
+    }
+    // Notices are driven from durable state as well as fresh loss edges: a crash between
+    // recording the loss and reaching this point must not erase the owner's escalation.
+    if claim_loss_notice(&mut st, now) && save_state(&home, &st) {
+        push_owner(&state, "amux: every worker stopped",
+            &format!("The tmux server was lost with {} worker(s) recorded. Recovery is bounded to one pass per ten minutes, with backoff after repeated losses.", st.pending.len()),
+            "tmux-server-lost").await;
+    }
+    if claim_storm_notice(&mut st, now) && save_state(&home, &st) {
+        tracing::error!(target: "tmux_watch", verdict = "fleet_restore_halted", losses = st.episode_losses,
+            "repeated tmux losses halted automatic starts; pending evidence retained");
+        push_owner(&state, "amux: tmux recovery halted",
+            "The tmux server keeps dying. Automatic starts have stopped; pending workers and loss evidence are preserved. Inspect GET /api/debug/tmux.",
+            "tmux-recovery-halted").await;
     }
     // The pending set (persisted) is retried on every readable tick, not only at the loss, so a
     // failed start, a restart mid-restore or a second loss never leaves a worker down for good.
@@ -507,11 +640,20 @@ async fn drive_pending(state: &AppState, home: &Path, st: &mut WatchState, kept:
         save_state(home, st);
         return;
     }
-    save_state(home, st);
+    begin_restore(st, now);
+    if !save_state(home, st) { return; }
     let todo = st.pending.clone();
+    // Bounded fixture pause from 5fd4e6128; zero in production.
+    let step_delay_ms = crate::config::env_i64("AMUX_TMUX_WATCH_RESTORE_STEP_DELAY_MS", 0).clamp(0, 10_000) as u64;
     let r = restore_fleet(home, &todo, |name| {
         let s = state.clone();
-        async move { start(&s, &name).await }
+        async move {
+            let result = start(&s, &name).await;
+            if step_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(step_delay_ms)).await;
+            }
+            result
+        }
     })
     .await;
     let done = settle_pending(st, &r, now);
@@ -525,7 +667,7 @@ async fn drive_pending(state: &AppState, home: &Path, st: &mut WatchState, kept:
         "fleet restore pass: {} restored, {} failed, {} skipped, {} still pending", r.restored.len(), r.failed.len(), r.skipped.len(), st.pending.len());
     if done {
         mark_prev_restored(home, now);
-    } else if st.pending_attempts >= 3 && st.pending_alerted_at.is_none_or(|t| now - t >= 3600.0) {
+    } else if st.pending_attempts >= 3 && st.pending_alerted_at.is_none() {
         st.pending_alerted_at = Some(now);
         save_state(home, st);
         push_owner(state, "amux: workers are not coming back",
@@ -675,15 +817,100 @@ mod tests {
     fn restores_are_at_most_one_per_ten_minutes() {
         let mut st = WatchState::default();
         observe(&mut st, &up(&["a"]), 0.0, None);
-        assert!(matches!(observe(&mut st, &Census::NoServer, 10.0, None), Decision::Lost { restore: true, .. }));
+        observe(&mut st, &Census::NoServer, 10.0, None);
+        assert!(pending_due(&st, 10.0));
+        begin_restore(&mut st, 10.0);
+        assert!(settle_pending(&mut st, &Restore { restored: vec!["a".into()], ..Default::default() }, 12.0));
         observe(&mut st, &up(&["a"]), 20.0, None);
-        assert!(matches!(observe(&mut st, &Census::NoServer, 300.0, None), Decision::Lost { restore: false, .. }),
-            "a second loss inside the gap is reported but not restored");
-        observe(&mut st, &up(&["a"]), 320.0, None);
-        // The gap runs from the most recent loss (storm safety), so 300 + 600.
-        assert!(matches!(observe(&mut st, &Census::NoServer, 300.0 + RESTORE_GAP_SECS - 1.0, None), Decision::Lost { restore: false, .. }));
-        observe(&mut st, &up(&["a"]), 950.0, None);
-        assert!(matches!(observe(&mut st, &Census::NoServer, 899.0 + RESTORE_GAP_SECS, None), Decision::Lost { restore: true, .. }));
+        assert!(matches!(observe(&mut st, &Census::NoServer, 40.0, None), Decision::Lost { restore: false, .. }));
+        assert_eq!(st.pending_next_at, Some(610.0));
+        assert!(!pending_due(&st, 609.0));
+        assert!(pending_due(&st, 610.0));
+        // Failure retries also consume a restore slot; no 30-second retry loophole.
+        begin_restore(&mut st, 610.0);
+        assert!(!settle_pending(&mut st, &Restore::default(), 612.0));
+        assert!(!pending_due(&st, 1211.0));
+        assert!(pending_due(&st, 1212.0));
+    }
+
+    #[test]
+    fn successful_restores_preserve_exponential_episode_backoff_across_restart() {
+        let d = tempfile::tempdir().unwrap();
+        let mut st = WatchState::default();
+        for (loss, start, expected_losses) in [(10.0, 10.0, 1), (40.0, 610.0, 2), (640.0, 1810.0, 3)] {
+            observe(&mut st, &up(&["a"]), loss - 1.0, None);
+            observe(&mut st, &Census::NoServer, loss, None);
+            if expected_losses > 1 {
+                assert!(!pending_due(&st, start - 1.0));
+            }
+            assert!(pending_due(&st, start));
+            begin_restore(&mut st, start);
+            settle_pending(&mut st, &Restore { restored: vec!["a".into()], ..Default::default() }, start + 1.0);
+            assert!(save_state(d.path(), &st));
+            st = load_state(d.path());
+            assert_eq!(st.episode_losses, expected_losses, "success/restart must preserve storm history");
+            assert_eq!(st.last_restore_at, Some(start));
+        }
+    }
+
+    #[test]
+    fn a_fourth_loss_halts_starts_and_alerts_once_until_a_quiet_hour() {
+        let d = tempfile::tempdir().unwrap();
+        let mut st = WatchState::default();
+        let mut notices = 0;
+        let mut escalations = 0;
+        for n in 0..6 {
+            let now = 10.0 + f64::from(n) * 30.0;
+            observe(&mut st, &up(&["a"]), now - 1.0, None);
+            observe(&mut st, &Census::NoServer, now, None);
+            notices += u32::from(claim_loss_notice(&mut st, now));
+            escalations += u32::from(claim_storm_notice(&mut st, now));
+            assert!(save_state(d.path(), &st));
+            st = load_state(d.path());
+            if n >= MAX_EPISODE_LOSSES - 1 {
+                assert!(st.restore_halted);
+                assert!(!pending_due(&st, now + 86_400.0), "waiting alone cannot unlatch the stop");
+                assert_eq!(st.pending, vec!["a"], "retain pending evidence when halted");
+            }
+        }
+        assert_eq!((notices, escalations), (1, 1), "one loss notice and one stop escalation per episode, including restarts");
+        observe(&mut st, &up(&["a"]), 4000.0, None);
+        observe(&mut st, &Census::NoServer, 4010.0, None);
+        assert_eq!(st.episode_losses, 1);
+        assert!(!st.restore_halted);
+        assert!(claim_loss_notice(&mut st, 4010.0));
+        assert!(!claim_storm_notice(&mut st, 4010.0));
+    }
+
+    #[test]
+    fn a_restart_before_notification_preserves_one_loss_notice_and_one_halt_alert() {
+        let d = tempfile::tempdir().unwrap();
+        let mut st = WatchState::default();
+        for n in 0..MAX_EPISODE_LOSSES {
+            observe(&mut st, &up(&["a"]), f64::from(n) * 20.0, None);
+            observe(&mut st, &Census::NoServer, f64::from(n) * 20.0 + 10.0, None);
+        }
+        assert!(save_state(d.path(), &st));
+        st = load_state(d.path());
+        assert_eq!(observe(&mut st, &Census::NoServer, 100.0, None), Decision::Quiet);
+        assert!(claim_loss_notice(&mut st, 100.0));
+        assert!(claim_storm_notice(&mut st, 100.0));
+        assert!(save_state(d.path(), &st));
+        st = load_state(d.path());
+        assert!(!claim_loss_notice(&mut st, 115.0));
+        assert!(!claim_storm_notice(&mut st, 115.0));
+    }
+
+    #[test]
+    fn restarting_mid_pass_adopts_without_resetting_the_restore_slot() {
+        let d = tempfile::tempdir().unwrap();
+        let mut st = WatchState { pending: vec!["a".into()], ..Default::default() };
+        begin_restore(&mut st, 10.0);
+        assert!(save_state(d.path(), &st));
+        st = load_state(d.path());
+        assert!(pending_due(&st, 25.0));
+        begin_restore(&mut st, 25.0);
+        assert_eq!(st.last_restore_at, Some(10.0));
     }
 
     #[test]
@@ -692,6 +919,72 @@ mod tests {
         observe(&mut st, &up(&["a", "b"]), 0.0, None);
         observe(&mut st, &up(&["a"]), 15.0, None); // b stopped by a person
         assert_eq!(observe(&mut st, &Census::NoServer, 30.0, None), Decision::Lost { workers: vec!["a".into()], before: vec!["a".into()], restore: true, rebooted: false });
+    }
+
+    #[test]
+    fn a_stopped_worker_with_a_live_shell_is_excluded_from_the_recorded_census() {
+        let d = tempfile::tempdir().unwrap();
+        let mut signals = crate::api::sessions_legacy::tests::signals();
+        signals.running.extend(["amux-a".into(), "amux-stopped".into()]);
+        signals.shell_only.insert("amux-stopped".into());
+        let census = worker_census(up(&["a", "stopped"]), &signals);
+        let (st, _, _, _) = begin_tick(d.path(), &census, 0.0, None);
+        assert_eq!(st.workers, vec!["a"]);
+        assert_eq!(read_running_set(d.path()), Some(vec!["a".into()]));
+        begin_tick(d.path(), &Census::NoServer, 10.0, None);
+        let (st, _, _, _) = begin_tick(d.path(), &Census::NoServer, 15.0, None);
+        assert_eq!(st.pending, vec!["a"], "a surviving shell is never a restore candidate");
+    }
+
+    fn health(verdict: &str, measured: bool) -> crate::backend::tmux_health::Observation {
+        crate::backend::tmux_health::Observation {
+            measured, n_considered: 0, why_unmeasured: None,
+            socket_path: "/private/fixture/socket".into(), responding_pid: None,
+            probe_error: Some("Connection refused".into()), owners: vec![], verdict: verdict.into(),
+        }
+    }
+
+    #[test]
+    fn a_single_refusal_is_not_a_loss_and_two_agreeing_readings_five_seconds_apart_are() {
+        let d = tempfile::tempdir().unwrap();
+        begin_tick(d.path(), &up(&["a"]), 0.0, None);
+        let down = corroborate_down(health("no_server", true));
+        let (st, decision, _, census) = begin_tick(d.path(), &down, 10.0, None);
+        assert_eq!(decision, Decision::Quiet);
+        assert!(matches!(census, Census::Unreadable(_)));
+        assert!(st.was_up && st.pending.is_empty());
+        let (_, decision, _, _) = begin_tick(d.path(), &down, 14.99, None);
+        assert_eq!(decision, Decision::Quiet, "less than five seconds cannot confirm");
+        let (st, decision, _, census) = begin_tick(d.path(), &down, 15.0, None);
+        assert_eq!(census, Census::NoServer);
+        assert!(matches!(decision, Decision::Lost { .. }));
+        assert_eq!(st.pending, vec!["a"]);
+    }
+
+    #[test]
+    fn live_owner_or_unmeasured_health_never_confirms_loss_and_breaks_the_debounce() {
+        for (verdict, measured) in [("live_server_unreachable", true), ("multiple_socket_owners", true), ("no_server", false), ("unmeasured", false), ("ok", true)] {
+            let d = tempfile::tempdir().unwrap();
+            begin_tick(d.path(), &up(&["a"]), 0.0, None);
+            begin_tick(d.path(), &Census::NoServer, 10.0, None);
+            let census = corroborate_down(health(verdict, measured));
+            assert!(matches!(census, Census::Unreadable(_)), "{verdict}/{measured}");
+            let (st, decision, _, _) = begin_tick(d.path(), &census, 15.0, None);
+            assert_eq!(decision, Decision::Quiet);
+            assert_eq!(st.down_since, None);
+            let (_, decision, _, _) = begin_tick(d.path(), &Census::NoServer, 20.0, None);
+            assert_eq!(decision, Decision::Quiet, "two down readings separated by an uncertain reading disagree");
+        }
+    }
+
+    #[test]
+    fn an_up_reading_breaks_the_down_confirmation_sequence() {
+        let d = tempfile::tempdir().unwrap();
+        begin_tick(d.path(), &up(&["a"]), 0.0, None);
+        begin_tick(d.path(), &Census::NoServer, 10.0, None);
+        begin_tick(d.path(), &up(&["a"]), 15.0, None);
+        let (_, decision, _, _) = begin_tick(d.path(), &Census::NoServer, 20.0, None);
+        assert_eq!(decision, Decision::Quiet);
     }
 
     #[test]
@@ -793,9 +1086,9 @@ mod tests {
         let r = Restore { restored: vec!["a".into()], failed: vec![("b".into(), "busy".into())], skipped: vec![] };
         assert!(!settle_pending(&mut st, &r, 25.0));
         assert_eq!(st.pending, vec!["b".to_string()]);
-        assert!(!pending_due(&st, 54.0) && pending_due(&st, 55.0), "a failed start retries after backoff");
+        assert!(!pending_due(&st, 624.0) && pending_due(&st, 625.0), "a failed start waits at least ten minutes");
         let r = Restore { restored: vec![], failed: vec![], skipped: vec![("b".into(), "paused")] };
-        assert!(settle_pending(&mut st, &r, 60.0), "a worker that became ineligible leaves the set");
+        assert!(settle_pending(&mut st, &r, 630.0), "a worker that became ineligible leaves the set");
         assert_eq!((st.pending_attempts, st.pending_next_at), (0, None));
     }
 
@@ -804,9 +1097,10 @@ mod tests {
         // The boundary review round 2 named: the loss is saved, the keeper starts mrpopo, amux
         // dies before anything else, and on restart tmux shows only mrpopo on the same boot.
         let d = tempfile::tempdir().unwrap();
-        let (_, observed, _) = begin_tick(d.path(), &up(&["a", "mrpopo"]), 0.0, Some(-10.0));
+        let (_, observed, _, _) = begin_tick(d.path(), &up(&["a", "mrpopo"]), 0.0, Some(-10.0));
         assert_eq!(observed, Decision::Quiet);
-        let (_, loss, _) = begin_tick(d.path(), &Census::NoServer, 10.0, Some(-10.0));
+        begin_tick(d.path(), &Census::NoServer, 5.0, Some(-10.0));
+        let (_, loss, _, _) = begin_tick(d.path(), &Census::NoServer, 10.0, Some(-10.0));
         assert!(matches!(loss, Decision::Lost { .. }));
         // Simulated crash before keep_alive: discard the returned in-memory state.
         let mut st = load_state(d.path());
@@ -838,15 +1132,16 @@ mod tests {
         let mut st = WatchState::default();
         observe(&mut st, &up(&["a"]), 0.0, None);
         observe(&mut st, &Census::NoServer, 10.0, None);
-        assert!(pending_due(&st, 10.0), "the first loss restores at once");
+        begin_restore(&mut st, 10.0);
         settle_pending(&mut st, &Restore { restored: vec!["a".into()], ..Default::default() }, 12.0);
         observe(&mut st, &up(&["a"]), 20.0, None);
-        assert!(matches!(observe(&mut st, &Census::NoServer, 40.0, None), Decision::Lost { restore: false, .. }));
-        assert_eq!(st.pending, vec!["a".to_string()], "the worker is still owed a restore");
-        assert!(!pending_due(&st, 40.0) && pending_due(&st, 70.0), "but after backoff, not immediately");
-        observe(&mut st, &up(&[]), 75.0, None);
+        observe(&mut st, &Census::NoServer, 40.0, None);
+        assert_eq!(st.pending, vec!["a"]);
+        assert_eq!(st.pending_next_at, Some(610.0));
+        assert!(!pending_due(&st, 70.0), "a successful previous pass cannot reopen the 30-second loop");
+        observe(&mut st, &up(&["a"]), 75.0, None);
         observe(&mut st, &Census::NoServer, 80.0, None);
-        assert!(st.pending_next_at.unwrap() >= 140.0, "each repeat within the gap grows the backoff");
+        assert_eq!(st.pending_next_at, Some(1210.0), "another loss doubles the delay even before the retry");
     }
 
     #[test]
