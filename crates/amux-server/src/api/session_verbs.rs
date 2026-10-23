@@ -18747,7 +18747,10 @@ async fn restore_pane_tty(name: &str) {
         return;
     }
     let reset = match std::fs::File::open(&tty) {
-        Ok(f) => tokio::time::timeout(OP_TIMEOUT, tokio::process::Command::new("stty").arg("sane").stdin(f).status()).await,
+        Ok(f) => {
+            tokio::time::timeout(OP_TIMEOUT, tokio::process::Command::new("stty").arg("sane").stdin(f).kill_on_drop(true).status())
+                .await
+        }
         Err(e) => {
             tracing::warn!(session = %name, tty = %tty, error = %e, verdict = "pane_tty_reset_failed", measured = true,
                 n_considered = 1, "terminal modes not reset after SIGKILL");
@@ -34640,7 +34643,12 @@ pub(crate) fn membership_refusal_body(headers: &HeaderMap, membership_named: boo
 /// (`worker_identity::verified_worker`): empty for the owner/dashboard and
 /// verified human members, and a name matching no worker for a refused claim.
 pub(crate) fn worker_origin(headers: &HeaderMap) -> String {
-    super::worker_identity::claimed_worker(headers)
+    // The claim, as main read it before #10 renamed it: a verified member has
+    // no worker origin, whatever worker header it also sends.
+    match super::worker_identity::claimed_identity(headers) {
+        Ok(name) => name.unwrap_or_default(),
+        Err(_) => super::worker_identity::UNVERIFIED_IDENTITY.to_string(),
+    }
 }
 
 /// CONFIGURING ANOTHER WORKER IS THE OWNER'S (review round 3, N2/N3). A worker
@@ -38115,6 +38123,19 @@ mod tests {
         std::fs::write(sessions.join("outsider.env"), "CC_TAGS=beta\n").unwrap();
     }
 
+    /// A verified member is never a worker origin, whatever worker header it
+    /// also sends (e2e local-multiplayer: a member's create read as the
+    /// spoofed worker and was refused `worker_create_requires_lead`).
+    #[test]
+    fn a_verified_member_is_never_a_worker_origin_whatever_it_claims() {
+        let mut member = axum::http::HeaderMap::new();
+        member.insert("x-amux-local-member-verified", "1".parse().unwrap());
+        member.insert("x-amux-local-member-actor", "member:guest@example.com".parse().unwrap());
+        member.insert("x-amux-worker", "spoofed-worker-author".parse().unwrap());
+        assert_eq!(worker_origin(&member), "");
+        assert_eq!(worker_origin(&worker_headers("caller")), "caller", "a worker claim still counts for policy");
+    }
+
     /// A `/start` prompt was queued as OWNER input whoever sent it. From
     /// another worker it now answers to send's gate; its text is queued
     /// unstamped, because the send layer stamps it once at delivery (#10).
@@ -38191,7 +38212,7 @@ mod tests {
         assert!(queue_start_prompt_from(&state, &axum::http::HeaderMap::new(), "outsider", "owner work", &Sender::Unverified).await.0);
         let rows: Vec<(String, String, String, String, String)> = {
             let c = state.store.read().unwrap();
-            let mut q = c.prepare("SELECT session, sender, guard, stamp, text FROM steering_queue ORDER BY session").unwrap();
+            let mut q = c.prepare("SELECT session, COALESCE(sender,''), COALESCE(guard,''), COALESCE(stamp,''), text FROM steering_queue ORDER BY session").unwrap();
             q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap().map(Result::unwrap).collect()
         };
         let senders: Vec<(String, String)> = rows.iter().map(|r| (r.0.clone(), r.1.clone())).collect();
@@ -42952,6 +42973,59 @@ mod tests {
             waiting_in_queue, 1,
             "a row nobody has claimed must not be reconciled away"
         );
+    }
+
+    /// Unguarded owner and peer input deliberately stores a NULL guard. A
+    /// restart must reconcile those claims just like guarded system input.
+    #[tokio::test]
+    async fn reconcile_orphaned_steering_claims_handles_null_guard() {
+        let (st, _dir) = state();
+        st.store
+            .write_async(|conn| {
+                ensure_fleet_tables(conn)?;
+                for id in ["null-landed", "null-absent", "null-unknown"] {
+                    conn.execute(
+                        "INSERT INTO steering_queue(id, session, text, queued_at, guard, sender, delivering_since) \
+                         VALUES(?1,'null-guard-lane',?1,10.0,NULL,'origin-lane',5.0)",
+                        [id],
+                    )?;
+                }
+                let n = reconcile_orphaned_steering_claims_with(conn, |session, text, queued_at| {
+                    assert_eq!(session, "null-guard-lane");
+                    assert_eq!(queued_at, 10.0);
+                    match text {
+                        "null-landed" => OrphanLanding::Landed,
+                        "null-absent" => OrphanLanding::Absent,
+                        "null-unknown" => OrphanLanding::Unknown,
+                        other => panic!("unexpected orphan: {other}"),
+                    }
+                })?;
+                assert_eq!(n, 3, "every NULL-guard claim must be reconciled");
+                for (id, prefix) in [("null-landed", "sent:"), ("null-unknown", "interrupted:")] {
+                    let (outcome, guard, sender): (String, Option<String>, String) = conn.query_row(
+                        "SELECT outcome, guard, sender FROM steering_history WHERE id=?1",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )?;
+                    assert!(outcome.starts_with(prefix), "{id}: {outcome}");
+                    assert_eq!(guard, None, "preserve the absent guard in history");
+                    assert_eq!(sender, "origin-lane", "preserve the peer sender");
+                }
+                let remaining: (String, Option<String>, String, Option<f64>) = conn.query_row(
+                    "SELECT id, guard, sender, delivering_since FROM steering_queue",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?;
+                assert_eq!(remaining, ("null-absent".into(), None, "origin-lane".into(), None));
+                let count: i64 = conn.query_row("SELECT COUNT(*) FROM steering_queue", [], |r| r.get(0))?;
+                assert_eq!(count, 1, "only the unsubmitted message remains queued");
+                assert_eq!(reconcile_orphaned_steering_claims_with(conn, |_, _, _| {
+                    panic!("a settled claim must not be inspected again")
+                })?, 0, "recovery is idempotent");
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
     }
 
     /// MSG-72091 (2026-10-01): a message queued to an idle worker waited for
