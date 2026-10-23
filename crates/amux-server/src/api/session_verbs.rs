@@ -557,6 +557,15 @@ fn worker_incarnation_for_write(path: &Path) -> std::io::Result<Option<String>> 
 
 fn worker_text_with_incarnation(path: &Path, text: &str) -> std::io::Result<String> {
     let Some(id) = worker_incarnation_for_write(path)? else { return Ok(text.to_string()); };
+    let mut identities = text.lines().filter_map(EnvFile::parse_line)
+        .filter(|(key, _)| key == super::rename_identity::INCARNATION_KEY);
+    // Raw undo must keep the original bytes, including identity position and
+    // quoting. Only a single assignment of the current identity is safe to keep.
+    if identities.next().is_some_and(|(_, value)| value == id) && identities.next().is_none() {
+        return Ok(text.to_string());
+    }
+    tracing::info!(path = %path.display(), verdict = "env_incarnation_text_repaired", measured = true, n_considered = 1,
+        "env replacement needed its missing, different or duplicate identity replaced with the worker's current incarnation");
     let mut text: String = text.split_inclusive('\n').filter(|line| {
         EnvFile::parse_line(line).is_none_or(|(key, _)| key != super::rename_identity::INCARNATION_KEY)
     }).collect();
@@ -54684,6 +54693,37 @@ mod claude_session_file_tests {
 #[cfg(test)]
 mod merge_plain_quoting_tests {
     use super::EnvFile;
+
+    #[test]
+    fn delegation_raw_replacement_preserves_matching_identity_bytes_and_rejects_identity_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let f = sessions.join("worker.env");
+        let before = "# original\r\nCC_DIR=/tmp\r\nCC_INCARNATION='original-worker'\r\nCC_DESC=fixture";
+        std::fs::write(&f, before).unwrap();
+        EnvFile::replace_text(&f, before).unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), before.as_bytes(), "raw replacement must retain order, quoting, CRLF and no final newline");
+        for replacement in [
+            "CC_DESC=changed\n",
+            "CC_INCARNATION=other-worker\nCC_DESC=changed\n",
+            "CC_INCARNATION=original-worker\nCC_INCARNATION=other-worker\n",
+            "CC_INCARNATION=original-worker\nCC_INCARNATION=original-worker\n",
+        ] {
+            EnvFile::replace_text(&f, replacement).unwrap();
+            let cfg = EnvFile::load(&f);
+            assert_eq!(cfg.get("CC_INCARNATION"), Some("original-worker"), "{replacement}");
+            let text = std::fs::read_to_string(&f).unwrap();
+            assert_eq!(text.lines().filter(|line| line.starts_with("CC_INCARNATION=")).count(), 1, "{text}");
+        }
+        // Both other writer paths must preserve the same identity too.
+        EnvFile::merge_plain(&f, &[("CC_INCARNATION".into(), Some("other-worker".into()))]).unwrap();
+        assert_eq!(EnvFile::load(&f).get("CC_INCARNATION"), Some("original-worker"));
+        let mut cfg = EnvFile::load(&f);
+        cfg.set("CC_INCARNATION", "other-worker");
+        cfg.write(&f).unwrap();
+        assert_eq!(EnvFile::load(&f).get("CC_INCARNATION"), Some("original-worker"));
+    }
 
     #[test]
     fn a_scope_merge_keeps_a_worker_file_sourceable_and_round_trips_values() {

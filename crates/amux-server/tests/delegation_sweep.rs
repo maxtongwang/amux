@@ -195,8 +195,8 @@ async fn every_config_mutating_route_consults_delegation() {
         // A grant row (mrpopo) cites Max's row in another lane: it applies and
         // logs the change plus the grant.
         let body = if c.needs_ref {
-            // The ask names every target and setting these grant cases use.
-            let row = e.cite(&format!("Max, may I add {DEV_B} and {OPS_A} to leads, and open routing for {OPS_A}?"));
+            // N3: each tag change explicitly names its direction and worker.
+            let row = e.cite(&format!("Max, may I add leads to {DEV_B}, add leads to {OPS_A}, and clear routing for {OPS_A}?"));
             cited(c.allowed.clone(), row)
         } else {
             c.allowed.clone()

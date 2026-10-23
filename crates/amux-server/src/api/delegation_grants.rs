@@ -26,7 +26,7 @@
 //! Worker asks record server-derived CC_INCARNATION bindings at message time;
 //! legacy asks without them need a fresh ask. Rename/name reuse cannot transfer
 //! a grant, including pending apply, internal replay, and undo.
-//! Tag asks use `add [the] TAG tag to WORKER` / `remove [the] TAG tag from WORKER`
+//! Tag asks use `add [the] TAG [tag] to WORKER` / `remove [the] TAG [tag] from WORKER`
 //! for each changed tag. Mismatches refuse as `cite_ask_missing_change`.
 //! Env writes compare their checked state under EnvFile's process/file locks;
 //! a mismatch answers 409 `delegation_state_changed` without the stale write.
@@ -1652,10 +1652,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _home = crate::api::settings::test_env::set_home(tmp.path());
         let state = test_state(tmp.path());
-        state.store.write(|c| {
-            c.execute("INSERT INTO _amux_delegation_grants (code, actor, class, action, target, method, path, body, sentence, created_at, expires_at, status, changes, undoable) \
+        // N2: a hand-inserted applied grant must bind the same worker as a
+        // real grant. Missing legacy identity correctly fails closed earlier.
+        let incarnation = worker_identity("test-dev-a").unwrap().unwrap();
+        state.store.write(move |c| {
+            c.execute("INSERT INTO _amux_delegation_grants (code, actor, class, action, target, method, path, body, sentence, created_at, expires_at, status, changes, undoable, target_incarnation) \
                 VALUES ('ZZZZ','mrpopo','mrpopo','set_config:scope:connectors','test-dev-a','PUT','/api/scope','{}','amux grant ZZZZ',1,2,'applied', \
-                '{\"env\":{},\"text\":{},\"group_config\":{},\"created\":[]}',1)", [])?;
+                '{\"env\":{},\"text\":{},\"group_config\":{},\"created\":[]}',1,?1)", [&incarnation])?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         }).unwrap();
         let app = super::super::router(state.clone());

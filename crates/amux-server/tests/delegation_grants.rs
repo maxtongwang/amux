@@ -233,6 +233,8 @@ async fn citation_requires_the_actual_tag_direction_and_target() {
         let before = e.snapshot();
         let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &cfg(DEV_B), Some(cited(json!({"tags":""}),pair))).await;
         assert_code(st, &v, code, &ask);
+        let error = v["error"].as_str().expect("refusal explains the required ask");
+        assert!(error.contains(&format!("remove dev from {DEV_B}")), "{v}");
         assert_eq!(e.snapshot(), before, "refused citation writes nothing");
     }
     assert_eq!(e.latest_grant(), "");
