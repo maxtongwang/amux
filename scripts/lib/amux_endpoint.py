@@ -1,19 +1,12 @@
 """Isolated-run endpoint guard shared by amux's Python clients and hooks.
 
-Under amux-isolated (AMUX_ISOLATED_RUN=1) a client must never address the live
-server. Each client computes its URL as it always has and passes the result
-through guard(). FAIL CLOSED: an isolated run may use only a test URL of one
-strict shape (TEST_URL_RE) whose port is not live; anything else, including any
-spelling a client might still parse into a live port, becomes a dead port and
-the refusal is logged. Live ports are
-8824, 8822, and every port named by an endpoint.json the server wrote (the
-real user's ~/.amux, $AMUX_HOME, $CC_HOME, $HOME/.amux). The server binds
-0.0.0.0, so any host on a live port is the live server, which is why the host
-is not consulted. Outside an isolated run guard() returns its input unchanged.
-
-2026-10-19: a test that unset AMUX_API/AMUX_URL sent a real request to 8824, and
-two reviews then escaped spelling-based checks with LOCALHOST, 0.0.0.0, 127.1,
-[::ffff:127.0.0.1], user@host, :08824, the hostname and a non-8824 canonical.
+Under amux-isolated (AMUX_ISOLATED_RUN=1), guard() fails closed: allow only
+lowercase http(s)://127.0.0.1|localhost|[::1]:<port>[/<path>] or file:///<path>
+matching TEST_URL_RE in full. The port must be 1-65535 with no sign or zero
+padding, excluding live ports: 8824, 8822, and every port named by endpoint.json
+in the real user's ~/.amux, $AMUX_HOME, $CC_HOME or $HOME/.amux. No whitespace,
+control characters, backslashes or '@' are allowed. Everything else becomes
+the dead port with a logged refusal. Outside isolation the input is unchanged.
 
 Same rule in scripts/lib/amux-endpoint.sh (shell, and the Bash CLI's copy),
 crates/amux-cli (Rust), and the inline fallback each client carries for copies

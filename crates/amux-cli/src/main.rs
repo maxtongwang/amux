@@ -327,19 +327,19 @@ fn resolve_url_from(
     isolated: bool,
     live_ports: &[u16],
 ) -> (String, Option<&'static str>) {
+    // Validate isolated input before normalization can hide surrounding whitespace.
     let chosen = [explicit, env_url]
         .into_iter()
         .flatten()
-        .map(|u| u.trim().trim_end_matches('/').to_string())
-        .find(|u| !u.is_empty());
+        .find(|u| !u.trim().trim_end_matches('/').is_empty());
     match chosen {
         None if isolated => (ISOLATED_DEAD_URL.to_string(), Some("unset_would_use_builtin")),
         Some(u) if isolated => match test_url_port(&u) {
             TestUrl::Bad => (ISOLATED_DEAD_URL.to_string(), Some("not_test_shape")),
             TestUrl::Http(p) if live_ports.contains(&p) => (ISOLATED_DEAD_URL.to_string(), Some("live_port")),
-            TestUrl::Http(_) | TestUrl::File => (u, None),
+            TestUrl::Http(_) | TestUrl::File => (u.trim_end_matches('/').to_string(), None),
         },
-        Some(u) => (u, None),
+        Some(u) => (u.trim().trim_end_matches('/').to_string(), None),
         None => (DEFAULT_CLIENT_URL.to_string(), None),
     }
 }
@@ -1112,6 +1112,7 @@ mod isolated_endpoint_tests {
                     "http://127.0.0.1:8824\\x", "http://127.0.0.1:8824\\@localhost:9999", "http://127.0.0.1:88\t24",
                     "HTTP://127.0.0.1:41234", "http://127.0.0.1:041234", "http://127.0.0.1:88240",
                     "https://cloud.example", "http://127.0.0.1:41234/a b",
+                    "http://127.0.0.1:41234/a@b", "http://127.0.0.1:41234/a\\b",
                     "http://127.0.0.1:41234/\u{7}", "ftp://127.0.0.1:41234"] {
             probes.push(esc.to_string());
         }
@@ -1125,15 +1126,30 @@ mod isolated_endpoint_tests {
     }
 
     #[test]
+    fn isolated_run_refuses_padded_urls() {
+        let mut results = Vec::new();
+        for padded in [" http://127.0.0.1:41234", "http://127.0.0.1:41234 "] {
+            results.push(resolve_url_from(None, Some(padded.into()), true, LIVE));
+            results.push(resolve_url_from(Some(padded.into()), None, true, LIVE));
+        }
+        assert_eq!(results, vec![(ISOLATED_DEAD_URL.to_string(), Some("not_test_shape")); 4]);
+    }
+
+    #[test]
     fn isolated_run_keeps_a_test_server_and_normal_runs_are_unchanged() {
-        for kept in ["http://127.0.0.1:41234", "https://localhost:65535/x?y=1", "http://[::1]:9", "file:///tmp/h.json"] {
+        for kept in ["http://127.0.0.1:41234", "https://localhost:65535/x?y=1", "http://[::1]:9", "file:///tmp/h.json",
+                     "http://127.0.0.1:41234/a-b_c.txt/sub?x=1&y=2#ok"] {
             assert_eq!(resolve_url_from(None, Some(kept.into()), true, LIVE), (kept.to_string(), None), "{kept}");
         }
+        assert_eq!(resolve_url_from(None, Some("http://127.0.0.1:41234/".into()), true, LIVE),
+                   ("http://127.0.0.1:41234".to_string(), None));
         assert_eq!(resolve_url_from(None, None, false, LIVE), (DEFAULT_CLIENT_URL.to_string(), None));
         let live = format!("https://localhost:{}", FIXED_LIVE_PORTS[0]);
         assert_eq!(resolve_url_from(None, Some(live.clone()), false, LIVE), (live, None));
         assert_eq!(resolve_url_from(None, Some("https://cloud.example".into()), false, LIVE),
                    ("https://cloud.example".to_string(), None));
+        assert_eq!(resolve_url_from(None, Some(" http://127.0.0.1:41234/ ".into()), false, LIVE),
+                   ("http://127.0.0.1:41234".to_string(), None));
     }
 
     #[test]

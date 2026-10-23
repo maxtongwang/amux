@@ -84,14 +84,14 @@ CC_HOME="${CC_HOME:-$HOME/.amux}"
 CC_SESSIONS="$CC_HOME/sessions"
 CC_DEFAULTS="$CC_HOME/defaults.env"
 
-# Under amux-isolated (AMUX_ISOLATED_RUN=1) this CLI never talks to the live
-# server (2026-10-19: a test that unset AMUX_API/AMUX_URL sent a real `start`
-# request to 8824, and the stale-URL heal below turned the wrapper's dead port
-# back into the live URL). Under isolation: an unset AMUX_API/AMUX_URL, or one
-# whose PARSED port is live (8824, 8822, any endpoint.json port; any host
-# spelling), becomes the dead port; endpoint.json is never followed (no heal,
-# no `amux url` lookup); and transport breadcrumbs are not posted. Each refusal
-# is logged. The block between the markers is byte-identical to
+# Under amux-isolated (AMUX_ISOLATED_RUN=1), fail closed: allow only lowercase
+# http(s)://127.0.0.1|localhost|[::1]:<port>[/<path>] or file:///<path>.
+# The port must be 1-65535 with no sign or zero padding, excluding live ports
+# (8824, 8822, every endpoint.json port). No whitespace, control characters,
+# backslashes or '@' are allowed. Everything else becomes the dead port with
+# a logged refusal. endpoint.json is never followed (no heal or `amux url`
+# lookup), and transport breadcrumbs are not posted.
+# The block between the markers is byte-identical to
 # scripts/lib/amux-endpoint.sh (test-endpoint-clients-isolated.py checks).
 # >>> amux-endpoint-sh (identical in the amux CLI)
 AMUX_ENDPOINT_DEAD_URL="http://127.0.0.1:9"

@@ -1,9 +1,11 @@
 # amux-endpoint.sh — isolated-run endpoint guard for amux's shell clients (sourced, POSIX sh).
-# amux_endpoint_guard <url> <client> prints <url>, unless AMUX_ISOLATED_RUN=1 and <url>
-# is not a test URL of the one allowed shape, or its port is live: then it prints the
-# dead port and logs the refusal (fail closed).
-# Live ports: 8824, 8822 and every port in an endpoint.json the server wrote. The host
-# is never consulted (the server binds 0.0.0.0). Same rule as scripts/lib/amux_endpoint.py;
+# amux_endpoint_guard <url> <client> prints <url> unchanged outside isolation.
+# With AMUX_ISOLATED_RUN=1, fail closed: allow only lowercase
+# http(s)://127.0.0.1|localhost|[::1]:<port>[/<path>] or file:///<path>.
+# The port must be 1-65535 with no sign or zero padding, excluding live ports
+# (8824, 8822, every endpoint.json port). No whitespace, control characters,
+# backslashes or '@' are allowed. Everything else prints the dead port and logs
+# the refusal. Same rule as scripts/lib/amux_endpoint.py;
 # the Bash CLI carries a byte-identical copy of the block below, and
 # test-endpoint-clients-isolated.py drives every implementation over one probe table.
 # 2026-10-19: a test that unset AMUX_API/AMUX_URL sent a real request to 8824.
