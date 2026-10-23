@@ -1100,6 +1100,16 @@ async fn scope_write(
                  Change it from the dashboard."), "code": "owner_only_key", "key": k}));
         }
     }
+    // A worker layer's env IS the worker's session file, and the merge writer
+    // creates a missing file. A session writing "its own" layer under a name
+    // with no session yet was therefore a create that skipped the create rule
+    // (session_verbs::worker_create_refusal). Creating is POST /api/sessions.
+    if key == "env" && level == "worker" && !actor.is_empty() && member.is_none() && !env_file(&home, level, name).exists() {
+        tracing::warn!(actor = %actor, name, verdict = "scope_env_write_no_worker", measured = true, n_considered = 1,
+            "a session tried to write the env layer of a worker that does not exist");
+        return j(404, json!({"error": format!("no worker named '{name}'; create workers with POST /api/sessions"),
+            "code": "no_such_worker"}));
+    }
     let write_result: Result<(), (u16, String)> = match key {
         "memory" | "rules" => write_memory(&home, level, name, key, &value),
         "env" => write_env(&home, level, name, &value),

@@ -3,6 +3,9 @@
 # Cargo binary while a suite is running. Dependency artifacts still share the
 # sanctioned target. All server state and tmux sockets are disposable fixtures.
 set -euo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 ARTIFACT_DIR="${AMUX_RECOVERY_ARTIFACT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/amux-recovery.XXXXXX")}"

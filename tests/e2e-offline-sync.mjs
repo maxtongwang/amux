@@ -15,10 +15,11 @@
  * Cleans up every board item it creates.
  */
 import { createRequire } from 'module';
+import { testBase } from './lib/live-base.mjs';
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
 
-const URL = process.env.AMUX_E2E_URL || 'https://localhost:8824/';
+const URL = testBase('AMUX_E2E_URL', 'https://localhost:8824/');
 // A session that exists but cannot accept a send right now (archived/stopped)
 // exercises the retention path; if the send settles instead, the test degrades
 // gracefully and only asserts the queue reached a terminal state.

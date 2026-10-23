@@ -690,6 +690,24 @@ pub(crate) mod test_env {
         _g: MutexGuard<'static, ()>,
     }
 
+    /// The Rust half of `scripts/lib/test-isolation.sh`: a fixture home must
+    /// not be the user's real home or lie inside the real `~/.amux`, or a test
+    /// writes into the live fleet's state (2026-10-16, a CLI test that pinned
+    /// HOME but inherited CC_HOME created workers on the live server). Panics
+    /// with the two paths, so the refusal names its cause.
+    pub fn assert_isolated_home(path: &std::path::Path) {
+        let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let fixture = canon(path);
+        let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else { return };
+        let home = canon(std::path::Path::new(&home));
+        assert!(
+            fixture != home && !fixture.starts_with(home.join(".amux")),
+            "test home REFUSED: {} is the real home or inside the real ~/.amux ({}); use a tempdir",
+            fixture.display(),
+            home.display()
+        );
+    }
+
     /// Point AMUX_HOME at a fixture for this guard's lifetime.
     ///
     /// COVERAGE IS ONE-DIRECTIONAL, and the honest scope matters
@@ -720,6 +738,7 @@ pub(crate) mod test_env {
     /// occurrence identifies its own cause instead of costing another
     /// investigation that ends here.
     pub fn set_home(path: &std::path::Path) -> HomeGuard {
+        assert_isolated_home(path);
         let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_leaky: Vec<(&'static str, Option<String>)> = leaky_keys()
             .iter()

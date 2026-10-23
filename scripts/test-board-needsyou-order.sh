@@ -13,6 +13,9 @@
 #     ask was recorded and the move was not.
 # Nothing here touches a real board.
 set -euo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 cd "$(dirname "$0")/.."
 AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0
@@ -72,7 +75,7 @@ PORT=$(cat "$TMPD/port")
 run_needsyou() {  # run_needsyou <refuse_status true|false> -> sets RC, OUT, ORDER
   python3 -c "import json,sys; json.dump({'status':'blocked','refuse_status':sys.argv[1]=='true'}, open(sys.argv[2],'w'))" "$1" "$TMPD/state.json"
   : > "$TMPD/patches.log"
-  if OUT=$(timeout 30 env AMUX_API="http://127.0.0.1:$PORT" AMUX_SESSION=needsyou-order-test CC_HOME="$TMPD" \
+  if OUT=$(timeout 30 env AMUX_API="http://127.0.0.1:$PORT" AMUX_URL="http://127.0.0.1:$PORT" AMUX_SESSION=needsyou-order-test CC_HOME="$TMPD" \
       bash "$AMUX_BIN" board needsyou TEST-1 --actor Ethan --ask "${2:-decision}" \
       --question "Should this ship?" --unblocks "The lane ships it." 2>&1); then RC=0; else RC=$?; fi
   ORDER=$(tr '\n' ' ' < "$TMPD/patches.log" | sed 's/ $//')

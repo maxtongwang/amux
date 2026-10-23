@@ -21,6 +21,10 @@ cd "$(dirname "$0")/.."
 # a check that cannot fail on the case that motivated it is theatre).
 SCAN="${FRUSTRATION_SCAN:-$(pwd)/scripts/frustration_scan.py}"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+mkdir -p "$TMP/home"
+source scripts/lib/test-isolation.sh; amux_test_isolate "$TMP/home" || exit 1
 DB="$TMP/t.db"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ok   — $1"; }

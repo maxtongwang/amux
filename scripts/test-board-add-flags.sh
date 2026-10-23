@@ -29,6 +29,9 @@ AMUX_BIN="${AMUX_BIN:-./amux}"
 PASS=0; FAIL=0
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source scripts/lib/test-isolation.sh; amux_test_isolate "$TMP" || exit 1
 export AMUX_SESSION="addflagtest"
 # AMUX_API, *not* AMUX_URL. The board verbs read `AMUX_API` (`local
 # AMUX_API="${AMUX_API:-https://localhost:8824}"`); AMUX_URL only feeds the `url`
@@ -217,7 +220,7 @@ rm -f "$BODY"
 # failure here ended the whole script silently, before the (i) checks and the
 # summary. Capture it the AF-562 way so the exit code is asserted and the CLI
 # output is shown when it fails.
-if out=$(AMUX_API="http://127.0.0.1:$STUB_PORT" run "a real title" --type blocker --desc-file "$TMP/desc.md"); then rc=0; else rc=$?; fi
+if out=$(AMUX_API="http://127.0.0.1:$STUB_PORT" AMUX_URL="http://127.0.0.1:$STUB_PORT" run "a real title" --type blocker --desc-file "$TMP/desc.md"); then rc=0; else rc=$?; fi
 check_rc "(i) board add against the stub exits 0" 0 "$rc"
 [ "$rc" = 0 ] || echo "  got: $(printf '%s' "$out" | head -5)"
 

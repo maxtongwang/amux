@@ -8,6 +8,9 @@ set -uo pipefail
 AM="${1:-$(cd "$(dirname "$0")/.." && pwd)/amux}"
 AM="$(cd "$(dirname "$AM")" && pwd)/$(basename "$AM")"
 H="$(mktemp -d "${TMPDIR:-/tmp}/lwn.XXXXXX")"; mkdir -p "$H/.amux/logs/land"
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate "$H" || exit 1
 cd "$H" || exit 1
 git init -q --bare --initial-branch=main origin.git
 git clone -q origin.git lane 2>/dev/null; cd lane || exit 1

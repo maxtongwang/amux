@@ -4,6 +4,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TMP="$(mktemp -d)"
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+mkdir -p "$TMP/home"
+source scripts/lib/test-isolation.sh; amux_test_isolate "$TMP/home" || exit 1
 SERVER_PID=""
 cleanup() {
   [[ -z "$SERVER_PID" ]] || kill "$SERVER_PID" 2>/dev/null || true
@@ -161,10 +165,13 @@ ok "direct cat blocks and a narrowing pipeline passes"
 
 # Global Claude settings also apply outside amux and to isolated raw agents.
 # Neither may inherit this fleet policy merely because the hook is installed.
-read_payload "$TMP/large.txt" | HOOK_ISOLATED=1 hook
-read_payload "$TMP/large.txt" | HOME="$TMP/home" AMUX_HOME="$TMP/home/.amux" \
+unmanaged_payload=$(read_payload "$TMP/large.txt")
+# These paths exit before reading stdin; buffer it so pipefail cannot turn the
+# intended early return into a timing-dependent BrokenPipeError in the writer.
+HOOK_ISOLATED=1 hook <<< "$unmanaged_payload"
+HOME="$TMP/home" AMUX_HOME="$TMP/home/.amux" \
   CC_ISOLATED=0 AMUX_SESSION= AMUX_WORKER= AMUX_BULK_READ_LINES=3 \
-  python3 scripts/hooks/large-read-guard.py
+  python3 scripts/hooks/large-read-guard.py <<< "$unmanaged_payload"
 ok "isolated and unmanaged Claude processes remain untouched"
 
 # A bad hook payload must fail open and announce that its probe did not run.
@@ -210,7 +217,7 @@ for _ in $(seq 1 100); do [[ -s "$PORT_FILE" ]] && break; sleep .02; done
 printf '%s\n' 'auth-test-token' > "$TMP/home/.amux/auth_token"
 printf 'alpha\nbeta\n' > "$TMP/sample.txt"
 set +e
-cli_output="$(HOME="$TMP/home" AMUX_API="http://127.0.0.1:$(<"$PORT_FILE")" \
+cli_output="$(HOME="$TMP/home" AMUX_API="http://127.0.0.1:$(<"$PORT_FILE")" AMUX_URL="http://127.0.0.1:$(<"$PORT_FILE")" \
   AMUX_SESSION=test-lane bash ./amux delegate read --question 'Where is beta?' \
   --for AMUX-T -- "$TMP/sample.txt" 2>"$TMP/cli.err")"
 cli_rc=$?
@@ -232,7 +239,7 @@ PY
 # JSON mode must preserve the measured failure receipt AND return nonzero. A
 # machine-readable error with exit 0 is still a false success to automation.
 set +e
-json_error="$(HOME="$TMP/home" AMUX_API="http://127.0.0.1:$(<"$PORT_FILE")" \
+json_error="$(HOME="$TMP/home" AMUX_API="http://127.0.0.1:$(<"$PORT_FILE")" AMUX_URL="http://127.0.0.1:$(<"$PORT_FILE")" \
   AMUX_SESSION=test-lane bash ./amux delegate read --json \
   --question 'force helper error' --for AMUX-T -- "$TMP/sample.txt" 2>"$TMP/json.err")"
 json_rc=$?

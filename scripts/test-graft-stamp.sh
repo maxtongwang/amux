@@ -37,6 +37,9 @@
 #
 # Exit 0 = pass, 1 = failure.
 set -euo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
 # GRAFT_STAMP_HOOK exists so these cells can be shown to FAIL: point it at a

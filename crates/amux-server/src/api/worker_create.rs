@@ -56,7 +56,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn run(bin: &str, args: &[&str], timeout: Duration) -> Option<std::process::Output> {
-    let mut cmd = tokio::process::Command::new(bin);
+    let mut cmd = if bin == "tmux" { crate::tmux_guard::tokio_tmux() } else { tokio::process::Command::new(bin) };
     cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

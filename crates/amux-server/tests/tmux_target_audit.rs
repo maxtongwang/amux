@@ -1,6 +1,8 @@
 //! Every tmux `-t` target in the crate must come from the exact-match L2
 //! helpers (`session_target` / `pane_target`, reached as `st`/`pt`/`stq`/`ptq`).
 //!
+//! tmux-lint: allow-file(source-audit fixtures in string literals; nothing here runs tmux)
+//!
 //! This is a SOURCE audit rather than a behavioural test on purpose: the
 //! failure it guards cannot be reproduced on demand. tmux resolves a bare `-t
 //! foo` by PREFIX, and `amux-amux` is a prefix of `amux-amux-frustrations`,

@@ -15,6 +15,9 @@ PASS=0; FAIL=0
 has()  { if grep -qF -- "$2" "$1"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); echo "FAIL: $3 (missing '$2')"; fi; }
 
 TMP=$(mktemp -d)
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source scripts/lib/test-isolation.sh; amux_test_isolate "$TMP" || exit 1
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/curl" <<'MOCK'
 #!/usr/bin/env bash

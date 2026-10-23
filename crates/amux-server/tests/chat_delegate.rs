@@ -175,6 +175,7 @@ async fn a_chat_delegate_reads_the_live_worker_without_ever_touching_it() {
     // Never anything into the worker's pane: no tmux verb that sends input.
     assert!(logged.lines().any(|l| l.starts_with("TMUX capture-pane ")), "the seed read the pane: {logged}");
     for line in logged.lines().filter(|l| l.starts_with("TMUX ")) {
+        // tmux-lint: allow(a list of pane-write verbs this test forbids, not a tmux call)
         for input in ["send-keys", "paste-buffer", "load-buffer", "set-buffer", "respawn-pane", "kill-"] {
             assert!(!line.contains(input), "nothing may be sent to the worker's pane: {line}");
         }
@@ -202,9 +203,20 @@ async fn a_chat_delegate_reads_the_live_worker_without_ever_touching_it() {
 
     // 1b. Attribution: a LANE posting to a Chat tab is that lane, not the owner.
     // An owner send would start the stopped Chat; a lane's is refused instead.
+    // A lane outside the worker's groups is stopped at the group boundary
+    // first (a Chat tab speaks for the owner, so it is not a side door).
     let (code, r) = call(&app, "POST", "/api/sessions/social@chat/send", "some-helper",
         Some(json!({"text": "probe from a helper"}))).await;
+    assert_eq!((code, r["code"].clone()), (403, json!("worker_group_boundary")), "an outside-group lane: {r}");
+    // A lane inside them passes the boundary and is still not the owner.
+    let social_env = std::fs::read_to_string(home.join("sessions/social.env")).unwrap();
+    std::fs::write(home.join("sessions/social.env"), format!("{social_env}CC_TAGS=\"events\"\n")).unwrap();
+    std::fs::write(home.join("sessions/team-helper.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"events\"\n").unwrap();
+    let (code, r) = call(&app, "POST", "/api/sessions/social@chat/send", "team-helper",
+        Some(json!({"text": "probe from a helper"}))).await;
     assert_eq!(code, 409, "a lane's send is not the owner's and cannot start a stopped Chat: {r}");
+    std::fs::remove_file(home.join("sessions/team-helper.env")).unwrap();
+    std::fs::write(home.join("sessions/social.env"), social_env).unwrap();
 
     // 2. The API guard: a delegate identity may read, never change anything.
     let (code, _) = call(&app, "POST", "/api/board", "social@delegate", Some(json!({"title": "x"}))).await;
@@ -322,6 +334,7 @@ async fn a_chat_delegate_reads_the_live_worker_without_ever_touching_it() {
 fn the_delegate_module_has_no_path_into_a_worker_pane() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/api/chat_delegate.rs")).unwrap();
     let code: String = src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+    // tmux-lint: allow(a banned-word source audit, not a tmux call)
     for banned in ["send-keys", "paste-buffer", "load-buffer", "steer_enqueue", "send_to_session", "deliver_to_pane", "/send\""] {
         assert!(!code.contains(banned), "chat_delegate.rs must not contain `{banned}`");
     }

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Canonical status-hook installation and payload regression cells.
 set -Eeuo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 trap 'echo "FAIL status-hook fixture line=$LINENO command=$BASH_COMMAND" >&2' ERR
 cd "$(dirname "$0")/.."
 TMP="$(mktemp -d)"

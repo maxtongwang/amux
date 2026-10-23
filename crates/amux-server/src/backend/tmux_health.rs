@@ -55,7 +55,7 @@ fn default_socket() -> String {
 }
 
 async fn output(bin: &str, args: &[&str]) -> Result<std::process::Output, String> {
-    let mut cmd = tokio::process::Command::new(bin);
+    let mut cmd = if bin == "tmux" { crate::tmux_guard::tokio_tmux() } else { tokio::process::Command::new(bin) };
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

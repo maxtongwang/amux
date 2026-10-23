@@ -30,6 +30,9 @@ cd "$(dirname "$0")/.."
 CLI="$(pwd)/amux"
 PASS=0; FAIL=0
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"; [ -n "${STUB_PID:-}" ] && kill "$STUB_PID" 2>/dev/null' EXIT
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source scripts/lib/test-isolation.sh; amux_test_isolate "$TMP" || exit 1
 printf 'outcome text\n' > "$TMP/oc.md"
 
 DEAD="http://127.0.0.1:9"          # discard port: refuses instantly

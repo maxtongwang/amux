@@ -18,6 +18,9 @@
 #
 # Runs the SHIPPED hook, not a retyped copy.
 set -euo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 cd "$(dirname "$0")/.."
 HOOK="${COMMIT_STAMP_HOOK:-$(pwd)/scripts/git-hooks/prepare-commit-msg}"
 PASS=0; FAIL=0
@@ -262,7 +265,7 @@ echo "cell: env/ancestry disagreement"
 _pane_lane=""
 _pp=$$
 _hops=0
-_panelist="$(tmux list-panes -a -F '#{pane_pid} #{session_name}' 2>/dev/null || true)"
+_panelist="$(amux_tmux list-panes -a -F '#{pane_pid} #{session_name}' 2>/dev/null || true)"
 while [ -n "$_panelist" ] && [ "$_hops" -lt 12 ]; do
   _hops=$((_hops + 1))
   _m="$(printf '%s\n' "$_panelist" | awk -v p="$_pp" '$1==p {print $2; exit}')"
@@ -345,6 +348,7 @@ mkdir -p "$TMP/tmux-bin"
 printf '' > "$TMP/home/sessions/peer.env"
 cat > "$TMP/tmux-bin/tmux" <<'SH'
 #!/bin/sh
+[ "${1:-}" = "-S" ] && shift 2
 case "$1" in
   list-panes) exit 0 ;;
   display-message)

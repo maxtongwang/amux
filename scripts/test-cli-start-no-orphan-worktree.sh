@@ -13,6 +13,9 @@
 # (a plain claude worker, which the CLI launches itself) must still get one, or
 # a CLI that never creates worktrees at all would pass every negative cell.
 set -euo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="$ROOT/amux"
@@ -31,6 +34,8 @@ git -C "$repo" -c user.email=t@t -c user.name=t -c core.hooksPath=/dev/null comm
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/tmux" <<'EOF'
 #!/bin/bash
+# Under the test guard the CLI names its private socket first (-S <path>).
+[ "${1:-}" = "-S" ] && shift 2
 case "${1:-}" in has-session|list-sessions|list-panes) exit 1 ;; esac
 exit 0
 EOF

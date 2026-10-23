@@ -123,6 +123,7 @@ pub mod reconciliation;
 pub mod runtime_jobs;
 pub mod search_firehose;
 pub mod tls;
+pub mod tmux_guard;
 
 use std::sync::Arc;
 use std::time::Instant;

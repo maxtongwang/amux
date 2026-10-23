@@ -931,13 +931,14 @@ pub(crate) mod tests {
         // must not resurrect an earlier ID that the server rejects.
         std::fs::write(&path, "CC_INCARNATION=earlier\nCC_INCARNATION=invalid/value\n").unwrap();
         assert_eq!(incarnation(d.path(), "w"), None);
-        let cli = include_str!("../../../../amux");
-        let code = cli.split("<<'PYREGISTER'\n").nth(1).unwrap().split("\nPYREGISTER").next().unwrap();
-        let output = std::process::Command::new("python3").args(["-c", code])
-            .arg(&path).args(["w", "/tmp", "", "", ""]).output().unwrap();
-        assert!(output.status.success(), "registrar failed: {}", String::from_utf8_lossy(&output.stderr));
+        // Registration now merges through PUT /api/scope; exercise its real
+        // writer instead of extracting the removed CLI-side Python registrar.
+        super::super::session_verbs::EnvFile::merge_plain(&path, &[
+            ("CC_DIR".into(), Some("/tmp".into())),
+            ("CC_FLAGS".into(), Some(String::new())),
+        ]).unwrap();
         let id = incarnation(d.path(), "w").unwrap();
-        assert_ne!(id, "earlier", "CLI must replace an invalid final assignment, like the server");
+        assert_ne!(id, "earlier", "registration must replace an invalid final assignment");
     }
 
     #[test]

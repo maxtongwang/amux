@@ -9,6 +9,9 @@ set -uo pipefail
 AM="${1:-$(cd "$(dirname "$0")/.." && pwd)/amux}"
 AM="$(cd "$(dirname "$AM")" && pwd)/$(basename "$AM")"
 H="$(mktemp -d "${TMPDIR:-/tmp}/lcs.XXXXXX")"
+# Hermetic: never the live server or the real ~/.amux (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate "$H" || exit 1
 mkdir -p "$H/.amux/locks/detached" "$H/.amux/locks/land-k.q" "$H/.amux/logs/land" "$H/repo"
 git -C "$H/repo" init -q
 printf '#!/usr/bin/env bash\nsleep 300\n' > "$H/amux"; chmod +x "$H/amux"

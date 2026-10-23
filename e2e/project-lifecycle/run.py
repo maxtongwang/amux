@@ -34,6 +34,7 @@ finally:
         if command==binary:
             os.kill(pid,signal.SIGTERM)
     tmux=home/'bin'/'tmux'
+    # tmux-lint: allow(home/bin/tmux is serve.py's wrapper: exec tmux -S <private socket>)
     if tmux.exists():subprocess.run([str(tmux),'kill-server'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     try:server.wait(timeout=5)
     except subprocess.TimeoutExpired:pass

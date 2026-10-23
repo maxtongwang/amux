@@ -10,6 +10,9 @@ import {createHash,randomBytes} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
 import {chromium} from 'playwright';
 import {api} from '../scripts/browser-route-driver.mjs';
+// The isolated server's private tmux, never the host's: TMUX/TMUX_PANE would
+// override TMUX_TMPDIR and point tmux at the caller's own server.
+const privateTmuxEnv=home=>{const e={...process.env,TMUX_TMPDIR:home+'/tmux'};delete e.TMUX;delete e.TMUX_PANE;return e;};
 const base=process.env.AMUX_ROUTING_E2E_BASE,home=process.env.AMUX_ROUTING_E2E_HOME;
 const root=process.env.AMUX_ROUTING_CHROME_ROOT,out=process.env.AMUX_ROUTING_EVIDENCE;
 assert(base&&home&&root&&out&&root.startsWith(home+'/'));
@@ -152,7 +155,7 @@ try{
   console.log('START real worker '+name+' timeout_ms='+timeoutMs);
   let receipt,terminal='',done=false,last='';const deadline=Date.now()+timeoutMs;
   while(Date.now()<deadline){
-   try{terminal=execFileSync('tmux',['capture-pane','-p','-S','-10000','-t','amux-'+name],{env:{...process.env,TMUX_TMPDIR:home+'/tmux'},encoding:'utf8',stdio:['ignore','pipe','pipe']});}catch{}
+   try{terminal=execFileSync('tmux',['-S',join(home,'tmux',`tmux-${process.getuid()}`,'default'),'capture-pane','-p','-S','-10000','-t','amux-'+name],{env:privateTmuxEnv(home),encoding:'utf8',stdio:['ignore','pipe','pipe']});}catch{}
    writeFileSync(join(out,name+'-terminal.txt'),terminal);
    if(existsSync(receiptFile(name))){receipt=JSON.parse(readFileSync(receiptFile(name)));const change=JSON.stringify({backend:receipt.backend,profile:receipt.profile,attempts:receipt.attempts});if(change!==last){routeHistory.push({worker:name,at:new Date().toISOString(),receipt});last=change;writeFileSync(join(out,'route-history.json'),JSON.stringify(routeHistory,null,2));console.log('ROUTE '+phase+' '+receipt.backend+' '+receipt.profile);}}
    if(phase!=='exhausted'&&events.some(e=>e.kind==='resolve'&&e.phase===phase&&e.accepted)){done=true;await pause(12000);break;}
@@ -162,7 +165,7 @@ try{
    if(receipt && /Worked for|Baked for|Cogitated for|Cooked for|Brewed for/.test(terminal.slice(-3500)) && !/esc to interrupt/.test(terminal.slice(-1000))){break;}
    await pause(3000);
   }
-  try{terminal=execFileSync('tmux',['capture-pane','-p','-S','-10000','-t','amux-'+name],{env:{...process.env,TMUX_TMPDIR:home+'/tmux'},encoding:'utf8',stdio:['ignore','pipe','pipe']});writeFileSync(join(out,name+'-terminal.txt'),terminal);}catch{}
+  try{terminal=execFileSync('tmux',['-S',join(home,'tmux',`tmux-${process.getuid()}`,'default'),'capture-pane','-p','-S','-10000','-t','amux-'+name],{env:privateTmuxEnv(home),encoding:'utf8',stdio:['ignore','pipe','pipe']});writeFileSync(join(out,name+'-terminal.txt'),terminal);}catch{}
   const transcript=await api(base,`/api/sessions/${name}/transcript?max=200000`);writeFileSync(join(out,name+'-transcript.json'),JSON.stringify(transcript,null,2));
   const message=await api(base,`/api/sessions/${name}/last-message`);writeFileSync(join(out,name+'-last-message.json'),JSON.stringify(message,null,2));
   const rules=join(home,'rules',name+'.md');const rulesText=existsSync(rules)?readFileSync(rules,'utf8'):terminal;writeFileSync(join(out,name+'-launch-guide.txt'),rulesText);
