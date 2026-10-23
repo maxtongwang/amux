@@ -92,6 +92,7 @@ _bounded() { # seconds cmd...
     perl -e 'my $s = shift; my $pid = fork; exit 127 unless defined $pid;
       if (!$pid) { setpgrp(0, 0); exec @ARGV or exit 127 }
       $SIG{ALRM} = sub { kill "TERM", -$pid; select(undef, undef, undef, 0.5); kill "KILL", -$pid; exit 124 };
+      for my $sig (qw(TERM INT HUP)) { $SIG{$sig} = sub { kill $sig, -$pid; exit 128 + 15 } }
       alarm $s; waitpid($pid, 0); exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' "$s" "$@"
   fi
 }

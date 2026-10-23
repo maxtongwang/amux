@@ -21,12 +21,15 @@
 set -euo pipefail
 # Hermetic: the hook writes its bound log under AMUX_HOME and, by default,
 # probes https://localhost:8824/health. Neither may be the real one.
-export AMUX_HOME="$(mktemp -d "${TMPDIR:-/tmp}/freshness-home.XXXXXX")"
+# Assigned, then exported: `export X="$(mktemp ...)"` hides a mktemp failure
+# from set -e (export's own status wins).
+AMUX_HOME=$(mktemp -d "${TMPDIR:-/tmp}/freshness-home.XXXXXX")
+export AMUX_HOME
 export AMUX_HEALTH_URL="file://$AMUX_HOME/no-such-health.json"
 cd "$(dirname "$0")/.."
 HOOK="$(pwd)/.claude/session-freshness.sh"
 PASS=0; FAIL=0
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d); trap 'rm -rf "$TMP" "$AMUX_HOME"' EXIT
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 # Pin the default branch instead of inheriting it. The first cut of this file did
 # not, and passed locally (init.defaultBranch=main) while failing 4 assertions in
