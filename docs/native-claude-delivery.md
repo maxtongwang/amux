@@ -70,6 +70,39 @@ Amux, queue admission and model consumption are separate facts. Logs expose
 countable selection, pre-write unavailability, quarantine, callback rejection,
 state transition and recovery verdicts without tokens or message bodies.
 
+## Structured agent interface
+
+Use the existing authenticated worker client; identity is verified by the server,
+never supplied by a body field or inferred from an origin stamp.
+
+| Request | Input and output |
+| --- | --- |
+| `POST /api/workers/{worker}/send` | JSON `text` and stable client `msg_id`; returns `ok`, `id`, `submitted`, `submission`, optional `queue_id` and `delivery_receipt` |
+| `GET /api/sessions/{worker}/send?msg_id={client_id}` | Read durable acceptance and the current `delivery_receipt` without sending again |
+| `GET /api/history/{id}` | Existing Messages row by numeric ID or `MSG-{id}`, with its current receipt |
+| `GET /api/history?session={worker}` | History rows with receipts batched by exact client/queue IDs |
+
+Example peer request body: `{"text":"Review the attached task note","msg_id":"stable-client-command-id"}`.
+Keep the same client ID when reading a late receipt. The server assigns a stable
+attempt ID and separate native `msg_id`/command `uuid`; these are distinct from
+the client's `msg_id`. Receipt timestamps are Unix seconds; existing history
+`delivered_at` remains milliseconds.
+
+For an unconfirmed write, `submitted` is `null`, `submission` is
+`written_unconfirmed`, and `delivery_receipt.state` is `written_unconfirmed`.
+The receipt also contains `transport`, `attempt_id`, native `msg_id`, `uuid`,
+endpoint PID/start/session, executable hash, reason and evidence timestamps.
+`ok`/`accepted` report acceptance into Amux. Only `admitted`/`consumed` provide
+positive receiver evidence. Native denial, refusal, expiry and drop are durable
+receipt states; a pre-write identity quarantine returns HTTP 409 with a readable
+reason and remediation. Neither authorizes another transport or a fresh send.
+
+The CLI reads the same structured evidence on first replies, retry replies and
+late receipts. It prints `ADMITTED` or `RECEIVED` only with positive evidence;
+other native states print a refusal or unconfirmed result, return nonzero and
+say not to resend. Responses without a structured receipt retain existing CLI
+behavior. Machine clients should use the API state rather than parsing prose.
+
 ## Fixture verification
 
 All Rust fixtures use private temporary directories, injected process identity,
@@ -83,6 +116,7 @@ CARGO_TARGET_DIR="$HOME/.amux/rust-build-target/verification" scripts/safe-cargo
 scripts/test-native-delivery.sh
 CARGO_TARGET_DIR="$HOME/.amux/rust-build-target/verification" scripts/safe-cargo.sh clippy --workspace --all-targets -- -D warnings
 node --test e2e/native-delivery-chip.test.mjs e2e/board-delivery-chip.test.mjs
+python3 scripts/test-native-delivery-cli.py
 ```
 
 The fake server establishes client and recovery behavior, not compatibility with

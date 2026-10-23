@@ -2121,6 +2121,35 @@ except Exception:
 PY
 }
 
+# Structured delivery evidence is shared by first, retried and late replies.
+# stdout is a shell disposition (none/0/1); readable evidence goes to stderr.
+_report_delivery_receipt() {
+  RESP="$1" TGT="$2" python3 - <<'PYEOF'
+import json, os, sys
+try:
+    response = json.loads(os.environ["RESP"])
+except (ValueError, TypeError):
+    print("none"); raise SystemExit
+if not isinstance(response, dict) or "delivery_receipt" not in response:
+    print("none"); raise SystemExit
+receipt = response["delivery_receipt"]
+state = receipt.get("state") if isinstance(receipt, dict) else "unknown"
+# Evidence states are a transport-neutral receipt contract, not provider routing.
+positive = {"admitted": "ADMITTED to the receiver queue; model consumption is unconfirmed",
+            "consumed": "RECEIVED with exact receiver evidence"}
+negative = {"denied", "refused", "expired", "dropped"}
+known_pending = {"reserved", "written_unconfirmed", "held", "unknown"}
+if not isinstance(state, str) or state not in positive.keys() | negative | known_pending:
+    state = "unknown"
+message = positive.get(state)
+if message is None:
+    disposition = "REFUSED" if state in negative else "UNCONFIRMED"
+    message = f"{disposition}; accepted into Amux, state={state}. Do NOT resend or paste around this receipt"
+print(f"delivery_receipt: {os.environ['TGT']} state={state}: {message}", file=sys.stderr)
+print(0 if state in positive else 1)
+PYEOF
+}
+
 _send_via_api() {
   local name="$1" text="$2" nb="${3:-}"
   _warn_second_person_resend "$name" "$text"
@@ -2137,6 +2166,12 @@ print(json.dumps(d))")
     -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
     -d "$body" "$AMUX_API/api/workers/$name/send" 2>/dev/null) || resp=""
   if [[ -n "$resp" ]]; then
+    local receipt_rc
+    receipt_rc=$(_report_delivery_receipt "$resp" "$name")
+    if [[ "$receipt_rc" != none ]]; then
+      [[ "$receipt_rc" == 0 ]] && { _flush_unstamped_ledger || true; }
+      return "$receipt_rc"
+    fi
     rc=0
     RESP="$resp" TGT="$name" python3 - <<'PYEOF' || rc=$?
 import json, os, sys
@@ -2191,6 +2226,11 @@ PYEOF
       -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
       -d "$body" "$AMUX_API/api/workers/$name/send" 2>/dev/null) || resp=""
     if [[ -n "$resp" ]]; then
+      receipt_rc=$(_report_delivery_receipt "$resp" "$name")
+      if [[ "$receipt_rc" != none ]]; then
+        [[ "$receipt_rc" == 0 ]] && { _flush_unstamped_ledger || true; }
+        return "$receipt_rc"
+      fi
       rc=0
       # AF-556: `_R` is PASSED here. It used to be read from the environment and
       # nothing in this file ever set it, so the attempt number interpolated to
@@ -2334,6 +2374,8 @@ try:
     d = json.loads(os.environ["RESP"])
 except Exception:
     print("unknown"); raise SystemExit
+if "delivery_receipt" in d:
+    print("receipt:" + json.dumps(d)); raise SystemExit
 if d.get("accepted") is True: print("accepted")
 elif d.get("stranded") is True: print("stranded")
 elif d.get("expired") is True: print("unknown")
@@ -2352,6 +2394,12 @@ _send_settle_by_receipt() {
   id=$(BODY="$body" python3 -c 'import json,os; print(json.loads(os.environ["BODY"])["msg_id"])')
   text=$(BODY="$body" python3 -c 'import json,os,sys; sys.stdout.write(json.loads(os.environ["BODY"])["text"])')
   state=$(_await_send_receipt "$api" "$name" "$id" "$max" "$text")
+  if [[ "$state" == receipt:* ]]; then
+    local receipt_rc
+    receipt_rc=$(_report_delivery_receipt "${state#receipt:}" "$name")
+    [[ "$receipt_rc" == 0 ]] && { _flush_unstamped_ledger || true; }
+    return "$receipt_rc"
+  fi
   case "$state" in
     accepted)
       echo "sent to $name (origin-stamped; confirmed by the server's durable receipt after ${waited}s — the reply itself was slow)"
