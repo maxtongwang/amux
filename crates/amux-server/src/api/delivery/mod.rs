@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 pub(super) const FEATURE_ENV: &str = "AMUX_NATIVE_CLAUDE_DELIVERY";
+pub(super) const QUARANTINE_PREFIX: &str = "native delivery quarantined:";
+pub(super) const QUARANTINE_CODE: &str = "native_delivery_quarantined";
 pub(super) const IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const HALF_CLOSE_DELAY: Duration = Duration::from_millis(150);
 pub(super) const OBSERVATION_TIMEOUT_S: f64 = 600.0;
@@ -239,10 +241,10 @@ async fn resolve(
                     reason,
                     measured = true,
                     n_considered = 1,
-                    verdict = "native_delivery_quarantined",
+                    verdict = QUARANTINE_CODE,
                     "delivery stopped; identity/policy failures never permit paste fallback"
                 );
-                return (false, format!("native delivery quarantined: {reason}"));
+                return (false, format!("{QUARANTINE_PREFIX} {reason}"));
             }
             DeliveryOutcome::Terminal(ok, message) => return (ok, message),
         }

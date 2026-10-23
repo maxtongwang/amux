@@ -11298,7 +11298,7 @@ fn bg_view_refusal(generating: bool) -> String {
 /// added later cannot silently land in the 500 bucket.
 pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str>) {
     let m = msg.trim();
-    if msg.starts_with("native delivery quarantined:") {
+    if m.starts_with(super::delivery::QUARANTINE_PREFIX) {
         return (StatusCode::CONFLICT, Some("Inspect the native delivery receipt and endpoint identity; policy or identity refusals cannot use paste fallback."));
     }
     if msg.contains("durable owner input remains queued") {
@@ -11486,16 +11486,19 @@ pub(crate) const ISOLATED_REFUSAL_PREFIX: &str = "target is an isolated (raw-age
 
 /// A machine-readable code for a send refusal, beside the HTTP status.
 ///
-/// Only isolation has one today, and it is the SAME `isolated_target` code the
-/// peer gate (`isolated_peer_refusal`) has always returned, so a caller can
-/// branch on one field no matter which layer refused (AMUX-5241). The
+/// Isolation retains the SAME `isolated_target` code as the peer gate, and
+/// native identity refusals have their own stable quarantine code, so a caller
+/// can branch on one field no matter which layer refused (AMUX-5241). The
 /// "auto-wake failed: " wrapper is unwrapped the same way
 /// `send_failure_status` unwraps it.
 pub(crate) fn send_failure_code(msg: &str) -> Option<&'static str> {
     let m = msg.trim();
     let m = m.strip_prefix("auto-wake failed: ").unwrap_or(m);
     if m == "worker_group_boundary" || m == "peer_receive_denied" { return Some(if m == "worker_group_boundary" { "worker_group_boundary" } else { "peer_receive_denied" }); }
-    m.starts_with(ISOLATED_REFUSAL_PREFIX).then_some("isolated_target")
+    [
+        (ISOLATED_REFUSAL_PREFIX, "isolated_target"),
+        (super::delivery::QUARANTINE_PREFIX, super::delivery::QUARANTINE_CODE),
+    ].into_iter().find_map(|(prefix,code)|m.starts_with(prefix).then_some(code))
 }
 
 /// A verb's `(ok, msg)` rendered as its HTTP answer, classified by

@@ -94,8 +94,9 @@ The receipt also contains `transport`, `attempt_id`, native `msg_id`, `uuid`,
 endpoint PID/start/session, executable hash, reason and evidence timestamps.
 `ok`/`accepted` report acceptance into Amux. Only `admitted`/`consumed` provide
 positive receiver evidence. Native denial, refusal, expiry and drop are durable
-receipt states; a pre-write identity quarantine returns HTTP 409 with a readable
-reason and remediation. Neither authorizes another transport or a fresh send.
+receipt states; a pre-write identity quarantine returns HTTP 409 with stable
+`code: "native_delivery_quarantined"`, a readable reason and remediation.
+Neither authorizes another transport or a fresh send.
 
 The CLI reads the same structured evidence on first replies, retry replies and
 late receipts. It prints `ADMITTED` or `RECEIVED` only with positive evidence;

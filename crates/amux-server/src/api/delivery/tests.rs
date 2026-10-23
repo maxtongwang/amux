@@ -397,6 +397,15 @@ fn receipts_never_invent_a_normal_ack_and_only_release_after_held() {
 
 #[test]
 fn native_submission_boundary_and_late_http_result_never_fabricate_or_regress_evidence() {
+    let quarantine = format!("{QUARANTINE_PREFIX} connected_endpoint_mismatch");
+    assert_eq!(
+        crate::api::session_verbs::send_failure_code(&quarantine),
+        Some(QUARANTINE_CODE)
+    );
+    assert_eq!(
+        crate::api::session_verbs::send_failure_status(&quarantine).0,
+        axum::http::StatusCode::CONFLICT
+    );
     for state in [
         ReceiptState::Reserved,
         ReceiptState::WrittenUnconfirmed,
