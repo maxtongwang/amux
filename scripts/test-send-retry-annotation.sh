@@ -39,10 +39,10 @@ check_not() {  # check_not <label> <forbidden-substring> <haystack>
 }
 
 # The retry block's python, taken from the shipped file: the LAST PYEOF-delimited
-# block whose body mentions "origin-stamped, retry".
+# block whose body reads the required attempt number.
 PY=$(awk '
   /python3 - <<.PYEOF./ { collecting=1; buf=""; next }
-  collecting && /^PYEOF$/ { if (buf ~ /origin-stamped, retry/) print buf; collecting=0; next }
+  collecting && /^PYEOF$/ { if (buf ~ /attempt = os.environ/) print buf; collecting=0; next }
   collecting { buf = buf $0 "\n" }
 ' amux)
 
@@ -141,7 +141,7 @@ fi
 # opposite defect: it spoke, but on stdout.
 PY_FIRST=$(awk '
   /python3 - <<.PYEOF./ { collecting=1; buf=""; next }
-  collecting && /^PYEOF$/ { if (buf ~ /origin-stamped\)/ && buf !~ /origin-stamped, retry/) print buf; collecting=0; next }
+  collecting && /^PYEOF$/ { if (buf ~ /stamp_label/ && buf !~ /attempt = os.environ/) print buf; collecting=0; next }
   collecting { buf = buf $0 "\n" }
 ' amux)
 CELLS=$((CELLS + 1))
@@ -172,6 +172,17 @@ for blk in PY PY_FIRST; do
   CELLS=$((CELLS + 1))
   case "$err" in *UNCONFIRMED*rc=4*) echo "  ok    $blk: uncertain says UNCONFIRMED and exits 4" ;;
     *) echo "  FAIL  $blk: uncertain gave: $err"; FAILED=$((FAILED + 1)) ;; esac
+done
+
+# The stamp is a server receipt field, never inferred from HTTP success.
+for blk in "$PY" "$PY_FIRST"; do
+  labelled=$(_R=2 _R_WAITED=4 RESP='{"ok":true,"stamp_label":"outside process, claims B; unverified"}' TGT=somelane python3 -c "$blk")
+  check "prints the server's exact stamp label" "outside process, claims B; unverified" "$labelled"
+  unknown=$(_R=2 _R_WAITED=4 RESP='{"ok":true}' TGT=somelane python3 -c "$blk")
+  check "absent receipt says stamp unknown" "stamp not reported by server" "$unknown"
+  check_not "success never invents a stamp" "origin-stamped" "$unknown"
+  pending=$(_R=2 _R_WAITED=4 _R_PENDING=1 RESP='{"ok":true,"stamp_label":"server label"}' TGT=somelane python3 -c "$blk")
+  check "pending acknowledgement keeps server label" "server label" "$pending"
 done
 
 # 4. THE SHELL HALF. Cells 1-3 drive the python directly, so deleting the

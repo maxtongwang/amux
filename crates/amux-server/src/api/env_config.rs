@@ -649,10 +649,13 @@ async fn apply(
     // After the env files exist. Delivered at the worker's next turn boundary;
     // if its session is not up yet (provisioned separately) it queues and lands
     // when the worker starts. Only newly-created workers are here (see the loop).
+    // A worker's kickoff is queued under that worker's stamp, rendered once at
+    // delivery (#10); the owner's stays an amux job's, as before.
+    let kickoff_sender = (!origin.is_empty()).then(|| crate::api::session_verbs::request_sender_of(&state, &headers, ""));
     for (name, prompt) in &worker_prompts {
-        let text = crate::api::session_verbs::origin_stamped(&origin, name, prompt).unwrap_or_else(|| prompt.clone());
+        let who = crate::api::session_verbs::QueueSender { name: &origin, stamp: kickoff_sender.as_ref() };
         if let Err(code) =
-            crate::api::session_verbs::steer_enqueue(&state, name, &text, "env-apply-prompt", &origin)
+            crate::api::session_verbs::steer_enqueue_from(&state, name, prompt, "env-apply-prompt", who, None)
                 .await
         {
             tracing::warn!(worker = %name, sender = %origin, %code,

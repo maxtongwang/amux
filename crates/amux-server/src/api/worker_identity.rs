@@ -228,6 +228,8 @@ pub(crate) enum IdentityRefusal {
     Mismatch { session: String, worker: String },
     /// A claimed name that is not a worker name (`../sessions/x`, `a b`).
     Invalid { value: String },
+    /// Valid syntax is a claim, never process proof.
+    Unproven { claim: String },
 }
 
 /// Returned by [`claimed_worker`] for a claim that failed [`claimed_identity`]:
@@ -246,15 +248,14 @@ pub(crate) fn valid_identity(name: &str) -> bool {
     base != "." && base != ".." && super::session_verbs::valid_session_name(base)
 }
 
-/// THE worker identity of a request (fix/worker-membership-create, review B1).
-/// Every authorization reader goes through this; keep the signature stable
-/// (delivery stamping and process attribution build on it).
+/// Parse a single syntactically valid header claim for legacy authorization.
+/// This is NOT verification. Message attribution uses `verified_worker` and
+/// the server-only connection evidence recorded by `process_identity`.
 ///
 /// - `Ok(Some(name))`: the worker this request speaks for. On a protected
 ///   route `enforce` has refused the request unless this name carried its
 ///   rule-10 token (mutating requests over a socket on a rule-10 lane).
-/// - `Ok(None)`: no worker identity: the owner, a verified human member, or
-///   a request with neither header.
+/// - `Ok(None)`: no worker claim, never by itself proof of the owner.
 /// - `Err`: `X-Amux-Session` and `X-Amux-Worker` name different workers, or
 ///   the claim is not a worker identity ([`valid_identity`]). `enforce`
 ///   answers 403 `worker_identity_mismatch` / `worker_identity_invalid`.
@@ -264,7 +265,7 @@ pub(crate) fn valid_identity(name: &str) -> bool {
 /// its own session and token plus `X-Amux-Worker: <a lead>` and be authorized
 /// as the lead; and a claim failing the name check skipped rule 10 while
 /// still resolving another lane's env by path (`../sessions/<lead>`).
-pub(crate) fn verified_worker(headers: &axum::http::HeaderMap) -> Result<Option<String>, IdentityRefusal> {
+pub(crate) fn claimed_identity(headers: &axum::http::HeaderMap) -> Result<Option<String>, IdentityRefusal> {
     if super::org::local_member_actor(headers).is_some() {
         return Ok(None);
     }
@@ -284,7 +285,21 @@ pub(crate) fn verified_worker(headers: &axum::http::HeaderMap) -> Result<Option<
     }
 }
 
-/// [`verified_worker`] as the attribution string the existing readers expect:
+/// Only a server-set process proof verifies a worker. Tokens and environment
+/// headers authenticate a claim for legacy policy; they do not prove a pane.
+pub(crate) fn verified_worker(headers: &axum::http::HeaderMap) -> Result<Option<String>, IdentityRefusal> {
+    let claim = claimed_identity(headers)?;
+    let proof = headers.get(super::process_identity::PROCESS_WORKER_HEADER)
+        .and_then(|v| v.to_str().ok()).filter(|w| valid_identity(w));
+    match (claim, proof) {
+        (Some(claim), Some(worker)) if claim != worker => Err(IdentityRefusal::Unproven { claim }),
+        (_, Some(worker)) => Ok(Some(worker.to_string())),
+        (Some(claim), None) => Err(IdentityRefusal::Unproven { claim }),
+        (None, None) => Ok(None),
+    }
+}
+
+/// [`claimed_identity`] as the attribution string legacy policy readers expect:
 /// the worker's name, "" for none, [`UNVERIFIED_IDENTITY`] for an `Err`
 /// (never the owner, never another lane). A verified member keeps its stamped
 /// `member:<email>` attribution; callers tell a member apart with
@@ -297,7 +312,7 @@ pub(crate) fn claimed_worker(headers: &axum::http::HeaderMap) -> String {
             .unwrap_or("")
             .to_string();
     }
-    match verified_worker(headers) {
+    match claimed_identity(headers) {
         Ok(name) => name.unwrap_or_default(),
         Err(_) => UNVERIFIED_IDENTITY.to_string(),
     }
@@ -307,6 +322,7 @@ fn identity_refusal(req: &Request, refusal: IdentityRefusal) -> Response {
     let (code, error) = match &refusal {
         IdentityRefusal::Mismatch { session, worker } => ("worker_identity_mismatch", format!(
             "X-Amux-Session names '{session}' but X-Amux-Worker names '{worker}'; a request speaks for one worker")),
+        IdentityRefusal::Unproven { claim } => ("worker_identity_unproven", format!("process identity does not verify '{claim}'")),
         IdentityRefusal::Invalid { value } => ("worker_identity_invalid", format!(
             "'{value}' is not a worker name")),
     };
@@ -321,7 +337,7 @@ fn identity_refusal(req: &Request, refusal: IdentityRefusal) -> Response {
 /// server's own in-process calls (no ConnectInfo) act for lanes by design and
 /// are not a lane asserting itself.
 pub async fn enforce(req: Request, next: Next) -> Response {
-    let claimed = match verified_worker(req.headers()) {
+    let claimed = match claimed_identity(req.headers()) {
         Ok(name) => name.unwrap_or_default(),
         Err(refusal) => return identity_refusal(&req, refusal),
     };

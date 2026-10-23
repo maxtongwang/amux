@@ -562,6 +562,16 @@ impl SessionBackend for HerdrBackend {
         }
     }
 
+    /// The pane's process. Spawn `exec`s the command in the pane shell, so
+    /// this is the provider itself (the same `shell_pid` spawn records).
+    async fn pid(&self, proc: &ProcessRef) -> Result<Option<u32>> {
+        let pane = self.resolve_pane(&proc.backend_ref).await?;
+        let v = self
+            .run_json(&["pane", "process-info", "--pane", &pane], OP_TIMEOUT)
+            .await?;
+        Ok(v["result"]["process_info"]["shell_pid"].as_u64().map(|p| p as u32))
+    }
+
     /// #84: one `workspace list` for the whole fleet, returning
     /// `(backend_ref, agent_status)` for every `amux-` workspace whose pane
     /// herdr has recognized as a known agent (`idle`/`working`/`blocked`/

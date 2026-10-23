@@ -6173,3 +6173,14 @@ FIX: Withhold completion while scans or entries fail, persist pending paths, and
   retry at startup or once per minute on identity operations. Successful entries
   leave the pending list; WARN identity_migration_pending reports counts and
   identity_migration_attempt records each bounded pass.
+
+## Outside self-send arrived as owner input while the CLI claimed a stamp
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-10-17
+SESSION: dev-lead (reproduced around 22:10; reported in the owner task)
+CARD: none (this task is confined to an uncommitted worktree; PR #10 tracks the fix)
+SYMPTOM: A launchd job outside tmux set AMUX_WORKER/AMUX_SESSION=dev-lead and sent to dev-lead. The CLI said origin-stamped; receiving text had no stamp and read as owner input.
+COST: A non-owner process delivered falsely owner-attributed input; dev-lead reproduced the provenance breach.
+FIX: Uncommitted PR #10 follow-up: connection-derived Sender, preserved mismatched claims, explicit outside-process attribution, owner proof, and server-reported CLI labels. Standalone policy/ancestry and CLI unit checks pass; full crate typechecking remains unverified. See docs/design/message-provenance.md.
