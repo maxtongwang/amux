@@ -45,6 +45,7 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(list).post(create))
         .route("/runs", get(recent_runs))
         .route("/audit", get(audit_trail))
+        .route("/provenance-audit", get(provenance_audit))
         .route("/{id}", get(get_one).patch(patch).delete(delete_schedule))
         .route("/{id}/run", post(run_now))
         .route("/{id}/skip", post(skip_next))
@@ -855,6 +856,44 @@ fn attach_isolated_note(o: &mut serde_json::Map<String, Value>, verb: &str) {
     }
 }
 
+/// ai-config#210: who authored a schedule write. The VERIFIED worker identity
+/// (`worker_identity::verified_worker`, the same reader every authorization
+/// check uses), or "" for the owner. A claim that fails verification is a 403,
+/// never the owner.
+fn schedule_author(headers: &HeaderMap) -> Result<String, Box<Response>> {
+    match crate::api::worker_identity::verified_worker(headers) {
+        Ok(w) => Ok(w.unwrap_or_default()),
+        Err(_) => {
+            tracing::warn!(verdict = "schedule_author_unverified", measured = true, n_considered = 1,
+                "schedule write refused: the worker identity did not verify");
+            Err(Box::new(err(StatusCode::FORBIDDEN, json!({
+                "error": "schedule write refused: the worker identity on this request did not verify",
+                "code": "worker_identity_refused",
+            }))))
+        }
+    }
+}
+
+/// ai-config#210: a worker may aim a schedule only at itself or at a worker it
+/// may `send` to (a shared group, not isolated). The rule is send's own
+/// (`peer_input_gate`); the owner and a worker scheduling itself pass. A
+/// schedule with no target delivers to nobody and passes.
+fn schedule_target_gate(headers: &HeaderMap, target: &str, verb: &str) -> Option<Response> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let refusal = crate::api::session_verbs::peer_input_gate(headers, target, verb)?;
+    tracing::warn!(target, verb, verdict = "schedule_target_refused", measured = true, n_considered = 1,
+        "a worker's schedule may target only itself or a same-group worker");
+    Some(refusal)
+}
+
+fn shell_author_refusal(reason: String) -> Response {
+    tracing::warn!(verdict = "schedule_shell_author_mismatch", measured = true, n_considered = 1, "{reason}");
+    err(StatusCode::FORBIDDEN, json!({"error": reason, "code": "schedule_shell_author_mismatch"}))
+}
+
 pub async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -879,6 +918,17 @@ pub async fn create(
         return unhonoured_refusal(&dead);
     }
     let by = mutation_by(&headers, body.by.as_deref());
+    let author = match schedule_author(&headers) {
+        Ok(a) => a,
+        Err(r) => return *r,
+    };
+    if let Some(r) = schedule_target_gate(&headers, body.session.as_deref().unwrap_or(""), "schedule.create") {
+        return r;
+    }
+    if let Some(reason) = scheduler::shell_author_refusal(Some(&author),
+        body.session.as_deref().unwrap_or(""), body.kind.as_deref().unwrap_or("tmux")) {
+        return shell_author_refusal(reason);
+    }
     let now = Local::now();
     let now_ts = chrono::Utc::now().timestamp();
     let run_at = body.run_at.clone().unwrap_or_else(|| fmt_minute(now));
@@ -936,6 +986,7 @@ pub async fn create(
     let kind = body.kind.clone().unwrap_or_else(|| "tmux".into());
     let kind_defaulted = body.kind.is_none();
     m.insert("kind".into(), json!(kind));
+    m.insert("created_by".into(), json!(author));
     m.insert("sched_type".into(), json!(sched_type));
     m.insert(
         "recurrence".into(),
@@ -1167,10 +1218,49 @@ pub async fn patch(
         return unhonoured_refusal(&dead);
     }
     let by = mutation_by(&headers, body.by.as_deref());
+    let author = match schedule_author(&headers) {
+        Ok(a) => a,
+        Err(r) => return *r,
+    };
+    // A worker may PATCH only a schedule aimed (before and after the edit) at
+    // itself or a same-group worker: retargeting, or rewriting the command of
+    // another lane's schedule, is input to that lane (ai-config#210).
+    if !author.is_empty() {
+        let current = {
+            let store = state.store.clone();
+            let id_r = id.clone();
+            crate::db::interactions::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+                let conn = store.read()?;
+                Ok(get_schedule(&conn, &id_r)?.map(|s| s.str_field("session").to_string()))
+            })
+            .await
+        };
+        let current = match current {
+            Ok(Ok(target)) => target,
+            result => {
+                let error = match result {
+                    Ok(Err(e)) => e.to_string(),
+                    Err(e) => e.to_string(),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                tracing::warn!(schedule = %id, %error, verdict = "schedule_target_read_failed",
+                    measured = true, n_considered = 1, "schedule PATCH refused: cannot read target");
+                return err(StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": error, "code": "schedule_target_read_failed"}));
+            }
+        };
+        for target in [current.as_deref(), body.session.as_deref()].into_iter().flatten() {
+            if let Some(r) = schedule_target_gate(&headers, target, "schedule.patch") {
+                return r;
+            }
+        }
+    }
+    let content_changed = body.session.is_some() || body.command.is_some() || body.kind.is_some();
     let now = Local::now();
 
     enum Outcome {
         NotFound,
+        ShellRefused(String),
         Tombstone {
             deleted_at: i64,
             deleted_by: Option<String>,
@@ -1186,6 +1276,18 @@ pub async fn patch(
             let Some(mut s) = get_schedule(conn, &id_w)? else {
                 return finish(&slot_w, Outcome::NotFound, no_write());
             };
+            if content_changed {
+                let effective_author = if author.is_empty() {
+                    scheduler::schedule_worker_author(Some(conn), &s)
+                } else {
+                    Some(author.clone())
+                };
+                if let Some(reason) = scheduler::shell_author_refusal(effective_author.as_deref(),
+                    body.session.as_deref().unwrap_or(s.str_field("session")),
+                    body.kind.as_deref().unwrap_or(s.str_field("kind"))) {
+                    return finish(&slot_w, Outcome::ShellRefused(reason), no_write());
+                }
+            }
             // A tombstone accepts NO ordinary write (AMUX-3431): the row will
             // never fire, so a 200 here is fictional coverage. The one honest
             // write is an EXPLICIT resurrect, audited as such.
@@ -1233,6 +1335,12 @@ pub async fn patch(
             }
             if let Some(v) = &body.command {
                 s.set("command", json!(v));
+            }
+            // The last author of what gets DELIVERED owns its provenance: a
+            // worker that rewrites an owner schedule's command or target makes
+            // it worker input (ai-config#210). An owner edit leaves it as is.
+            if content_changed && !author.is_empty() {
+                s.set("created_by", json!(author));
             }
             if let Some(v) = &body.kind {
                 s.set("kind", json!(v));
@@ -1366,6 +1474,7 @@ pub async fn patch(
                 Json(v).into_response()
             }
             Some(Outcome::NotFound) => not_found(),
+            Some(Outcome::ShellRefused(reason)) => shell_author_refusal(reason),
             Some(Outcome::Tombstone {
                 deleted_at,
                 deleted_by,
@@ -1657,6 +1766,10 @@ pub async fn run_now(
     // body this endpoint never reads would be fabricated attribution.
     let by = mutation_by(&headers, None);
     let source = format!("manual:{by}");
+    let author = match schedule_author(&headers) {
+        Ok(a) => a,
+        Err(r) => return *r,
+    };
 
     // READ the row first, then DELIVER outside any write lock, then RECORD what
     // delivery did. The old shape did the opposite — one write transaction that
@@ -1678,7 +1791,30 @@ pub async fn run_now(
     })
     .await
     {
-        Ok(Ok((Some(s), _))) if !s.is_deleted() => s,
+        Ok(Ok((Some(s), _))) if !s.is_deleted() => {
+            // A worker pressing Run now is input from that worker to the
+            // target: gated like a send, and delivered as that worker's
+            // (ai-config#210), whoever authored the schedule.
+            let mut s = s;
+            if !author.is_empty() {
+                if let Some(r) = schedule_target_gate(&headers, s.str_field("session"), "schedule.run") {
+                    return r;
+                }
+                s.set("__run_by_worker", json!(author));
+            }
+            let refusal = {
+                let conn = match state.store.read() {
+                    Ok(conn) => conn,
+                    Err(e) => return internal(e),
+                };
+                let author = scheduler::schedule_worker_author(Some(&conn), &s);
+                scheduler::shell_author_refusal(author.as_deref(), s.str_field("session"), s.str_field("kind"))
+            };
+            if let Some(reason) = refusal {
+                return shell_author_refusal(reason);
+            }
+            s
+        }
         Ok(Ok((Some(s), del_by))) => {
             // Running a deleted schedule by hand is the same fiction as
             // PATCHing one: it LOOKS live while the scheduler will never
@@ -2064,6 +2200,46 @@ pub async fn audit_trail(
 // api/mod.rs belongs to the integrator).
 // ---------------------------------------------------------------------------
 
+/// GET /api/schedules/provenance-audit (ai-config#210 AC3): every live
+/// schedule a worker authored that targets a DIFFERENT worker. Before the fix
+/// these were delivered as owner input into isolated workers and with no
+/// author into the rest; they now deliver stamped with their author, and an
+/// isolated target refuses them. Listed so the owner can decide each one.
+pub async fn provenance_audit(State(state): State<AppState>) -> Response {
+    let store = state.store.clone();
+    let rows = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<(usize, Vec<Value>)> {
+        let conn = store.read()?;
+        let all = list_schedules(&conn, None)?;
+        let n = all.len();
+        let mut out = Vec::new();
+        for s in all {
+            let raw_creator = s.raw().get("created_by").cloned().unwrap_or(Value::Null);
+            let Some(author) = scheduler::schedule_worker_author(Some(&conn), &s) else { continue };
+            let target = s.str_field("session").trim().to_string();
+            if target.is_empty() || target == author {
+                continue;
+            }
+            out.push(json!({
+                "id": s.id(), "title": s.str_field("title"), "target": target, "author": author,
+                "author_source": if raw_creator.is_null() { "creation_audit" } else { "created_by" },
+                "enabled": s.i64_field("enabled", 1) != 0,
+                "target_isolated": crate::api::session_verbs::session_is_isolated(&target),
+                "same_group": crate::api::session_verbs::peer_input_refusal(&author, &target).is_none(),
+            }));
+        }
+        Ok((n, out))
+    })
+    .await;
+    match rows {
+        Ok(Ok((n, out))) => Json(json!({
+            "measured": true, "n_considered": n, "count": out.len(), "schedules": out,
+        }))
+        .into_response(),
+        Ok(Err(e)) => Json(json!({"measured": false, "why_unmeasured": e.to_string(), "n_considered": 0})).into_response(),
+        Err(e) => Json(json!({"measured": false, "why_unmeasured": e.to_string(), "n_considered": 0})).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2181,6 +2357,7 @@ mod tests {
         };
         let router = Router::new()
             .nest("/api/schedules", routes())
+            .nest("/api/env", crate::api::env_config::routes())
             .with_state(state);
         (router, dir)
     }
@@ -2219,8 +2396,251 @@ mod tests {
 
     const SES: [(&str, &str); 1] = [("x-amux-session", "tester-session")];
 
+    /// A temp AMUX_HOME with three workers: dev-a and dev-b share group `dev`,
+    /// ops-c is in `ops` (groups are CC_TAGS, as in production).
+    fn grouped_home() -> (tempfile::TempDir, crate::api::settings::test_env::HomeGuard) {
+        let home = tempfile::tempdir().unwrap();
+        let guard = crate::api::settings::test_env::set_home(home.path());
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        for (w, tags) in [("dev-a", "dev"), ("dev-b", "dev"), ("ops-c", "ops")] {
+            std::fs::write(sessions.join(format!("{w}.env")), format!("CC_TAGS={tags}\n")).unwrap();
+        }
+        (home, guard)
+    }
+
+    /// The older tests write as worker `tester-session` (SES) for lanes alpha
+    /// and beta. Since ai-config#210 a worker may only schedule a lane it
+    /// shares a group with, so they run in a home where all three share one.
+    fn team_home() -> (tempfile::TempDir, crate::api::settings::test_env::HomeGuard) {
+        let home = tempfile::tempdir().unwrap();
+        let guard = crate::api::settings::test_env::set_home(home.path());
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        for w in ["tester-session", "alpha", "beta"] {
+            std::fs::write(sessions.join(format!("{w}.env")), "CC_TAGS=team\n").unwrap();
+        }
+        (home, guard)
+    }
+
+    fn sched_body(target: &str) -> Value {
+        json!({"title": "t", "session": target, "command": "hi", "schedule_expr": "every 1h"})
+    }
+
+    /// ai-config#210 (1): a worker-originated schedule may target only itself
+    /// or a same-group worker; cross-group creation is refused and nothing is
+    /// written. The author is the verified identity, "" for the owner.
+    #[tokio::test]
+    async fn a_worker_schedule_is_refused_across_groups_and_records_its_author() {
+        let (_home, _g) = grouped_home();
+        let (app, _dir) = app();
+        let as_a = [("x-amux-session", "dev-a")];
+        let (st, v) = send(&app, "POST", "/api/schedules", Some(sched_body("ops-c")), &as_a).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], json!("worker_group_boundary"), "{v}");
+        let (_, list) = send(&app, "GET", "/api/schedules", None, &[]).await;
+        assert!(list.as_array().unwrap().is_empty(), "a refused create writes nothing: {list}");
+
+        for target in ["dev-b", "dev-a"] {
+            let (st, v) = send(&app, "POST", "/api/schedules", Some(sched_body(target)), &as_a).await;
+            assert_eq!(st, StatusCode::CREATED, "{target}: {v}");
+            assert_eq!(v["created_by"], json!("dev-a"), "{target}: {v}");
+        }
+        // The owner (no worker identity) may target anyone, and is recorded as "".
+        let (st, v) = send(&app, "POST", "/api/schedules", Some(sched_body("ops-c")), &[]).await;
+        assert_eq!(st, StatusCode::CREATED, "{v}");
+        assert_eq!(v["created_by"], json!(""), "{v}");
+    }
+
+    /// A worker cannot retarget a schedule across groups, nor rewrite another
+    /// group's schedule; a worker that rewrites what gets delivered becomes
+    /// its author (so an owner schedule it edits is no longer owner input).
+    #[tokio::test]
+    async fn a_worker_patch_is_gated_and_takes_authorship_of_what_it_rewrites() {
+        let (_home, _g) = grouped_home();
+        let (app, _dir) = app();
+        let as_a = [("x-amux-session", "dev-a")];
+        let (_, own) = send(&app, "POST", "/api/schedules", Some(sched_body("dev-b")), &[]).await;
+        let (_, ops) = send(&app, "POST", "/api/schedules", Some(sched_body("ops-c")), &[]).await;
+        let own_id = own["id"].as_str().unwrap().to_string();
+        let ops_id = ops["id"].as_str().unwrap().to_string();
+
+        let (st, v) = send(&app, "PATCH", &format!("/api/schedules/{own_id}"),
+            Some(json!({"session": "ops-c"})), &as_a).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "retarget across groups: {v}");
+        let (st, v) = send(&app, "PATCH", &format!("/api/schedules/{ops_id}"),
+            Some(json!({"command": "do this"})), &as_a).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "rewriting another group's schedule: {v}");
+
+        let (st, v) = send(&app, "PATCH", &format!("/api/schedules/{own_id}"),
+            Some(json!({"command": "rewritten by a worker"})), &as_a).await;
+        assert!(st.is_success(), "{v}");
+        let (_, got) = send(&app, "GET", &format!("/api/schedules/{own_id}"), None, &[]).await;
+        assert_eq!(got["created_by"], json!("dev-a"), "the rewriting worker owns its provenance: {got}");
+
+        // A worker toggling enabled does not take authorship.
+        let (_, ops2) = send(&app, "POST", "/api/schedules", Some(sched_body("dev-b")), &[]).await;
+        let id2 = ops2["id"].as_str().unwrap().to_string();
+        let (st, _) = send(&app, "PATCH", &format!("/api/schedules/{id2}"), Some(json!({"enabled": 0})), &as_a).await;
+        assert!(st.is_success());
+        let (_, got) = send(&app, "GET", &format!("/api/schedules/{id2}"), None, &[]).await;
+        assert_eq!(got["created_by"], json!(""), "{got}");
+    }
+
+    #[tokio::test]
+    async fn review_b1_worker_shell_create_refuses_borrowed_identity() {
+        let (_home, _g) = grouped_home();
+        let (app, _dir) = app();
+        let as_a = [("x-amux-session", "dev-a")];
+        for target in ["dev-b", ""] {
+            let mut body = sched_body(target);
+            body["kind"] = json!("shell");
+            let (st, v) = send(&app, "POST", "/api/schedules", Some(body), &as_a).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "B1 shell create must refuse target {target:?}: {v}");
+            assert_eq!(v["code"], "schedule_shell_author_mismatch");
+        }
+        let (_, rows) = send(&app, "GET", "/api/schedules", None, &[]).await;
+        assert!(rows.as_array().unwrap().is_empty());
+        for (target, headers) in [("dev-a", as_a.as_slice()), ("dev-b", &[][..])] {
+            let mut body = sched_body(target);
+            body["kind"] = json!("shell");
+            let (st, v) = send(&app, "POST", "/api/schedules", Some(body), headers).await;
+            assert_eq!(st, StatusCode::CREATED, "self or owner shell allowed: {v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn review_b1_worker_shell_patch_gates_the_resulting_row() {
+        let (_home, _g) = grouped_home();
+        let (app, dir) = app();
+        let as_a = [("x-amux-session", "dev-a")];
+        // Each independent field can turn an otherwise permitted row into a
+        // shell that borrows dev-b's runtime identity.
+        for (target, kind, edit) in [
+            ("dev-b", "tmux", json!({"kind": "shell"})),
+            ("dev-a", "shell", json!({"session": "dev-b"})),
+            ("dev-b", "shell", json!({"command": "true"})),
+        ] {
+            let mut body = sched_body(target);
+            body["kind"] = json!(kind);
+            let (st, row) = send(&app, "POST", "/api/schedules", Some(body), &[]).await;
+            assert_eq!(st, StatusCode::CREATED, "{row}");
+            let id = row["id"].as_str().unwrap();
+            let (st, v) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(edit), &as_a).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "B1 shell PATCH must evaluate resulting row: {v}");
+            assert_eq!(v["code"], "schedule_shell_author_mismatch");
+            let (_, got) = send(&app, "GET", &format!("/api/schedules/{id}"), None, &[]).await;
+            assert_eq!(got["created_by"], "", "refused PATCH must not change provenance");
+        }
+        // Even an owner edit must not preserve an unsafe worker author.
+        let (_, row) = send(&app, "POST", "/api/schedules", Some(sched_body("dev-b")), &as_a).await;
+        let id = row["id"].as_str().unwrap();
+        let (st, v) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({"kind":"shell"})), &[]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "persisted worker author: {v}");
+        // Repairing a legacy bad row to self is permitted.
+        let conn = rusqlite::Connection::open(dir.path().join("sched-api-test.db")).unwrap();
+        conn.execute("UPDATE schedules SET kind='shell' WHERE id=?1", [id]).unwrap();
+        let (st, v) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({"session":"dev-a"})), &as_a).await;
+        assert_eq!(st, StatusCode::OK, "repair to self: {v}");
+    }
+
+    #[tokio::test]
+    async fn review_b1_worker_shell_run_now_refuses_borrowed_identity() {
+        let (_home, _g) = grouped_home();
+        struct Firing;
+        impl Drop for Firing {
+            fn drop(&mut self) { std::env::remove_var("AMUX_RS_SCHEDULER"); }
+        }
+        std::env::set_var("AMUX_RS_SCHEDULER", "1");
+        let _firing = Firing;
+        let (app, dir) = app();
+        let mut body = sched_body("dev-b");
+        body["kind"] = json!("shell");
+        body["command"] = json!("true");
+        let (_, row) = send(&app, "POST", "/api/schedules", Some(body), &[]).await;
+        let id = row["id"].as_str().unwrap();
+        let (st, v) = send(&app, "POST", &format!("/api/schedules/{id}/run"), None, &[("x-amux-session", "dev-a")]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "B1 run-now must refuse borrowed shell identity: {v}");
+        assert_eq!(v["code"], "schedule_shell_author_mismatch");
+        let conn = rusqlite::Connection::open(dir.path().join("sched-api-test.db")).unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM schedule_runs", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        // The owner pressing Run now does not erase a persisted worker author.
+        conn.execute("UPDATE schedules SET created_by='dev-a' WHERE id=?1", [id]).unwrap();
+        let (st, v) = send(&app, "POST", &format!("/api/schedules/{id}/run"), None, &[]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "legacy unsafe worker row: {v}");
+    }
+
+    #[tokio::test]
+    async fn review_n1_isolated_self_schedule_saves_but_peer_target_refuses() {
+        let (home, _g) = grouped_home();
+        std::fs::write(home.path().join("sessions/dev-a.env"), "CC_TAGS=dev\nCC_ISOLATED=1\n").unwrap();
+        let (app, _dir) = app();
+        let (st, row) = send(&app, "POST", "/api/schedules", Some(sched_body("dev-a")), &[("x-amux-session", "dev-a")]).await;
+        assert_eq!(st, StatusCode::CREATED, "{row}");
+        assert_eq!(row["created_by"], "dev-a");
+        let (st, row) = send(&app, "POST", "/api/schedules", Some(sched_body("dev-a")), &[("x-amux-session", "dev-b")]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "peer into isolated target: {row}");
+    }
+
+    #[tokio::test]
+    async fn review_n4_env_apply_records_worker_and_owner_schedule_authorship() {
+        let (_home, _g) = grouped_home();
+        let (app, _dir) = app();
+        for (title, headers, author) in [
+            ("worker", vec![("x-amux-session", "dev-a")], "dev-a"),
+            ("owner", vec![], ""),
+        ] {
+            let (st, v) = send(&app, "POST", "/api/env/apply", Some(json!({"schedules":[{
+                "worker":"dev-a", "title":title, "command":"hi", "expr":"every 1h"
+            }]})), &headers).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            let (_, rows) = send(&app, "GET", "/api/schedules", None, &[]).await;
+            let row = rows.as_array().unwrap().iter().find(|r| r["title"] == title).expect("env apply saved schedule");
+            assert_eq!(row["created_by"], author, "env apply author: {row}");
+        }
+        let (st, v) = send(&app, "POST", "/api/env/apply", Some(json!({"schedules":[{
+            "worker":"dev-b", "title":"peer", "command":"hi"
+        }]})), &[("x-amux-session", "dev-a")]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "env apply remains self-only: {v}");
+    }
+
+    #[tokio::test]
+    async fn review_n5_patch_refuses_a_failed_target_read() {
+        let (_home, _g) = grouped_home();
+        let (app, dir) = app();
+        let (_, row) = send(&app, "POST", "/api/schedules", Some(sched_body("dev-b")), &[]).await;
+        let conn = rusqlite::Connection::open(dir.path().join("sched-api-test.db")).unwrap();
+        // A real read failure, rather than a missing row (which is 404).
+        conn.execute("ALTER TABLE schedules RENAME TO unavailable_schedules", []).unwrap();
+        let (st, v) = send(&app, "PATCH", &format!("/api/schedules/{}", row["id"].as_str().unwrap()), Some(json!({"enabled":0})), &[("x-amux-session", "dev-a")]).await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "failed target lookup: {v}");
+        assert_eq!(v["code"], "schedule_target_read_failed", "lookup must fail closed before the write");
+        assert_eq!(conn.query_row("SELECT enabled FROM unavailable_schedules", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    /// ai-config#210 (3): the provenance audit lists worker-authored schedules
+    /// aimed at another worker, and only those.
+    #[tokio::test]
+    async fn the_provenance_audit_lists_worker_schedules_aimed_at_another_worker() {
+        let (_home, _g) = grouped_home();
+        let (app, _dir) = app();
+        let as_a = [("x-amux-session", "dev-a")];
+        send(&app, "POST", "/api/schedules", Some(sched_body("dev-b")), &as_a).await;
+        send(&app, "POST", "/api/schedules", Some(sched_body("dev-a")), &as_a).await;
+        send(&app, "POST", "/api/schedules", Some(sched_body("ops-c")), &[]).await;
+        let (st, v) = send(&app, "GET", "/api/schedules/provenance-audit", None, &[]).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["measured"], json!(true));
+        assert_eq!(v["n_considered"], json!(3));
+        let rows = v["schedules"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{v}");
+        assert_eq!((rows[0]["author"].as_str(), rows[0]["target"].as_str()), (Some("dev-a"), Some("dev-b")));
+        assert_eq!(rows[0]["same_group"], json!(true));
+    }
+
     #[tokio::test]
     async fn create_lists_and_audits_with_attribution() {
+        let (_team, _team_guard) = team_home();
         let (app, _dir) = app();
         let (st, created) = send(
             &app,
@@ -2281,6 +2701,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_scope_only_surfaces_bound_schedules() {
+        let (_team, _team_guard) = team_home();
         let (app, _dir) = app();
         for (title, session) in [("a-task", "alpha"), ("b-task", "beta")] {
             let (st, _) = send(
@@ -2304,6 +2725,7 @@ mod tests {
 
     #[tokio::test]
     async fn patch_updates_recomputes_and_audits() {
+        let (_team, _team_guard) = team_home();
         let (app, _dir) = app();
         let (_, created) = send(
             &app,
@@ -2508,10 +2930,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_now_is_409_in_shadow_mode() {
-        // Default deployment: AMUX_RS_SCHEDULER unset -> shadow mode. (No
-        // test in this crate ever SETS the var — the firing paths are
-        // exercised through scheduler_tick's explicit bool — so clearing it
-        // here cannot race another test.)
+        let (_home, _g) = team_home();
+        // Serialize firing-mode changes with the API run-now regression test.
         std::env::remove_var("AMUX_RS_SCHEDULER");
         let (app, _dir) = app();
         let (_, created) = send(
@@ -2612,7 +3032,8 @@ mod tests {
             &app,
             "POST",
             "/api/schedules",
-            Some(json!({ "title": "pf", "schedule_expr": "every 1h", "kind": "shell", "command": "true" })),
+            // A worker-authored shell schedule must target its author (#56 B1).
+            Some(json!({ "title": "pf", "schedule_expr": "every 1h", "kind": "shell", "command": "true", "session": "tester-session" })),
             &SES,
         )
         .await;
@@ -3013,6 +3434,7 @@ mod tests {
 
     #[tokio::test]
     async fn inert_values_for_those_fields_still_save() {
+        let (_team, _team_guard) = team_home();
         let (app, _dir) = app();
         let (st, body) = send(
             &app,
@@ -3085,6 +3507,7 @@ mod tests {
     /// with the denominator published beside them.
     #[tokio::test]
     async fn list_counts_runs_and_failures_from_run_history() {
+        let (_team, _team_guard) = team_home();
         let (app, dir) = app();
         let (st, created) = send(
             &app,

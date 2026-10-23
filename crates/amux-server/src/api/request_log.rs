@@ -1735,6 +1735,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET"],
     },
     RouteEntry {
+        path: "/api/schedules/provenance-audit",
+        methods: &["GET"],
+    },
+    RouteEntry {
         path: "/api/schedules/{id}",
         methods: &["GET", "PATCH", "DELETE"],
     },

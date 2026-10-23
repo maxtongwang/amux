@@ -833,8 +833,9 @@ async fn recover_completed_review(exit: &str, verdict: &str, live: bool) {
     rig.spawn();
     let before = rig.wait_healthy().await;
     // Create through the API before the crash, then seed only the internal
-    // execution states for which there is no API writer.
-    let (status, schedule) = rig.post("/api/schedules", json!({"title":"Interrupted shell", "kind":"shell", "command":"exit 0", "schedule_expr":"daily at 3am", "enabled":0})).await;
+    // execution states for which there is no API writer. The poster is the
+    // worker rr0150-suite, and a worker shell schedule must target its author (#56 B1).
+    let (status, schedule) = rig.post("/api/schedules", json!({"title":"Interrupted shell", "kind":"shell", "command":"exit 0", "schedule_expr":"daily at 3am", "enabled":0, "session":"rr0150-suite"})).await;
     assert_eq!(status, 201, "{schedule}");
     let sid = schedule["id"].as_str().unwrap();
     // These internal execution states and detached-review artifacts form one

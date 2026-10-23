@@ -1057,7 +1057,7 @@ fn due_schedules(conn: &Connection, now_str: &str) -> rusqlite::Result<Vec<Durab
 /// is still written, and the only behavioural difference is that an unset
 /// defaulted column now gets its default instead of failing the insert.
 pub fn insert_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Result<()> {
-    const COLS: [&str; 27] = [
+    const COLS: [&str; 28] = [
         "id",
         "title",
         "session",
@@ -1085,6 +1085,7 @@ pub fn insert_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Resu
         "worktree",
         "fan_out",
         "fan_out_model",
+        "created_by",
     ];
     let present: Vec<&str> = COLS
         .iter()
@@ -1104,7 +1105,7 @@ pub fn insert_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Resu
 
 /// Full-row UPDATE with Python's PATCH column list.
 pub fn update_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Result<usize> {
-    const COLS: [&str; 22] = [
+    const COLS: [&str; 23] = [
         "title",
         "session",
         "command",
@@ -1127,6 +1128,7 @@ pub fn update_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Resu
         "worktree",
         "fan_out",
         "fan_out_model",
+        "created_by",
     ];
     let sets: Vec<String> = COLS
         .iter()
@@ -1803,6 +1805,53 @@ pub fn fail_orphaned_manual_shell_runs(conn: &Connection) -> rusqlite::Result<us
 /// can produce a status the other could — a shell exit code is not a delivery
 /// verdict and vice versa — which is the point of returning [`RunOutcome`]
 /// rather than a bool.
+/// The worker that authored a schedule's delivered content, or None for the
+/// owner (ai-config#210). Sources, in order:
+/// - `__run_by_worker`: a worker pressed Run now (schedules::run_now sets it
+///   on the in-memory row); that run is the worker's input, whoever wrote the
+///   schedule;
+/// - `created_by`: the verified identity of the create or last content PATCH,
+///   '' for the owner;
+/// - a row from before that column (NULL): the creation audit row's `by_who`,
+///   counted as a worker only when it names a registered worker. Header-only
+///   legacy attribution cannot prove the owner, so a registered name wins.
+pub(crate) fn schedule_worker_author(conn: Option<&Connection>, sched: &DurableSchedule) -> Option<String> {
+    if let Some(w) = sched.raw.get("__run_by_worker").and_then(Value::as_str).filter(|w| !w.is_empty()) {
+        return Some(w.to_string());
+    }
+    match sched.raw.get("created_by") {
+        Some(Value::String(w)) => return (!w.trim().is_empty()).then(|| w.trim().to_string()),
+        Some(Value::Null) | None => {}
+        Some(_) => return None,
+    }
+    let by: String = conn?
+        .query_row(
+            "SELECT by_who FROM schedule_audit WHERE schedule_id=?1 AND field='created' \
+             ORDER BY id ASC LIMIT 1",
+            [sched.id()],
+            |r| r.get(0),
+        )
+        .ok()?;
+    legacy_worker_author(&by, |name| crate::api::session_verbs::env_path(name).exists())
+}
+
+/// A legacy `by_who` ("lane", or "lane (claimed other)") names a worker when
+/// its header part is a registered session.
+pub(crate) fn legacy_worker_author(by_who: &str, registered: impl Fn(&str) -> bool) -> Option<String> {
+    let name = by_who.split(" (claimed ").next().unwrap_or("").trim();
+    (!name.is_empty() && crate::api::session_verbs::valid_session_name(name) && registered(name))
+        .then(|| name.to_string())
+}
+
+/// A shell runs with its target's session, run token and vault secrets. A
+/// worker may therefore author one only for itself, including legacy rows.
+pub(crate) fn shell_author_refusal(author: Option<&str>, target: &str, kind: &str) -> Option<String> {
+    let author = author.filter(|w| !w.is_empty())?;
+    (kind == "shell" && author != target.trim()).then(|| format!(
+        "shell schedule refused: worker author '{author}' may run only as itself, not target '{target}'"
+    ))
+}
+
 pub struct LiveDeliverer {
     state: crate::api::AppState,
 }
@@ -2135,6 +2184,32 @@ pub fn reserve_applies_to(source: &str) -> bool {
 #[async_trait::async_trait]
 impl Deliverer for LiveDeliverer {
     async fn deliver(&self, sched: &DurableSchedule, source: &str) -> RunOutcome {
+        let session = sched.str_field("session").to_string();
+        let author = {
+            let conn = match self.state.store.read() {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::warn!(schedule = %sched.id(), %error, verdict = "schedule_author_read_failed",
+                        measured = true, n_considered = 1, "schedule refused: cannot read authorship");
+                    return RunOutcome::Refused { reason: format!("cannot read schedule authorship: {error}") };
+                }
+            };
+            schedule_worker_author(Some(&conn), sched)
+        };
+        if let Some(reason) = shell_author_refusal(author.as_deref(), &session, sched.str_field("kind")) {
+            tracing::warn!(schedule = %sched.id(), session, author, verdict = "schedule_shell_author_mismatch",
+                measured = true, n_considered = 1, "{reason}");
+            return RunOutcome::Refused { reason };
+        }
+        // Reuse send's live group/receive/isolation decision on every fire;
+        // a boundary accepted when the row was written may no longer exist.
+        if let Some(w) = author.as_deref().filter(|w| *w != session) {
+            if let Some((code, reason)) = crate::api::session_verbs::send_group_refusal(w, &session) {
+                tracing::warn!(schedule = %sched.id(), session, author = w, code,
+                    verdict = "schedule_delivery_group_refused", measured = true, n_considered = 1, "{reason}");
+                return RunOutcome::Refused { reason };
+            }
+        }
         if sched.str_field("kind") == "shell" {
             // NOT GATED BY THE RESERVE, and the exemption is the point: a shell
             // schedule wakes no model turn, so it consumes none of the plan
@@ -2200,15 +2275,27 @@ impl Deliverer for LiveDeliverer {
             };
         }
 
-        let session = sched.str_field("session").to_string();
         let text = delivered_text(&command, source);
-        let d = crate::api::session_verbs::deliver_automated(
-            &self.state,
-            &session,
-            &text,
-            &format!("sched:{}", sched.id()),
-        )
-        .await;
+        // Cross-target worker input retains the automation guard and stamp.
+        // Self-authored schedules are standing input to that same worker,
+        // including isolated workers; persisted authorship stays unchanged.
+        let (text, guard) = match &author {
+            Some(w) if w == &session => {
+                tracing::info!(schedule = %sched.id(), session, author = %w,
+                    verdict = "worker_self_schedule_delivered", measured = true, n_considered = 1,
+                    "self-authored schedule uses the standing schedule input path");
+                (text, format!("sched:{}", sched.id()))
+            }
+            Some(w) => {
+                tracing::info!(schedule = %sched.id(), session = %session, author = %w,
+                    verdict = "worker_schedule_delivered_as_automation", measured = true, n_considered = 1,
+                    "a worker-authored schedule is delivered stamped with its author, never as owner input");
+                let stamped = crate::api::session_verbs::origin_stamped(w, &session, &text).unwrap_or(text);
+                (stamped, format!("{}{}", crate::api::session_verbs::WORKER_SCHEDULE_GUARD, sched.id()))
+            }
+            None => (text, format!("sched:{}", sched.id())),
+        };
+        let d = crate::api::session_verbs::deliver_automated(&self.state, &session, &text, &guard).await;
         if d.refused {
             return RunOutcome::Refused { reason: d.message };
         }
@@ -2989,6 +3076,34 @@ mod shell_output_tests {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+    /// ai-config#210: who authored a schedule's delivered content.
+    #[test]
+    fn a_schedule_author_comes_from_run_now_then_created_by_then_the_creation_audit() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schedule_audit (id INTEGER PRIMARY KEY, schedule_id TEXT, field TEXT, \
+             old_value TEXT, new_value TEXT, source TEXT, by_who TEXT, ts INTEGER);",
+        )
+        .unwrap();
+        use serde_json::json;
+        let mk = |raw: Value| DurableSchedule::from_map(raw.as_object().unwrap().clone());
+        assert_eq!(schedule_worker_author(Some(&conn), &mk(json!({"id": "S1", "created_by": "dev-a"}))), Some("dev-a".into()));
+        assert_eq!(schedule_worker_author(Some(&conn), &mk(json!({"id": "S1", "created_by": ""}))), None, "owner");
+        assert_eq!(
+            schedule_worker_author(Some(&conn), &mk(json!({"id": "S1", "created_by": "", "__run_by_worker": "dev-b"}))),
+            Some("dev-b".into()),
+            "a worker's Run now is that worker's input, whoever wrote the schedule"
+        );
+        // A row from before created_by: the creation audit decides, and only a
+        // REGISTERED worker name counts.
+        conn.execute("INSERT INTO schedule_audit (schedule_id, field, by_who) VALUES ('S2','created','dev-a (claimed x)')", []).unwrap();
+        assert_eq!(legacy_worker_author("dev-a (claimed x)", |n| n == "dev-a"), Some("dev-a".into()));
+        assert_eq!(legacy_worker_author("unattributed-http", |_| false), None);
+        assert_eq!(legacy_worker_author("someone@example.com", |_| true), None, "not a session name");
+        assert_eq!(schedule_worker_author(Some(&conn), &mk(json!({"id": "S3"}))), None, "no audit row: owner");
+    }
+
 
     #[tokio::test]
     async fn reserve_refusal_preserves_a_one_off_but_never_replays_uncertain_delivery() {
@@ -3065,6 +3180,156 @@ mod tests {
             let note: String = conn.query_row("SELECT note FROM schedule_runs WHERE schedule_id='CATCHUP' AND note LIKE '%missed occurrence%' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
             assert!(note.contains("missed occurrence"), "{note}");
         }
+    }
+
+    /// ai-config#210 (4), end to end on the private test tmux socket: a
+    /// WORKER-authored schedule reaches its target stamped with its author and
+    /// is refused by an isolated target; the same schedule authored by the
+    /// OWNER is still delivered to the isolated target as owner input.
+    #[tokio::test]
+    async fn e2e_a_worker_schedule_is_stamped_and_an_isolated_worker_refuses_it() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("dev-a.env"), "CC_TAGS=dev\n").unwrap();
+        std::fs::write(sessions.join("dev-b.env"), "CC_TAGS=dev\n").unwrap();
+        std::fs::write(sessions.join("iso.env"), "CC_TAGS=dev\nCC_ISOLATED=1\n").unwrap();
+        struct Panes(Vec<String>);
+        impl Drop for Panes {
+            fn drop(&mut self) {
+                for p in &self.0 {
+                    let st = crate::backend::tmux::session_target(p);
+                    let _ = crate::api::session_verbs::tmux_command().args(["kill-session", "-t", &st]).output();
+                }
+            }
+        }
+        let panes = Panes(vec!["amux-dev-b".into(), "amux-iso".into()]);
+        for p in &panes.0 {
+            let o = crate::api::session_verbs::tmux_command()
+                .args(["new-session", "-d", "-s", p, "-x", "200", "-y", "40", "cat"])
+                .output()
+                .expect("tmux required for the provenance e2e");
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        }
+        let (store, _dir) = store();
+        let state = crate::api::AppState { store, started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let live = LiveDeliverer::new(state.clone());
+        let row = |id: &str, target: &str, author: &str| {
+            let mut r = make_row(id, target, None, "2020-01-01T00:00");
+            r.raw.insert("command".into(), Value::from(format!("probe-{id}")));
+            r.raw.insert("created_by".into(), Value::from(author));
+            r
+        };
+
+        // 1. Worker-authored, same-group target: delivered (or queued) stamped.
+        let out = live.deliver(&row("W1", "dev-b", "dev-a"), "cron").await;
+        assert!(!matches!(out, RunOutcome::Refused { .. }), "{out:?}");
+        let mut seen = String::new();
+        for _ in 0..40 {
+            let ptq = crate::backend::tmux::pane_target("amux-dev-b");
+            let cap = crate::api::session_verbs::tmux_command().args(["capture-pane", "-p", "-t", &ptq]).output().unwrap();
+            let conn = state.store.read().unwrap();
+            let queued: Vec<String> = conn
+                .prepare("SELECT text FROM steering_queue WHERE session='dev-b'").unwrap()
+                .query_map([], |r| r.get(0)).unwrap().flatten().collect();
+            seen = format!("{}\n{}", String::from_utf8_lossy(&cap.stdout), queued.join("\n"));
+            if seen.contains("probe-W1") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(seen.contains("probe-W1"), "the schedule's text reached neither the pane nor the queue: {seen}");
+        assert!(seen.contains("[amux-origin: dev-a"), "a worker schedule must carry its author's stamp: {seen}");
+
+        // 2. Worker-authored into an isolated worker: refused, never owner input.
+        let out = live.deliver(&row("W2", "iso", "dev-a"), "cron").await;
+        assert!(matches!(out, RunOutcome::Refused { .. }), "an isolated worker must refuse a worker's schedule: {out:?}");
+
+        // 3. The same schedule authored by the OWNER still reaches the isolated worker.
+        let out = live.deliver(&row("O1", "iso", ""), "cron").await;
+        assert!(!matches!(out, RunOutcome::Refused { .. }), "owner configuration still reaches an isolated worker: {out:?}");
+        // Existing isolated self rows retain authorship and still fire.
+        let self_row = row("SELF", "iso", "iso");
+        let saved = self_row.clone();
+        state.store.write_async(move |conn| {
+            insert_schedule(conn, &saved)?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        let self_row = get_schedule(&state.store.read().unwrap(), "SELF").unwrap().unwrap();
+        let out = live.deliver(&self_row, "manual:test").await;
+        assert!(matches!(out, RunOutcome::Queued { .. } | RunOutcome::Delivered { .. }), "N1 isolated self row must fire: {out:?}");
+        drop(panes);
+    }
+
+    #[tokio::test]
+    async fn review_b1_fire_refuses_legacy_cross_target_shell_and_allows_self() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        for name in ["dev-a", "dev-b"] {
+            std::fs::write(home.path().join(format!("sessions/{name}.env")), "CC_TAGS=dev\n").unwrap();
+        }
+        let (store, _dir) = store();
+        let state = crate::api::AppState { store, started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let marker = home.path().join("executed");
+        let mut row = make_row("LEGACY", "dev-b", None, "2020-01-01T00:00");
+        row.set("kind", json!("shell"));
+        row.set("command", json!(format!("printf %s \"$AMUX_SESSION\" > '{}'", marker.display())));
+        // NULL created_by uses the legacy creation audit.
+        state.store.write_async(|conn| {
+            insert_audit(conn, "LEGACY", "created", "", "", "api-create", "dev-a")?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        let live = LiveDeliverer::new(state);
+        let out = live.deliver(&row, "cron").await;
+        assert!(matches!(&out, RunOutcome::Refused { reason } if reason.contains("shell") && reason.contains("author")), "B1 legacy shell must refuse: {out:?}");
+        assert!(!marker.exists(), "refusal must happen before shell side effects");
+        row.set("created_by", json!("dev-a"));
+        row.set("session", json!("dev-a"));
+        let out = live.deliver(&row, "cron").await;
+        assert!(matches!(out, RunOutcome::ShellOk { .. }), "self shell is allowed: {out:?}");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "dev-a");
+        row.set("created_by", json!(""));
+        row.set("session", json!("dev-b"));
+        let out = live.deliver(&row, "cron").await;
+        assert!(matches!(out, RunOutcome::ShellOk { .. }), "owner shell unchanged: {out:?}");
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "dev-b");
+    }
+
+    #[tokio::test]
+    async fn review_b2_delivery_rechecks_group_changes_after_write() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        for name in ["dev-a", "dev-b"] {
+            std::fs::write(home.path().join(format!("sessions/{name}.env")), "CC_TAGS=dev\n").unwrap();
+        }
+        let (store, _dir) = store();
+        let mut row = make_row("GROUP", "dev-b", None, "2020-01-01T00:00");
+        row.set("created_by", json!("dev-a"));
+        assert!(crate::api::session_verbs::send_group_refusal("dev-a", "dev-b").is_none());
+        let saved = row.clone();
+        store.write_async(move |conn| {
+            insert_schedule(conn, &saved)?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        // A bounded private fixture session keeps this a delivery test; it
+        // exits on its own and never touches another worker's tmux session.
+        let pane = crate::api::session_verbs::tmux_command()
+            .args(["new-session", "-d", "-s", "amux-dev-b", "sleep 30"])
+            .output().expect("private tmux fixture");
+        assert!(pane.status.success(), "{}", String::from_utf8_lossy(&pane.stderr));
+        std::fs::write(home.path().join("sessions/dev-b.env"), "CC_TAGS=ops\n").unwrap();
+        assert!(crate::api::session_verbs::send_group_refusal("dev-a", "dev-b").is_some());
+        let state = crate::api::AppState { store, started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let row = get_schedule(&state.store.read().unwrap(), "GROUP").unwrap().unwrap();
+        let out = LiveDeliverer::new(state.clone()).deliver(&row, "manual:test").await;
+        assert!(matches!(&out, RunOutcome::Refused { reason } if reason.contains("group")), "B2 changed group must refuse at the send boundary: {out:?}");
+        assert_eq!(state.store.read().unwrap().query_row("SELECT COUNT(*) FROM steering_queue", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     }
 
     #[tokio::test]
