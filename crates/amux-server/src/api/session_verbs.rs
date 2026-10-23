@@ -57530,7 +57530,8 @@ mod relay_idle_submit_tests {
         struct Pane(String);
         impl Drop for Pane {
             fn drop(&mut self) {
-                let _ = tmux_command().args(["kill-session", "-t", &session_target(&self.0)]).output();
+                let st = session_target(&self.0);
+                let _ = tmux_command().args(["kill-session", "-t", &st]).output();
             }
         }
         let home = tempfile::tempdir().unwrap();
