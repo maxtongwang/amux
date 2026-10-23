@@ -26,6 +26,88 @@ fn yolo_on(e: &Env) -> bool {
     t.contains("dangerously") || t.contains("CC_AUTO_CONTINUE=\"1\"")
 }
 
+/// Second B1: older asks do not bind, and the reply itself is single-use
+/// across actors, targets and routes, including after an owner undo.
+#[tokio::test]
+async fn two_asks_one_reply_funds_only_latest_once_across_actors_workers_and_routes() {
+    let e = setup().await;
+    let old = e.seed_row(MAX_PANE, &format!("Max, may I remove the dev tag from {DEV_A}?"), "session", DEV_LEAD, Some("direct"), now_s() - 90.0);
+    let latest = e.seed_row(MAX_PANE, &format!("Max, may I remove the dev tag from {DEV_B}?"), "session", DEV_LEAD, Some("direct"), now_s() - 60.0);
+    let peer = e.seed_row(MAX_PANE, &format!("Max, may I remove the dev tag from {DEV_A}?"), "session", DEV_LEAD2, Some("direct"), now_s() - 45.0);
+    let reply = e.seed_pane_prompt(MAX_PANE, "yes", now_s() - 30.0);
+    let pair = |ask| json!({"ask_row_id": ask, "reply_row_id": reply});
+    let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &cfg(DEV_A), Some(cited(json!({"tags": ""}), pair(old)))).await;
+    assert_code(st, &v, "cite_ask_not_latest", "older ask cannot bind the reply");
+    assert_eq!(e.latest_grant(), "");
+    let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &cfg(DEV_B), Some(cited(json!({"tags": ""}), pair(latest)))).await;
+    assert_allowed(st, &v, "latest ask gets the single grant");
+    let code = e.latest_grant();
+    let (st, v) = e.call(Who::Owner, "POST", &format!("/api/delegation/grants/{code}/undo"), None).await;
+    assert_allowed(st, &v, "undo does not release the reply");
+    for (actor, ask, method, path, body) in [
+        (DEV_LEAD, latest, "PATCH", cfg(DEV_B), json!({"tags": ""})),
+        (DEV_LEAD, old, "PATCH", cfg(DEV_A), json!({"tags": ""})),
+        (DEV_LEAD2, peer, "PATCH", cfg(DEV_A), json!({"tags": ""})),
+        (DEV_LEAD2, peer, "PUT", "/api/scope".into(), scope_body("worker", DEV_A, "env", json!({"CC_TAGS": ""}))),
+    ] {
+        let before = e.config_snapshot();
+        let (st, v) = e.call(Who::Worker(actor), method, &path, Some(cited(body, pair(ask)))).await;
+        assert_code(st, &v, "cite_pair_spent", "the reply is spent regardless of ask/actor/worker/route");
+        assert_eq!(before, e.config_snapshot());
+    }
+    let conn = e.store.read().unwrap();
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM _amux_delegation_grants WHERE evidence_row=?1", [reply], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
+    drop(conn);
+    assert_eq!(e.grant_status(&code), "undone");
+}
+
+#[tokio::test]
+async fn non_affirmative_owner_replies_refuse_without_effects() {
+    let e = setup().await;
+    for text in ["no", "wait", "not yet", "yes?", "don't do it", "no, go ahead", "yes, don't proceed"] {
+        let a = e.seed_row(MAX_PANE, &format!("Max, may I remove the dev tag from {DEV_B}?"), "session", DEV_LEAD, Some("direct"), now_s() - 60.0);
+        let reply = e.seed_pane_prompt(MAX_PANE, text, now_s() - 30.0);
+        let before = e.config_snapshot();
+        let (st, v) = e.call(Who::Worker(DEV_LEAD), "PATCH", &cfg(DEV_B), Some(cited(json!({"tags": ""}), json!({"ask_row_id": a, "reply_row_id": reply})))).await;
+        assert_code(st, &v, "cite_reply_not_affirmative", text);
+        assert_eq!(before, e.config_snapshot(), "{text}");
+        assert_eq!(e.latest_grant(), "", "refusal must not spend a grant");
+    }
+}
+
+#[tokio::test]
+async fn multiple_settings_in_one_body_reserve_one_immutable_grant() {
+    let e = setup().await;
+    let pair = e.cite(&format!("Max, may I enable yolo and auto continue for {DEV_A}?"));
+    let body = json!({"toggle_yolo": true, "toggle_auto_continue": true});
+    let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_A), Some(cited(body.clone(), pair.clone()))).await;
+    assert_allowed(st, &v, "one body with two settings");
+    let conn = e.store.read().unwrap();
+    let (count, stored): (i64, String) = conn.query_row("SELECT COUNT(*), body FROM _amux_delegation_grants", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&stored).unwrap(), body);
+    drop(conn);
+    let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &cfg(DEV_B), Some(cited(body, pair))).await;
+    assert_code(st, &v, "cite_pair_spent", "body cannot be replayed on another target");
+}
+
+#[tokio::test]
+async fn batch_targets_cannot_launder_one_reply_through_declarative_apply() {
+    let e = setup().await;
+    let pair = e.cite(&format!("Max, may I add leads to {DEV_A} and add leads to {DEV_B}?"));
+    for (method, path, workers) in [
+        ("PUT", "/api/config/apply", json!([{"name": DEV_A, "tags": ["dev", "leads"]}, {"name": DEV_B, "tags": ["dev", "leads"]}])),
+        ("POST", "/api/env/apply", json!([{"name": DEV_A, "groups": ["dev", "leads"]}, {"name": DEV_B, "groups": ["dev", "leads"]}])),
+    ] {
+        let before = e.config_snapshot();
+        let (st, v) = e.call(Who::Worker(MRPOPO), method, path, Some(json!({"workers": workers, "cite": pair.clone()}))).await;
+        assert_refused(st, &v, "batch targets have no cite-mode bypass");
+        assert_eq!(before, e.config_snapshot());
+        assert_eq!(e.latest_grant(), "");
+    }
+}
+
 #[tokio::test]
 async fn cite_mode_applies_at_once_logs_feeds_and_undoes_exactly() {
     let e = setup().await;

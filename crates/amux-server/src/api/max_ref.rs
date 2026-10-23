@@ -27,6 +27,12 @@
 //!   judges relevance. Accepted limit (ai-config#136): another lane can mint
 //!   a pane row through its own `/report`; in cite mode that is mitigated by
 //!   the audit log, the leads feed and one-step undo, not prevented.
+//!   Dev-lead rulings 2026-10-23 (second B1 in the approval-reuse class):
+//!   the ask must be that actor's latest unanswered message in the session
+//!   before the reply. The reply's entire text must match
+//!   [`AFFIRMATIVE_REPLIES`] (case-insensitive, outer punctuation/space trimmed;
+//!   questions always refuse). A reply funds one grant globally, across asks,
+//!   actors, workers, routes and approval modes, including failed/undone grants.
 //! - APPROVAL ([`approval_source_allowed`], passkey mode): a pending grant is
 //!   approved only by an owner send from a NON-LOCAL Remote peer (the phone or
 //!   another device on the tailnet). A tailscale-serve forward over loopback
@@ -47,6 +53,7 @@ pub(crate) enum MaxRefRefusal {
     OwnLane,
     /// A single quoted row instead of the (ask, reply) pair.
     PairRequired,
+    /// Stable wire code `cite_pair_spent`; the spent unit is the reply alone.
     PairSpent,
     AskNotFound,
     /// The ask row is not a message the requesting agent sent.
@@ -55,6 +62,8 @@ pub(crate) enum MaxRefRefusal {
     AskMissingSetting,
     TargetIdentityChanged,
     AskMissingChange,
+    AskNotLatest,
+    ReplyNotAffirmative,
     /// The reply is in a different session from the ask.
     WrongSession,
     /// The reply is not Max's first typed message after the ask.
@@ -80,6 +89,8 @@ impl MaxRefRefusal {
             Self::AskMissingSetting => "cite_ask_missing_setting",
             Self::TargetIdentityChanged => "cite_target_identity_changed",
             Self::AskMissingChange => "cite_ask_missing_change",
+            Self::AskNotLatest => "cite_ask_not_latest",
+            Self::ReplyNotAffirmative => "cite_reply_not_affirmative",
             Self::WrongSession => "cite_reply_wrong_session",
             Self::ReplyNotFirst => "cite_reply_not_first",
             Self::ReplyOutsideWindow => "cite_reply_outside_window",
@@ -268,6 +279,20 @@ pub(crate) struct CiteTerms {
 /// The reply must come within this long after the ask.
 pub(crate) const ASK_REPLY_WINDOW_S: f64 = 7_200.0;
 
+/// Entire accepted reply phrases, never substring/keyword matches. The
+/// combined phrase retains the existing owner fixture. Additional prose,
+/// negations, and questions fail closed rather than guessing owner intent.
+const AFFIRMATIVE_REPLIES: &[&str] = &[
+    "yes", "y", "yep", "approve", "approved", "go ahead", "do it", "ok to proceed", "yes, go ahead",
+];
+
+fn reply_is_affirmative(text: &str) -> bool {
+    if text.contains('?') { return false; }
+    let normalized = text.trim_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+        .to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    AFFIRMATIVE_REPLIES.contains(&normalized.as_str())
+}
+
 /// THE citation rule (cite mode): another lane's human row counts; in the
 /// actor's own lane only a non-local Remote owner send.
 pub(crate) fn cite_source_allowed(actor: &str, session: &str, source: HumanSource, remote: bool) -> bool {
@@ -373,13 +398,15 @@ fn one(state: &AppState, id: i64) -> Result<Option<Row>, MaxRefRefusal> {
 
 /// Fast refusal, also used for a replay whose change has become a no-op.
 /// The INSERT's unique index is the final authority against racing requests.
+pub(crate) fn reply_spent(conn: &rusqlite::Connection, reply: i64) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM _amux_delegation_grants WHERE evidence_row=?1)", [reply], |r| r.get(0))
+}
+
+/// A missing ask cannot bypass the global reply-consumption check.
 pub(crate) fn pair_unspent(state: &AppState, cite: &Cite) -> Result<(), MaxRefRefusal> {
-    let (Some(ask), Some(reply)) = (cite.ask_row_id, cite.reply_row_id) else { return Ok(()) };
+    let Some(reply) = cite.reply_row_id else { return Ok(()) };
     let conn = state.store.read().map_err(|_| MaxRefRefusal::NoSuchRow)?;
-    let spent: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM _amux_delegation_grants WHERE ask_row=?1 AND evidence_row=?2)",
-        rusqlite::params![ask, reply], |r| r.get(0),
-    ).map_err(|_| MaxRefRefusal::NoSuchRow)?;
+    let spent = reply_spent(&conn, reply).map_err(|_| MaxRefRefusal::NoSuchRow)?;
     if spent { return Err(MaxRefRefusal::PairSpent); }
     Ok(())
 }
@@ -450,6 +477,14 @@ fn cite_pair_at(state: &AppState, cite: Option<&Cite>, actor: &str, terms: &Cite
         .map_err(|_| MaxRefRefusal::ReplyNotFirst)?;
     if between.len() as i64 >= ROW_LIMIT || between.iter().any(|r| typed_by_max(state, r).is_some()) {
         return Err(MaxRefRefusal::ReplyNotFirst);
+    }
+    // Every later session message from the actor supersedes its prior ask;
+    // no attempt to infer which settings an intervening message concerns.
+    if between.iter().any(|r| r.ctype == "session" && r.origin == actor) {
+        return Err(MaxRefRefusal::AskNotLatest);
+    }
+    if !reply_is_affirmative(&reply.text) {
+        return Err(MaxRefRefusal::ReplyNotAffirmative);
     }
     Ok(Cited {
         row_id: reply.id,
@@ -671,6 +706,45 @@ mod tests {
         cite_pair_at(st, Some(c), ACTOR, &terms(), NOW)
     }
 
+    #[test]
+    fn citation_reply_requires_explicit_affirmative_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        for (i, text) in ["no", "wait", "not yet", "yes?", "yes?\"", "don't", "don't do it",
+            "no, go ahead", "yes, don't proceed", "yes but wait", "yesterday", "approval", "ok"].iter().enumerate() {
+            let lane = format!("test-negative-{i}");
+            let a = ask(&st, &lane, ACTOR, YOLO_ASK, NOW - 60.0);
+            let r = put(&st, pane(&lane, text, NOW - 30.0));
+            assert_eq!(check(&st, &pair(a, r)).unwrap_err().code(), "cite_reply_not_affirmative", "{text:?}");
+            let later = put(&st, pane(&lane, "yes", NOW - 10.0));
+            assert_eq!(check(&st, &pair(a, later)).unwrap_err().code(), "cite_reply_not_first", "{text:?} already answered the ask; a later yes cannot replace it");
+        }
+        for (i, text) in ["yes", "Y", "Yep!", "approve", "APPROVED.", "go ahead", "do it", "ok to proceed", "yes, go ahead", "  \"YES!\"  "].iter().enumerate() {
+            let lane = format!("test-positive-{i}");
+            let a = ask(&st, &lane, ACTOR, YOLO_ASK, NOW - 60.0);
+            let r = put(&st, pane(&lane, text, NOW - 30.0));
+            assert!(check(&st, &pair(a, r)).is_ok(), "{text:?}");
+        }
+        assert!(!reply_is_affirmative(""), "empty replies never approve");
+    }
+
+    #[test]
+    fn citation_reply_binds_only_the_actors_latest_unanswered_ask() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let first = ask(&st, DESK, ACTOR, YOLO_ASK, NOW - 90.0);
+        let latest = ask(&st, DESK, ACTOR, YOLO_ASK, NOW - 60.0);
+        // Other actors and other sessions cannot replace this actor's ask.
+        ask(&st, DESK, "test-peer", YOLO_ASK, NOW - 50.0);
+        ask(&st, "test-other-desk", ACTOR, YOLO_ASK, NOW - 40.0);
+        let reply = put(&st, pane(DESK, "yes", NOW - 30.0));
+        assert_eq!(check(&st, &pair(first, reply)).unwrap_err().code(), "cite_ask_not_latest");
+        assert!(check(&st, &pair(latest, reply)).is_ok());
+        let later = put(&st, pane(DESK, "yes!", NOW - 20.0));
+        assert_eq!(check(&st, &pair(latest, later)).unwrap_err().code(), "cite_reply_not_first", "an already answered ask cannot use a later reply");
+        assert_eq!(check(&st, &pair(latest, put(&st, pane("test-other-desk", "yes", NOW - 10.0)))).unwrap_err().code(), "cite_reply_wrong_session");
+    }
+
     /// Review B4 ruling: the ask names target and setting, the reply is Max's
     /// first typed message after it in that session, within 2 hours.
     #[test]
@@ -737,8 +811,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let st = state(tmp.path());
         let a = ask(&st, DESK, ACTOR, YOLO_ASK, NOW - 600.0);
-        let first = put(&st, pane(DESK, "one sec", NOW - 500.0));
-        let later = put(&st, pane(DESK, "ok", NOW - 400.0));
+        let first = put(&st, pane(DESK, "yes", NOW - 500.0));
+        let later = put(&st, pane(DESK, "yes!", NOW - 400.0));
         assert_eq!(check(&st, &pair(a, later)).map(|_| ()), Err(MaxRefRefusal::ReplyNotFirst));
         assert!(check(&st, &pair(a, first)).is_ok(), "the first typed reply is the one that counts");
         // A reply BEFORE the ask is not an answer to it.
