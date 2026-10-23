@@ -25,3 +25,9 @@ test('board row later handed over reads as delivered', () => {
 test('direct row is unchanged', () => {
   assert.equal(label({ delivery: 'direct' }), 'direct');
 });
+
+test('approval request is shown in Messages without claiming a pane delivery', () => {
+  assert.equal(label({ delivery: 'approval_request' }), 'approval request');
+  assert.match(chip({ delivery: 'approval_request' }), /Shown in this session’s Messages/);
+  for (const delivery of ['__proto__', 'constructor']) assert.equal(label({delivery}), 'direct?');
+});

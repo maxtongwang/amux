@@ -19,10 +19,10 @@ const failed = { code: 'ABCD', status: 'failed', sentence: 'A delegated change',
 const payload = { measured: true, n_considered: 1, mode: 'cite', grants: [failed] };
 const esc = value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
 
-async function render(grants) {
+async function render(grants, resolutions = []) {
   const box = { innerHTML: '' };
   const ctx = vm.createContext({ API: '', esc, _authHeaders: () => ({}), document: { getElementById: () => box },
-    fetch: async () => ({ ok: true, json: async () => ({ ...payload, grants }) }) });
+    fetch: async () => ({ ok: true, json: async () => ({ ...payload, grants, resolutions }) }) });
   vm.runInContext(source.slice(start, end), ctx);
   await ctx._delegationGrantsLoad();
   return box.innerHTML;
@@ -74,4 +74,31 @@ test('grant list refuses unreadable, refused and unmeasured responses', () => {
     assert.match(out.stderr, /amux grant list:/);
   }
   assert.notEqual(grantCli(['list', '--unknown']).status, 0);
+});
+
+
+test('ambiguous requests and no-candidate replies remain visible in dashboard and CLI', async () => {
+  const pending = { code: 'REQ1', status: 'pending', resolution_code: 'request_ambiguous', resolution_note: 'multiple unanswered requests <ask separately>' };
+  const resolutions = [{reply_row: 12, session: 'desk', code: 'request_no_candidate', note: 'no shown request', request_id: null}];
+  const html = await render([pending], resolutions);
+  assert.ok(html.includes('request_ambiguous: multiple unanswered requests &lt;ask separately&gt;'));
+  assert.ok(html.includes('request_no_candidate'));
+  assert.ok(html.includes('no shown request'));
+  const data = {...payload, grants: [pending], requests: [pending], resolutions};
+  const out = grantCli(['requests'], data);
+  assert.equal(out.status, 0, out.stderr);
+  assert.ok(out.stdout.includes(pending.resolution_note));
+  assert.ok(out.stdout.includes('reply 12 in desk: request_no_candidate: no shown request'));
+  assert.ok(out.stderr.includes('/api/delegation/requests'));
+  assert.deepEqual(JSON.parse(grantCli(['requests', '--json'], data).stdout), data);
+});
+
+test('grant request CLI creates explicit records and propagates server refusals', () => {
+  const out = grantCli(['request', '--stdin'], {ok:true, request_id:'REQ1', sentence:'exact change', reply_session:'desk'});
+  assert.equal(out.status, 0, out.stderr);
+  assert.ok(out.stderr.includes('POST') && out.stderr.includes('--data-binary @-'));
+  assert.ok(out.stdout.includes('REQ1  pending') && out.stdout.includes('Reply session: desk'));
+  const no = grantCli(['request', '--stdin'], {ok:false, code:'request_identity_missing', error:'stable identity required'});
+  assert.notEqual(no.status, 0);
+  assert.ok(no.stderr.includes('request_identity_missing'));
 });
