@@ -18,6 +18,11 @@
 //! keep their evidence spent (`cite_pair_spent`), including after undo. The
 //! files and other handler writes are separate resources, not a SQLite ACID
 //! transaction; an interrupted `applying` grant is never automatically replayed.
+//! B1 ruling (a): EnvFile commits by temp file + same-directory rename. A
+//! failed handler returns `grant_apply_failed`, records `failed`, and emits
+//! WARN `delegation_grant_failed`. Grant lists expose `failure_reason` with
+//! the instruction to re-ask the owner, also shown by `amux grant list
+//! [--json]` and Settings > Delegated changes. The pair stays spent.
 //! Worker asks record server-derived CC_INCARNATION bindings at message time;
 //! legacy asks without them need a fresh ask. Rename/name reuse cannot transfer
 //! a grant, including pending apply, internal replay, and undo.
@@ -72,6 +77,8 @@ const ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTVWXYZ";
 const CODE_LEN: usize = 4;
 /// A request body larger than this is not captured, so it cannot become a grant.
 const CAPTURE_LIMIT: usize = 1 << 20;
+/// Fail closed: a write failure never releases an already reserved citation.
+const APPLY_FAILED_REASON: &str = "failed: re-ask the owner; any cited pair remains spent";
 /// The paths whose handlers can make a grant.
 const CAPTURE_PREFIXES: [&str; 8] = [
     "/api/sessions/", "/api/workers", "/api/scope", "/api/groups/", "/api/settings/", "/api/config/", "/api/env/", "/api/alert/config",
@@ -382,13 +389,18 @@ pub async fn capture(State(state): State<AppState>, req: Request<Body>, next: Ne
     let compare_failed = captured.compare_failed.clone();
     let req = Request::from_parts(parts, Body::from(bytes));
     let mut resp = CAPTURED.scope(captured, next.run(req)).await;
-    if *compare_failed.lock().unwrap_or_else(|e| e.into_inner()) {
+    let comparison_failed = *compare_failed.lock().unwrap_or_else(|e| e.into_inner());
+    if comparison_failed {
         resp = (StatusCode::CONFLICT, Json(super::delegation::refusal_body(
             "delegation_state_changed", "configuration changed after authorization; read it and ask again"))).into_response();
     }
     let taken = armed.lock().ok().and_then(|mut a| a.take());
     if let Some((code, before)) = taken {
         finalize(&state, &code, &before, resp.status());
+        if !resp.status().is_success() && !comparison_failed {
+            resp = (resp.status(), Json(json!({"ok": false, "code": "grant_apply_failed",
+                "error": APPLY_FAILED_REASON, "grant_code": code}))).into_response();
+        }
         if let Ok(v) = axum::http::HeaderValue::from_str(&code) {
             resp.headers_mut().insert(GRANT_CODE_HEADER, v);
         }
@@ -628,10 +640,19 @@ fn finalize(state: &AppState, code: &str, before: &Snapshot, status: StatusCode)
     }
     log_transition(state, code, to, &g.actor, &g.class, &g.target,
         json!({"sentence": g.sentence, "cited_excerpt": g.cited_excerpt, "ask_text": g.ask_text, "reply_text": g.reply_text,
-            "status": status.as_u16(), "changes": changes, "undoable": undoable}), None);
-    tracing::info!(grant = code, actor = %g.actor, status = status.as_u16(), undoable,
-        verdict = if to == "applied" { "delegation_grant_applied" } else { "delegation_grant_failed" }, measured = true, n_considered = 1,
-        "a grant's change ran");
+            "status": status.as_u16(), "failure_reason": failure_reason(to), "changes": changes, "undoable": undoable}), None);
+    if to == "failed" {
+        tracing::warn!(grant = code, actor = %g.actor, status = status.as_u16(), reason = APPLY_FAILED_REASON,
+            verdict = "delegation_grant_failed", measured = true, n_considered = 1,
+            "a grant failed; its citation remains spent");
+    } else {
+        tracing::info!(grant = code, actor = %g.actor, status = status.as_u16(), undoable,
+            verdict = "delegation_grant_applied", measured = true, n_considered = 1, "a grant's change ran");
+    }
+}
+
+fn failure_reason(status: &str) -> Option<&'static str> {
+    (status == "failed").then_some(APPLY_FAILED_REASON)
 }
 
 /// A pending grant past its expiry becomes `expired` (logged once).
@@ -1003,7 +1024,7 @@ async fn list(State(state): State<AppState>, uri: Uri, headers: HeaderMap) -> Re
     let rows: Vec<Value> = rows.iter().map(|g| {
         let status = if g.status == "pending" && now() > g.expires_at { "expired" } else { g.status.as_str() };
         json!({"code": g.code, "actor": g.actor, "class": g.class, "action": g.action, "target": g.target, "sentence": g.sentence,
-            "status": status, "expires_at": g.expires_at, "method": g.method, "path": g.path, "cited_row": g.evidence_row,
+            "status": status, "failure_reason": failure_reason(status), "expires_at": g.expires_at, "method": g.method, "path": g.path, "cited_row": g.evidence_row,
             "target_incarnation": g.target_incarnation, "cite_spent_at": g.cite_spent_at,
             "cited_excerpt": g.cited_excerpt, "ask_row": g.ask_row, "ask_text": g.ask_text, "reply_text": g.reply_text, "body": serde_json::from_str::<Value>(&g.body).unwrap_or(Value::Null)})
     }).collect();
@@ -1040,6 +1061,17 @@ pub(crate) fn routes() -> Router<AppState> {
 mod tests {
     use super::*;
     use tower::ServiceExt;
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct GrantTestLogs(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for GrantTestLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
 
     #[test]
     fn codes_are_read_from_a_typed_line_in_any_case() {
@@ -1119,6 +1151,78 @@ mod tests {
         let conn = state.store.read().unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM _amux_delegation_grants",[],|r|r.get(0)).unwrap();
         assert_eq!(count,1);
+    }
+
+    /// B1 ruling (a): both grant-applicable env entrypoints fail before rename.
+    /// The grant/pair are already committed, so recovery requires a fresh ask.
+    #[tokio::test]
+    async fn delegation_failed_env_write_spends_pair_and_requires_owner_reask() {
+        for writer in ["write", "merge_plain"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let _home = crate::api::settings::test_env::set_home(tmp.path());
+            let state = test_state(tmp.path());
+            let app = super::super::router(state.clone());
+            let path = tmp.path().join("sessions/test-dev-a.env");
+            let before = std::fs::read(&path).unwrap();
+            let cite = pair(&state, "test-desk", "Max, may I remove the dev tag from test-dev-a?", "yes");
+            let (method, route, body) = match writer {
+                "write" => ("PATCH", "/api/sessions/test-dev-a/config", json!({"tags": [], "cite": cite})),
+                "merge_plain" => ("PUT", "/api/scope", json!({"level": "worker", "name": "test-dev-a", "capability": "env", "value": {"CC_TAGS": ""}, "cite": cite})),
+                _ => unreachable!(),
+            };
+            // Task-local and cfg(test): no HTTP header or production env can
+            // enable this seam. Fail AFTER temp write/sync, BEFORE rename.
+            let logs = GrantTestLogs::default();
+            let sink = logs.clone();
+            let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+                .with_max_level(tracing::Level::WARN).with_writer(move || sink.clone()).finish();
+            let (st, v, h) = super::super::session_verbs::TEST_ENV_RENAME_FAILURE.scope(path.clone(),
+                call(&app, method, route, Some("mrpopo"), body.clone(), None)).with_subscriber(subscriber).await;
+            assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{writer}: {v}");
+            assert_eq!(v["code"], "grant_apply_failed", "{writer}: {v}");
+            assert_eq!(v["error"], APPLY_FAILED_REASON);
+            assert!(v["error"].as_str().unwrap().contains("re-ask the owner"));
+            let code = h.get(GRANT_CODE_HEADER).unwrap().to_str().unwrap();
+            let g = load(&state, code).unwrap();
+            assert_eq!(g.status, "failed", "{writer}: failure must be durable");
+            let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            assert!(logs.lines().any(|line| line.contains("WARN") && line.contains("delegation_grant_failed") && line.contains(code)),
+                "{writer}: failed grant must announce itself as a WARN with its code: {logs}");
+            assert!(g.cite_spent_at.is_some(), "{writer}: citation must stay spent");
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{writer}: failed rename changed env bytes");
+            let citation = serde_json::from_value::<super::super::max_ref::Cite>(cite).unwrap();
+            assert_eq!(super::super::max_ref::pair_unspent(&state, &citation), Err(super::super::max_ref::MaxRefRefusal::PairSpent));
+            let (st, rows, _) = call(&app, "GET", "/api/delegation/grants", None, Value::Null, None).await;
+            assert_eq!(st, StatusCode::OK, "{rows}");
+            let rows = rows["grants"].as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["code"], code);
+            assert_eq!(rows[0]["status"], "failed");
+            assert_eq!(rows[0]["failure_reason"], APPLY_FAILED_REASON);
+            // The seam has ended; the SAME request is refused even though
+            // the env is unchanged and a normal write would now succeed.
+            let (st, v, _) = call(&app, method, route, Some("mrpopo"), body, None).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{writer}: {v}");
+            assert_eq!(v["code"], "cite_pair_spent", "{writer}: {v}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    /// Raw env replacement is owner-only, including with a cite. Preserve
+    /// that gate and prove its underlying writer has the same atomic failure.
+    #[tokio::test]
+    async fn delegation_owner_raw_env_failure_preserves_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        let app = super::super::router(state);
+        let path = tmp.path().join("sessions/test-dev-a.env");
+        let before = std::fs::read(&path).unwrap();
+        let (st, v, _) = super::super::session_verbs::TEST_ENV_RENAME_FAILURE.scope(path.clone(),
+            call(&app, "PUT", "/api/scope", None, json!({"level": "worker", "name": "test-dev-a",
+                "capability": "env", "value": "CC_TAGS=ops\nCC_DIR=/tmp\nCC_INCARNATION=inc-test-dev-a\n"}), None)).await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "replace_text must not partially replace owner env");
     }
 
     #[tokio::test]
