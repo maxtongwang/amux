@@ -1215,6 +1215,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegation_0127_legacy_replies_stay_spent_in_cite_and_pending_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let conn = rusqlite::Connection::open(tmp.path().join("t.db")).unwrap();
+        crate::db::migrate::apply_history_through(&conn, 126);
+        conn.execute("INSERT INTO _amux_delegation_grants
+            (code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,status,evidence_row)
+            VALUES('old','mrpopo','mrpopo','x','fleet','PUT','/api/scope','{}','old',1,2,'failed',42),
+                  ('later','other','lead','x','fleet','PUT','/api/scope','{}','later',2,3,'undone',42),
+                  ('single','other','lead','x','fleet','PUT','/api/scope','{}','single',3,4,'denied',44)", []).unwrap();
+        drop(conn);
+        let logs = GrantTestLogs::default();
+        let sink = logs.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_max_level(tracing::Level::WARN).with_writer(move || sink.clone()).finish();
+        // Store::open runs the shipped upgrade against the actual 0126 file.
+        let state = tracing::subscriber::with_default(subscriber, || test_state(tmp.path()));
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.lines().any(|line| line.contains("WARN") && line.contains("delegation_legacy_reply_duplicates")
+            && line.contains("legacy_duplicates=1") && line.contains("n_considered=3")), "{logs}");
+        // An excluded row alone must also spend its reply: the partial index
+        // is deliberately narrower than the shared code-level spent check.
+        state.store.write(|conn| {
+            conn.execute("INSERT INTO _amux_delegation_grants
+                (code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,evidence_row,legacy_duplicate)
+                VALUES('excluded','other','lead','x','fleet','PUT','/api/scope','{}','excluded',4,5,46,1)", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let c = context(json!({"toggle_yolo": true}));
+        let cited = super::super::max_ref::Cited { row_id: 42, ask_row_id: 41, session: "test-desk".into(),
+            excerpt: "yes".into(), ask_text: "old ask".into(), reply_text: "yes".into(),
+            target_incarnation: Some("inc-test-dev-a".into()) };
+        let pending = NewGrant { actor: "mrpopo", class: "mrpopo", action: "set_config:toggle_yolo", target: "test-dev-a", why: None, status: "pending", cited: None };
+        let (waiting, _) = insert(&state, &pending, &c).unwrap();
+        for reply in [42, 44, 46] {
+            let cited = super::super::max_ref::Cited { row_id: reply, ..cited.clone() };
+            let response = insert(&state, &NewGrant { cited: Some(&cited), status: "applying", why: None, ..pending }, &c).unwrap_err();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["code"], "cite_pair_spent");
+            assert_eq!(claim_pending(&state, &waiting, "owner", Some(reply)).unwrap_err().0, "cite_pair_spent");
+            assert_eq!(super::super::max_ref::pair_unspent(&state, &super::super::max_ref::Cite {
+                reply_row_id: Some(reply), ..Default::default()
+            }), Err(super::super::max_ref::MaxRefRefusal::PairSpent));
+        }
+        assert_eq!(load(&state, &waiting).unwrap().status, "pending");
+        let fresh = super::super::max_ref::Cited { row_id: 48, ..cited };
+        insert(&state, &NewGrant { cited: Some(&fresh), status: "applying", why: None, ..pending }, &c).unwrap();
+        let response = insert(&state, &NewGrant { cited: Some(&fresh), status: "applying", why: None, ..pending }, &c).unwrap_err();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "cite_pair_spent");
+        assert_eq!(claim_pending(&state, &waiting, "owner", Some(48)).unwrap_err().0, "cite_pair_spent");
+        claim_pending(&state, &waiting, "owner", Some(50)).unwrap();
+        let (other, _) = insert(&state, &pending, &c).unwrap();
+        assert_eq!(claim_pending(&state, &other, "owner", Some(50)).unwrap_err().0, "cite_pair_spent");
+    }
+
+    #[tokio::test]
     async fn delegation_pending_claim_names_spent_reply_without_changing_the_grant() {
         let tmp = tempfile::tempdir().unwrap();
         let _home = crate::api::settings::test_env::set_home(tmp.path());
