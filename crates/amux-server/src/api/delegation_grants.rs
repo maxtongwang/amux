@@ -487,8 +487,8 @@ fn insert(state: &AppState, g: &NewGrant, c: &Captured) -> Result<(String, Strin
             // are reserved by the SAME transaction as the grant, before any
             // handler side effect. A failed/interrupted handler never frees it.
             if let Some(reply) = row.11 {
-                let spent = super::max_ref::reply_spent(conn, reply)?;
-                if spent {
+                let cited_reply_spent = super::max_ref::reply_spent(conn, reply)?;
+                if cited_reply_spent {
                     return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
                         std::io::Error::other("cite_pair_spent"),
                     )));
@@ -701,8 +701,8 @@ fn claim_pending(state: &AppState, code: &str, by: &str, evidence: Option<i64>) 
     let at = now();
     let result = state.store.write(move |conn| {
         if let Some(reply) = evidence {
-            let spent = super::max_ref::reply_spent(conn, reply)?;
-            if spent {
+            let approval_reply_spent = super::max_ref::reply_spent(conn, reply)?;
+            if approval_reply_spent {
                 return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
                     std::io::Error::other("cite_pair_spent"),
                 )));
@@ -1212,6 +1212,30 @@ mod tests {
         assert!(set_status(&state, &code, "applying", "failed", "owner", None));
         let cite = super::super::max_ref::Cite { ask_row_id: Some(99), reply_row_id: Some(42), ..Default::default() };
         assert_eq!(super::super::max_ref::pair_unspent(&state, &cite), Err(super::super::max_ref::MaxRefRefusal::PairSpent));
+    }
+
+    #[tokio::test]
+    async fn delegation_pending_claim_names_spent_reply_without_changing_the_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = test_state(tmp.path());
+        let c = context(json!({"toggle_yolo": true}));
+        let pending = NewGrant { actor: "mrpopo", class: "mrpopo", action: "set_config:toggle_yolo", target: "test-dev-a", why: None, status: "pending", cited: None };
+        let (first, _) = insert(&state, &pending, &c).unwrap();
+        let (second, _) = insert(&state, &pending, &c).unwrap();
+        claim_pending(&state, &first, "owner", Some(42)).unwrap();
+        // The UNIQUE index also stops reuse, but without the claim guard its
+        // error maps to grant_claim_failed instead of the actionable refusal.
+        assert_eq!(claim_pending(&state, &second, "owner", Some(42)).unwrap_err().0, "cite_pair_spent");
+        let refused = load(&state, &second).unwrap();
+        assert_eq!(refused.status, "pending");
+        assert_eq!(refused.evidence_row, None);
+        assert_eq!(refused.cite_spent_at, None);
+        claim_pending(&state, &second, "owner", Some(43)).unwrap();
+        let claimed = load(&state, &second).unwrap();
+        assert_eq!(claimed.status, "applying");
+        assert_eq!(claimed.evidence_row, Some(43));
+        assert!(claimed.cite_spent_at.is_some());
     }
 
     #[tokio::test]
