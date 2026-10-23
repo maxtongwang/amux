@@ -8,8 +8,9 @@
 //! - owner: any action.
 //! - lead of team T (CC_ORCHESTRATOR=1 AND `leads`): create in T (never
 //!   untagged; never with yolo, flags, isolated or creator); rename and stop
-//!   a T worker that is not a peer lead; tag changes only through a cited
-//!   grant (no-ops refused); team rules for T; model/effort on a T worker.
+//!   a T worker that is not a peer lead; tag changes on non-lead T workers
+//!   only through a cited grant (no-ops refused; other targets owner-only);
+//!   team rules for T; model/effort on a T worker.
 //!   Adding or removing `leads` is refused even with a cited pair. Any other
 //!   config field, group config, settings and guards are refused.
 //! - a `leads` member without CC_ORCHESTRATOR is not a lead, and
@@ -204,24 +205,31 @@ async fn lead_changes_tags_only_through_a_cited_grant_and_never_makes_a_lead() {
     assert_eq!(e.tags(DEV_B), before, "uncited removal changed tags");
     assert_eq!(e.latest_grant(), "", "refused tag changes record no grant");
 
-    let t = now_s() - 120.0;
-    let a = e.seed_row(MAX_PANE, &format!("Max, may I remove the dev tag from {DEV_B}'s tags?"), "session", DEV_LEAD, Some("direct"), t);
-    let r = e.seed_pane_prompt(MAX_PANE, "yes", t + 30.0);
+    let cited_at = now_s() - 120.0;
+    let a = e.seed_row(MAX_PANE, &format!("Max, may I remove the dev tag from {DEV_B}'s tags?"), "session", DEV_LEAD, Some("direct"), cited_at);
+    let r = e.seed_pane_prompt(MAX_PANE, "yes", cited_at + 30.0);
     let (st, v) = e.call(lead, "PATCH", &cfg(DEV_B), Some(json!({"tags": "", "cite": {"ask_row_id": a, "reply_row_id": r}}))).await;
     assert_allowed(st, &v, "lead removes T through a cited grant");
     let grant = e.latest_grant();
     assert_eq!(e.grant_status(&grant), "applied", "cited tag removal is an applied grant");
     assert!(e.tags(DEV_B).is_empty(), "{:?}", e.tags(DEV_B));
 
-    // Keep every widening/privileged-target case: an own-pane instruction
-    // cannot replace a cited pair, and changing `leads` is never delegable.
+    // Eligibility follows the current target: DEV_A may gain ops via a grant,
+    // but other-team/privileged targets stay owner-only. Changing `leads`
+    // takes precedence over that target refusal; no-op wins over it too.
     let t = now_s() - 60.0;
     for (target, tags, ctx, code) in [
         (DEV_A, "dev,leads", "adds leads", "worker_group_membership_refused"),
         (DEV_A, "dev,ops", "adds another team's tag", "cite_missing"),
-        (OPS_A, "ops,dev", "pulls another team's worker into T", "cite_missing"),
-        (MRPOPO, "leads,dev", "touches mrpopo", "cite_missing"),
-        (DEV_LEAD2, "dev", "touches a peer lead", "worker_group_membership_refused"),
+        (OPS_A, "ops,dev", "pulls another team's worker into T", "peer_config_owner_only"),
+        (MRPOPO, "leads,dev", "touches mrpopo", "peer_config_owner_only"),
+        (DEV_LEAD2, "dev,leads,ops", "touches a peer lead", "peer_config_owner_only"),
+        (DEV_LEAD2, "dev", "removes leads from a peer lead", "worker_group_membership_refused"),
+        (OPS_A, "ops,leads", "adds leads to another team's worker", "worker_group_membership_refused"),
+        (MRPOPO, "dev", "removes leads from mrpopo", "worker_group_membership_refused"),
+        (OPS_A, "ops", "leaves another team's worker unchanged", "delegation_not_allowed"),
+        (MRPOPO, "leads", "leaves mrpopo unchanged", "delegation_not_allowed"),
+        (DEV_LEAD2, "dev,leads", "leaves a peer lead unchanged", "delegation_not_allowed"),
     ] {
         e.seed_pane_prompt(DEV_LEAD, &format!("set {target} tags to {tags}"), t);
         let before = e.tags(target);
@@ -230,10 +238,24 @@ async fn lead_changes_tags_only_through_a_cited_grant_and_never_makes_a_lead() {
         let (st, v) = e.call(lead, "PATCH", &cfg(target), Some(with_ref(json!({"tags": tags}), max_ref(DEV_LEAD, t), "Max asked"))).await;
         assert_code(st, &v, code, &format!("lead {ctx} with max_ref"));
         assert_eq!(e.tags(target), before, "lead {ctx}: refused change wrote tags");
+        assert_eq!(e.latest_grant(), grant, "lead {ctx}: refused change recorded a grant");
+    }
+
+    // A qualifying ask/reply pair cannot cross the target boundary either.
+    // Keep pairs chronological so each cited reply is the first after its ask.
+    for (i, (target, tags)) in [(OPS_A, "ops,dev"), (MRPOPO, "leads,dev"), (DEV_LEAD2, "dev,leads,ops")].into_iter().enumerate() {
+        let t = cited_at + 40.0 + i as f64 * 20.0;
+        let a = e.seed_row(MAX_PANE, &format!("Max, may I set {target}'s tags to {tags}?"), "session", DEV_LEAD, Some("direct"), t);
+        let r = e.seed_pane_prompt(MAX_PANE, "yes", t + 10.0);
+        let before = e.tags(target);
+        let (st, v) = e.call(lead, "PATCH", &cfg(target), Some(json!({"tags": tags, "cite": {"ask_row_id": a, "reply_row_id": r}}))).await;
+        assert_code(st, &v, "peer_config_owner_only", &format!("lead changes {target}'s tags with a citation"));
+        assert_eq!(e.tags(target), before, "cited refusal changed {target}'s tags");
+        assert_eq!(e.latest_grant(), grant, "cited refusal for {target} recorded a grant");
     }
 
     // Even a qualifying pair cannot authorize a lead to add `leads`.
-    let t = now_s() - 30.0;
+    let t = cited_at + 100.0;
     let a = e.seed_row(MAX_PANE, &format!("Max, may I set {DEV_A}'s tags to dev,leads?"), "session", DEV_LEAD, Some("direct"), t);
     let r = e.seed_pane_prompt(MAX_PANE, "yes", t + 10.0);
     let before = e.tags(DEV_A);
@@ -241,6 +263,17 @@ async fn lead_changes_tags_only_through_a_cited_grant_and_never_makes_a_lead() {
     assert_code(st, &v, "worker_group_membership_refused", "lead adds leads with a citation");
     assert_eq!(e.tags(DEV_A), before, "cited lead promotion changed tags");
     assert_eq!(e.latest_grant(), grant, "refused lead promotion records no new grant");
+
+    // The target is an own-team worker even when the requested tag is ops.
+    let t = cited_at + 115.0;
+    let a = e.seed_row(MAX_PANE, &format!("Max, may I set {DEV_A}'s tags to dev,ops?"), "session", DEV_LEAD, Some("direct"), t);
+    let r = e.seed_pane_prompt(MAX_PANE, "yes", t + 1.0);
+    let (st, v) = e.call(lead, "PATCH", &cfg(DEV_A), Some(json!({"tags": "dev,ops", "cite": {"ask_row_id": a, "reply_row_id": r}}))).await;
+    assert_allowed(st, &v, "lead adds ops on its own team's worker through a cited grant");
+    assert_eq!(e.tags(DEV_A), e.set(&["dev", "ops"]));
+    let widening_grant = e.latest_grant();
+    assert_ne!(widening_grant, grant, "cited own-team widening records a new grant");
+    assert_eq!(e.grant_status(&widening_grant), "applied", "cited own-team widening is an applied grant");
 }
 
 // ---- lead of team T: rules, config ------------------------------------------

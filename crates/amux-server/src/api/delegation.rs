@@ -20,7 +20,7 @@
 //! | Class | Allowed | Through a grant Max approves |
 //! |---|---|---|
 //! | Owner | everything | - |
-//! | Lead | create workers tagged with a non-empty subset of its teams, writing only SelfOk/LeadOk settings; rename (not to a reserved name), stop and lifecycle verbs on non-lead workers in its team; rules and group config of its teams; model and effort on such workers | a membership (tag) change, through a cited grant |
+//! | Lead | create workers tagged with a non-empty subset of its teams, writing only SelfOk/LeadOk settings; rename (not to a reserved name), stop and lifecycle verbs on non-lead workers in its team; rules and group config of its teams; model and effort on such workers | membership (tag) changes on own-team non-lead workers only, through a cited grant; other targets are owner-only; changing `leads` is refused |
 //! | Mrpopo | nothing | each setting in [`GRANT_ROWS`] and the action rows in `decide_mrpopo`: stored as a pending grant, applied only on Max's approval (api/delegation_grants.rs) |
 //! | SelfWorker | settings in [`SELF_ENV_KEYS`] / SelfOk config fields, rename (not to a reserved name), stop and lifecycle verbs | nothing |
 //! | Worker | nothing | nothing |
@@ -37,7 +37,7 @@
 //! |---|---|---|---|---|---|---|---|---|---|
 //! | Owner | - | allow | allow, unstamped | allow | - | allow | allow | allow, unstamped | allow, as owner or named sender |
 //! | Self | allow | - | allow, unchanged | `worker_group_membership_refused` | allow (Chat tab too) | - | `env_apply_groups_owner_only` | - | - |
-//! | Lead | allow | `env_apply_card_other_worker` | send gate | cited grant only (no direct change; dev-lead 2026-10-19) | allow | `peer_config_owner_only` | `env_apply_groups_owner_only` | team: allow, stamped, sender kept; outside: `worker_create_tags_outside_team` | send gate; `env_message_sender_refused` for another sender |
+//! | Lead | allow | `env_apply_card_other_worker` | send gate | own-team non-lead worker: cited grant only; others: owner-only; changing `leads`: refused (dev-lead 2026-10-23) | allow | `peer_config_owner_only` | `env_apply_groups_owner_only` | team: allow, stamped, sender kept; outside: `worker_create_tags_outside_team` | send gate; `env_message_sender_refused` for another sender |
 //! | Mrpopo | allow | `env_apply_card_other_worker` | send gate | cited grant only | allow | `peer_config_owner_only` | `env_apply_groups_owner_only` | `worker_create_requires_lead` | send gate; `env_message_sender_refused` |
 //! | Worker | - | `env_apply_card_other_worker` | send gate | `worker_group_membership_refused` | - | `peer_config_owner_only` | `env_apply_groups_owner_only` | `worker_create_requires_lead` | send gate; `env_message_sender_refused` |
 //!
@@ -615,18 +615,22 @@ fn decide_lead(team: &str, teams: &[String], action: &Action, t: &TargetFacts) -
             Some(k) => deny("peer_config_owner_only", format!("a lead may set only model and effort on workers in its team '{team}', not '{k}'")),
         },
         Action::RenameWorker { .. } | Action::StopWorker | Action::Lifecycle { .. } | Action::SetConfig { .. } => not_team(),
-        // No worker changes groups directly; membership widens reach, so a
-        // lead applies it only through a cited grant, like mrpopo (dev-lead
-        // ruling 2026-10-19: Max's option C; the own-team-tag removal row is gone).
+        // dev-lead ruling 2026-10-23: a lead owns its team's queue. Changing
+        // another team's worker alters that team's permissions, which a cited
+        // relay must not unlock. Eligibility follows the target's current team,
+        // even when an own-team worker gains another team's tag, via a grant.
         Action::SetTags { from, to } => {
             let (from, to) = (set(from), set(to));
+            // Precedence: changing `leads`, then no-op, then target boundary.
+            // Making/unmaking a lead wins even for an out-of-team target.
+            if from.symmetric_difference(&to).any(|g| g == LEADS_GROUP) {
+                return membership_denied("make lead");
+            }
             if from == to {
                 return deny("delegation_not_allowed", "a tag change that changes nothing is not delegable".into());
             }
-            // Adding or removing `leads` is making or unmaking a lead, which
-            // stays refused for a lead even with a grant (as MakeLead does).
-            if from.symmetric_difference(&to).any(|g| g == LEADS_GROUP) {
-                return membership_denied("make lead");
+            if !on_team_worker {
+                return not_team();
             }
             Decision::NeedsGrant
         }
@@ -1111,6 +1115,7 @@ mod tests {
     }
     const TEAM: TargetFacts = TargetFacts { in_team: true, privileged: false, is_actor: false, covers_actor: false };
     const PEER_LEAD: TargetFacts = TargetFacts { in_team: true, privileged: true, is_actor: false, covers_actor: false };
+    const MRPOPO_FACTS: TargetFacts = TargetFacts { in_team: false, privileged: true, is_actor: false, covers_actor: false };
     const OTHER: TargetFacts = TargetFacts { in_team: false, privileged: false, is_actor: false, covers_actor: false };
     const ME: TargetFacts = TargetFacts { in_team: false, privileged: false, is_actor: true, covers_actor: true };
     /// A group or global layer the actor reads.
@@ -1152,6 +1157,15 @@ mod tests {
     cell!(table_lead_membership_add, lead("dev"), tags(&["dev"], &["dev", "ops"]), TEAM, "grant");
     cell!(table_lead_membership_remove_own_team_tag, lead("dev"), tags(&["dev"], &[]), TEAM, "grant");
     cell!(table_lead_membership_noop, lead("dev"), tags(&["dev"], &["dev"]), TEAM, "delegation_not_allowed");
+    cell!(table_lead_membership_other_team, lead("dev"), tags(&["ops"], &["ops", "dev"]), OTHER, "peer_config_owner_only");
+    cell!(table_lead_membership_mrpopo, lead("dev"), tags(&["leads"], &["leads", "dev"]), MRPOPO_FACTS, "peer_config_owner_only");
+    cell!(table_lead_membership_peer_lead, lead("dev"), tags(&["dev", "leads"], &["dev", "leads", "ops"]), PEER_LEAD, "peer_config_owner_only");
+    cell!(table_lead_membership_other_team_noop, lead("dev"), tags(&["ops"], &["ops"]), OTHER, "delegation_not_allowed");
+    cell!(table_lead_membership_mrpopo_noop, lead("dev"), tags(&["leads"], &["leads"]), MRPOPO_FACTS, "delegation_not_allowed");
+    cell!(table_lead_membership_peer_lead_noop, lead("dev"), tags(&["dev", "leads"], &["leads", "dev"]), PEER_LEAD, "delegation_not_allowed");
+    cell!(table_lead_membership_other_team_add_leads, lead("dev"), tags(&["ops"], &["ops", "leads"]), OTHER, "worker_group_membership_refused");
+    cell!(table_lead_membership_peer_lead_remove_leads, lead("dev"), tags(&["dev", "leads"], &["dev"]), PEER_LEAD, "worker_group_membership_refused");
+    cell!(table_lead_membership_mrpopo_remove_leads, lead("dev"), tags(&["leads"], &[]), MRPOPO_FACTS, "worker_group_membership_refused");
     cell!(table_mrpopo_membership, Class::Mrpopo, tags(&["dev"], &["dev", "leads"]), OTHER, "grant");
     cell!(table_worker_membership, Class::Worker, tags(&["dev"], &["dev", "ops"]), OTHER, "worker_group_membership_refused");
 
@@ -1240,13 +1254,16 @@ mod tests {
     #[test]
     fn delegation_lead_tags_go_through_a_cited_grant() {
         let l = lead("dev");
-        // dev-lead 2026-10-19: no direct membership change; every real tag
-        // change is a cited grant, except making or unmaking a lead.
+        // dev-lead 2026-10-23: only own-team non-lead targets reach a grant.
         assert_eq!(code(decide(&l, &tags(&["dev"], &["dev"]), &TEAM)), "delegation_not_allowed");
         for (from, to, f) in [(&["dev"][..], &[][..], TEAM), (&["dev"][..], &["dev", "ops"][..], TEAM),
-            (&["ops"][..], &["ops", "dev"][..], OTHER), (&["dev", "infra"][..], &["dev"][..], TEAM),
-            (&["dev"][..], &[][..], PEER_LEAD)] {
+            (&["dev", "infra"][..], &["dev"][..], TEAM)] {
             assert_eq!(code(decide(&l, &tags(from, to), &f)), "grant", "{from:?} -> {to:?}");
+        }
+        for (from, to, f) in [(&["ops"][..], &["ops", "dev"][..], OTHER),
+            (&["leads"][..], &["leads", "dev"][..], MRPOPO_FACTS),
+            (&["dev", "leads"][..], &["dev", "leads", "ops"][..], PEER_LEAD)] {
+            assert_eq!(code(decide(&l, &tags(from, to), &f)), "peer_config_owner_only", "{from:?} -> {to:?}");
         }
         for (from, to, f) in [(&["dev"][..], &["dev", "leads"][..], TEAM), (&["dev", "leads"][..], &["dev"][..], PEER_LEAD)] {
             assert_eq!(code(decide(&l, &tags(from, to), &f)), "worker_group_membership_refused", "{from:?} -> {to:?}");
