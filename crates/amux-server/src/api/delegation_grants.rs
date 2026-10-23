@@ -1,60 +1,16 @@
-// Structured grants: the audit unit for every widening change mrpopo makes — cite-and-apply by default, passkey-approved when the owner sets it — refs maxtongwang/ai-config#160.
-// Cite mode verifies an (ask, reply) citation pair (review B4); Max's rule: automation is not traded for security, so audit, feed and one-step undo are the control.
-//! MODES (`AMUX_DELEGATION_APPROVAL`, global; owner-only, in HELD_FOR_MAX):
-//! - `cite` (default): mrpopo submits the change WITH `cite`
-//!   `{ask_row_id, reply_row_id}`: its own message into a session naming the
-//!   target and the setting, and Max's first typed reply there within 2 hours
-//!   (`max_ref::cite_pair`, ruling of review B4). The server records a grant
-//!   (code, exact change, both texts, actor) and the change APPLIES at once.
-//! - `passkey`: the change is stored as a PENDING grant (202 with the code and
-//!   the exact sentence) and applies only with an approval proof
-//!   ([`approval_proof_ok`], the one extension point a passkey follow-up
-//!   plugs into): today the owner's Approve button from a NON-LOCAL Remote
-//!   peer, or an owner send from one containing `amux grant <code>`.
-//!
-//! CITATION RESERVATION. One owner reply reserves one grant globally (all
-//! actors, workers, routes and modes). It answers only the citing actor's
-//! latest unanswered ask in that session and must match max_ref's documented
-//! affirmative phrase allowlist; questions, negations and other text refuse.
-//! Its unique reply, spent timestamp, target incarnation and exact change request are
-//! committed together before handler execution; failed/interrupted grants
-//! keep their evidence spent (`cite_pair_spent`), including after undo. The
-//! files and other handler writes are separate resources, not a SQLite ACID
-//! transaction; an interrupted `applying` grant is never automatically replayed.
-//! B1 ruling (a): EnvFile commits by temp file + same-directory rename. A
-//! failed handler returns `grant_apply_failed`, records `failed`, and emits
-//! WARN `delegation_grant_failed`. Grant lists expose `failure_reason` with
-//! the instruction to re-ask the owner, also shown by `amux grant list
-//! [--json]` and Settings > Delegated changes. The reply stays spent.
-//! Worker asks record server-derived CC_INCARNATION bindings at message time;
-//! legacy asks without them need a fresh ask. Rename/name reuse cannot transfer
-//! a grant, including pending apply, internal replay, and undo.
-//! Tag asks use `add [the] TAG [tag] to WORKER` / `remove [the] TAG [tag] from WORKER`
-//! for each changed tag. Mismatches refuse as `cite_ask_missing_change`.
-//! Env writes compare their checked state under EnvFile's process/file locks;
-//! a mismatch answers 409 `delegation_state_changed` without the stale write.
-//!
-//! EXACTLY ONCE. The handler that applies a grant runs inside the [`capture`]
-//! middleware, which snapshots the files a config change can write before the
-//! handler and records the difference after it: the grant moves `applying`
-//! -> `applied` (or `failed`) once, keeps the before/after of each changed key
-//! for undo, logs `grant:applied` and posts the sentence and the cited excerpt
-//! to the leads. A pending grant is replayed through the router with a
-//! server-only `x-amux-grant` header; `enforce` strips any copy on a socket.
-//!
-//! UNDO. `POST /api/delegation/grants/<code>/undo` (the owner, or mrpopo)
-//! restores the stored before-state when nothing changed since; otherwise it
-//! refuses and names what changed. Every store a grant kind writes is in the
-//! snapshot (env files, rules/memory text, and whole rows of [`TABLES`]);
-//! table rows come back by UPDATE of the changed columns. An undo with
-//! nothing to restore refuses (`grant_undo_nothing_restorable`). A worker that is running keeps its
-//! process until its next restart; the files are restored exactly.
-//!
-//! ACCEPTED LIMIT (ai-config#136): another lane's process can mint a pane row
-//! through its own `/report`, and a same-user process can type into Max's
-//! pane. In cite mode that is mitigated by the audit log, the leads feed and
-//! undo, not prevented. A forwarded Remote verdict (tailscale serve over
-//! loopback) is never owner proof: a local process can ride that forward.
+// Explicit requests and grants for widening changes — Max 2026-10-23: approval identity resolution; refs maxtongwang/ai-config#160.
+//! POST /api/delegation/requests derives a pending request through the real
+//! authorization table, stores the exact structured change, stable actor/target
+//! and reply-session identities, and shows a generated question in Messages.
+//! Its grant code is the request ID. Free text never creates requests.
+//! Typed affirmative correlation lives in delegation_requests; passkey approval
+//! still requires a direct Remote owner. Every application cites request_id and
+//! compares operands plus method/path/body; internal replay rechecks identities.
+//! A reply is spent once in the grant claim transaction (0127/0128). Failed,
+//! interrupted and undone grants retain their evidence. Handler/filesystem
+//! writes are separate resources: applying grants are never blindly replayed.
+//! Undo restores the original recorded delta only while identities and current
+//! state match; it never releases or transfers approval to another request.
 use super::AppState;
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -78,6 +34,10 @@ pub(crate) const GRANT_CODE_HEADER: &str = "x-amux-grant-code";
 /// Unambiguous code alphabet (no 0/O, 1/I/L, U).
 const ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTVWXYZ";
 const CODE_LEN: usize = 4;
+/// Bound random-code collision retries; existing request IDs are never replaced.
+const CODE_MINT_ATTEMPTS: usize = 10;
+/// Recent request/resolution rows returned by each list surface.
+const LIST_LIMIT_ROWS: i64 = 200;
 /// A request body larger than this is not captured, so it cannot become a grant.
 const CAPTURE_LIMIT: usize = 1 << 20;
 /// Fail closed: a write failure never releases an already reserved citation.
@@ -87,7 +47,7 @@ const CAPTURE_PREFIXES: [&str; 8] = [
     "/api/sessions", "/api/workers", "/api/scope", "/api/groups/", "/api/settings/", "/api/config/", "/api/env/", "/api/alert/config",
 ];
 /// Request fields that are delegation metadata, never part of the change.
-const META: [&str; 2] = ["cite", "why"];
+const META: [&str; 3] = super::delegation::META_FIELDS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -445,7 +405,6 @@ fn new_code() -> Option<String> {
 fn sentence(code: &str, actor: &str, action: &str, target: &str, c: &Captured) -> String {
     let body = change_body(&c.body);
     let body = if body.is_null() { String::new() } else { format!(" {body}") };
-    let body: String = body.chars().take(400).collect();
     format!("amux grant {code}: {actor} asks to {action} on {target}: {} {}{body}", c.method, c.path)
 }
 
@@ -460,55 +419,48 @@ struct NewGrant<'a> {
     action: &'a str,
     target: &'a str,
     why: Option<String>,
-    status: &'static str,
-    cited: Option<&'a super::max_ref::Cited>,
+    reply_session: &'a str,
+    change: Value,
+    target_incarnation: Option<String>,
 }
 
-/// Insert a grant for the captured request; returns its code and sentence.
-#[allow(clippy::result_large_err)] // the refusal IS the handler's response; it is returned as-is
+/// The request and its visible message commit together; a failed creation
+/// cannot leave a request that claims it was shown. Identity is read, never minted.
+#[allow(clippy::result_large_err)]
 fn insert(state: &AppState, g: &NewGrant, c: &Captured) -> Result<(String, String), Response> {
+    let actor_id = super::delegation_requests::incarnation(g.actor)
+        .ok_or_else(|| forbid("request_actor_identity_missing", "asking worker needs an existing stable identity".into()))?;
+    let reply_id = super::delegation_requests::incarnation(g.reply_session)
+        .ok_or_else(|| forbid("request_reply_identity_missing", "reply session needs an existing stable identity".into()))?;
     let created = now();
-    for _ in 0..10 {
+    for _ in 0..CODE_MINT_ATTEMPTS {
         let Some(code) = new_code() else { break };
         let text = sentence(&code, g.actor, g.action, g.target, c);
-        let row = (code.clone(), g.actor.to_string(), g.class.to_string(), g.action.to_string(), g.target.to_string(),
-            c.method.clone(), c.path.clone(), change_body(&c.body).to_string(), text.clone(), g.why.clone(), g.status.to_string(),
-            g.cited.map(|x| x.row_id), g.cited.map(|x| x.excerpt.clone()), mode_str(mode()).to_string(),
-            g.cited.map(|x| x.ask_row_id), g.cited.map(|x| x.ask_text.clone()), g.cited.map(|x| x.reply_text.clone()));
-        let target_incarnation = match worker_identity(g.target) {
-            Ok(id) => id,
-            Err(e) => return Err(forbid("grant_target_identity_changed", e)),
-        };
-        if g.cited.is_some_and(|c| c.target_incarnation != target_incarnation) {
-            return Err(forbid("cite_target_identity_changed", "the cited worker changed identity".into()));
-        }
-        let inserted = state.store.write(move |conn| {
-            // The spent marker and exact immutable request (body/path/method)
-            // are reserved by the SAME transaction as the grant, before any
-            // handler side effect. A failed/interrupted handler never frees it.
-            if let Some(reply) = row.11 {
-                let cited_reply_spent = super::max_ref::reply_spent(conn, reply)?;
-                if cited_reply_spent {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        std::io::Error::other("cite_pair_spent"),
-                    )));
-                }
+        // The whole structured change is visible, without truncating operands.
+        let question = format!("Approval request {code} from {}: {} {} {}. Reply yes to approve this exact change.", g.actor, c.method, c.path, g.change);
+        let (id, actor, class, action, target, why, method, path, body, sentence, reply_session, change, actor_id, reply_id, target_id) =
+            (code.clone(), g.actor.to_string(), g.class.to_string(), g.action.to_string(), g.target.to_string(), g.why.clone(), c.method.clone(), c.path.clone(), change_body(&c.body).to_string(), text.clone(), g.reply_session.to_string(), g.change.to_string(), actor_id.clone(), reply_id.clone(), g.target_incarnation.clone());
+        let stored = state.store.write(move |conn| {
+            if conn.query_row("SELECT EXISTS(SELECT 1 FROM _amux_delegation_grants WHERE code=?1)", [&id], |r| r.get::<_, bool>(0))? {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
             }
-            let n = conn.execute(
-                "INSERT OR IGNORE INTO _amux_delegation_grants (code, actor, class, action, target, method, path, body, sentence, why, created_at, expires_at, status, evidence_row, cited_excerpt, mode, ask_row, ask_text, reply_text, cite_spent_at, target_incarnation) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
-                rusqlite::params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, created, created + GRANT_TTL_S, row.10, row.11, row.12, row.13, row.14, row.15, row.16, row.14.map(|_| created), target_incarnation],
-            )?;
-            Ok(crate::db::WriteOutcome { applied: n == 1, events: vec![] })
+            conn.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery,delegation_session_incarnation) VALUES(?1,'session',?2,?3,?4,'approval_request',?5)",
+                rusqlite::params![question,reply_session,(created*1000.0) as i64,actor,reply_id])?;
+            let shown = conn.last_insert_rowid();
+            conn.execute("INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,why,created_at,expires_at,status,mode,target_incarnation,actor_incarnation,reply_session,reply_incarnation,shown_row,change_spec,ask_row,ask_text,resolution_note) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'pending',?13,?14,?15,?16,?17,?18,?19,?18,?20,'awaiting Max reply in the shown session')",
+                rusqlite::params![id,actor,class,action,target,method,path,body,sentence,why,created,created+GRANT_TTL_S,mode_str(mode()),target_id,actor_id,reply_session,reply_id,shown,change,question])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Message, entity_id: format!("MSG-{shown}"),
+                mutation: amux_core::revision::MutationKind::Created, payload: None,
+            }] })
         });
-        match inserted {
+        match stored {
             Ok(o) if o.applied => return Ok((code, text)),
             Ok(_) => continue,
-            Err(e) if e.to_string().contains("cite_pair_spent") => return Err(forbid("cite_pair_spent", "this owner reply already reserved a grant; ask Max again".into())),
-            Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": e.to_string()}))).into_response()),
+            Err(e) => return Err(forbid("request_create_failed", e.to_string())),
         }
     }
-    Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": "could not mint a grant code"}))).into_response())
+    Err(forbid("request_id_unavailable", "could not mint a unique request ID".into()))
 }
 
 /// Arm the running request to finalize `code` after its handler, with the
@@ -520,39 +472,87 @@ fn arm(state: &AppState, code: &str) -> bool {
     true
 }
 
-/// Cite mode: record the grant for the captured request with its citation and
-/// let the handler apply it now. Returns the code.
-#[allow(clippy::result_large_err)] // the refusal IS the handler's response; it is returned as-is
-pub(crate) fn begin_cited(state: &AppState, actor: &str, class: &str, action: &str, target: &str, why: Option<String>, cited: &super::max_ref::Cited) -> Result<String, Response> {
-    let Some(c) = captured() else {
-        return Err(forbid("grant_unavailable", format!("{action} could not be recorded as a grant (no captured body)")));
+/// Only the explicit creation endpoint enters this function through draft scope.
+pub(crate) fn request_explicit(state: &AppState, actor: &str, class: &str, target: &super::delegation::Target, action: &super::delegation::Action, body: Option<&Value>, reply_session: &str) -> Response {
+    let Some(c) = captured() else { return forbid("grant_unavailable", "request body was not captured".into()); };
+    let target_id = match target {
+        super::delegation::Target::Worker(w) => match super::delegation_requests::incarnation(w) {
+            Some(id) => Some(id),
+            None => return forbid("request_target_identity_missing", "target worker needs an existing stable identity".into()),
+        },
+        _ => None,
     };
-    let (code, text) = insert(state, &NewGrant { actor, class, action, target, why, status: "applying", cited: Some(cited) }, &c)?;
-    if !arm(state, &code) {
-        return Err(forbid("grant_unavailable", "the grant could not be armed".into()));
-    }
-    tracing::info!(actor, action, target, grant = %code, cited_row = cited.row_id, ask_row = cited.ask_row_id, cited_session = %cited.session,
-        verdict = "delegation_grant_cited", measured = true, n_considered = 1, "a cited widening change is applying as a grant");
-    let _ = text;
-    Ok(code)
+    let action_name = action.label();
+    let target_name = target.name();
+    let change = super::delegation_requests::change(target, action, body);
+    let (code, text) = match insert(state, &NewGrant { actor, class, action: &action_name, target: &target_name,
+        why: super::delegation::request_why(body), reply_session, change, target_incarnation: target_id }, &c) {
+        Ok(x) => x, Err(r) => return r,
+    };
+    tracing::info!(request_id = %code, actor, reply_session, verdict = "delegation_request_shown", measured = true, n_considered = 1, "explicit approval question is visible in Messages");
+    (StatusCode::ACCEPTED, Json(json!({"ok":true,"pending":true,"request_id":code,"grant_code":code,"sentence":text,
+        "reply_session":reply_session,"how":"Max replies yes in the shown session; apply the exact mutation with request_id"}))).into_response()
 }
 
-/// Passkey mode: store a pending grant for the captured request and answer
-/// 202 with its code and sentence.
-pub(crate) fn request(state: &AppState, actor: &str, class: &str, action: &str, target: &str, why: Option<String>) -> Response {
-    let Some(c) = captured() else {
-        return forbid("grant_unavailable", format!("{action} needs Max's approval, but this request could not be stored as a grant (no captured body)"));
-    };
-    let (code, text) = match insert(state, &NewGrant { actor, class, action, target, why: why.clone(), status: "pending", cited: None }, &c) {
-        Ok(x) => x,
-        Err(r) => return r,
-    };
-    log_transition(state, &code, "requested", actor, class, target, json!({"sentence": text, "method": c.method, "path": c.path, "body": change_body(&c.body)}), why);
-    tracing::info!(actor, action, target, grant = %code, verdict = "delegation_grant_requested", measured = true, n_considered = 1,
-        "a widening change was stored as a pending grant (passkey mode)");
-    (StatusCode::ACCEPTED, Json(json!({"ok": true, "pending": true, "grant_code": code, "sentence": text,
-        "expires_at": now() + GRANT_TTL_S,
-        "how": format!("passkey mode: Max approves with Approve in Settings > Delegated changes, or by sending `amux grant {code}` from his phone")}))).into_response()
+/// Cite-mode applications spend the request's resolved reply; no new grant
+/// is minted, and the stored change is checked before claiming it.
+pub(crate) fn begin_requested(state: &AppState, id: &str, actor: &str, change: &Value) -> Result<String, (&'static str, String)> {
+    let mut g = load(state, id).ok_or(("request_not_found", "unknown request ID".into()))?;
+    let session = g.reply_session.as_deref().ok_or(("request_not_explicit", "legacy grant has no explicit request".into()))?;
+    super::delegation_requests::resolve_session(state, session).map_err(|e| ("request_resolution_failed", e))?;
+    g = load(state, id).ok_or(("request_not_found", "unknown request ID".into()))?;
+    validate_requested(state, &g, actor, change)?;
+    if let Some(e) = not_applicable(state, &g) { return Err(e); }
+    if mode() == Mode::Passkey { return Err(("request_passkey_required", "approve this request with the Remote owner proof".into())); }
+    let reply = g.resolution_row.ok_or((resolution_refusal(g.resolution_code.as_deref()), g.resolution_note.clone().unwrap_or_default()))?;
+    let row = super::max_ref::one(state, reply).map_err(|e| (e.code(), "owner reply unavailable".into()))?
+        .ok_or(("request_reply_missing", "owner reply unavailable".into()))?;
+    let source = super::max_ref::typed_by_max(state, &row).ok_or(("max_ref_not_human_typed", "reply is not owner input".into()))?;
+    if !super::max_ref::cite_source_allowed(actor, &row.session, source, row.remote) {
+        return Err(("max_ref_own_lane", "own-lane reply needs direct Remote owner proof".into()));
+    }
+    claim_pending(state, &g.code, &format!("owner:reply:{reply}"), Some(reply))?;
+    if !arm(state, &g.code) { return Err(("grant_unavailable", "request could not be armed; reply remains spent".into())); }
+    Ok(g.code)
+}
+
+fn resolution_refusal(code: Option<&str>) -> &'static str {
+    match code {
+        Some("request_ambiguous") => "request_ambiguous",
+        Some("request_no_candidate") => "request_no_candidate",
+        Some("request_reply_not_affirmative") => "request_reply_not_affirmative",
+        Some("request_reply_identity_changed") => "request_reply_identity_changed",
+        Some("request_reply_outside_window") => "request_reply_outside_window",
+        _ => "request_unresolved",
+    }
+}
+
+fn validate_request_identity(state: &AppState, g: &GrantRow, actor: &str) -> Result<(), (&'static str, String)> {
+    if g.shown_row.is_none() { return Err(("request_not_shown", "request was never shown in a reply session".into())); }
+    let conn = state.store.read().map_err(|_|("request_read_failed", "request message ledger unavailable".into()))?;
+    let shown: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM cmd_history WHERE id=?1 AND session=?2 AND origin=?3 AND type='session' AND text=?4 AND delegation_session_incarnation=?5)",
+        rusqlite::params![g.shown_row,g.reply_session,g.actor,g.ask_text,g.reply_incarnation],|r|r.get(0))
+        .map_err(|_|("request_read_failed", "request message ledger unavailable".into()))?;
+    if !shown { return Err(("request_not_shown", "the recorded question is absent from the reply session".into())); }
+    drop(conn);
+    if !same_target(g) { return Err(("request_target_identity_changed", "request target identity changed".into())); }
+    if !g.reply_session.as_ref().is_some_and(|session| g.reply_incarnation.is_some() && g.reply_incarnation == super::delegation_requests::incarnation(session)) {
+        return Err(("request_reply_identity_changed", "shown reply session identity changed".into()));
+    }
+    if g.actor != actor || g.actor_incarnation.is_none() || g.actor_incarnation != super::delegation_requests::incarnation(actor) {
+        return Err(("request_actor_identity_changed", "request belongs to a different asking worker incarnation".into()));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_requested(state: &AppState, g: &GrantRow, actor: &str, change: &Value) -> Result<(), (&'static str, String)> {
+    validate_request_identity(state,g,actor)?;
+    let Some(c) = captured() else { return Err(("grant_unavailable", "mutation not captured".into())); };
+    if g.change_spec.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()).as_ref() != Some(change)
+        || g.method != c.method || g.path != c.path || serde_json::from_str::<Value>(&g.body).ok() != Some(change_body(&c.body)) {
+        return Err(("request_change_mismatch", "applied action, target, setting, value, direction, method, path and body must equal the stored request".into()));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -577,15 +577,24 @@ pub(crate) struct GrantRow {
     pub reply_text: Option<String>,
     pub target_incarnation: Option<String>,
     pub cite_spent_at: Option<f64>,
+    pub actor_incarnation: Option<String>,
+    pub reply_session: Option<String>,
+    pub reply_incarnation: Option<String>,
+    pub shown_row: Option<i64>,
+    pub change_spec: Option<String>,
+    pub resolution_row: Option<i64>,
+    pub resolution_code: Option<String>,
+    pub resolution_note: Option<String>,
+    pub created_at: f64,
 }
 
-const COLS: &str = "code, actor, class, action, target, method, path, body, sentence, status, expires_at, evidence_row, cited_excerpt, changes, ask_row, ask_text, reply_text, target_incarnation, cite_spent_at";
+const COLS: &str = "code, actor, class, action, target, method, path, body, sentence, status, expires_at, evidence_row, cited_excerpt, changes, ask_row, ask_text, reply_text, target_incarnation, cite_spent_at, actor_incarnation, reply_session, reply_incarnation, shown_row, change_spec, resolution_row, resolution_code, resolution_note, created_at";
 
 fn map_row(r: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
     Ok(GrantRow {
         code: r.get(0)?, actor: r.get(1)?, class: r.get(2)?, action: r.get(3)?, target: r.get(4)?, method: r.get(5)?,
         path: r.get(6)?, body: r.get(7)?, sentence: r.get(8)?, status: r.get(9)?, expires_at: r.get(10)?, evidence_row: r.get(11)?,
-        cited_excerpt: r.get(12)?, changes: r.get(13)?, ask_row: r.get(14)?, ask_text: r.get(15)?, reply_text: r.get(16)?, target_incarnation: r.get(17)?, cite_spent_at: r.get(18)?,
+        cited_excerpt: r.get(12)?, changes: r.get(13)?, ask_row: r.get(14)?, ask_text: r.get(15)?, reply_text: r.get(16)?, target_incarnation: r.get(17)?, cite_spent_at: r.get(18)?, actor_incarnation: r.get(19)?, reply_session: r.get(20)?, reply_incarnation: r.get(21)?, shown_row: r.get(22)?, change_spec: r.get(23)?, resolution_row: r.get(24)?, resolution_code: r.get(25)?, resolution_note: r.get(26)?, created_at:r.get(27)?,
     })
 }
 
@@ -680,12 +689,13 @@ fn worker_identity(target: &str) -> Result<Option<String>, String> {
     super::rename_identity::incarnation(&home, target).map(Some).ok_or_else(|| "worker has no stable incarnation; record a fresh ask".into())
 }
 
-fn same_worker(g: &GrantRow) -> bool {
+fn same_target(g: &GrantRow) -> bool {
     worker_identity(&g.target).is_ok_and(|id| id == g.target_incarnation)
 }
 
+
 fn not_applicable(state: &AppState, g: &GrantRow) -> Option<(&'static str, String)> {
-    if !same_worker(g) {
+    if !same_target(g) {
         return Some(("grant_target_identity_changed", format!("grant {} belongs to a different worker incarnation", g.code)));
     }
     if expire_if_due(state, g) {
@@ -700,6 +710,12 @@ fn claim_pending(state: &AppState, code: &str, by: &str, evidence: Option<i64>) 
     let (owned_code, by) = (code.to_string(), by.to_string());
     let at = now();
     let result = state.store.write(move |conn| {
+        let binding: (Option<i64>, Option<i64>, Option<String>) = conn.query_row(
+            "SELECT shown_row,resolution_row,actor_incarnation FROM _amux_delegation_grants WHERE code=?1", [&owned_code],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        if binding.0.is_none() || binding.2.is_none() || (evidence.is_some() && evidence != binding.1) {
+            return Err(rusqlite::Error::InvalidParameterName("request_reply_mismatch".into()));
+        }
         if let Some(reply) = evidence {
             let approval_reply_spent = super::max_ref::reply_spent(conn, reply)?;
             if approval_reply_spent {
@@ -710,7 +726,8 @@ fn claim_pending(state: &AppState, code: &str, by: &str, evidence: Option<i64>) 
         }
         let n = conn.execute(
             "UPDATE _amux_delegation_grants SET status='applying', decided_by=?1, decided_at=?2, evidence_row=?3, \
-             cite_spent_at=CASE WHEN ?3 IS NOT NULL THEN ?2 ELSE cite_spent_at END WHERE code=?4 AND status='pending'",
+             cite_spent_at=CASE WHEN ?3 IS NOT NULL THEN ?2 ELSE cite_spent_at END, \
+             reply_text=(SELECT text FROM cmd_history WHERE id=?3),cited_excerpt=(SELECT text FROM cmd_history WHERE id=?3) WHERE code=?4 AND status='pending'",
             rusqlite::params![by, at, evidence, owned_code],
         )?;
         Ok(crate::db::WriteOutcome { applied: n == 1, events: vec![] })
@@ -719,7 +736,7 @@ fn claim_pending(state: &AppState, code: &str, by: &str, evidence: Option<i64>) 
         Ok(o) if o.applied => Ok(()),
         Ok(_) => Err(("grant_not_pending", format!("grant {code} was already taken"))),
         Err(e) => {
-            let refusal = if e.to_string().contains("cite_pair_spent") { "cite_pair_spent" } else { "grant_claim_failed" };
+            let refusal = if e.to_string().contains("cite_pair_spent") { "cite_pair_spent" } else if e.to_string().contains("request_reply_mismatch") { "request_reply_mismatch" } else { "grant_claim_failed" };
             tracing::warn!(grant = code, evidence_row = ?evidence, error = %e, code = refusal,
                 verdict = "delegation_grant_claim_refused", measured = true, n_considered = 1,
                 "pending grant could not reserve owner evidence; no replay occurred");
@@ -731,6 +748,7 @@ fn claim_pending(state: &AppState, code: &str, by: &str, evidence: Option<i64>) 
 /// Apply a pending grant: exactly the stored request, once.
 pub(crate) async fn apply(state: &AppState, code: &str, by: &str, evidence: Option<i64>) -> Result<Value, (&'static str, String)> {
     let g = load(state, code).ok_or(("grant_not_found", format!("no grant {code}")))?;
+    validate_request_identity(state,&g,&g.actor)?;
     if let Some(why) = not_applicable(state, &g) {
         return Err(why);
     }
@@ -745,7 +763,9 @@ pub(crate) async fn apply(state: &AppState, code: &str, by: &str, evidence: Opti
     if let Some(t) = state.auth_token.as_deref() {
         req = req.header(axum::http::header::AUTHORIZATION, format!("Bearer {t}"));
     }
-    let body = if g.body == "null" { Body::empty() } else { Body::from(g.body.clone()) };
+    let mut stored_body: Value = serde_json::from_str(&g.body).map_err(|_| ("request_change_invalid", "stored body is invalid".into()))?;
+    stored_body["request_id"] = json!(g.code);
+    let body = Body::from(stored_body.to_string());
     let req = match req.body(body) {
         Ok(r) => r,
         Err(e) => {
@@ -768,9 +788,10 @@ pub(crate) async fn apply(state: &AppState, code: &str, by: &str, evidence: Opti
 /// `authorize`'s check on the replay of a pending grant: the request carries
 /// an `applying` grant's code and is that grant's actor, action and target.
 /// Arms the request so its middleware finalizes the grant.
-pub(crate) fn claim_applying(state: &AppState, code: &str, actor: &str, action: &str, target: &str) -> Result<Option<i64>, String> {
+pub(crate) fn claim_applying(state: &AppState, code: &str, actor: &str, action: &str, target: &str, change: &Value) -> Result<Option<i64>, String> {
     let g = load(state, code).ok_or_else(|| format!("no grant {code}"))?;
-    if !same_worker(&g) { return Err("grant_target_identity_changed".into()); }
+    if !same_target(&g) { return Err("grant_target_identity_changed".into()); }
+    validate_requested(state, &g, actor, change).map_err(|(code, note)| format!("{code}: {note}"))?;
     if g.status != "applying" {
         return Err(format!("grant {code} is {}, not being applied", g.status));
     }
@@ -783,31 +804,19 @@ pub(crate) fn claim_applying(state: &AppState, code: &str, actor: &str, action: 
     Ok(g.evidence_row)
 }
 
-/// The grant codes a line names (`amux grant 7K3Q`, any case).
-pub(crate) fn codes_in(text: &str) -> Vec<String> {
-    // Every Messages row passes through here: compile once.
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"(?i)\bamux\s+grant\s+([A-Za-z0-9]{4})\b").expect("static regex"));
-    re.captures_iter(text).map(|c| c[1].to_ascii_uppercase()).collect()
-}
-
-/// Called for every Messages row as it is written: an owner send from a
-/// non-local Remote peer naming a pending grant approves it.
-pub(crate) async fn on_row(state: &AppState, row_id: i64, text: &str) {
-    for code in codes_in(text) {
-        let Some(g) = load(state, &code) else {
-            tracing::info!(row_id, grant = %code, verdict = "delegation_grant_unknown_code", measured = true, n_considered = 1,
-                "a line named a grant code that does not exist");
-            continue;
-        };
-        if let Err(r) = super::max_ref::row_qualifies(state, row_id) {
-            tracing::warn!(row_id, grant = %code, actor = %g.actor, code = r.code(), verdict = "delegation_grant_row_not_qualifying",
-                measured = true, n_considered = 1, "a line naming a grant is not an owner send from a non-local Remote peer; it does not approve");
-            continue;
-        }
+/// Every recorded human reply is correlated, even if it names no request.
+/// Passkey mode additionally requires the direct Remote owner proof before replay.
+pub(crate) async fn on_row(state: &AppState, row_id: i64) {
+    if let Err(e) = super::delegation_requests::resolve_observed(state, row_id) {
+        tracing::warn!(row_id, error = %e, verdict = "delegation_request_resolution_failed", measured = false, n_considered = 0, "reply correlation failed closed");
+        return;
+    }
+    if mode() != Mode::Passkey || super::max_ref::row_qualifies(state, row_id).is_err() { return; }
+    let code: Option<String> = state.store.read().ok().and_then(|conn| conn.query_row(
+        "SELECT request_id FROM _amux_delegation_resolutions WHERE reply_row=?1", [row_id], |r| r.get(0)).ok()).flatten();
+    if let Some(code) = code {
         if let Err((c, why)) = apply(state, &code, &format!("owner:sent:{row_id}"), Some(row_id)).await {
-            tracing::warn!(row_id, grant = %code, code = c, why = %why, verdict = "delegation_grant_sent_not_applied", measured = true,
-                n_considered = 1, "a qualifying approval did not apply its grant");
+            tracing::warn!(row_id, request_id = %code, code = c, why, verdict = "delegation_grant_sent_not_applied", measured = true, n_considered = 1, "resolved approval did not apply");
         }
     }
 }
@@ -1015,7 +1024,9 @@ async fn undo(State(state): State<AppState>, uri: Uri, headers: HeaderMap, Path(
     if g.status != "applied" {
         return (StatusCode::CONFLICT, Json(super::delegation::refusal_body("grant_not_applied", &format!("grant {} is {}; only an applied grant is undone", g.code, g.status)))).into_response();
     }
-    if !same_worker(&g) {
+    // Reversal checks the original target. A retired asking worker must not
+    // strand the owner's undo; it is not funding a new change.
+    if !same_target(&g) {
         return forbid("grant_target_identity_changed", "undo target has a different worker incarnation".into());
     }
     let changes: Value = g.changes.as_deref().and_then(|c| serde_json::from_str(c).ok()).unwrap_or(Value::Null);
@@ -1045,27 +1056,64 @@ async fn undo(State(state): State<AppState>, uri: Uri, headers: HeaderMap, Path(
     }
 }
 
+fn request_view(g: &GrantRow) -> Value {
+        let status = if g.status == "pending" && now() > g.expires_at { "expired" } else { g.status.as_str() };
+        json!({"code": g.code, "actor": g.actor, "class": g.class, "action": g.action, "target": g.target, "sentence": g.sentence,
+            "status": status, "failure_reason": failure_reason(status), "expires_at": g.expires_at, "method": g.method, "path": g.path, "cited_row": g.evidence_row,
+            "target_incarnation": g.target_incarnation, "cite_spent_at": g.cite_spent_at,
+            "request_id": g.code, "created_at":g.created_at, "actor_incarnation":g.actor_incarnation, "reply_session":g.reply_session, "reply_incarnation":g.reply_incarnation,
+            "shown_row":g.shown_row, "change":g.change_spec.as_deref().and_then(|s|serde_json::from_str::<Value>(s).ok()),
+            "resolution_row":g.resolution_row,"resolution_code":g.resolution_code,"resolution_note":g.resolution_note,
+            "cited_excerpt": g.cited_excerpt, "ask_row": g.ask_row, "ask_text": g.ask_text, "reply_text": g.reply_text, "body": serde_json::from_str::<Value>(&g.body).unwrap_or(Value::Null)})
+}
+
+async fn read_request(State(state): State<AppState>, uri: Uri, headers: HeaderMap, Path(code): Path<String>) -> Response {
+    if let Some(r) = super::delegation_log::read_refusal(&state, &headers, &uri) { return r; }
+    let Some(g) = load(&state, &code) else { return forbid("request_not_found", "unknown request ID".into()); };
+    if let Some(session) = g.reply_session.as_deref() {
+        if let Err(e) = super::delegation_requests::resolve_session(&state, session) { return forbid("request_resolution_failed", e); }
+    }
+    match load(&state, &code) {
+        Some(g) => Json(json!({"request":request_view(&g),"measured":true,"n_considered":1})).into_response(),
+        None => forbid("request_not_found", "unknown request ID".into()),
+    }
+}
+
 /// `GET /api/delegation/grants`: newest first; readers as the delegation log.
 async fn list(State(state): State<AppState>, uri: Uri, headers: HeaderMap) -> Response {
     if let Some(r) = super::delegation_log::read_refusal(&state, &headers, &uri) {
         return r;
     }
-    let rows: Vec<GrantRow> = state.store.read().ok().map(|conn| {
-        conn.prepare(&format!("SELECT {COLS} FROM _amux_delegation_grants ORDER BY created_at DESC LIMIT 200"))
-            .and_then(|mut st| st.query_map([], map_row).map(|it| it.flatten().collect()))
-            .unwrap_or_default()
-    }).unwrap_or_default();
-    for g in &rows {
-        expire_if_due(&state, g);
+    let mut rows = match list_rows(&state) {
+        Ok(rows) => rows,
+        Err(e) => return forbid("request_read_failed", e),
+    };
+    let sessions: std::collections::BTreeSet<_> = rows.iter().filter(|g|g.status=="pending").filter_map(|g|g.reply_session.clone()).collect();
+    for session in sessions {
+        if let Err(e) = super::delegation_requests::resolve_session(&state,&session) { return forbid("request_resolution_failed",e); }
     }
-    let rows: Vec<Value> = rows.iter().map(|g| {
-        let status = if g.status == "pending" && now() > g.expires_at { "expired" } else { g.status.as_str() };
-        json!({"code": g.code, "actor": g.actor, "class": g.class, "action": g.action, "target": g.target, "sentence": g.sentence,
-            "status": status, "failure_reason": failure_reason(status), "expires_at": g.expires_at, "method": g.method, "path": g.path, "cited_row": g.evidence_row,
-            "target_incarnation": g.target_incarnation, "cite_spent_at": g.cite_spent_at,
-            "cited_excerpt": g.cited_excerpt, "ask_row": g.ask_row, "ask_text": g.ask_text, "reply_text": g.reply_text, "body": serde_json::from_str::<Value>(&g.body).unwrap_or(Value::Null)})
-    }).collect();
-    Json(json!({"grants": rows, "mode": mode_str(mode()), "measured": true, "n_considered": rows.len()})).into_response()
+    rows = match list_rows(&state) { Ok(rows) => rows, Err(e) => return forbid("request_read_failed",e) };
+    for g in &rows { expire_if_due(&state,g); }
+    let rows: Vec<Value> = rows.iter().map(request_view).collect();
+    let resolutions = match resolution_views(&state) {
+        Ok(rows) => rows,
+        Err(e) => return forbid("request_resolution_read_failed", e),
+    };
+    Json(json!({"requests": rows, "grants": rows, "resolutions":resolutions, "mode": mode_str(mode()), "measured": true, "n_considered": rows.len()+resolutions.len()})).into_response()
+}
+
+fn list_rows(state: &AppState) -> Result<Vec<GrantRow>, String> {
+    let conn = state.store.read().map_err(|e|e.to_string())?;
+    let mut st = conn.prepare(&format!("SELECT {COLS} FROM _amux_delegation_grants ORDER BY created_at DESC, rowid DESC LIMIT ?1")).map_err(|e|e.to_string())?;
+    let rows = st.query_map([LIST_LIMIT_ROWS],map_row).map_err(|e|e.to_string())?;
+    rows.collect::<rusqlite::Result<_>>().map_err(|e|e.to_string())
+}
+
+fn resolution_views(state: &AppState) -> Result<Vec<Value>, String> {
+    let conn = state.store.read().map_err(|e|e.to_string())?;
+    let mut st = conn.prepare("SELECT reply_row,request_id,session,code,note FROM _amux_delegation_resolutions ORDER BY reply_row DESC LIMIT ?1").map_err(|e|e.to_string())?;
+    let rows = st.query_map([LIST_LIMIT_ROWS], |r| Ok(json!({"reply_row":r.get::<_,i64>(0)?,"request_id":r.get::<_,Option<String>>(1)?,"session":r.get::<_,String>(2)?,"code":r.get::<_,String>(3)?,"note":r.get::<_,String>(4)?}))).map_err(|e|e.to_string())?;
+    rows.collect::<rusqlite::Result<_>>().map_err(|e|e.to_string())
 }
 
 /// `GET /api/delegation/whoami`: the caller as the server sees it (process
@@ -1088,6 +1136,8 @@ async fn whoami(headers: HeaderMap) -> Response {
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/delegation/grants", get(list))
+        .route("/api/delegation/requests", get(list).post(super::delegation_requests::create))
+        .route("/api/delegation/requests/{code}", get(read_request))
         .route("/api/delegation/whoami", get(whoami))
         .route("/api/delegation/grants/{code}/approve", post(approve))
         .route("/api/delegation/grants/{code}/deny", post(deny))
@@ -1098,25 +1148,6 @@ pub(crate) fn routes() -> Router<AppState> {
 mod tests {
     use super::*;
     use tower::ServiceExt;
-    use tracing::instrument::WithSubscriber;
-
-    #[derive(Clone, Default)]
-    struct GrantTestLogs(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for GrantTestLogs {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-    }
-
-    #[test]
-    fn codes_are_read_from_a_typed_line_in_any_case() {
-        assert_eq!(codes_in("ok — amux grant 7k3q please"), vec!["7K3Q".to_string()]);
-        assert_eq!(codes_in("amux grant 7K3Q and amux  grant ABCD"), vec!["7K3Q".to_string(), "ABCD".to_string()]);
-        assert!(codes_in("amux granted 7K3Q").is_empty());
-        assert!(codes_in("amux grant 7K3QX").is_empty(), "five characters is not a code");
-    }
 
     fn context(body: Value) -> Captured {
         Captured {
@@ -1124,48 +1155,6 @@ mod tests {
             armed: Arc::new(Mutex::new(None)), checked_env: Arc::new(Mutex::new(BTreeMap::new())),
             compare_failed: Arc::new(Mutex::new(false)),
         }
-    }
-
-    #[tokio::test]
-    async fn delegation_message_recorder_binds_the_ask_to_worker_identity() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        let state = test_state(tmp.path());
-        let row = super::super::session_verbs::cmd_hist_record_with_id(
-            &state,"test-desk","Max, may I enable yolo for test-dev-a?","session","mrpopo",true,
-            super::super::session_verbs::DeliveryMeta { delivery:Some(super::super::session_verbs::Delivery::Direct),..Default::default() }).await;
-        assert!(row > 0);
-        let conn = state.store.read().unwrap();
-        let raw: String = conn.query_row("SELECT cite_worker_ids FROM cmd_history WHERE id=?1",[row],|r|r.get(0)).unwrap();
-        let ids: BTreeMap<String,String> = serde_json::from_str(&raw).unwrap();
-        assert_eq!(ids.get("test-dev-a").map(String::as_str),Some("inc-test-dev-a"));
-    }
-
-    #[tokio::test]
-    async fn delegation_citation_insert_refuses_spent_pair_even_without_precheck() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        let state = test_state(tmp.path());
-        let cited = super::super::max_ref::Cited { row_id: 2, ask_row_id: 1, session: "test-desk".into(),
-            excerpt: "yes".into(), ask_text: "Max, may I enable yolo for test-dev-a?".into(), reply_text: "yes".into(),
-            target_incarnation: Some("inc-test-dev-a".into()) };
-        let c = context(json!({"toggle_yolo":true}));
-        CAPTURED.scope(c, async {
-            let code = begin_cited(&state,"mrpopo","mrpopo","set_config:toggle_yolo","test-dev-a",None,&cited).unwrap();
-            let other_ask = super::super::max_ref::Cited { ask_row_id: 3, ..cited.clone() };
-            let response = begin_cited(&state,"test-dev-lead","lead","set_config:toggle_yolo","test-dev-a",None,&other_ask).unwrap_err();
-            assert_eq!(response.status(),StatusCode::FORBIDDEN);
-            let bytes = axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap();
-            let body: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(body["code"],"cite_pair_spent","insert guard must name spent evidence, not code exhaustion");
-            assert_eq!(super::super::max_ref::pair_unspent(&state,&super::super::max_ref::Cite {
-                ask_row_id:Some(3),reply_row_id:Some(2),..Default::default() }),Err(super::super::max_ref::MaxRefRefusal::PairSpent));
-            let conn = state.store.read().unwrap();
-            let (spent, body): (Option<f64>,String) = conn.query_row(
-                "SELECT cite_spent_at,body FROM _amux_delegation_grants WHERE code=?1",[&code],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-            assert!(spent.is_some());
-            assert_eq!(body,json!({"toggle_yolo":true}).to_string());
-        }).await;
     }
 
     #[tokio::test]
@@ -1201,160 +1190,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegation_reply_spent_precheck_ignores_ask_actor_and_status() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        let state = test_state(tmp.path());
-        let c = context(json!({"toggle_yolo": true}));
-        let g = NewGrant { actor: "mrpopo", class: "mrpopo", action: "set_config:toggle_yolo", target: "test-dev-a", why: None, status: "pending", cited: None };
-        let (code, _) = insert(&state, &g, &c).unwrap();
-        assert!(set_status(&state, &code, "pending", "applying", "owner", Some(42)));
-        assert!(set_status(&state, &code, "applying", "failed", "owner", None));
-        let cite = super::super::max_ref::Cite { ask_row_id: Some(99), reply_row_id: Some(42), ..Default::default() };
-        assert_eq!(super::super::max_ref::pair_unspent(&state, &cite), Err(super::super::max_ref::MaxRefRefusal::PairSpent));
-    }
-
-    #[tokio::test]
-    async fn delegation_0128_legacy_replies_stay_spent_in_cite_and_pending_modes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        let conn = rusqlite::Connection::open(tmp.path().join("t.db")).unwrap();
-        crate::db::migrate::apply_history_through(&conn, 126);
-        conn.execute("INSERT INTO _amux_delegation_grants
-            (code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,status,evidence_row)
-            VALUES('old','mrpopo','mrpopo','x','fleet','PUT','/api/scope','{}','old',1,2,'failed',42),
-                  ('later','other','lead','x','fleet','PUT','/api/scope','{}','later',2,3,'undone',42),
-                  ('single','other','lead','x','fleet','PUT','/api/scope','{}','single',3,4,'denied',44)", []).unwrap();
-        drop(conn);
-        let logs = GrantTestLogs::default();
-        let sink = logs.clone();
-        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
-            .with_max_level(tracing::Level::WARN).with_writer(move || sink.clone()).finish();
-        // Store::open runs the shipped upgrade against the actual 0126 file.
-        let state = tracing::subscriber::with_default(subscriber, || test_state(tmp.path()));
-        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        assert!(logs.lines().any(|line| line.contains("WARN") && line.contains("delegation_legacy_reply_duplicates")
-            && line.contains("legacy_duplicates=1") && line.contains("n_considered=3")), "{logs}");
-        // An excluded row alone must also spend its reply: the partial index
-        // is deliberately narrower than the shared code-level spent check.
-        state.store.write(|conn| {
-            conn.execute("INSERT INTO _amux_delegation_grants
-                (code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,evidence_row,legacy_duplicate)
-                VALUES('excluded','other','lead','x','fleet','PUT','/api/scope','{}','excluded',4,5,46,1)", [])?;
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-        }).unwrap();
-        let c = context(json!({"toggle_yolo": true}));
-        let cited = super::super::max_ref::Cited { row_id: 42, ask_row_id: 41, session: "test-desk".into(),
-            excerpt: "yes".into(), ask_text: "old ask".into(), reply_text: "yes".into(),
-            target_incarnation: Some("inc-test-dev-a".into()) };
-        let pending = NewGrant { actor: "mrpopo", class: "mrpopo", action: "set_config:toggle_yolo", target: "test-dev-a", why: None, status: "pending", cited: None };
-        let (waiting, _) = insert(&state, &pending, &c).unwrap();
-        for reply in [42, 44, 46] {
-            let cited = super::super::max_ref::Cited { row_id: reply, ..cited.clone() };
-            let response = insert(&state, &NewGrant { cited: Some(&cited), status: "applying", why: None, ..pending }, &c).unwrap_err();
-            assert_eq!(response.status(), StatusCode::FORBIDDEN);
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let body: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(body["code"], "cite_pair_spent");
-            assert_eq!(claim_pending(&state, &waiting, "owner", Some(reply)).unwrap_err().0, "cite_pair_spent");
-            assert_eq!(super::super::max_ref::pair_unspent(&state, &super::super::max_ref::Cite {
-                reply_row_id: Some(reply), ..Default::default()
-            }), Err(super::super::max_ref::MaxRefRefusal::PairSpent));
-        }
-        assert_eq!(load(&state, &waiting).unwrap().status, "pending");
-        let fresh = super::super::max_ref::Cited { row_id: 48, ..cited };
-        insert(&state, &NewGrant { cited: Some(&fresh), status: "applying", why: None, ..pending }, &c).unwrap();
-        let response = insert(&state, &NewGrant { cited: Some(&fresh), status: "applying", why: None, ..pending }, &c).unwrap_err();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["code"], "cite_pair_spent");
-        assert_eq!(claim_pending(&state, &waiting, "owner", Some(48)).unwrap_err().0, "cite_pair_spent");
-        claim_pending(&state, &waiting, "owner", Some(50)).unwrap();
-        let (other, _) = insert(&state, &pending, &c).unwrap();
-        assert_eq!(claim_pending(&state, &other, "owner", Some(50)).unwrap_err().0, "cite_pair_spent");
-    }
-
-    #[tokio::test]
-    async fn delegation_pending_claim_names_spent_reply_without_changing_the_grant() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        let state = test_state(tmp.path());
-        let c = context(json!({"toggle_yolo": true}));
-        let pending = NewGrant { actor: "mrpopo", class: "mrpopo", action: "set_config:toggle_yolo", target: "test-dev-a", why: None, status: "pending", cited: None };
-        let (first, _) = insert(&state, &pending, &c).unwrap();
-        let (second, _) = insert(&state, &pending, &c).unwrap();
-        claim_pending(&state, &first, "owner", Some(42)).unwrap();
-        // The UNIQUE index also stops reuse, but without the claim guard its
-        // error maps to grant_claim_failed instead of the actionable refusal.
-        assert_eq!(claim_pending(&state, &second, "owner", Some(42)).unwrap_err().0, "cite_pair_spent");
-        let refused = load(&state, &second).unwrap();
-        assert_eq!(refused.status, "pending");
-        assert_eq!(refused.evidence_row, None);
-        assert_eq!(refused.cite_spent_at, None);
-        claim_pending(&state, &second, "owner", Some(43)).unwrap();
-        let claimed = load(&state, &second).unwrap();
-        assert_eq!(claimed.status, "applying");
-        assert_eq!(claimed.evidence_row, Some(43));
-        assert!(claimed.cite_spent_at.is_some());
-    }
-
-    #[tokio::test]
-    async fn delegation_reply_is_single_use_across_pending_and_cite_in_both_orders() {
-        for cite_first in [true, false] {
-            let tmp = tempfile::tempdir().unwrap();
-            let _home = crate::api::settings::test_env::set_home(tmp.path());
-            let state = test_state(tmp.path());
-            let c = context(json!({"toggle_yolo": true}));
-            let pending = NewGrant { actor: "mrpopo", class: "mrpopo", action: "set_config:toggle_yolo", target: "test-dev-a", why: None, status: "pending", cited: None };
-            let (code, _) = insert(&state, &pending, &c).unwrap();
-            let cited = super::super::max_ref::Cited { row_id: 42, ask_row_id: 41, session: "test-desk".into(), excerpt: "yes".into(), ask_text: "enable yolo for test-dev-a".into(), reply_text: "yes".into(), target_incarnation: Some("inc-test-dev-a".into()) };
-            let immediate = NewGrant { cited: Some(&cited), status: "applying", ..pending };
-            if cite_first {
-                insert(&state, &immediate, &c).unwrap();
-                let err = apply(&state, &code, "owner", Some(42)).await.unwrap_err();
-                assert_eq!(err.0, "cite_pair_spent");
-                assert_eq!(load(&state, &code).unwrap().status, "pending");
-            } else {
-                // Reserve at the same boundary apply uses, without executing
-                // an unrelated handler: qualification is independently tested.
-                claim_pending(&state, &code, "owner", Some(42)).unwrap();
-                let response = insert(&state, &immediate, &c).unwrap_err();
-                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-                let body: Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(body["code"], "cite_pair_spent");
-                let (other, _) = insert(&state, &NewGrant { cited: None, status: "pending", ..immediate }, &c).unwrap();
-                assert_eq!(claim_pending(&state, &other, "owner", Some(42)).unwrap_err().0, "cite_pair_spent");
-            }
-            let conn = state.store.read().unwrap();
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM _amux_delegation_grants WHERE evidence_row=42", [], |r| r.get(0)).unwrap();
-            assert_eq!(count, 1, "one reply can belong to only one grant in either mode");
-        }
-    }
-
-    #[tokio::test]
-    async fn delegation_one_owner_line_naming_two_pending_codes_funds_one_grant() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        let state = test_state(tmp.path());
-        let c = context(json!({"toggle_yolo": true}));
-        let g = NewGrant { actor: "mrpopo", class: "mrpopo", action: "set_config:toggle_yolo", target: "test-dev-a", why: None, status: "pending", cited: None };
-        let (first, _) = insert(&state, &g, &c).unwrap();
-        let (second, _) = insert(&state, &g, &c).unwrap();
-        let text = format!("amux grant {first} and amux grant {second}");
-        let row = put_row(&state, "test-phone", &text, "user", "", "direct", Some("remote"), now());
-        on_row(&state, row, &text).await;
-        assert_eq!(load(&state, &first).unwrap().status, "applied");
-        assert_eq!(load(&state, &second).unwrap().status, "pending");
-        assert!(load(&state, &first).unwrap().cite_spent_at.is_some());
-        // Re-observing the delivery cannot allocate its row to the other code.
-        on_row(&state, row, &text).await;
-        assert_eq!(load(&state, &second).unwrap().status, "pending");
-        let conn = state.store.read().unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM _amux_delegation_grants WHERE evidence_row=?1", [row], |r| r.get(0)).unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[tokio::test]
     async fn delegation_env_apply_holds_config_lock_across_handler_awaits() {
         let tmp = tempfile::tempdir().unwrap();
         let _home = crate::api::settings::test_env::set_home(tmp.path());
@@ -1375,61 +1210,6 @@ mod tests {
         for path in ["/api/env/apply", "/api/sessions", "/api/sessions/test-dev-a/config"] {
             let (status, body, _) = call(&app, "POST", path, None, json!({}), None).await;
             assert!(status.is_success(), "{body}");
-        }
-    }
-
-    /// B1 ruling (a): both grant-applicable env entrypoints fail before rename.
-    /// The grant/pair are already committed, so recovery requires a fresh ask.
-    #[tokio::test]
-    async fn delegation_failed_env_write_spends_pair_and_requires_owner_reask() {
-        for writer in ["write", "merge_plain"] {
-            let tmp = tempfile::tempdir().unwrap();
-            let _home = crate::api::settings::test_env::set_home(tmp.path());
-            let state = test_state(tmp.path());
-            let app = super::super::router(state.clone());
-            let path = tmp.path().join("sessions/test-dev-a.env");
-            let before = std::fs::read(&path).unwrap();
-            let cite = pair(&state, "test-desk", "Max, may I remove the dev tag from test-dev-a?", "yes");
-            let (method, route, body) = match writer {
-                "write" => ("PATCH", "/api/sessions/test-dev-a/config", json!({"tags": [], "cite": cite})),
-                "merge_plain" => ("PUT", "/api/scope", json!({"level": "worker", "name": "test-dev-a", "capability": "env", "value": {"CC_TAGS": ""}, "cite": cite})),
-                _ => unreachable!(),
-            };
-            // Task-local and cfg(test): no HTTP header or production env can
-            // enable this seam. Fail AFTER temp write/sync, BEFORE rename.
-            let logs = GrantTestLogs::default();
-            let sink = logs.clone();
-            let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
-                .with_max_level(tracing::Level::WARN).with_writer(move || sink.clone()).finish();
-            let (st, v, h) = super::super::session_verbs::TEST_ENV_RENAME_FAILURE.scope(path.clone(),
-                call(&app, method, route, Some("mrpopo"), body.clone(), None)).with_subscriber(subscriber).await;
-            assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{writer}: {v}");
-            assert_eq!(v["code"], "grant_apply_failed", "{writer}: {v}");
-            assert_eq!(v["error"], APPLY_FAILED_REASON);
-            assert!(v["error"].as_str().unwrap().contains("re-ask the owner"));
-            let code = h.get(GRANT_CODE_HEADER).unwrap().to_str().unwrap();
-            let g = load(&state, code).unwrap();
-            assert_eq!(g.status, "failed", "{writer}: failure must be durable");
-            let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-            assert!(logs.lines().any(|line| line.contains("WARN") && line.contains("delegation_grant_failed") && line.contains(code)),
-                "{writer}: failed grant must announce itself as a WARN with its code: {logs}");
-            assert!(g.cite_spent_at.is_some(), "{writer}: citation must stay spent");
-            assert_eq!(std::fs::read(&path).unwrap(), before, "{writer}: failed rename changed env bytes");
-            let citation = serde_json::from_value::<super::super::max_ref::Cite>(cite).unwrap();
-            assert_eq!(super::super::max_ref::pair_unspent(&state, &citation), Err(super::super::max_ref::MaxRefRefusal::PairSpent));
-            let (st, rows, _) = call(&app, "GET", "/api/delegation/grants", None, Value::Null, None).await;
-            assert_eq!(st, StatusCode::OK, "{rows}");
-            let rows = rows["grants"].as_array().unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0]["code"], code);
-            assert_eq!(rows[0]["status"], "failed");
-            assert_eq!(rows[0]["failure_reason"], APPLY_FAILED_REASON);
-            // The seam has ended; the SAME request is refused even though
-            // the env is unchanged and a normal write would now succeed.
-            let (st, v, _) = call(&app, method, route, Some("mrpopo"), body, None).await;
-            assert_eq!(st, StatusCode::FORBIDDEN, "{writer}: {v}");
-            assert_eq!(v["code"], "cite_pair_spent", "{writer}: {v}");
-            assert_eq!(std::fs::read(&path).unwrap(), before);
         }
     }
 
@@ -1577,33 +1357,6 @@ mod tests {
         assert!(std::fs::read_to_string(path).unwrap().contains("dev,owner-choice"));
     }
 
-    #[tokio::test]
-    async fn delegation_pending_grant_refuses_a_reused_name_on_apply_claim_and_undo() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        let state = test_state(tmp.path());
-        let c = context(json!({"toggle_yolo":true}));
-        let g = NewGrant { actor:"mrpopo",class:"mrpopo",action:"set_config:toggle_yolo",target:"test-dev-a",why:None,status:"pending",cited:None };
-        let (code,_) = insert(&state,&g,&c).unwrap();
-        let row = load(&state,&code).unwrap();
-        assert_eq!(row.target_incarnation.as_deref(),Some("inc-test-dev-a"));
-        let path = tmp.path().join("sessions/test-dev-a.env");
-        std::fs::rename(&path,tmp.path().join("sessions/renamed.env")).unwrap();
-        // A new worker with the released name has its own incarnation.
-        std::fs::write(&path,"CC_TAGS=dev\nCC_INCARNATION=other-worker\n").unwrap();
-        assert_eq!(not_applicable(&state,&row).unwrap().0,"grant_target_identity_changed");
-        let err = apply(&state,&code,"owner",None).await.unwrap_err();
-        assert_eq!(err.0,"grant_target_identity_changed");
-        assert!(set_status(&state,&code,"pending","applying","owner",None));
-        assert_eq!(claim_applying(&state,&code,"mrpopo","set_config:toggle_yolo","test-dev-a").unwrap_err(),"grant_target_identity_changed");
-        assert!(set_status(&state,&code,"applying","applied","owner",None));
-        let app = super::super::router(state.clone());
-        let (st,v,_) = call(&app,"POST",&format!("/api/delegation/grants/{code}/undo"),None,Value::Null,None).await;
-        assert_eq!(st,StatusCode::FORBIDDEN,"{v}");
-        assert_eq!(v["code"],"grant_target_identity_changed");
-        assert!(std::fs::read_to_string(&path).unwrap().contains("other-worker"));
-    }
-
     #[test]
     fn delegation_tags_normalize_array_and_string_with_one_grammar() {
         let wanted = vec!["dev".to_string(),"ops".to_string()];
@@ -1629,6 +1382,7 @@ mod tests {
         std::fs::write(dir.join("sessions/test-dev-a.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"dev\"\nCC_INCARNATION=\"inc-test-dev-a\"\n").unwrap();
         std::fs::write(dir.join("sessions/mrpopo.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads\"\nCC_INCARNATION=\"inc-mrpopo\"\n").unwrap();
         std::fs::write(dir.join("sessions/test-dev-lead.env"), "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads,dev\"\nCC_ORCHESTRATOR=\"1\"\nCC_INCARNATION=\"inc-test-dev-lead\"\n").unwrap();
+        std::fs::write(dir.join("sessions/test-desk.env"), "CC_INCARNATION=inc-test-desk\n").unwrap();
         AppState {
             store: std::sync::Arc::new(crate::db::Store::open(&dir.join("t.db")).unwrap()),
             started: std::time::Instant::now(),
@@ -1636,40 +1390,6 @@ mod tests {
             auth_token: None,
             reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
-    }
-
-    fn env_of(dir: &std::path::Path) -> String {
-        std::fs::read_to_string(dir.join("sessions/test-dev-a.env")).unwrap()
-    }
-
-    fn yolo_on(dir: &std::path::Path) -> bool {
-        let env = env_of(dir);
-        env.contains("dangerously") || env.contains("CC_AUTO_CONTINUE=\"1\"")
-    }
-
-    fn logged(dir: &std::path::Path, action: &str) -> usize {
-        std::fs::read_to_string(super::super::delegation_log::log_path(dir)).unwrap_or_default()
-            .lines().filter(|l| l.contains(&format!("\"action\":\"{action}\""))).count()
-    }
-
-    #[allow(clippy::too_many_arguments)] // test fixture: one cmd_history row's columns
-    fn put_row(state: &AppState, session: &str, text: &str, ty: &str, origin: &str, delivery: &str, po: Option<&str>, ts: f64) -> i64 {
-        let ids = super::super::max_ref::worker_bindings(text);
-        let (session, text, ty, origin, delivery, po) = (session.to_string(), text.to_string(), ty.to_string(), origin.to_string(), delivery.to_string(), po.map(str::to_string));
-        let id = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
-        let idw = id.clone();
-        state.store.write(move |c| {
-            crate::api::session_verbs::ensure_fleet_tables(c)?;
-            c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,process_origin,ts,cite_worker_ids) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                rusqlite::params![session, text, ty, origin, delivery, po, (ts * 1000.0) as i64,ids])?;
-            idw.store(c.last_insert_rowid(), std::sync::atomic::Ordering::SeqCst);
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-        }).unwrap();
-        id.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn pane(state: &AppState, session: &str, text: &str) -> i64 {
-        put_row(state, session, text, "user", "pane", "pane", None, now())
     }
 
     async fn call(app: &axum::Router, method: &str, path: &str, who: Option<&str>, body: Value, port: Option<u16>) -> (StatusCode, Value, HeaderMap) {
@@ -1685,223 +1405,6 @@ mod tests {
         let (st, h) = (res.status(), res.headers().clone());
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         (st, serde_json::from_slice(&bytes).unwrap_or(Value::Null), h)
-    }
-
-    fn latest_code(state: &AppState) -> String {
-        state.store.read().unwrap().query_row("SELECT code FROM _amux_delegation_grants ORDER BY created_at DESC LIMIT 1", [], |r| r.get(0)).unwrap()
-    }
-
-    /// A citation pair (review B4): mrpopo's ask into `session`, then Max's
-    /// reply typed in that session's pane.
-    fn pair(state: &AppState, session: &str, ask_text: &str, reply: &str) -> Value {
-        let ask = put_row(state, session, ask_text, "session", "mrpopo", "direct", None, now() - 60.0);
-        let reply = put_row(state, session, reply, "user", "pane", "pane", None, now() - 30.0);
-        json!({"ask_row_id": ask, "reply_row_id": reply})
-    }
-
-    /// Every row of every table undo restores, and every file under the home
-    /// except the store and the append-only audit log: the before-state.
-    /// (table -> row key -> row, file -> bytes).
-    type WholeState = (BTreeMap<String, BTreeMap<String, Map<String, Value>>>, BTreeMap<String, Vec<u8>>);
-
-    fn whole_state(state: &AppState, dir: &std::path::Path) -> WholeState {
-        let conn = state.store.read().unwrap();
-        let tables = TABLES.iter().map(|(t, k)| (t.to_string(), table_rows(&conn, t, k))).collect();
-        let mut files = BTreeMap::new();
-        let mut stack = vec![dir.to_path_buf()];
-        while let Some(d) = stack.pop() {
-            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-                let p = e.path();
-                let r = rel(dir, &p);
-                if r.starts_with("audit") || r.starts_with("t.db") || r.ends_with(".lock") {
-                    continue;
-                }
-                if p.is_dir() {
-                    stack.push(p);
-                } else {
-                    files.insert(r, std::fs::read(&p).unwrap());
-                }
-            }
-        }
-        (tables, files)
-    }
-
-    /// dev-lead 2026-10-19: a lead changes membership only through a cited
-    /// grant (its direct own-team-tag removal row is gone). Uncited: refused;
-    /// cited by the lead's own ask and Max's reply: applied, as a grant.
-    #[tokio::test]
-    async fn a_lead_changes_membership_only_through_a_cited_grant() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        let state = test_state(tmp.path());
-        let app = super::super::router(state.clone());
-        let (st, v, _) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("test-dev-lead"),
-            json!({"tags": []}), None).await;
-        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
-        assert!(env_of(tmp.path()).contains("CC_TAGS=\"dev\""), "uncited: nothing changed");
-        let ask = put_row(&state, "test-desk", "Max, may I remove the dev tag from test-dev-a?", "session", "test-dev-lead", "direct", None, now() - 60.0);
-        let reply = put_row(&state, "test-desk", "yes", "user", "pane", "pane", None, now() - 30.0);
-        let (st, v, h) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("test-dev-lead"),
-            json!({"tags": [], "cite": {"ask_row_id": ask, "reply_row_id": reply}}), None).await;
-        assert!(st.is_success(), "{st} {v}");
-        let code = h.get(GRANT_CODE_HEADER).and_then(|v| v.to_str().ok()).unwrap().to_string();
-        assert_eq!(load(&state, &code).unwrap().status, "applied");
-        assert!(!env_of(tmp.path()).contains("CC_TAGS=\"dev\""), "cited: the tag change applied: {}", env_of(tmp.path()));
-    }
-
-    /// Cite mode (the default): a valid citation pair applies the change at
-    /// once as a grant, stores BOTH texts, is logged and fed to the leads, and
-    /// undo restores the files exactly.
-    #[tokio::test]
-    async fn cite_mode_applies_at_once_and_undo_restores_exactly() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        let state = test_state(tmp.path());
-        let app = super::super::router(state.clone());
-        let before = config_pairs(&tmp.path().join("sessions/test-dev-a.env"));
-        let ask = "Max, may I turn on yolo for test-dev-a? It needs to run unattended tonight.";
-        let cite = pair(&state, "test-desk", ask, "yes, go ahead");
-        let (st, v, h) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("mrpopo"),
-            json!({"toggle_yolo": true, "cite": cite, "why": "Max asked"}), None).await;
-        assert!(st.is_success(), "{st} {v}");
-        let code = h.get(GRANT_CODE_HEADER).and_then(|v| v.to_str().ok()).unwrap().to_string();
-        let g = load(&state, &code).unwrap();
-        assert_eq!((g.status.as_str(), g.evidence_row, g.ask_row), ("applied", cite["reply_row_id"].as_i64(), cite["ask_row_id"].as_i64()));
-        assert_eq!(g.cited_excerpt.as_deref(), Some("yes, go ahead"));
-        // Review B4: the grant row stores both texts.
-        assert_eq!((g.ask_text.as_deref(), g.reply_text.as_deref()), (Some(ask), Some("yes, go ahead")));
-        assert!(yolo_on(tmp.path()));
-        assert_eq!(logged(tmp.path(), "grant:applied"), 1);
-        let line = std::fs::read_to_string(super::super::delegation_log::log_path(tmp.path())).unwrap();
-        assert!(line.contains("yes, go ahead") && line.contains("run unattended tonight"), "both texts are logged: {line}");
-        // Undo: a lead may not; mrpopo (or the owner) may; it restores exactly.
-        let (st, _, _) = call(&app, "POST", &format!("/api/delegation/grants/{code}/undo"), Some("test-dev-lead"), Value::Null, None).await;
-        assert_eq!(st, StatusCode::FORBIDDEN);
-        let (st, v, _) = call(&app, "POST", &format!("/api/delegation/grants/{code}/undo"), Some("mrpopo"), Value::Null, None).await;
-        assert!(st.is_success(), "{st} {v}");
-        assert_eq!(config_pairs(&tmp.path().join("sessions/test-dev-a.env")), before, "undo restores every configuration key exactly");
-        assert_eq!(load(&state, &code).unwrap().status, "undone");
-        assert_eq!(logged(tmp.path(), "grant:undone"), 1);
-        let (st, _, _) = call(&app, "POST", &format!("/api/delegation/grants/{code}/undo"), None, Value::Null, None).await;
-        assert_eq!(st, StatusCode::CONFLICT, "undo applies once");
-    }
-
-    #[tokio::test]
-    async fn undo_refuses_when_the_state_changed_since() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        let state = test_state(tmp.path());
-        let app = super::super::router(state.clone());
-        let cite = pair(&state, "test-desk", "Max, set isolated to true for test-dev-a", "yes");
-        let (st, v, h) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("mrpopo"), json!({"isolated": true, "cite": cite}), None).await;
-        assert!(st.is_success(), "{st} {v}");
-        let code = h.get(GRANT_CODE_HEADER).and_then(|v| v.to_str().ok()).unwrap().to_string();
-        super::super::session_verbs::EnvFile::merge_plain(&tmp.path().join("sessions/test-dev-a.env"), &[("CC_ISOLATED".into(), Some("".into()))]).unwrap();
-        let (st, v, _) = call(&app, "POST", &format!("/api/delegation/grants/{code}/undo"), None, Value::Null, None).await;
-        assert_eq!(st, StatusCode::CONFLICT, "{v}");
-        assert_eq!(v["code"], json!("grant_undo_conflict"));
-    }
-
-    #[tokio::test]
-    async fn cite_mode_refuses_own_lane_delivered_stale_and_missing_citations() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        let state = test_state(tmp.path());
-        let app = super::super::router(state.clone());
-        let ask = "Max, may I turn on yolo for test-dev-a?";
-        let own = pair(&state, "mrpopo", ask, "yes");
-        let desk = |text: &str, reply: &str| pair(&state, &format!("test-desk-{}", text.len() + reply.len()), text, reply);
-        let stamped = desk(ask, "[amux-origin: test-peer] yes");
-        let unrelated = desk("what time is lunch?", "noon");
-        let a = put_row(&state, "test-old", ask, "session", "mrpopo", "direct", None, now() - 90_100.0);
-        let r = put_row(&state, "test-old", "yes", "user", "pane", "pane", None, now() - 90_000.0);
-        let stale = json!({"ask_row_id": a, "reply_row_id": r});
-        let a = put_row(&state, "mrpopo", ask, "session", "mrpopo", "direct", None, now() - 20.0);
-        let r = put_row(&state, "mrpopo", "ok", "user", "", "direct", Some("remote-forwarded"), now() - 10.0);
-        let fwd = json!({"ask_row_id": a, "reply_row_id": r});
-        let lunch = pane(&state, "test-desk", "what time is lunch?");
-        for (cite, code) in [(json!(null), "cite_missing"), (json!({"row_id": lunch}), "cite_pair_required"), (own, "max_ref_own_lane"),
-            (stamped, "max_ref_not_human_typed"), (stale, "max_ref_stale"), (fwd, "max_ref_own_lane"), (unrelated, "cite_ask_missing_target")] {
-            let (st, v, _) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("mrpopo"), json!({"toggle_yolo": true, "cite": cite}), None).await;
-            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!(code)), "{cite}: {v}");
-        }
-        assert!(!yolo_on(tmp.path()));
-        let n: i64 = state.store.read().unwrap().query_row("SELECT COUNT(*) FROM _amux_delegation_grants", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, 0, "a refused citation creates no grant");
-    }
-
-    /// Review B2: every grant kind records its before-state and undo puts it
-    /// back byte for byte: env files, rules text (and the derived per-worker
-    /// rules), prefs rows (connectors), session_gates rows (gates), and the
-    /// whole group_config row, execution_policy and execution_rev included.
-    #[tokio::test]
-    async fn every_grant_kind_undoes_to_its_before_state_byte_for_byte() {
-        let kinds: Vec<(&str, &str, &str, Value, &str)> = vec![
-            ("env (yolo)", "PATCH", "/api/sessions/test-dev-a/config", json!({"toggle_yolo": true}), "turn on yolo for test-dev-a"),
-            ("connectors (prefs)", "PUT", "/api/scope", json!({"level": "worker", "name": "test-dev-a", "capability": "connectors",
-                "value": {"gmail": {"enabled": true}}}), r#"set connector to {"gmail":{"enabled":true}} for test-dev-a"#),
-            ("gates (session_gates)", "PUT", "/api/scope", json!({"level": "worker", "name": "test-dev-a", "capability": "gates",
-                "value": {"review": true}}), r#"set gate to {"review":true} for test-dev-a"#),
-            ("group gates (session_gates)", "PUT", "/api/scope", json!({"level": "group", "name": "dev", "capability": "gates",
-                "value": {"review": true}}), r#"set gate to {"review":true} for dev"#),
-            ("group config (group_config)", "PATCH", "/api/groups/dev/config", json!({"department": "eng", "goal": "ship it"}),
-                r#"set department to eng for dev; set goal to ship it for dev; set kpis to [] for dev; set human_cost to 0 for dev"#),
-            ("group rules (text)", "PUT", "/api/scope", json!({"level": "group", "name": "dev", "capability": "rules",
-                "value": "Dev: report blockers first."}), "set rules to Dev: report blockers first. for dev"),
-        ];
-        let mut failures = Vec::new();
-        for (name, method, path, body, ask) in kinds {
-            let tmp = tempfile::tempdir().unwrap();
-            let _home = crate::api::settings::test_env::set_home(tmp.path());
-            let state = test_state(tmp.path());
-            state.store.write(|c| {
-                c.execute("INSERT INTO group_config (name, department, goal, kpis, human_cost, updated, execution_policy, execution_rev) \
-                    VALUES ('dev','old','old goal','[]',3,1700000000,'{\"mode\":\"tasks\",\"max_executors\":2}',7)", [])?;
-                c.execute("INSERT INTO prefs (key, value) VALUES ('connectors:worker:test-dev-a', '{\"slack\":{\"enabled\":false}}')", [])?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-            }).unwrap();
-            let app = super::super::router(state.clone());
-            // Warm the fixture the way a live home already is: one owner env
-            // write (canonical quoting, the worker's minted CC_INCARNATION,
-            // which undo never touches) and one refused worker request (the
-            // identity layer's lazy `renames.version`). The before-state then
-            // differs from the after-state only by what the grant wrote.
-            let (st, v, _) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", None, json!({"desc": "fixture"}), None).await;
-            assert!(st.is_success(), "warm-up: {st} {v}");
-            let (st, _, _) = call(&app, method, path, Some("mrpopo"), body.clone(), None).await;
-            assert_eq!(st, StatusCode::FORBIDDEN, "{name}: uncited is refused");
-            let before = whole_state(&state, tmp.path());
-            let mut b = body.clone();
-            b["cite"] = pair(&state, "test-desk", &format!("Max, may I {ask}?"), "yes");
-            let (st, v, h) = call(&app, method, path, Some("mrpopo"), b, None).await;
-            let Some(code) = h.get(GRANT_CODE_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string).filter(|_| st.is_success()) else {
-                failures.push(format!("{name}: the grant did not apply: {st} {v}"));
-                continue;
-            };
-            let applied = whole_state(&state, tmp.path());
-            if applied == before {
-                failures.push(format!("{name}: the grant changed nothing, so its undo proves nothing"));
-                continue;
-            }
-            let (st, v, _) = call(&app, "POST", &format!("/api/delegation/grants/{code}/undo"), None, Value::Null, None).await;
-            if !st.is_success() || v["restored"].as_u64().unwrap_or(0) == 0 || v["byte_exact"] != json!(true) {
-                failures.push(format!("{name}: undo answered {st} {v}"));
-                continue;
-            }
-            let after = whole_state(&state, tmp.path());
-            if after.0 != before.0 {
-                failures.push(format!("{name}: table rows differ after undo:\n before {:?}\n after  {:?}", before.0, after.0));
-            }
-            for (f, bytes) in before.1.iter().chain(after.1.iter()) {
-                if before.1.get(f) != after.1.get(f) {
-                    failures.push(format!("{name}: {f} differs after undo: {:?} vs {:?}", before.1.get(f).map(|b| String::from_utf8_lossy(b).into_owned()),
-                        after.1.get(f).map(|b| String::from_utf8_lossy(b).into_owned())));
-                    let _ = bytes;
-                    break;
-                }
-            }
-        }
-        assert!(failures.is_empty(), "{} grant kinds not undone exactly:\n{}", failures.len(), failures.join("\n"));
     }
 
     /// Review B2: the table restore covers the kinds mrpopo can no longer
@@ -1933,74 +1436,109 @@ mod tests {
         assert_eq!(restore(&state, &json!({"env": {}, "text": {}, "tables": {}, "created": []})).unwrap().0, 0);
     }
 
-    /// Review B2: an undo with nothing to restore fails loudly and leaves the
-    /// grant applied, never {undone:true, restored:0}.
-    #[tokio::test]
-    async fn an_undo_with_nothing_restorable_fails_loudly() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        let state = test_state(tmp.path());
-        // N2: a hand-inserted applied grant must bind the same worker as a
-        // real grant. Missing legacy identity correctly fails closed earlier.
-        let incarnation = worker_identity("test-dev-a").unwrap().unwrap();
-        state.store.write(move |c| {
-            c.execute("INSERT INTO _amux_delegation_grants (code, actor, class, action, target, method, path, body, sentence, created_at, expires_at, status, changes, undoable, target_incarnation) \
-                VALUES ('ZZZZ','mrpopo','mrpopo','set_config:scope:connectors','test-dev-a','PUT','/api/scope','{}','amux grant ZZZZ',1,2,'applied', \
-                '{\"env\":{},\"text\":{},\"group_config\":{},\"created\":[]}',1,?1)", [&incarnation])?;
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-        }).unwrap();
-        let app = super::super::router(state.clone());
-        let (st, v, _) = call(&app, "POST", "/api/delegation/grants/ZZZZ/undo", None, Value::Null, None).await;
-        assert_eq!((st, v["ok"].clone(), v["code"].clone()), (StatusCode::CONFLICT, json!(false), json!("grant_undo_nothing_restorable")), "{v}");
-        assert_eq!(load(&state, "ZZZZ").unwrap().status, "applied", "the grant is not marked undone");
-    }
-
-    /// Passkey mode: grants are created PENDING; only the approval proof (a
-    /// non-local Remote owner) applies one. A forwarded Remote or an Outside
-    /// owner, and a forwarded or pane row, do not.
-    #[tokio::test]
-    async fn passkey_mode_needs_the_approval_proof() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        std::fs::write(tmp.path().join("amux.env"), format!("{MODE_KEY}=\"passkey\"\n")).unwrap();
-        let state = test_state(tmp.path());
-        assert_eq!(mode(), Mode::Passkey);
-        let _r = super::super::process_identity::test_support::set_resolver(std::sync::Arc::new(
-            super::super::process_identity::test_support::ByPort(std::collections::HashMap::from([
-                (41001u16, super::super::process_identity::Origin::Outside),
-                (41002u16, super::super::process_identity::Origin::Remote { forwarded: false }),
-                (41003u16, super::super::process_identity::Origin::Remote { forwarded: true }),
-            ]))));
-        let app = super::super::router(state.clone());
-        let (st, v, _) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("mrpopo"), json!({"toggle_yolo": true}), None).await;
-        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
-        let code = v["grant_code"].as_str().unwrap().to_string();
-        assert!(!yolo_on(tmp.path()), "pending, not applied");
-        for row in [pane(&state, "test-desk", &format!("amux grant {code}")),
-            put_row(&state, "test-desk", &format!("ok amux grant {code}"), "user", "", "direct", Some("remote-forwarded"), now()),
-            put_row(&state, "test-desk", &format!("go amux grant {code}"), "user", "", "direct", Some("outside"), now())] {
-            on_row(&state, row, &format!("amux grant {code}")).await;
-            assert_eq!(load(&state, &code).unwrap().status, "pending", "row {row} is not approval proof");
-        }
-        for port in [41001u16, 41003] {
-            let (st, v, _) = call(&app, "POST", &format!("/api/delegation/grants/{code}/approve"), None, Value::Null, Some(port)).await;
-            assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("grant_approve_requires_remote")), "port {port}: {v}");
-        }
-        let (st, v, _) = call(&app, "POST", &format!("/api/delegation/grants/{code}/approve"), None, Value::Null, Some(41002)).await;
-        assert!(st.is_success(), "a non-local Remote owner approves: {st} {v}");
-        assert_eq!(load(&state, &code).unwrap().status, "applied");
-        assert!(yolo_on(tmp.path()));
-        assert_eq!(logged(tmp.path(), "grant:applied"), 1, "applied once");
-        // A second pending grant approved by a non-local Remote owner SEND.
-        let (_, v, _) = call(&app, "PATCH", "/api/sessions/test-dev-a/config", Some("mrpopo"), json!({"isolated": true}), None).await;
-        let code2 = v["grant_code"].as_str().unwrap().to_string();
-        let row = put_row(&state, "test-desk", &format!("amux grant {code2}"), "user", "", "direct", Some("remote"), now());
-        on_row(&state, row, &format!("amux grant {code2}")).await;
-        assert_eq!(load(&state, &code2).unwrap().status, "applied", "a non-local Remote owner send approves");
-        assert_ne!(latest_code(&state), "");
-    }
-
     /// whoami reports each verdict, forwarded included.
+    async fn explicit_request(app: &Router, body: Value) -> String {
+        let (st,v,_) = call(app,"POST","/api/delegation/requests",Some("mrpopo"),json!({
+            "reply_session":"test-desk","method":"PATCH","path":"/api/sessions/test-dev-a/config","body":body}),None).await;
+        assert_eq!(st,StatusCode::ACCEPTED,"{v}");
+        v["request_id"].as_str().unwrap().to_string()
+    }
+
+    async fn record_reply(state: &AppState, text: &str, source: &str) -> i64 {
+        let session="test-desk".to_string();
+        let text=text.to_string();
+        let source=source.to_string();
+        let id=Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let out=id.clone();
+        state.store.write(move|c| {
+            c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,process_origin,ts,delegation_session_incarnation) VALUES(?1,?2,'user',?3,?4,?5,?6,'inc-test-desk')",
+                rusqlite::params![session,text,if source=="pane" {"pane"} else {""},if source=="pane" {"pane"} else {"direct"},source,(now()*1000.0) as i64])?;
+            out.store(c.last_insert_rowid(),std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        let id=id.load(std::sync::atomic::Ordering::SeqCst);
+        on_row(state,id).await;
+        id
+    }
+
+    #[tokio::test]
+    async fn explicit_request_pending_passkey_checks_proof_and_replays_exactly_once() {
+        let tmp=tempfile::tempdir().unwrap();
+        let _home=crate::api::settings::test_env::set_home(tmp.path());
+        let state=test_state(tmp.path());
+        std::fs::write(tmp.path().join("amux.env"),format!("{MODE_KEY}=passkey\n")).unwrap();
+        let _r=super::super::process_identity::test_support::set_resolver(Arc::new(
+            super::super::process_identity::test_support::ByPort(std::collections::HashMap::from([
+                (41001u16,super::super::process_identity::Origin::Outside),
+                (41002u16,super::super::process_identity::Origin::Remote{forwarded:false}),
+                (41003u16,super::super::process_identity::Origin::Remote{forwarded:true})]))));
+        let app=super::super::router(state.clone());
+        let id=explicit_request(&app,json!({"worktree_verify":"one"})).await;
+        for port in [41001u16,41003] {
+            let (st,v,_)=call(&app,"POST",&format!("/api/delegation/grants/{id}/approve"),None,Value::Null,Some(port)).await;
+            assert_eq!(st,StatusCode::FORBIDDEN,"{v}");
+            assert_eq!(v["code"],"grant_approve_requires_remote");
+        }
+        let (st,v,_)=call(&app,"POST",&format!("/api/delegation/grants/{id}/approve"),None,Value::Null,Some(41002)).await;
+        assert!(st.is_success(),"{v}");
+        assert_eq!(load(&state,&id).unwrap().status,"applied");
+        let id2=explicit_request(&app,json!({"worktree_verify":"two"})).await;
+        record_reply(&state,"yes","pane").await;
+        assert_eq!(load(&state,&id2).unwrap().status,"pending","pane lacks passkey proof");
+        let (st,v,_)=call(&app,"POST",&format!("/api/delegation/grants/{id2}/approve"),None,Value::Null,Some(41002)).await;
+        assert!(st.is_success(),"{v}");
+        let id3=explicit_request(&app,json!({"worktree_verify":"three"})).await;
+        let reply=record_reply(&state,"yes","remote").await;
+        let row=load(&state,&id3).unwrap();
+        assert_eq!(row.status,"applied");
+        assert_eq!(row.evidence_row,Some(reply));
+        on_row(&state,reply).await;
+        assert_eq!(load(&state,&id3).unwrap().status,"applied");
+        assert_eq!(state.store.read().unwrap().query_row("SELECT COUNT(*) FROM _amux_delegation_grants WHERE evidence_row=?1",[reply],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[tokio::test]
+    async fn explicit_request_failed_env_write_keeps_reply_spent_and_failure_visible() {
+        let tmp=tempfile::tempdir().unwrap();
+        let _home=crate::api::settings::test_env::set_home(tmp.path());
+        let state=test_state(tmp.path());
+        let app=super::super::router(state.clone());
+        let id=explicit_request(&app,json!({"worktree_verify":"one"})).await;
+        record_reply(&state,"yes","pane").await;
+        let path=tmp.path().join("sessions/test-dev-a.env");
+        let before=std::fs::read(&path).unwrap();
+        let body=json!({"worktree_verify":"one","request_id":id});
+        let (st,v,_)=super::super::session_verbs::TEST_ENV_RENAME_FAILURE.scope(path.clone(),
+            call(&app,"PATCH","/api/sessions/test-dev-a/config",Some("mrpopo"),body.clone(),None)).await;
+        assert_eq!(st,StatusCode::INTERNAL_SERVER_ERROR,"{v}");
+        assert_eq!(v["code"],"grant_apply_failed");
+        assert_eq!(std::fs::read(path).unwrap(),before);
+        let g=load(&state,&id).unwrap();
+        assert_eq!(g.status,"failed");
+        assert!(g.cite_spent_at.is_some());
+        assert!(request_view(&g)["failure_reason"].as_str().unwrap().contains("re-ask"));
+        let (st,v,_)=call(&app,"PATCH","/api/sessions/test-dev-a/config",Some("mrpopo"),body,None).await;
+        assert_eq!(st,StatusCode::FORBIDDEN,"{v}");
+        assert_eq!(v["code"],"cite_pair_spent");
+    }
+
+    #[tokio::test]
+    async fn explicit_request_claim_refuses_legacy_spent_reply_before_unique_index() {
+        let tmp=tempfile::tempdir().unwrap();
+        let _home=crate::api::settings::test_env::set_home(tmp.path());
+        let state=test_state(tmp.path());
+        let app=super::super::router(state.clone());
+        let id=explicit_request(&app,json!({"worktree_verify":"one"})).await;
+        let reply=record_reply(&state,"yes","pane").await;
+        state.store.write(move|c| {
+            c.execute("INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,status,evidence_row,legacy_duplicate) VALUES('old','old','old','old','old','PATCH','/old','{}','old',1,2,'undone',?1,1)",[reply])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        assert_eq!(claim_pending(&state,&id,"owner",Some(reply)).unwrap_err().0,"cite_pair_spent");
+        assert_eq!(load(&state,&id).unwrap().status,"pending");
+        assert!(load(&state,&id).unwrap().evidence_row.is_none());
+    }
+
     #[tokio::test]
     async fn whoami_returns_each_verdict() {
         let tmp = tempfile::tempdir().unwrap();

@@ -7899,9 +7899,8 @@ pub(crate) async fn cmd_hist_record_with_id(
     if session.is_empty() || text.is_empty() {
         return 0;
     }
-    // A typed `amux grant <code>` approves a pending grant (ai-config #160);
-    // the grant module decides whether this row qualifies.
-    let grant_text = (!super::delegation_grants::codes_in(text).is_empty()).then(|| text.to_string());
+    // Every typed reply reaches explicit request correlation, including a
+    // plain yes with no request ID (Max 2026-10-23, ai-config #160).
     if ctype == "user" {
         spawn_task_title(session, text);
     }
@@ -8048,7 +8047,7 @@ pub(crate) async fn cmd_hist_record_with_id(
                 && amux_core::board::reads_as_qualifier(&text)
                 && !amux_core::board::is_conversational_ack(&text)))
         && !amux_core::board::is_informational_query(&text);
-    let cite_worker_ids = (ctype == "session").then(|| super::max_ref::worker_bindings(&text));
+    let delegation_session_incarnation = super::rename_identity::incarnation(&crate::config::amux_home(), &session);
     let msg_row_id_w = msg_row_id.clone();
     let cap_session = session.clone();
     let truth_session = cap_session.clone();
@@ -8067,12 +8066,12 @@ pub(crate) async fn cmd_hist_record_with_id(
                 dup_prior_ts_w.store(pts, std::sync::atomic::Ordering::SeqCst);
             }
             conn.execute(
-                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, repeat_of, process_origin, cite_worker_ids) \
+                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, repeat_of, process_origin, delegation_session_incarnation) \
                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rusqlite::params![
                     text, ctype, session, now_ms, origin,
                     delivery, queued_at_ms, delivered_at_ms, submit_verdict, capture_pending,
-                    client_meta, repeat_of, process_origin, cite_worker_ids
+                    client_meta, repeat_of, process_origin, delegation_session_incarnation
                 ],
             )?;
             let row_id = conn.last_insert_rowid();
@@ -8084,6 +8083,8 @@ pub(crate) async fn cmd_hist_record_with_id(
             msg_row_id_w.store(row_id, std::sync::atomic::Ordering::SeqCst);
             conn.execute(
                 "DELETE FROM cmd_history WHERE session=?1 AND project_group IS NULL AND capture_pending=0 AND ts<?3 \
+                 AND NOT EXISTS (SELECT 1 FROM _amux_delegation_grants dg WHERE dg.shown_row=cmd_history.id OR dg.evidence_row=cmd_history.id OR (dg.reply_session=cmd_history.session AND dg.status='pending' AND cmd_history.id>=dg.shown_row)) \
+                 AND NOT EXISTS (SELECT 1 FROM _amux_delegation_resolutions dr WHERE dr.reply_row=cmd_history.id) \
                  AND NOT EXISTS (SELECT 1 FROM issues i WHERE i.id=cmd_history.card_id AND i.deleted IS NULL AND i.archived=0 AND i.status NOT IN ('done','verified','discarded','quarantined','cancelled')) AND id NOT IN \
                  (SELECT id FROM cmd_history WHERE session=?1 ORDER BY ts DESC LIMIT ?2)",
                 rusqlite::params![session, CMD_HIST_KEEP, now_ms-3_600_000],
@@ -8216,8 +8217,8 @@ pub(crate) async fn cmd_hist_record_with_id(
         }
     }
     let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
-    if let Some(t) = grant_text.filter(|_| row_id > 0) {
-        Box::pin(super::delegation_grants::on_row(state, row_id, &t)).await;
+    if row_id > 0 {
+        Box::pin(super::delegation_grants::on_row(state, row_id)).await;
     }
     row_id
 }

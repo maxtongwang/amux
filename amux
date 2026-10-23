@@ -6914,14 +6914,38 @@ ${BOLD}amux approvals${RESET}: standing approvals, asks the owner has already an
 USAGE
 }
 
-# Structured grants — keep failed decisions and owner recovery visible (PR18 B1).
+# Explicit approval requests — stable IDs and resolution notes (PR18 B1/B2).
 cmd_grant() {
-  local sub="${1:-list}" raw_json=0
+  local sub="${1:-list}" raw_json=0 endpoint="grants"
   shift 2>/dev/null || true
+  local me="${AMUX_WORKER:-${AMUX_SESSION:-}}"
+  local -a who=()
+  [[ -n "$me" ]] && who=(-H "X-Amux-Worker: $me")
   case "$sub" in
-    help|--help|-h) echo 'Usage: amux grant list [--json]  (recent grants, including failures)'; return 0 ;;
+    help|--help|-h)
+      echo 'Usage: amux grant list|requests [--json]; amux grant request --stdin'
+      echo 'Request JSON: {"reply_session":"...","method":"PATCH","path":"/api/sessions/.../config","body":{...}}'
+      echo 'Apply the exact mutation with {"request_id":"ID",...} after Max replies in the shown session.'
+      return 0 ;;
+    request)
+      [[ "${1:-}" == "--stdin" && $# -eq 1 ]] || die 'Usage: amux grant request --stdin'
+      _curl -sk -X POST -H 'Content-Type: application/json' ${who[@]+"${who[@]}"} --data-binary @- "$AMUX_API/api/delegation/requests" | python3 -c '
+import json,sys
+try:
+    d=json.load(sys.stdin)
+except (ValueError,OSError):
+    sys.exit("amux grant request: unreadable server response")
+if not isinstance(d,dict):
+    sys.exit("amux grant request: invalid server response")
+if not d.get("ok") or not d.get("request_id"):
+    sys.exit("amux grant request: %s: %s" % (d.get("code","invalid_response"),d.get("error",d)))
+print("%s  pending  %s" % (d["request_id"],d.get("sentence","")))
+print("Reply session: " + d.get("reply_session",""))
+'
+      return $? ;;
     list|ls) ;;
-    *) die 'Usage: amux grant list [--json]' ;;
+    requests) endpoint="requests" ;;
+    *) die 'Usage: amux grant list|requests [--json]; amux grant request --stdin' ;;
   esac
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -6929,10 +6953,7 @@ cmd_grant() {
       *) die "amux grant list: unknown argument '$1'" ;;
     esac
   done
-  local me="${AMUX_WORKER:-${AMUX_SESSION:-}}"
-  local -a who=()
-  [[ -n "$me" ]] && who=(-H "X-Amux-Worker: $me")
-  _curl -sk ${who[@]+"${who[@]}"} "$AMUX_API/api/delegation/grants" | GRANT_JSON="$raw_json" python3 -c '
+  _curl -sk ${who[@]+"${who[@]}"} "$AMUX_API/api/delegation/$endpoint" | GRANT_JSON="$raw_json" python3 -c '
 import json, os, sys
 try:
     d = json.load(sys.stdin)
@@ -6946,8 +6967,13 @@ else:
     print("%d recent grant(s), mode: %s" % (len(d["grants"]), d.get("mode", "unknown")))
     for g in d["grants"]:
         print("%s  %s  %s" % (g["code"], g["status"], g.get("sentence", "")))
+        if g.get("resolution_note"):
+            print("  %s: %s" % (g.get("resolution_code") or "pending",g["resolution_note"]))
         if g.get("failure_reason"):
             print("  " + g["failure_reason"])
+    for r in d.get("resolutions",[]):
+        if not r.get("request_id"):
+            print("reply %s in %s: %s: %s" % (r["reply_row"],r["session"],r["code"],r["note"]))
 '
 }
 

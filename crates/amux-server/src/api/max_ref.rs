@@ -1,47 +1,6 @@
-// Which Messages rows are the owner's own words: the row-qualification check for typed grant approvals — refs maxtongwang/ai-config#160 (piece b).
-// It also verifies cite mode's (ask, reply) citation pair (review B4); grants themselves live in api/delegation_grants.rs.
-//! HUMAN-TYPED. A `cmd_history` row is the owner's own words in exactly two
-//! shapes:
-//! - PANE: `type='user'`, `delivery='pane'`, `origin='pane'`, written only by
-//!   `pane_prompts::record` from the provider's UserPromptSubmit hook after it
-//!   ruled out an amux delivery (Claude Remote Control input lands here too).
-//! - OWNER SEND: `type='user'`, `delivery` `direct` or `queued`, and
-//!   `process_origin` `outside`, `remote` or `remote-forwarded` (migration 0124), proven by process
-//!   attribution (`process_identity`), not by a header the client chose.
-//!
-//! Every candidate then passes [`is_amux_delivery`], which refuses an `[amux`
-//! stamp, provider-injected text, and any text matching what amux delivered to
-//! that lane (the `pane_prompts` delivery ring and the lane's other
-//! `cmd_history` rows). A relayed text that matches exactly never counts.
-//!
-//! TWO RULES (dev-lead, 2026-10-17), each one function:
-//! - CITATION ([`cite_pair`], cite mode, the default; ruling dev-lead
-//!   2026-10-19, PR #18 review B4): a widening change cites a PAIR. (1) The
-//!   ask: a message the requesting agent sent into a session (a `session` row
-//!   whose origin is the agent) that names the target worker or layer AND
-//!   each exact directed change, including its value and target, through
-//!   [`names_changes`]. Examples: `enable yolo for worker-a`, `set flags to
-//!   --dangerously-skip-permissions for worker-a`, `remove dev from worker-a`.
-//!   Separate changes use separate clauses. Negated request clauses refuse;
-//!   values containing negation are literal operands, never request verbs.
-//!   (2) The reply: Max's own FIRST typed row in
-//!   that session after the ask (human-typed, not an amux delivery), within
-//!   [`ASK_REPLY_WINDOW_S`] of it and at most a day old. In the agent's own
-//!   lane only a non-local Remote owner send counts as the reply
-//!   ([`cite_source_allowed`]). Matching is whole words, computed; no model
-//!   judges relevance. Accepted limit (ai-config#136): another lane can mint
-//!   a pane row through its own `/report`; in cite mode that is mitigated by
-//!   the audit log, the leads feed and one-step undo, not prevented.
-//!   Dev-lead rulings 2026-10-23 (second B1 in the approval-reuse class):
-//!   the ask must be that actor's latest unanswered message in the session
-//!   before the reply. The reply's entire text must match
-//!   [`AFFIRMATIVE_REPLIES`] (case-insensitive, outer punctuation/space trimmed;
-//!   questions always refuse). A reply funds one grant globally, across asks,
-//!   actors, workers, routes and approval modes, including failed/undone grants.
-//! - APPROVAL ([`approval_source_allowed`], passkey mode): a pending grant is
-//!   approved only by an owner send from a NON-LOCAL Remote peer (the phone or
-//!   another device on the tailnet). A tailscale-serve forward over loopback
-//!   (`remote-forwarded`) is not owner proof.
+// Owner message identity and the single affirmative allowlist — explicit approval requests live in delegation_requests.rs.
+//! Human authorship is established from server-recorded pane/send provenance,
+//! never inferred from approval question text. Request IDs supply correlation.
 use super::pane_prompts;
 use super::AppState;
 
@@ -52,29 +11,7 @@ pub(crate) enum MaxRefRefusal {
     Stale,
     /// Human, but not an owner send from a non-local Remote peer.
     NotRemoteOwnerSend,
-    /// No citation was given.
-    Missing,
-    /// A citation in the actor's own lane that is not a non-local Remote owner send.
-    OwnLane,
-    /// A single quoted row instead of the (ask, reply) pair.
-    PairRequired,
-    /// Stable wire code `cite_pair_spent`; the spent unit is the reply alone.
-    PairSpent,
-    AskNotFound,
-    /// The ask row is not a message the requesting agent sent.
-    AskNotFromActor,
-    AskMissingTarget,
-    AskMissingSetting,
-    TargetIdentityChanged,
-    AskMissingChange,
-    AskNotLatest,
-    ReplyNotAffirmative,
-    /// The reply is in a different session from the ask.
-    WrongSession,
-    /// The reply is not Max's first typed message after the ask.
-    ReplyNotFirst,
-    /// The reply came more than [`ASK_REPLY_WINDOW_S`] after the ask.
-    ReplyOutsideWindow,
+
 }
 
 impl MaxRefRefusal {
@@ -84,21 +21,7 @@ impl MaxRefRefusal {
             Self::NotHumanTyped => "max_ref_not_human_typed",
             Self::Stale => "max_ref_stale",
             Self::NotRemoteOwnerSend => "max_ref_not_remote_owner_send",
-            Self::Missing => "cite_missing",
-            Self::OwnLane => "max_ref_own_lane",
-            Self::PairRequired => "cite_pair_required",
-            Self::PairSpent => "cite_pair_spent",
-            Self::AskNotFound => "cite_ask_not_found",
-            Self::AskNotFromActor => "cite_ask_not_from_actor",
-            Self::AskMissingTarget => "cite_ask_missing_target",
-            Self::AskMissingSetting => "cite_ask_missing_setting",
-            Self::TargetIdentityChanged => "cite_target_identity_changed",
-            Self::AskMissingChange => "cite_ask_missing_change",
-            Self::AskNotLatest => "cite_ask_not_latest",
-            Self::ReplyNotAffirmative => "cite_reply_not_affirmative",
-            Self::WrongSession => "cite_reply_wrong_session",
-            Self::ReplyNotFirst => "cite_reply_not_first",
-            Self::ReplyOutsideWindow => "cite_reply_outside_window",
+
         }
     }
 }
@@ -115,17 +38,14 @@ pub(crate) enum HumanSource {
 }
 
 #[derive(Debug, Clone)]
-struct Row {
-    id: i64,
-    session: String,
-    text: String,
-    ts: f64,
-    source: Option<HumanSource>,
-    ctype: String,
-    origin: String,
-    /// process_origin = remote: a non-local peer (owner proof); never the forwarded verdict.
-    remote: bool,
-    worker_ids: String,
+pub(crate) struct Row {
+    pub(crate) id: i64,
+    pub(crate) session: String,
+    pub(crate) text: String,
+    pub(crate) ts: f64,
+    pub(crate) source: Option<HumanSource>,
+    pub(crate) remote: bool,
+    pub(crate) incarnation: Option<String>,
 }
 
 /// Which human shape a row has, if any (see the module comment).
@@ -144,7 +64,7 @@ fn human_source(ctype: &str, origin: &str, delivery: &str, process_origin: &str)
     None
 }
 
-const ROW_COLS: &str = "id, session, text, COALESCE(type,''), COALESCE(origin,''), COALESCE(delivery,''), COALESCE(process_origin,''), ts, COALESCE(cite_worker_ids,'{}')";
+const ROW_COLS: &str = "id, session, text, COALESCE(type,''), COALESCE(origin,''), COALESCE(delivery,''), COALESCE(process_origin,''), ts, delegation_session_incarnation";
 
 fn rows(state: &AppState, sql_where: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<Row>, String> {
     let conn = state.store.read().map_err(|e| e.to_string())?;
@@ -160,9 +80,7 @@ fn rows(state: &AppState, sql_where: &str, params: &[&dyn rusqlite::ToSql]) -> R
                 ts: r.get::<_, i64>(7)? as f64 / 1000.0,
                 source: human_source(&ctype, &origin, &delivery, &po),
                 remote: po == super::process_identity::REMOTE_DIRECT,
-                ctype,
-                origin,
-                worker_ids: r.get(8)?,
+                incarnation: r.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -238,51 +156,6 @@ fn row_qualifies_at(state: &AppState, row_id: i64, now: f64) -> Result<(), MaxRe
     Ok(())
 }
 
-/// A citation (ruling, dev-lead 2026-10-19, review B4): the PAIR of
-/// (1) `ask_row_id`, the asking message the requesting agent sent into a
-/// session, naming the target and the setting in plain words, and
-/// (2) `reply_row_id`, Max's own FIRST typed message in that same session
-/// after it, within [`ASK_REPLY_WINDOW_S`]. A single quoted row (`row_id`, or
-/// `session` and `time`) no longer qualifies.
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Default)]
-pub(crate) struct Cite {
-    #[serde(default)]
-    pub ask_row_id: Option<i64>,
-    #[serde(default)]
-    pub reply_row_id: Option<i64>,
-    /// The retired single-row forms, kept only to answer them precisely.
-    #[serde(default)]
-    pub row_id: Option<i64>,
-    #[serde(default)]
-    pub session: Option<String>,
-}
-
-/// The pair a citation resolved to. `row_id`/`excerpt` are the reply's.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Cited {
-    pub row_id: i64,
-    pub session: String,
-    pub excerpt: String,
-    pub ask_row_id: i64,
-    pub ask_text: String,
-    pub reply_text: String,
-    pub target_incarnation: Option<String>,
-}
-
-/// What the ask must name: the target (any one spelling) and EACH setting
-/// (any one spelling per setting). Built by `delegation::cite_terms`.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct CiteTerms {
-    pub target: Vec<String>,
-    pub settings: Vec<Vec<String>>,
-    /// Worker name at request time; the ask must carry the same incarnation.
-    pub worker: Option<String>,
-    /// Each changed tag with its required direction (add/remove).
-    pub tag_changes: Vec<(String, String)>,
-    /// Each exact directed request; any spelling per request, all requests required.
-    pub changes: Vec<Vec<ChangePhrase>>,
-}
-
 /// The reply must come within this long after the ask.
 pub(crate) const ASK_REPLY_WINDOW_S: f64 = 7_200.0;
 
@@ -293,7 +166,7 @@ const AFFIRMATIVE_REPLIES: &[&str] = &[
     "yes", "y", "yep", "approve", "approved", "go ahead", "do it", "ok to proceed", "yes, go ahead",
 ];
 
-fn reply_is_affirmative(text: &str) -> bool {
+pub(crate) fn reply_is_affirmative(text: &str) -> bool {
     if text.contains('?') { return false; }
     let normalized = text.trim_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
         .to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
@@ -308,181 +181,12 @@ pub(crate) fn cite_source_allowed(actor: &str, session: &str, source: HumanSourc
 }
 
 /// Max's own typed row in its lane: human-typed, not an amux delivery.
-fn typed_by_max(state: &AppState, row: &Row) -> Option<HumanSource> {
+pub(crate) fn typed_by_max(state: &AppState, row: &Row) -> Option<HumanSource> {
     let source = row.source?;
     (!is_amux_delivery(state, &row.session, row.id, &row.text, row.ts, source)).then_some(source)
 }
 
-/// `name` appears in `text` as a whole name: case-insensitive, and not part
-/// of a longer name (no letter, digit, `-`, `_` or `.` on either side).
-pub(crate) fn names_exactly(text: &str, name: &str) -> bool {
-    let (t, n) = (text.to_lowercase(), name.trim().to_lowercase());
-    if n.is_empty() {
-        return false;
-    }
-    let part = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '.');
-    t.match_indices(&n).any(|(i, _)| {
-        let before = t[..i].chars().next_back();
-        let after = t[i + n.len()..].chars().next();
-        !before.is_some_and(part) && !after.is_some_and(part)
-    })
-}
-
-/// A worker name containing a tag/setting word is not a mention of that
-/// setting. Mask exact target names before checking the requested settings.
-fn setting_text(text: &str, targets: &[String]) -> String {
-    let mut text = text.to_lowercase();
-    for target in targets {
-        let target = target.to_lowercase();
-        if target.is_empty() { continue; }
-        let part = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '.');
-        let spans: Vec<_> = text.match_indices(&target).filter(|(i, _)| {
-            !text[..*i].chars().next_back().is_some_and(part)
-                && !text[*i + target.len()..].chars().next().is_some_and(part)
-        }).map(|(i, _)| i..i + target.len()).collect();
-        for span in spans.into_iter().rev() { text.replace_range(span, " "); }
-    }
-    text
-}
-
-/// Lowercase, `-`/`_`/`:` as spaces, whitespace collapsed.
-fn plain(s: &str) -> String {
-    s.to_lowercase().chars().map(|c| if matches!(c, '-' | '_' | ':') { ' ' } else { c }).collect::<String>()
-        .split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// `phrase` appears in `text` as whole words (a plural `s` allowed), with
-/// `-`, `_` and spaces interchangeable: "auto-continue" names auto continue.
-pub(crate) fn names_phrase(text: &str, phrase: &str) -> bool {
-    let (t, p) = (plain(text), plain(phrase));
-    if p.is_empty() {
-        return false;
-    }
-    t.match_indices(&p).any(|(i, _)| {
-        let before = t[..i].chars().next_back();
-        let rest = &t[i + p.len()..];
-        let rest = rest.strip_prefix("es").or_else(|| rest.strip_prefix('s')).filter(|r| !r.starts_with(char::is_alphanumeric)).unwrap_or(rest);
-        !before.is_some_and(char::is_alphanumeric) && !rest.starts_with(char::is_alphanumeric)
-    })
-}
-
-/// Server-derived identities at ASK recording time. Missing/legacy bindings
-/// fail closed at citation time; a name is never rebound to its new holder.
-pub(crate) fn worker_bindings(text: &str) -> String {
-    let home = crate::config::amux_home();
-    let mut ids = std::collections::BTreeMap::new();
-    // Look up only names in this message, never scan the fleet or mint an id.
-    // Creation/legacy migration owns identity assignment. Missing ids fail closed.
-    let text = text.to_lowercase();
-    for name in text.split(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))) {
-        let name = name.trim_end_matches('.');
-        if !super::session_verbs::valid_session_name(name) { continue; }
-        if let Some(id) = super::rename_identity::incarnation(&home, name) {
-            ids.insert(name.to_string(), id);
-        }
-    }
-    serde_json::to_string(&ids).expect("string map serializes")
-}
-
-/// A readable request plus its literal operand. Grammar/name casing is flexible;
-/// the value's bytes (including whitespace and case) must match exactly.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ChangePhrase {
-    pub text: String,
-    literal: Option<String>,
-}
-
-impl From<String> for ChangePhrase {
-    fn from(text: String) -> Self { Self { text, literal: None } }
-}
-
-impl ChangePhrase {
-    fn with_value(text: String, literal: String) -> Self { Self { text, literal: Some(literal) } }
-
-    fn pattern(&self) -> String {
-        let grammar = |s: &str| regex::escape(s).replace(' ', r"\s+");
-        match self.literal.as_deref().filter(|value| !value.is_empty()) {
-            Some(value) => self.text.split(value).map(grammar).collect::<Vec<_>>()
-                .join(&format!("(?-i:{})", regex::escape(value))),
-            None => grammar(&self.text),
-        }
-    }
-}
-
-/// One grammar for EVERY cite action. Each alternative is an entire directed
-/// request including its target and exact value, never independent keywords.
-/// Semicolons/newlines/punctuation bound negation scope; conjunctions do not
-/// erase a negation. Negated clauses cannot authorize a change.
-/// This is deliberately bounded syntax, not a natural-language consent model.
-pub(crate) fn names_changes(text: &str, changes: &[Vec<ChangePhrase>]) -> bool {
-    let clauses = regex::Regex::new(r"[;?!\n]").expect("clause grammar");
-    let negation = regex::Regex::new(r"(?i)\b(?:no|not|never|without|except|unless|leave|avoid|cannot|(?:do|does|did|ca|could|wo|would|should|is|are|was|were|has|have|had|must|need|sha)n['’]?t)\b").expect("negation grammar");
-    !changes.is_empty() && changes.iter().all(|alternatives| {
-        if alternatives.is_empty() { return false; }
-        let choices = alternatives.iter().map(ChangePhrase::pattern).collect::<Vec<_>>().join("|");
-        let pattern = format!(r"(?i)(?:^|[^\p{{L}}\p{{N}}_.-])(?P<change>{choices})(?:$|[^\p{{L}}\p{{N}}_.-])");
-        regex::Regex::new(&pattern).is_ok_and(|request| request.captures_iter(text).any(|captures| {
-            // Inspect around the request itself: delimiter characters matched
-            // for whole-name boundaries must remain in the clause slices.
-            let matched = captures.name("change").expect("request capture");
-            let before = clauses.split(&text[..matched.start()]).last().unwrap_or("");
-            let after = clauses.split(&text[matched.end()..]).next().unwrap_or("");
-            !negation.is_match(before) && !negation.is_match(after)
-        }))
-    })
-}
-
-/// All action builders use the same directed setting/value forms. Strings
-/// accept literal text or JSON quoting; objects/arrays use compact JSON.
-pub(crate) fn setting_requests(settings: &[String], targets: &[String], value: &serde_json::Value) -> Vec<ChangePhrase> {
-    let literal = value.as_str().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| value.to_string());
-    let mut forms = Vec::new();
-    for setting in settings {
-        for target in targets {
-            for setting in [setting.clone(), format!("the {setting}")] {
-                for (relation, prefix) in ["for", "on"].into_iter().flat_map(|relation|
-                    ["", "the ", "worker ", "group "].into_iter().map(move |prefix| (relation, prefix))) {
-                    let tail = format!("{relation} {prefix}{target}");
-                    forms.push(ChangePhrase::with_value(format!("set {setting} to {literal} {tail}"), literal.clone()));
-                    forms.push(ChangePhrase::with_value(format!("set {setting} {tail} to {literal}"), literal.clone()));
-                    if value.is_string() {
-                        forms.push(ChangePhrase::with_value(format!("set {setting} to {value} {tail}"), value.to_string()));
-                        forms.push(ChangePhrase::with_value(format!("set {setting} {tail} to {value}"), value.to_string()));
-                    }
-                    if let Some(enabled) = value.as_bool() {
-                        for verb in if enabled { ["enable", "turn on", "allow"] } else { ["disable", "turn off", "disallow"] } {
-                            forms.push(format!("{verb} {setting} {tail}").into());
-                        }
-                    }
-                    if value.is_null() { forms.push(format!("remove {setting} {tail}").into()); }
-                    if value.as_str() == Some("") { forms.push(format!("clear {setting} {tail}").into()); }
-                }
-            }
-        }
-    }
-    forms
-}
-
-fn tag_requests(targets: &[String], tag: &str, direction: &str) -> Vec<ChangePhrase> {
-    let preposition = if direction == "add" { "to" } else { "from" };
-    targets.iter().flat_map(|target| ["", "the "].into_iter().flat_map(move |article| {
-        ["", " tag", " tags"].into_iter().flat_map(move |noun| {
-            ["", "worker "].into_iter().map(move |worker| format!("{direction} {article}{tag}{noun} {preposition} {worker}{target}").into())
-        })
-    })).collect()
-}
-
-/// Tags use the same shared matcher and negation rule as every setting.
-pub(crate) fn tag_change_requests(targets: &[String], changes: &[(String, String)]) -> Vec<Vec<ChangePhrase>> {
-    changes.iter().map(|(tag, direction)| tag_requests(targets, tag, direction)).collect()
-}
-
-/// Resolve and verify a citation pair for `actor` asking for `terms`.
-pub(crate) fn cite_pair(state: &AppState, cite: Option<&Cite>, actor: &str, terms: &CiteTerms) -> Result<Cited, MaxRefRefusal> {
-    cite_pair_at(state, cite, actor, terms, crate::config::now_f64())
-}
-
-fn one(state: &AppState, id: i64) -> Result<Option<Row>, MaxRefRefusal> {
+pub(crate) fn one(state: &AppState, id: i64) -> Result<Option<Row>, MaxRefRefusal> {
     rows(state, "id=?1", &[&id]).map(|r| r.into_iter().next()).map_err(|_| MaxRefRefusal::NoSuchRow)
 }
 
@@ -492,163 +196,15 @@ pub(crate) fn reply_spent(conn: &rusqlite::Connection, reply: i64) -> rusqlite::
     conn.query_row("SELECT EXISTS(SELECT 1 FROM _amux_delegation_grants WHERE evidence_row=?1)", [reply], |r| r.get(0))
 }
 
-/// A missing ask cannot bypass the global reply-consumption check.
-pub(crate) fn pair_unspent(state: &AppState, cite: &Cite) -> Result<(), MaxRefRefusal> {
-    let Some(reply) = cite.reply_row_id else { return Ok(()) };
-    let conn = state.store.read().map_err(|_| MaxRefRefusal::NoSuchRow)?;
-    let spent = reply_spent(&conn, reply).map_err(|_| MaxRefRefusal::NoSuchRow)?;
-    if spent { return Err(MaxRefRefusal::PairSpent); }
-    Ok(())
-}
-
-fn cite_pair_at(state: &AppState, cite: Option<&Cite>, actor: &str, terms: &CiteTerms, now: f64) -> Result<Cited, MaxRefRefusal> {
-    let cite = cite.ok_or(MaxRefRefusal::Missing)?;
-    pair_unspent(state, cite)?;
-    let (Some(ask_id), Some(reply_id)) = (cite.ask_row_id, cite.reply_row_id) else {
-        return Err(if cite.row_id.is_some() || cite.session.is_some() || cite.ask_row_id.is_some() || cite.reply_row_id.is_some() {
-            MaxRefRefusal::PairRequired
-        } else {
-            MaxRefRefusal::Missing
-        });
-    };
-    // (1) The ask: a message the actor itself sent into the session.
-    let ask = one(state, ask_id)?.ok_or(MaxRefRefusal::AskNotFound)?;
-    if ask.ctype != "session" || ask.origin != actor {
-        return Err(MaxRefRefusal::AskNotFromActor);
-    }
-    if !terms.target.iter().any(|n| names_exactly(&ask.text, n)) {
-        return Err(MaxRefRefusal::AskMissingTarget);
-    }
-    let settings_text = setting_text(&ask.text, &terms.target);
-    if !terms.settings.iter().all(|alts| alts.iter().any(|p| names_phrase(&settings_text, p))) {
-        return Err(MaxRefRefusal::AskMissingSetting);
-    }
-    if !names_changes(&ask.text, &terms.changes) {
-        return Err(MaxRefRefusal::AskMissingChange);
-    }
-    let target_incarnation = if let Some(worker) = &terms.worker {
-        let ids: std::collections::BTreeMap<String, String> = serde_json::from_str(&ask.worker_ids).unwrap_or_default();
-        let current = super::rename_identity::incarnation(&crate::config::amux_home(), worker);
-        if current.is_none() || ids.get(worker) != current.as_ref() {
-            return Err(MaxRefRefusal::TargetIdentityChanged);
-        }
-        current
-    } else { None };
-    // (2) The reply: Max's own typed row in the same session.
-    let reply = one(state, reply_id)?.ok_or(MaxRefRefusal::NoSuchRow)?;
-    if reply.session != ask.session {
-        return Err(MaxRefRefusal::WrongSession);
-    }
-    let source = typed_by_max(state, &reply).ok_or(MaxRefRefusal::NotHumanTyped)?;
-    if !cite_source_allowed(actor, &reply.session, source, reply.remote) {
-        return Err(MaxRefRefusal::OwnLane);
-    }
-    if now - reply.ts > MAX_REF_MAX_AGE_S {
-        return Err(MaxRefRefusal::Stale);
-    }
-    if reply.id <= ask.id || reply.ts < ask.ts {
-        return Err(MaxRefRefusal::ReplyNotFirst);
-    }
-    if reply.ts - ask.ts > ASK_REPLY_WINDOW_S {
-        return Err(MaxRefRefusal::ReplyOutsideWindow);
-    }
-    // FIRST: no typed row of Max's sits between the ask and the reply. A
-    // bounded read that comes back full cannot prove that, so it refuses.
-    let between = rows(state, "session=?1 AND id>?2 AND id<?3 ORDER BY id", &[&ask.session, &ask.id, &reply.id])
-        .map_err(|_| MaxRefRefusal::ReplyNotFirst)?;
-    if between.len() as i64 >= ROW_LIMIT || between.iter().any(|r| typed_by_max(state, r).is_some()) {
-        return Err(MaxRefRefusal::ReplyNotFirst);
-    }
-    // Every later session message from the actor supersedes its prior ask;
-    // no attempt to infer which settings an intervening message concerns.
-    if between.iter().any(|r| r.ctype == "session" && r.origin == actor) {
-        return Err(MaxRefRefusal::AskNotLatest);
-    }
-    if !reply_is_affirmative(&reply.text) {
-        return Err(MaxRefRefusal::ReplyNotAffirmative);
-    }
-    Ok(Cited {
-        row_id: reply.id,
-        session: reply.session,
-        excerpt: reply.text.chars().take(200).collect(),
-        ask_row_id: ask.id,
-        ask_text: ask.text.chars().take(2000).collect(),
-        reply_text: reply.text.chars().take(2000).collect(),
-        target_incarnation,
-    })
-}
-
-#[cfg(test)]
-fn test_tag_change(text: &str, target: &str, tag: &str, direction: &str) -> bool {
-    names_changes(text, &tag_change_requests(&[target.into()], &[(tag.into(), direction.into())]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn citation_change_with_no_alternatives_cannot_match_empty_text_or_punctuation() {
-        let valid = setting_requests(&["yolo".into()], &["test-alpha".into()], &serde_json::json!(true));
-        let ask = "enable yolo for test-alpha?";
-        assert!(names_changes(ask, std::slice::from_ref(&valid)));
-        // Without the empty-list guard, joining zero alternatives builds an
-        // empty regex branch that matches empty text or a punctuation boundary.
-        for text in ["", "?", ask] {
-            assert!(!names_changes(text, &[vec![]]), "empty alternatives accepted {text:?}");
-            assert!(!names_changes(text, &[valid.clone(), vec![]]), "an empty requirement was skipped for {text:?}");
-        }
-    }
-
-    #[test]
-    fn delegation_tag_change_names_target_tag_and_direction_with_optional_tag_noun() {
-        for ask in [
-            "Max, may I add leads to review-dev-b?",
-            "Max, may I add the leads tag to worker review-dev-b?",
-            "Max, may I add leads tags to review-dev-b?",
-        ] {
-            assert!(test_tag_change(ask, "review-dev-b", "leads", "add"), "{ask}");
-        }
-        for ask in [
-            "remove leads from review-dev-b",
-            "remove the leads tag from review-dev-b",
-        ] {
-            assert!(test_tag_change(ask, "review-dev-b", "leads", "remove"), "{ask}");
-        }
-        for ask in [
-            "remove leads from review-dev-b",
-            "add ops to review-dev-b",
-            "review-dev-b is busy; add leads to review-dev-a",
-            "add leads to review-dev-b-other",
-            "review-dev-b has leads",
-            "add review-dev-b to leads",
-            "don't add leads to review-dev-b",
-            "do not add leads to review-dev-b and add leads to review-dev-b",
-            "add leads to review-dev-b and leave review-dev-b alone",
-        ] {
-            assert!(!test_tag_change(ask, "review-dev-b", "leads", "add"), "{ask}");
-        }
-    }
-
-    #[test]
-    fn citation_change_grammar_preserves_negation_clause_boundaries() {
-        let changes = vec![setting_requests(&["yolo".into()], &["test-alpha".into()], &serde_json::json!(true))];
-        for good in [
-            "Max, may I enable yolo for test-alpha? Reply yes or no.",
-            "Do not change the other worker; enable yolo for test-alpha?",
-            "I want to enable yolo for test-alpha?",
-            "May I enable yolo for test-alpha! No other worker should change.",
-        ] {
-            assert!(names_changes(good, &changes), "{good}");
-        }
-        for bad in [
-            "I don't want to enable yolo for test-alpha?",
-            "I can't enable yolo for test-alpha?",
-            "I shouldn't enable yolo for test-alpha?",
-            "enable yolo for test-alpha, no yolo",
-            "don't enable yolo for test-alpha and enable yolo for test-alpha",
-        ] {
-            assert!(!names_changes(bad, &changes), "{bad}");
+    fn approval_reply_requires_explicit_affirmative_text() {
+        for yes in AFFIRMATIVE_REPLIES { assert!(reply_is_affirmative(yes)); }
+        for no in ["no", "yes?", "yes, don't proceed", "yes but not yet", "yes yes", "rather than enable X"] {
+            assert!(!reply_is_affirmative(no), "{no}");
         }
     }
 
@@ -779,23 +335,6 @@ mod tests {
         assert_eq!(q(&st, edge), Ok(()), "the max age itself is allowed");
     }
 
-    #[test]
-    fn codes_are_stable() {
-        for (r, c) in [
-            (MaxRefRefusal::NoSuchRow, "max_ref_no_such_row"),
-            (MaxRefRefusal::NotHumanTyped, "max_ref_not_human_typed"),
-            (MaxRefRefusal::Stale, "max_ref_stale"),
-            (MaxRefRefusal::NotRemoteOwnerSend, "max_ref_not_remote_owner_send"),
-            (MaxRefRefusal::PairRequired, "cite_pair_required"),
-            (MaxRefRefusal::AskMissingTarget, "cite_ask_missing_target"),
-            (MaxRefRefusal::AskMissingSetting, "cite_ask_missing_setting"),
-            (MaxRefRefusal::ReplyNotFirst, "cite_reply_not_first"),
-            (MaxRefRefusal::ReplyOutsideWindow, "cite_reply_outside_window"),
-        ] {
-            assert_eq!(r.code(), c);
-        }
-    }
-
     /// Remote Control reaches the ledger as a pane row through the hook: a
     /// real user turn, and still never an approval (a lane can mint the same).
     #[tokio::test]
@@ -807,233 +346,6 @@ mod tests {
         pane_prompts::record(&st, "test-rc", "please go ahead: amux grant 7K3Q").await;
         let id: i64 = st.store.read().unwrap().query_row("SELECT MAX(id) FROM cmd_history WHERE session='test-rc'", [], |r| r.get(0)).unwrap();
         assert_eq!(row_qualifies_at(&st, id, now), Err(MaxRefRefusal::NotRemoteOwnerSend));
-    }
-
-    const DESK: &str = "test-desk";
-    const ACTOR: &str = "test-actor";
-    const YOLO_ASK: &str = "Max, may I turn on yolo for test-alpha? Reply yes or no.";
-
-    fn terms() -> CiteTerms {
-        CiteTerms { target: vec!["test-alpha".into()], settings: vec![vec!["yolo".into(), "CC_FLAGS".into()]], changes: vec![setting_requests(&["yolo".into(), "CC_FLAGS".into()], &["test-alpha".into()], &serde_json::json!(true))], ..Default::default() }
-    }
-
-    /// The ask: a message `from` sent into `session` (a peer send's row shape).
-    fn ask(st: &AppState, session: &str, from: &str, text: &str, ts: f64) -> i64 {
-        put(st, R(session, text, "session", from, "direct", None, ts))
-    }
-
-    fn pair(a: i64, r: i64) -> Cite {
-        Cite { ask_row_id: Some(a), reply_row_id: Some(r), ..Default::default() }
-    }
-
-    fn check(st: &AppState, c: &Cite) -> Result<Cited, MaxRefRefusal> {
-        cite_pair_at(st, Some(c), ACTOR, &terms(), NOW)
-    }
-
-    #[test]
-    fn citation_reply_requires_explicit_affirmative_text() {
-        let tmp = tempfile::tempdir().unwrap();
-        let st = state(tmp.path());
-        for (i, text) in ["no", "wait", "not yet", "yes?", "yes?\"", "don't", "don't do it",
-            "no, go ahead", "yes, don't proceed", "yes but wait", "yesterday", "approval", "ok"].iter().enumerate() {
-            let lane = format!("test-negative-{i}");
-            let a = ask(&st, &lane, ACTOR, YOLO_ASK, NOW - 60.0);
-            let r = put(&st, pane(&lane, text, NOW - 30.0));
-            assert_eq!(check(&st, &pair(a, r)).unwrap_err().code(), "cite_reply_not_affirmative", "{text:?}");
-            let later = put(&st, pane(&lane, "yes", NOW - 10.0));
-            assert_eq!(check(&st, &pair(a, later)).unwrap_err().code(), "cite_reply_not_first", "{text:?} already answered the ask; a later yes cannot replace it");
-        }
-        for (i, text) in ["yes", "Y", "Yep!", "approve", "APPROVED.", "go ahead", "do it", "ok to proceed", "yes, go ahead", "  \"YES!\"  "].iter().enumerate() {
-            let lane = format!("test-positive-{i}");
-            let a = ask(&st, &lane, ACTOR, YOLO_ASK, NOW - 60.0);
-            let r = put(&st, pane(&lane, text, NOW - 30.0));
-            assert!(check(&st, &pair(a, r)).is_ok(), "{text:?}");
-        }
-        assert!(!reply_is_affirmative(""), "empty replies never approve");
-    }
-
-    #[test]
-    fn citation_reply_binds_only_the_actors_latest_unanswered_ask() {
-        let tmp = tempfile::tempdir().unwrap();
-        let st = state(tmp.path());
-        let first = ask(&st, DESK, ACTOR, YOLO_ASK, NOW - 90.0);
-        let latest = ask(&st, DESK, ACTOR, YOLO_ASK, NOW - 60.0);
-        // Other actors and other sessions cannot replace this actor's ask.
-        ask(&st, DESK, "test-peer", YOLO_ASK, NOW - 50.0);
-        ask(&st, "test-other-desk", ACTOR, YOLO_ASK, NOW - 40.0);
-        let reply = put(&st, pane(DESK, "yes", NOW - 30.0));
-        assert_eq!(check(&st, &pair(first, reply)).unwrap_err().code(), "cite_ask_not_latest");
-        assert!(check(&st, &pair(latest, reply)).is_ok());
-        let later = put(&st, pane(DESK, "yes!", NOW - 20.0));
-        assert_eq!(check(&st, &pair(latest, later)).unwrap_err().code(), "cite_reply_not_first", "an already answered ask cannot use a later reply");
-        assert_eq!(check(&st, &pair(latest, put(&st, pane("test-other-desk", "yes", NOW - 10.0)))).unwrap_err().code(), "cite_reply_wrong_session");
-    }
-
-    /// Review B4 ruling: the ask names target and setting, the reply is Max's
-    /// first typed message after it in that session, within 2 hours.
-    #[test]
-    fn a_correct_pair_passes_and_carries_both_texts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let st = state(tmp.path());
-        let a = ask(&st, DESK, ACTOR, YOLO_ASK, NOW - 600.0);
-        let r = put(&st, pane(DESK, "yes", NOW - 500.0));
-        let got = check(&st, &pair(a, r)).unwrap();
-        assert_eq!((got.row_id, got.ask_row_id, got.session.as_str()), (r, a, DESK));
-        assert_eq!((got.ask_text.as_str(), got.reply_text.as_str()), (YOLO_ASK, "yes"));
-        // An owner send from the Mac counts as Max's typed reply too.
-        let a2 = ask(&st, "test-desk2", ACTOR, "turn on CC_FLAGS for test-alpha?", NOW - 100.0);
-        let r2 = put(&st, R("test-desk2", "go ahead", "user", "", "direct", Some("outside"), NOW - 50.0));
-        assert!(check(&st, &pair(a2, r2)).is_ok());
-    }
-
-    #[test]
-    fn citation_bindings_only_read_existing_identities_without_minting_on_mentions() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
-        let path = tmp.path().join("sessions/test-alpha.env");
-        let legacy = b"CC_TAGS=dev\n";
-        std::fs::write(&path,legacy).unwrap();
-        assert_eq!(worker_bindings("test-alpha is busy"), "{}");
-        assert_eq!(std::fs::read(&path).unwrap(), legacy);
-        assert_eq!(worker_bindings(YOLO_ASK), "{}", "legacy identity is never minted by ask capture");
-        assert_eq!(std::fs::read(&path).unwrap(), legacy);
-        std::fs::write(&path,"CC_TAGS=dev\nCC_INCARNATION=existing-worker\n").unwrap();
-        let before = std::fs::read(&path).unwrap();
-        let ids: std::collections::BTreeMap<String,String> = serde_json::from_str(&worker_bindings("May I enable yolo for Test-Alpha?")).unwrap();
-        assert_eq!(ids.get("test-alpha").map(String::as_str), Some("existing-worker"));
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-    }
-
-    #[test]
-    fn citation_identity_is_captured_at_ask_time_and_never_rebound() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = crate::api::settings::test_env::set_home(tmp.path());
-        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
-        let target = tmp.path().join("sessions/test-alpha.env");
-        std::fs::write(&target,"CC_TAGS=dev\nCC_INCARNATION=original-worker\n").unwrap();
-        let st = state(tmp.path());
-        let ids = worker_bindings(YOLO_ASK);
-        let parsed: std::collections::BTreeMap<String,String> = serde_json::from_str(&ids).unwrap();
-        assert_eq!(parsed.get("test-alpha").map(String::as_str),Some("original-worker"));
-        assert_eq!(worker_bindings("test-alpha2 has yolo"),"{}","whole names only");
-        let a = ask(&st,DESK,ACTOR,YOLO_ASK,NOW-60.0);
-        let r = put(&st,pane(DESK,"yes",NOW-30.0));
-        let mut t = terms();
-        t.worker = Some("test-alpha".into());
-        assert_eq!(cite_pair_at(&st,Some(&pair(a,r)),ACTOR,&t,NOW).map(|_|()),Err(MaxRefRefusal::TargetIdentityChanged),"legacy ask has no binding");
-        st.store.write(move |c| {
-            c.execute("UPDATE cmd_history SET cite_worker_ids=?1 WHERE id=?2",rusqlite::params![ids,a])?;
-            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
-        }).unwrap();
-        assert!(cite_pair_at(&st,Some(&pair(a,r)),ACTOR,&t,NOW).is_ok());
-        std::fs::rename(&target,tmp.path().join("sessions/renamed.env")).unwrap();
-        std::fs::write(&target,"CC_TAGS=dev\nCC_INCARNATION=new-holder\n").unwrap();
-        assert_eq!(cite_pair_at(&st,Some(&pair(a,r)),ACTOR,&t,NOW).map(|_|()),Err(MaxRefRefusal::TargetIdentityChanged));
-    }
-
-    #[test]
-    fn an_ask_missing_the_target_or_the_setting_fails() {
-        let tmp = tempfile::tempdir().unwrap();
-        let st = state(tmp.path());
-        for (i, (text, want)) in [
-            ("Max, may I turn on yolo for test-beta?", MaxRefRefusal::AskMissingTarget),
-            ("Max, may I turn on yolo for test-alpha2?", MaxRefRefusal::AskMissingTarget),
-            ("Max, may I change test-alpha's settings?", MaxRefRefusal::AskMissingSetting),
-            ("Max, may I turn on yolomode for test-alpha?", MaxRefRefusal::AskMissingSetting),
-        ].into_iter().enumerate() {
-            let lane = format!("test-lane-{i}");
-            let a = ask(&st, &lane, ACTOR, text, NOW - 60.0);
-            let r = put(&st, pane(&lane, "yes", NOW - 30.0));
-            assert_eq!(check(&st, &pair(a, r)).map(|_| ()), Err(want), "{text}");
-        }
-    }
-
-    #[test]
-    fn an_owner_reply_that_is_not_the_first_after_the_ask_fails() {
-        let tmp = tempfile::tempdir().unwrap();
-        let st = state(tmp.path());
-        let a = ask(&st, DESK, ACTOR, YOLO_ASK, NOW - 600.0);
-        let first = put(&st, pane(DESK, "yes", NOW - 500.0));
-        let later = put(&st, pane(DESK, "yes!", NOW - 400.0));
-        assert_eq!(check(&st, &pair(a, later)).map(|_| ()), Err(MaxRefRefusal::ReplyNotFirst));
-        assert!(check(&st, &pair(a, first)).is_ok(), "the first typed reply is the one that counts");
-        // A reply BEFORE the ask is not an answer to it.
-        let early = put(&st, pane("test-desk3", "yes", NOW - 900.0));
-        let a3 = ask(&st, "test-desk3", ACTOR, YOLO_ASK, NOW - 800.0);
-        assert_eq!(check(&st, &pair(a3, early)).map(|_| ()), Err(MaxRefRefusal::ReplyNotFirst));
-        // An amux delivery between them is not a reply of Max's.
-        let a4 = ask(&st, "test-desk4", ACTOR, YOLO_ASK, NOW - 300.0);
-        put(&st, pane("test-desk4", "[amux-origin: test-peer] status update", NOW - 200.0));
-        let r4 = put(&st, pane("test-desk4", "yes", NOW - 100.0));
-        assert!(check(&st, &pair(a4, r4)).is_ok());
-    }
-
-    #[test]
-    fn a_reply_outside_the_two_hour_window_fails() {
-        let tmp = tempfile::tempdir().unwrap();
-        let st = state(tmp.path());
-        let a = ask(&st, DESK, ACTOR, YOLO_ASK, NOW - ASK_REPLY_WINDOW_S - 120.0);
-        let r = put(&st, pane(DESK, "yes", NOW - 60.0));
-        assert_eq!(check(&st, &pair(a, r)).map(|_| ()), Err(MaxRefRefusal::ReplyOutsideWindow));
-        // An old "ok" stays stale whatever it answers.
-        let a2 = ask(&st, "test-desk2", ACTOR, YOLO_ASK, NOW - MAX_REF_MAX_AGE_S - 200.0);
-        let r2 = put(&st, pane("test-desk2", "ok", NOW - MAX_REF_MAX_AGE_S - 100.0));
-        assert_eq!(check(&st, &pair(a2, r2)).map(|_| ()), Err(MaxRefRefusal::Stale));
-    }
-
-    #[test]
-    fn a_citation_of_an_unrelated_message_fails() {
-        let tmp = tempfile::tempdir().unwrap();
-        let st = state(tmp.path());
-        let lunch = put(&st, pane(DESK, "what time is lunch?", NOW - 60.0));
-        // The retired single-row forms.
-        for c in [Cite { row_id: Some(lunch), ..Default::default() }, Cite { session: Some(DESK.into()), ..Default::default() },
-            Cite { reply_row_id: Some(lunch), ..Default::default() }] {
-            assert_eq!(check(&st, &c).map(|_| ()), Err(MaxRefRefusal::PairRequired), "{c:?}");
-        }
-        assert_eq!(cite_pair_at(&st, None, ACTOR, &terms(), NOW).map(|_| ()), Err(MaxRefRefusal::Missing));
-        // Max's own row, or another agent's message, is not the actor's ask.
-        let r = put(&st, pane(DESK, "yes", NOW - 30.0));
-        assert_eq!(check(&st, &pair(lunch, r)).map(|_| ()), Err(MaxRefRefusal::AskNotFromActor));
-        let peer = ask(&st, DESK, "test-peer", YOLO_ASK, NOW - 50.0);
-        assert_eq!(check(&st, &pair(peer, r)).map(|_| ()), Err(MaxRefRefusal::AskNotFromActor));
-        // An unrelated ask of the actor's.
-        let chat = ask(&st, "test-desk5", ACTOR, "lunch at noon?", NOW - 50.0);
-        let r5 = put(&st, pane("test-desk5", "yes", NOW - 30.0));
-        assert_eq!(check(&st, &pair(chat, r5)).map(|_| ()), Err(MaxRefRefusal::AskMissingTarget));
-        assert_eq!(check(&st, &pair(999_998, r5)).map(|_| ()), Err(MaxRefRefusal::AskNotFound));
-    }
-
-    #[test]
-    fn the_reply_must_be_maxs_typed_row_in_the_asks_session() {
-        let tmp = tempfile::tempdir().unwrap();
-        let st = state(tmp.path());
-        let a = ask(&st, DESK, ACTOR, YOLO_ASK, NOW - 600.0);
-        let elsewhere = put(&st, pane("test-other", "yes", NOW - 500.0));
-        assert_eq!(check(&st, &pair(a, elsewhere)).map(|_| ()), Err(MaxRefRefusal::WrongSession));
-        let stamped = put(&st, pane(DESK, "[amux-origin: test-peer] yes", NOW - 400.0));
-        assert_eq!(check(&st, &pair(a, stamped)).map(|_| ()), Err(MaxRefRefusal::NotHumanTyped));
-        let peer_row = put(&st, R(DESK, "yes", "session", "test-peer", "direct", None, NOW - 300.0));
-        assert_eq!(check(&st, &pair(a, peer_row)).map(|_| ()), Err(MaxRefRefusal::NotHumanTyped));
-        assert_eq!(check(&st, &pair(a, 999_997)).map(|_| ()), Err(MaxRefRefusal::NoSuchRow));
-        // In the actor's own lane only a non-local Remote owner send counts.
-        let own = ask(&st, ACTOR, ACTOR, YOLO_ASK, NOW - 300.0);
-        let own_pane = put(&st, pane(ACTOR, "yes", NOW - 200.0));
-        assert_eq!(check(&st, &pair(own, own_pane)).map(|_| ()), Err(MaxRefRefusal::OwnLane));
-        let own2 = ask(&st, ACTOR, ACTOR, YOLO_ASK, NOW - 150.0);
-        let own_remote = put(&st, remote(ACTOR, "yes", NOW - 100.0));
-        assert!(check(&st, &pair(own2, own_remote)).is_ok(), "own lane, non-local Remote");
-    }
-
-    #[test]
-    fn names_and_phrases_match_whole_words_only() {
-        assert!(names_exactly("for Test-Alpha?", "test-alpha"));
-        assert!(!names_exactly("for test-alpha2", "test-alpha") && !names_exactly("for xtest-alpha", "test-alpha"));
-        assert!(!names_exactly("for test-alpha.b", "test-alpha"));
-        assert!(names_phrase("turn on auto-continue", "auto continue") && names_phrase("set CC_FLAGS", "cc_flags"));
-        assert!(names_phrase("the gates", "gate") && names_phrase("two connectors", "connector"));
-        assert!(!names_phrase("yolomode", "yolo") && !names_phrase("leader", "lead"));
     }
 
     #[test]

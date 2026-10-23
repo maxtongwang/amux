@@ -1107,6 +1107,7 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // they are the whole trap.
     ("_amux_invariant_incident", "resolved_at", false),
     ("_amux_invariant_result", "ts", false),
+    ("_amux_delegation_resolutions", "created_at", false), // now_f64(), Unix seconds
     ("_amux_delegation_grants", "created_at", false), // delegation_grants.rs: now_f64()
     ("_amux_delegation_grants", "expires_at", false),
     ("_amux_delegation_grants", "decided_at", false),

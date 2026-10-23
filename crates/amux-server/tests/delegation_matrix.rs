@@ -142,7 +142,7 @@ async fn cc_orchestrator_is_never_a_leads_or_a_workers_to_set() {
         assert_refused_regardless_of_max_ref(st, &v, &format!("{who} sets CC_ORCHESTRATOR with max_ref"));
     }
     let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(body)).await;
-    assert_code(st, &v, "cite_missing", "mrpopo sets CC_ORCHESTRATOR with no citation of Max");
+    assert_code(st, &v, "request_id_required", "mrpopo sets CC_ORCHESTRATOR with no citation of Max");
     assert!(!e.env_text(DEV_A).contains("CC_ORCHESTRATOR"), "{}", e.env_text(DEV_A));
 }
 
@@ -202,14 +202,12 @@ async fn lead_changes_tags_only_through_a_cited_grant_and_never_makes_a_lead() {
     assert_eq!(e.tags(DEV_A), before, "refused no-op changed tags");
     let before = e.tags(DEV_B);
     let (st, v) = e.call(lead, "PATCH", &cfg(DEV_B), Some(json!({"tags": ""}))).await;
-    assert_code(st, &v, "cite_missing", "lead removes T without a citation");
+    assert_code(st, &v, "request_id_required", "lead removes T without a citation");
     assert_eq!(e.tags(DEV_B), before, "uncited removal changed tags");
     assert_eq!(e.latest_grant(), "", "refused tag changes record no grant");
 
-    let cited_at = now_s() - 120.0;
-    let a = e.seed_row(MAX_PANE, &format!("Max, may I remove the dev tag from {DEV_B}'s tags?"), "session", DEV_LEAD, Some("direct"), cited_at);
-    let r = e.seed_pane_prompt(MAX_PANE, "yes", cited_at + 30.0);
-    let (st, v) = e.call(lead, "PATCH", &cfg(DEV_B), Some(json!({"tags": "", "cite": {"ask_row_id": a, "reply_row_id": r}}))).await;
+    let id = e.approved_request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
+    let (st, v) = e.call(lead, "PATCH", &cfg(DEV_B), Some(cited(json!({"tags":""}),id))).await;
     assert_allowed(st, &v, "lead removes T through a cited grant");
     let grant = e.latest_grant();
     assert_eq!(e.grant_status(&grant), "applied", "cited tag removal is an applied grant");
@@ -571,7 +569,7 @@ async fn a_mixed_config_body_is_judged_key_by_key_on_both_routes() {
     // mrpopo with a valid citation for the tag change: the bundled key is
     // judged too, so the membership row cannot carry auto-continue.
     let before = e.snapshot();
-    let row = e.cite(&format!("Max, may I add {DEV_A} to ops?"));
+    let row = e.raw_ask_reply(&format!("Max, may I add {DEV_A} to ops?"));
     let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &format!("/api/sessions/{DEV_A}/config"),
         Some(json!({"tags": "dev,ops", "toggle_auto_continue": true, "cite": row}))).await;
     assert_code(st, &v, "worker_group_membership_refused", "mrpopo's cited mixed body");
