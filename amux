@@ -6635,6 +6635,7 @@ ${BOLD}Tunnel (public HTTPS URL for any localhost port — needs amux cloud):${R
 
 ${BOLD}Urgent owner alert (USE SPARINGLY — push + iMessage to the owner):${RESET}
   amux alert "message" [reason]  Fire an immediate alert to the amux owner
+  amux grant list [--json]       Recent delegated changes, including failed grants
   amux approvals ls|add|revoke|uses  Standing approvals: asks the owner already answered
                                  Only for things needing attention NOW.
 
@@ -6999,6 +7000,43 @@ ${BOLD}amux approvals${RESET}: standing approvals, asks the owner has already an
   An ask covered by one of these is already approved: act, then report on your card.
   Kill switch: AMUX_STANDING_APPROVALS=0 (worker > group > global).
 USAGE
+}
+
+# Structured grants — keep failed decisions and owner recovery visible (PR18 B1).
+cmd_grant() {
+  local sub="${1:-list}" raw_json=0
+  shift 2>/dev/null || true
+  case "$sub" in
+    help|--help|-h) echo 'Usage: amux grant list [--json]  (recent grants, including failures)'; return 0 ;;
+    list|ls) ;;
+    *) die 'Usage: amux grant list [--json]' ;;
+  esac
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) raw_json=1; shift ;;
+      *) die "amux grant list: unknown argument '$1'" ;;
+    esac
+  done
+  local me="${AMUX_WORKER:-${AMUX_SESSION:-}}"
+  local -a who=()
+  [[ -n "$me" ]] && who=(-H "X-Amux-Worker: $me")
+  _curl -sk ${who[@]+"${who[@]}"} "$AMUX_API/api/delegation/grants" | GRANT_JSON="$raw_json" python3 -c '
+import json, os, sys
+try:
+    d = json.load(sys.stdin)
+except (ValueError, OSError):
+    sys.exit("amux grant list: unreadable server response")
+if not isinstance(d, dict) or not isinstance(d.get("grants"), list) or d.get("measured") is not True:
+    sys.exit("amux grant list: " + str(d.get("error", "unmeasured or invalid response") if isinstance(d, dict) else "invalid response"))
+if os.environ["GRANT_JSON"] == "1":
+    print(json.dumps(d))
+else:
+    print("%d recent grant(s), mode: %s" % (len(d["grants"]), d.get("mode", "unknown")))
+    for g in d["grants"]:
+        print("%s  %s  %s" % (g["code"], g["status"], g.get("sentence", "")))
+        if g.get("failure_reason"):
+            print("  " + g["failure_reason"])
+'
 }
 
 cmd_approvals() {
@@ -9815,6 +9853,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     order)            shift; cmd_order "$@" ;;
     tunnel|t)         shift; cmd_tunnel "$@" ;;
     alert)            shift; cmd_alert "$@" ;;
+    grant)            shift; cmd_grant "$@" ;;
     approvals)        shift; cmd_approvals "$@" ;;
     iac)              shift; cmd_config "$@" ;;
     whoami)           cmd_whoami ;;

@@ -516,6 +516,12 @@ pub(crate) fn unique_tmp_path(path: &Path) -> std::path::PathBuf {
     ))
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    // Test-only, scoped to one async request; production has no failure switch.
+    pub(crate) static TEST_ENV_RENAME_FAILURE: std::path::PathBuf;
+}
+
 /// Cross-process companion to env_write_lock. The Bash registrar uses the
 /// same flock, so its env replacement cannot race the server's first mint.
 pub(crate) fn incarnation_file_lock(path: &Path) -> std::io::Result<Option<std::fs::File>> {
@@ -807,7 +813,17 @@ impl EnvFile {
             f.write_all(out.as_bytes())?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        Self::commit_tmp(&tmp, path)
+    }
+
+    /// Every env writer commits by same-directory rename, after writing/syncing
+    /// the complete temp file. A failed commit leaves the destination intact.
+    fn commit_tmp(tmp: &Path, path: &Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        if TEST_ENV_RENAME_FAILURE.try_with(|blocked| blocked == path).unwrap_or(false) {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected env rename failure"));
+        }
+        std::fs::rename(tmp, path)
     }
 
     pub(crate) fn replace_text(path: &Path, text: &str) -> std::io::Result<()> {
@@ -830,7 +846,7 @@ impl EnvFile {
             f.write_all(text.as_bytes())?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)?;
+        Self::commit_tmp(&tmp, path)?;
         super::delegation_grants::env_written(path);
         Ok(())
     }
@@ -908,7 +924,7 @@ impl EnvFile {
             file.write_all(text.as_bytes())?;
             file.sync_all()?;
         }
-        std::fs::rename(&tmp, path)?;
+        Self::commit_tmp(&tmp, path)?;
         super::delegation_grants::env_written(path);
         Ok(())
     }

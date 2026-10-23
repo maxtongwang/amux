@@ -6195,3 +6195,8 @@ FIX: Reserve one pair with its spent timestamp and exact request in the grant
   emit tags_array_normalized. SQLite uniqueness mutation failed as expected
   and reverted; Rust behavioral verification is pending. Handler side effects
   still span SQLite/files and are not one atomic resource transaction.
+  B1 ruling (a) follow-up: failed atomic env writes keep the pair spent and
+  persist failed status. WARN delegation_grant_failed names the grant; API
+  failure_reason, amux grant list [--json], and the existing dashboard audit
+  rows instruct a fresh owner ask. Failure-injection tests and exact mutations
+  are supplied for the parent's runtime verification.

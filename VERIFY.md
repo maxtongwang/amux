@@ -108,6 +108,23 @@ shows a 12-hex-digit hash after the server adopts the commit.
 
 ## Anything with a UI
 
+Delegated grant failure (PR18 B1):
+
+```bash
+scripts/safe-cargo.sh test -p amux-server --lib delegation_failed_env_write_spends_pair_and_requires_owner_reask
+scripts/safe-cargo.sh test -p amux-server --lib delegation_owner_raw_env_failure_preserves_bytes
+node --test e2e/delegation-grant-failure.test.mjs
+amux grant list --json
+```
+
+Pass: both Rust cases and all five Node cases pass. A failed grant appears as
+`status: "failed"` with `failure_reason` telling the owner to re-ask; the same
+citation is refused as `cite_pair_spent`. The Rust test injects a failure only
+under `cfg(test)`, after temp write/sync and before rename, on grant-applicable
+`write` and `merge_plain` paths; each destination stays byte-for-byte intact.
+The second case covers owner-only raw env `replace_text` through HTTP.
+The dashboard's Delegated changes list shows failed grants and the same reason.
+
 Exercise it in the real UI before `verified`. Tests, API calls and greps justify
 `done` at most.
 
