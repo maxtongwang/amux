@@ -1367,10 +1367,20 @@ fn configure_blocking_fixture_stream(stream: &std::os::unix::net::UnixStream) {
     // timeouts alone do not clear it: read_line can race the child's first write.
     stream.set_nonblocking(false).unwrap();
     let timeout = Some(FIXTURE_TIMEOUT);
-    stream.set_read_timeout(timeout).unwrap();
-    stream.set_write_timeout(timeout).unwrap();
+    // macOS setsockopt(SO_RCVTIMEO/SO_SNDTIMEO) returns EINVAL once the peer has
+    // already disconnected (the SIGKILL case can close before we configure). A
+    // blocking read on that socket still yields the buffered bytes, then EOF.
+    let peer_gone = |r: std::io::Result<()>| match r {
+        Ok(()) => false,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => true,
+        Err(e) => panic!("configuring fixture stream deadline: {e}"),
+    };
+    let read_gone = peer_gone(stream.set_read_timeout(timeout));
+    let write_gone = peer_gone(stream.set_write_timeout(timeout));
     eprintln!(
-        "verdict=native_fixture_stream_blocking measured=true n_considered=1 read_write_deadlines=true"
+        "verdict=native_fixture_stream_blocking measured=true n_considered=1 read_write_deadlines={} peer_already_closed={}",
+        !(read_gone || write_gone),
+        read_gone || write_gone
     );
 }
 
