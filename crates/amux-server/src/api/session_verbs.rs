@@ -46431,7 +46431,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         )
         .await;
         assert_eq!(st, StatusCode::OK);
-        assert_eq!(parse_env("probe").get("CC_TAGS"), Some("x, y"));
+        assert_eq!(parse_env("probe").get("CC_TAGS"), Some("x,y"));
         let (st, _) = call(
             &app,
             "PATCH",

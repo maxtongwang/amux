@@ -6230,3 +6230,23 @@ FIX: Max 2026-10-23: approval identity resolution. Supersedes the free-text
   dashboard list. 0129 adds the request bindings and resolution receipts;
   0124-0128 remain unchanged. Rust regressions/mutations await the parent;
   local CLI/dashboard and SQLite uniqueness/SIGKILL boundary probes pass.
+
+
+## Approval draft reused its parent receipt
+AREA: delegation
+SEVERITY: breaks
+STATUS: fixed
+DATE: 2026-10-23
+SESSION: pr18-r4
+CARD: maxtongwang/ai-config#160
+SYMPTOM: Three parent lib tests and explicit request creation returned 409
+  Interaction could not be recorded before deriving an approval request.
+COST: Parent test round blocked; integration fixtures also retained removed
+  citation helpers and an undefined cited_at timestamp.
+FIX: The internal config draft no longer inherits the POST interaction ID or
+  command kind. It retains actor/auth identity and gets its own durable receipt;
+  real method/path/actor conflicts remain refused. delegation_request_draft logs
+  the parent ID and draft method/path, alongside interaction_accept_failed for
+  actual collisions. The regression checks separate receipts and a genuine 409;
+  integration fixtures use request IDs and forbidden request creation. Parent
+  owns Rust execution; non-cargo syntax, registry and seven Node checks pass.

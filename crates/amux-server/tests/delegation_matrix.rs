@@ -9,20 +9,20 @@
 //! - lead of team T (CC_ORCHESTRATOR=1 AND `leads`): create in T (never
 //!   untagged; never with yolo, flags, isolated or creator); rename and stop
 //!   a T worker that is not a peer lead; tag changes on non-lead T workers
-//!   only through a cited grant, adding or removing only the lead's own groups
+//!   only through an approved request, adding or removing only the lead's own groups
 //!   (no-ops refused; other targets or changed groups owner-only);
 //!   team rules for T; model/effort on a T worker.
-//!   Adding or removing `leads` is refused even with a cited pair. Any other
+//!   Adding or removing `leads` is refused even through request creation. Any other
 //!   config field, group config, settings and guards are refused.
 //! - a `leads` member without CC_ORCHESTRATOR is not a lead, and
 //!   CC_ORCHESTRATOR is never a lead's or a worker's to set.
 //! - self: an explicit env allowlist (model/effort, ...); owner-only keys
-//!   refused, with or without a max_ref.
+//!   refused, directly or through request creation.
 //! - `X@chat` gets no delegated action without process attribution.
 //! - a worker acting on a peer: refused (config, rename, stop, keys, and
 //!   start/reset/clear/git/worktree/archive unless owner or lead of T).
 //! - the names `mrpopo` and `owner` are reserved for non-owners.
-//! - secrets: never delegable, max_ref or not.
+//! - secrets: never delegable, through request creation or not.
 
 mod delegation_support;
 
@@ -132,14 +132,12 @@ async fn a_leads_member_without_orchestrator_is_not_a_lead() {
 #[tokio::test]
 async fn cc_orchestrator_is_never_a_leads_or_a_workers_to_set() {
     let e = setup().await;
-    let t = now_s() - 60.0;
     let body = scope_body("worker", DEV_A, "env", json!({"CC_ORCHESTRATOR": "1"}));
     for who in [DEV_LEAD, DEV_A] {
-        e.seed_pane_prompt(who, &format!("make {DEV_A} lead"), t);
         let (st, v) = e.call(Who::Worker(who), "PUT", "/api/scope", Some(body.clone())).await;
-        assert_refused(st, &v, &format!("{who} sets CC_ORCHESTRATOR"));
-        let (st, v) = e.call(Who::Worker(who), "PUT", "/api/scope", Some(with_ref(body.clone(), max_ref(who, t), "Max asked"))).await;
-        assert_refused_regardless_of_max_ref(st, &v, &format!("{who} sets CC_ORCHESTRATOR with max_ref"));
+        assert_permission_refused(st, &v, &format!("{who} sets CC_ORCHESTRATOR"));
+        let (st, v) = e.request_result(who, "PUT", "/api/scope", body.clone(), MAX_PANE).await;
+        assert_permission_refused(st, &v, &format!("{who} requests CC_ORCHESTRATOR"));
     }
     let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(body)).await;
     assert_code(st, &v, "request_id_required", "mrpopo sets CC_ORCHESTRATOR with no citation of Max");
@@ -207,7 +205,7 @@ async fn lead_changes_tags_only_through_a_cited_grant_and_never_makes_a_lead() {
     assert_eq!(e.latest_grant(), "", "refused tag changes record no grant");
 
     let id = e.approved_request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
-    let (st, v) = e.call(lead, "PATCH", &cfg(DEV_B), Some(cited(json!({"tags":""}),id))).await;
+    let (st, v) = e.call(lead, "PATCH", &cfg(DEV_B), Some(with_request(json!({"tags":""}),id))).await;
     assert_allowed(st, &v, "lead removes T through a cited grant");
     let grant = e.latest_grant();
     assert_eq!(e.grant_status(&grant), "applied", "cited tag removal is an applied grant");
@@ -216,7 +214,6 @@ async fn lead_changes_tags_only_through_a_cited_grant_and_never_makes_a_lead() {
     // Both the target and changed tags must belong to the lead's teams.
     // Other-team tags and other-team/privileged targets stay owner-only.
     // Changing `leads` wins over these boundaries; no-op wins over them too.
-    let t = now_s() - 60.0;
     for (target, tags, ctx, code) in [
         (DEV_A, "dev,leads", "adds leads", "worker_group_membership_refused"),
         (DEV_A, "dev,ops", "adds another team's tag", "peer_config_owner_only"),
@@ -230,48 +227,39 @@ async fn lead_changes_tags_only_through_a_cited_grant_and_never_makes_a_lead() {
         (MRPOPO, "leads", "leaves mrpopo unchanged", "delegation_not_allowed"),
         (DEV_LEAD2, "dev,leads", "leaves a peer lead unchanged", "delegation_not_allowed"),
     ] {
-        e.seed_pane_prompt(DEV_LEAD, &format!("set {target} tags to {tags}"), t);
         let before = e.tags(target);
         let (st, v) = e.call(lead, "PATCH", &cfg(target), Some(json!({"tags": tags}))).await;
         assert_code(st, &v, code, &format!("lead {ctx}"));
-        let (st, v) = e.call(lead, "PATCH", &cfg(target), Some(with_ref(json!({"tags": tags}), max_ref(DEV_LEAD, t), "Max asked"))).await;
-        assert_code(st, &v, code, &format!("lead {ctx} with max_ref"));
+        let (st, v) = e.request_result(DEV_LEAD, "PATCH", &cfg(target), json!({"tags": tags}), MAX_PANE).await;
+        assert_code(st, &v, code, &format!("lead requests to {ctx}"));
         assert_eq!(e.tags(target), before, "lead {ctx}: refused change wrote tags");
         assert_eq!(e.latest_grant(), grant, "lead {ctx}: refused change recorded a grant");
     }
 
-    // A qualifying ask/reply pair cannot cross the target boundary either.
-    // Keep pairs chronological so each cited reply is the first after its ask.
-    for (i, (target, tags)) in [(OPS_A, "ops,dev"), (MRPOPO, "leads,dev"), (DEV_LEAD2, "dev,leads,ops")].into_iter().enumerate() {
-        let t = cited_at + 40.0 + i as f64 * 20.0;
-        let a = e.seed_row(MAX_PANE, &format!("Max, may I set {target}'s tags to {tags}?"), "session", DEV_LEAD, Some("direct"), t);
-        let r = e.seed_pane_prompt(MAX_PANE, "yes", t + 10.0);
+    // An approved request cannot be repurposed across target/group boundaries.
+    // The exact original request remains applicable; rejected drafts create none.
+    let id = e.approved_request(DEV_LEAD, "PATCH", &cfg(DEV_A), json!({"tags":""})).await;
+    let pending = id.as_str().unwrap();
+    for (target, tags, code) in [
+        (OPS_A, "ops,dev", "peer_config_owner_only"),
+        (MRPOPO, "leads,dev", "peer_config_owner_only"),
+        (DEV_LEAD2, "dev,leads,ops", "peer_config_owner_only"),
+        (DEV_A, "dev,leads", "worker_group_membership_refused"),
+        (DEV_A, "dev,ops", "peer_config_owner_only"),
+    ] {
         let before = e.tags(target);
-        let (st, v) = e.call(lead, "PATCH", &cfg(target), Some(json!({"tags": tags, "cite": {"ask_row_id": a, "reply_row_id": r}}))).await;
-        assert_code(st, &v, "peer_config_owner_only", &format!("lead changes {target}'s tags with a citation"));
-        assert_eq!(e.tags(target), before, "cited refusal changed {target}'s tags");
-        assert_eq!(e.latest_grant(), grant, "cited refusal for {target} recorded a grant");
+        let (st, v) = e.request_result(DEV_LEAD, "PATCH", &cfg(target), json!({"tags": tags}), MAX_PANE).await;
+        assert_code(st, &v, code, &format!("lead requests forbidden tags on {target}"));
+        let (st, v) = e.call(lead, "PATCH", &cfg(target), Some(with_request(json!({"tags": tags}), id.clone()))).await;
+        assert_code(st, &v, "request_change_mismatch", &format!("lead repurposes approval for {target}"));
+        assert_eq!(e.tags(target), before, "refused request changed {target}'s tags");
+        assert_eq!(e.latest_grant(), pending, "refused change created a new request");
+        assert_eq!(e.grant_status(pending), "pending", "refused change consumed the approval");
     }
-
-    // Even a qualifying pair cannot authorize a lead to add `leads`.
-    let t = cited_at + 100.0;
-    let a = e.seed_row(MAX_PANE, &format!("Max, may I set {DEV_A}'s tags to dev,leads?"), "session", DEV_LEAD, Some("direct"), t);
-    let r = e.seed_pane_prompt(MAX_PANE, "yes", t + 10.0);
-    let before = e.tags(DEV_A);
-    let (st, v) = e.call(lead, "PATCH", &cfg(DEV_A), Some(json!({"tags": "dev,leads", "cite": {"ask_row_id": a, "reply_row_id": r}}))).await;
-    assert_code(st, &v, "worker_group_membership_refused", "lead adds leads with a citation");
-    assert_eq!(e.tags(DEV_A), before, "cited lead promotion changed tags");
-    assert_eq!(e.latest_grant(), grant, "refused lead promotion records no new grant");
-
-    // A citation cannot add another team's tag even on an own-team worker.
-    let t = cited_at + 115.0;
-    let a = e.seed_row(MAX_PANE, &format!("Max, may I set {DEV_A}'s tags to dev,ops?"), "session", DEV_LEAD, Some("direct"), t);
-    let r = e.seed_pane_prompt(MAX_PANE, "yes", t + 1.0);
-    let before = e.tags(DEV_A);
-    let (st, v) = e.call(lead, "PATCH", &cfg(DEV_A), Some(json!({"tags": "dev,ops", "cite": {"ask_row_id": a, "reply_row_id": r}}))).await;
-    assert_code(st, &v, "peer_config_owner_only", "lead adds another team's tag with a citation");
-    assert_eq!(e.tags(DEV_A), before, "cited cross-team refusal changed tags");
-    assert_eq!(e.latest_grant(), grant, "cited cross-team refusal recorded a new grant");
+    let (st, v) = e.call(lead, "PATCH", &cfg(DEV_A), Some(with_request(json!({"tags":""}), id.clone()))).await;
+    assert_allowed(st, &v, "original approval still applies to exactly its own-team change");
+    assert!(e.tags(DEV_A).is_empty());
+    assert_eq!(e.grant_status(pending), "applied");
 }
 
 // ---- lead of team T: rules, config ------------------------------------------
@@ -304,11 +292,9 @@ async fn lead_sets_model_and_effort_on_a_team_worker_and_nothing_else() {
 
     for target in [OPS_A, DEV_LEAD2, MRPOPO] {
         let (st, v) = e.call(lead, "PATCH", &cfg(target), Some(json!({"model": "sonnet"}))).await;
-        assert_refused(st, &v, &format!("lead sets model on {target}"));
+        assert_permission_refused(st, &v, &format!("lead sets model on {target}"));
     }
 
-    let t = now_s() - 60.0;
-    e.seed_pane_prompt(DEV_LEAD, &format!("change {DEV_A} desc dir provider yolo external email isolated send allow"), t);
     for body in [
         json!({"desc": "rewritten by the lead"}),
         json!({"dir": "/tmp"}),
@@ -321,9 +307,9 @@ async fn lead_sets_model_and_effort_on_a_team_worker_and_nothing_else() {
     ] {
         let before = e.env_text(DEV_A);
         let (st, v) = e.call(lead, "PATCH", &cfg(DEV_A), Some(body.clone())).await;
-        assert_refused(st, &v, &format!("lead sets {body}"));
-        let (st, v) = e.call(lead, "PATCH", &cfg(DEV_A), Some(with_ref(body.clone(), max_ref(DEV_LEAD, t), "Max asked"))).await;
-        assert_refused_regardless_of_max_ref(st, &v, &format!("lead sets {body} with max_ref"));
+        assert_permission_refused(st, &v, &format!("lead sets {body}"));
+        let (st, v) = e.request_result(DEV_LEAD, "PATCH", &cfg(DEV_A), body.clone(), MAX_PANE).await;
+        assert_permission_refused(st, &v, &format!("lead requests {body}"));
         assert_eq!(e.env_text(DEV_A), before, "refused {body} changed the env file");
     }
 }
@@ -389,14 +375,12 @@ async fn self_sets_model_and_effort_but_not_owner_only_keys() {
     let (st, v) = e.call(me, "PATCH", &cfg(DEV_A), Some(json!({"model": "sonnet", "effort": "low"}))).await;
     assert_allowed(st, &v, "self model+effort");
 
-    let t = now_s() - 60.0;
-    e.seed_pane_prompt(DEV_A, &format!("{DEV_A}: you may turn on yolo, external email, isolated and leads"), t);
     for body in [json!({"external_email_allowed": true}), json!({"toggle_yolo": true}), json!({"isolated": true}), json!({"tags": "dev,leads"})] {
         let before = e.env_text(DEV_A);
         let (st, v) = e.call(me, "PATCH", &cfg(DEV_A), Some(body.clone())).await;
-        assert_refused(st, &v, &format!("self {body}"));
-        let (st, v) = e.call(me, "PATCH", &cfg(DEV_A), Some(with_ref(body.clone(), max_ref(DEV_A, t), "Max asked"))).await;
-        assert_refused_regardless_of_max_ref(st, &v, &format!("self {body} with max_ref"));
+        assert_permission_refused(st, &v, &format!("self {body}"));
+        let (st, v) = e.request_result(DEV_A, "PATCH", &cfg(DEV_A), body.clone(), MAX_PANE).await;
+        assert_permission_refused(st, &v, &format!("self requests {body}"));
         assert_eq!(e.env_text(DEV_A), before, "refused self {body} changed the env file");
     }
 }
@@ -418,14 +402,10 @@ async fn self_env_keys_outside_the_allowlist_are_refused() {
 #[tokio::test]
 async fn reserved_names_are_refused_for_non_owners() {
     let e = setup().await;
-    let t = now_s() - 60.0;
-    for who in [DEV_LEAD, MRPOPO] {
-        e.seed_pane_prompt(who, &format!("create owner and mrpopo in dev, rename {DEV_A} to owner"), t);
-    }
     for reserved in ["owner", "mrpopo", "Owner"] {
         for who in [DEV_LEAD, MRPOPO] {
             let (st, v) = e.call(Who::Worker(who), "POST", "/api/sessions",
-                Some(with_ref(create_body(&e.dir, reserved, json!(["dev"])), max_ref(who, t), "Max asked"))).await;
+                Some(create_body(&e.dir, reserved, json!(["dev"])))).await;
             assert_refused(st, &v, &format!("{who} creates {reserved}"));
             let (st, v) = e.call(Who::Worker(who), "POST", "/api/workers", Some(json!({"name": reserved, "cwd": "/tmp"}))).await;
             assert_refused(st, &v, &format!("{who} creates row {reserved}"));
@@ -504,32 +484,28 @@ async fn lifecycle_verbs_on_a_peer_are_the_owners_or_its_leads() {
 
 // ---- secrets ------------------------------------------------------------------
 
-/// Secret keys are the owner's whoever asks and whatever max_ref they cite.
+/// Secret keys remain owner-only for both direct mutations and approval requests.
 #[tokio::test]
 async fn secrets_are_never_delegable() {
     let e = setup().await;
-    let t = now_s() - 60.0;
-    for who in [DEV_LEAD, MRPOPO, DEV_A] {
-        e.seed_pane_prompt(who, &format!("set the secret env token key on {DEV_A} and dev"), t);
-    }
     let keys = ["AMUX_WORKER_TOKEN", "AMUX_CONTRACT_DONE", "AMUX_CONTRACT_RULES", "OPENAI_API_KEY", "GITHUB_TOKEN", "STRIPE_SECRET_KEY", "DB_PASSWORD"];
     for who in [DEV_LEAD, MRPOPO, DEV_A] {
         for key in keys {
             for (level, name) in [("worker", DEV_A), ("group", "dev")] {
                 let body = scope_body(level, name, "env", json!({ key: "review-secret-value" }));
-                for b in [body.clone(), with_ref(body.clone(), max_ref(who, t), "Max asked")] {
-                    let (st, v) = e.call(Who::Worker(who), "PUT", "/api/scope", Some(b)).await;
-                    assert_refused_regardless_of_max_ref(st, &v, &format!("{who} sets {level}:{name} {key}"));
-                }
+                let (st, v) = e.call(Who::Worker(who), "PUT", "/api/scope", Some(body.clone())).await;
+                assert_permission_refused(st, &v, &format!("{who} sets {level}:{name} {key}"));
+                let (st, v) = e.request_result(who, "PUT", "/api/scope", body, MAX_PANE).await;
+                assert_permission_refused(st, &v, &format!("{who} requests {level}:{name} {key}"));
             }
             let (st, v) = e.call(Who::Worker(who), "PATCH", &cfg(DEV_A),
-                Some(with_ref(json!({ key: "review-secret-value" }), max_ref(who, t), "Max asked"))).await;
+                Some(json!({ key: "review-secret-value" }))).await;
             assert!(!st.is_success() || !e.env_text(DEV_A).contains("review-secret-value"),
                 "{who} wrote {key} through config PATCH: {st} {v}");
         }
         let (st, v) = e.call(Who::Worker(who), "PATCH", "/api/settings/env",
-            Some(with_ref(json!({"OPENAI_API_KEY": "review-secret-value"}), max_ref(who, t), "Max asked"))).await;
-        assert_refused_regardless_of_max_ref(st, &v, &format!("{who} sets a provider API key"));
+            Some(json!({"OPENAI_API_KEY": "review-secret-value"}))).await;
+        assert_permission_refused(st, &v, &format!("{who} sets a provider API key"));
     }
     let snap = e.snapshot();
     assert!(snap.values().all(|text| !text.contains("review-secret-value")), "a secret value was written: {snap:?}");
@@ -566,15 +542,15 @@ async fn a_mixed_config_body_is_judged_key_by_key_on_both_routes() {
     }
     assert_eq!(tried, 32, "every mixed body was sent on both routes");
     assert!(!e.env_text(DEV_A).contains("dangerously"), "no YOLO: {}", e.env_text(DEV_A));
-    // mrpopo with a valid citation for the tag change: the bundled key is
-    // judged too, so the membership row cannot carry auto-continue.
+    // An approved membership request cannot carry an extra auto-continue setting.
+    let id = e.approved_request(MRPOPO, "PATCH", &cfg(DEV_A), json!({"tags":"dev,ops"})).await;
     let before = e.snapshot();
-    let row = e.raw_ask_reply(&format!("Max, may I add {DEV_A} to ops?"));
     let (st, v) = e.call(Who::Worker(MRPOPO), "PATCH", &format!("/api/sessions/{DEV_A}/config"),
-        Some(json!({"tags": "dev,ops", "toggle_auto_continue": true, "cite": row}))).await;
-    assert_code(st, &v, "worker_group_membership_refused", "mrpopo's cited mixed body");
+        Some(with_request(json!({"tags": "dev,ops", "toggle_auto_continue": true}), id.clone()))).await;
+    assert_code(st, &v, "request_change_mismatch", "mrpopo's approval cannot carry a bundled setting");
     assert_eq!(before, e.snapshot(), "nothing written");
-    assert_eq!(e.latest_grant(), "", "no grant");
+    assert_eq!(e.latest_grant(), id.as_str().unwrap(), "no new grant");
+    assert_eq!(e.grant_status(id.as_str().unwrap()), "pending", "mixed body did not consume the approval");
     // The owner: a mixed body is two settings, refused as malformed.
     let (st, v) = e.call(Who::Owner, "PATCH", &format!("/api/sessions/{DEV_A}/config"), Some(json!({"tags": "dev", "toggle_auto_continue": true}))).await;
     assert_eq!((st.as_u16(), v["code"].clone()), (400, json!("one_setting_per_patch")), "{v}");

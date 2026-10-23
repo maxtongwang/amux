@@ -14,7 +14,7 @@ async fn view(e: &Env, id: &str) -> Value {
 }
 
 async fn apply(e: &Env, actor: &str, id: &str, worker: &str, body: Value) -> (axum::http::StatusCode,Value) {
-    e.call(Who::Worker(actor),"PATCH",&cfg(worker),Some(cited(body,json!(id)))).await
+    e.call(Who::Worker(actor),"PATCH",&cfg(worker),Some(with_request(body,json!(id)))).await
 }
 
 #[tokio::test]
@@ -90,9 +90,10 @@ async fn negated_free_text_never_creates_or_funds_a_request() {
         *out.lock().unwrap()=(ask,c.last_insert_rowid());
         Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
     }).unwrap();
+    // Deliberate legacy wire specimen: a removed citation pair must never authorize.
     let (a,r)=*pair.lock().unwrap();
     let before=e.config_snapshot();
-    let (st,v)=e.call(Who::Worker(MRPOPO),"PATCH",&cfg(DEV_A),Some(cited(json!({"toggle_yolo":true}),json!({"ask_row_id":a,"reply_row_id":r})))).await;
+    let (st,v)=e.call(Who::Worker(MRPOPO),"PATCH",&cfg(DEV_A),Some(json!({"toggle_yolo":true,"cite":{"ask_row_id":a,"reply_row_id":r}}))).await;
     let attempted=(st,v);
     assert_eq!(before,e.config_snapshot(),"contrast prose must not authorize the excluded worker change");
     let (st,v)=e.call(Who::Worker(MRPOPO),"GET","/api/delegation/requests",None).await;
@@ -147,9 +148,9 @@ async fn changed_action_target_value_direction_or_route_is_refused() {
         assert_eq!(before,e.config_snapshot());
         assert_eq!(e.grant_status(id),"pending");
     }
-    let (st,v)=e.call(Who::Worker(MRPOPO),"PUT","/api/scope",Some(cited(scope_body("worker",DEV_A,"env",json!({"CC_WORKTREE_VERIFY":"one"})),json!(id)))).await;
+    let (st,v)=e.call(Who::Worker(MRPOPO),"PUT","/api/scope",Some(with_request(scope_body("worker",DEV_A,"env",json!({"CC_WORKTREE_VERIFY":"one"})),json!(id)))).await;
     assert_code(st,&v,"request_change_mismatch","equivalent routes cannot substitute for the stored route");
-    let (st,v)=e.call(Who::Worker(MRPOPO),"PATCH",&format!("/api/workers/{DEV_A}/config"),Some(cited(json!({"worktree_verify":"one"}),json!(id)))).await;
+    let (st,v)=e.call(Who::Worker(MRPOPO),"PATCH",&format!("/api/workers/{DEV_A}/config"),Some(with_request(json!({"worktree_verify":"one"}),json!(id)))).await;
     assert_code(st,&v,"request_change_mismatch","the worker alias route cannot replace the captured session route");
     let (st,v)=apply(&e,MRPOPO,id,DEV_A,json!({"worktree_verify":"one"})).await;
     assert_allowed(st,&v,"matching control still applies after mismatches");

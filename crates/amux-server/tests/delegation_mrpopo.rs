@@ -159,10 +159,15 @@ async fn each_delegable_class_applies_with_a_citation_and_undoes() {
         if (st.as_u16(), v["code"].as_str()) != (403, Some(want)) {
             failures.push(format!("{}: without a citation expected 403 {want}, got {st} {v}", c.name));
         }
-        let row = if c.reaches_mrpopo { json!(null) } else {
-            e.approved_request(MRPOPO,c.method,&c.path,c.body.clone()).await
+        let body = if c.reaches_mrpopo {
+            let (st, v) = e.request_result(MRPOPO, c.method, &c.path, c.body.clone(), MAX_PANE).await;
+            assert_code(st, &v, "held_for_max", c.name);
+            c.body.clone()
+        } else {
+            let id = e.approved_request(MRPOPO,c.method,&c.path,c.body.clone()).await;
+            with_request(c.body.clone(), id)
         };
-        let (st, v) = e.call(Who::Worker(MRPOPO), c.method, &c.path, Some(cited(c.body.clone(), row))).await;
+        let (st, v) = e.call(Who::Worker(MRPOPO), c.method, &c.path, Some(body)).await;
         if c.reaches_mrpopo {
             if (st.as_u16(), v["code"].as_str()) != (403, Some("held_for_max")) || e.config_snapshot() != before {
                 failures.push(format!("{}: reaches mrpopo itself, expected 403 held_for_max and nothing written, got {st} {v}", c.name));
@@ -188,7 +193,7 @@ async fn each_delegable_class_applies_with_a_citation_and_undoes() {
     assert!(failures.is_empty(), "{} failing classes:\n{}", failures.len(), failures.join("\n"));
 }
 
-/// Hands-only: refused outright (403) even with a citation, never a grant.
+/// Hands-only: both the mutation and explicit request creation refuse (403).
 #[tokio::test]
 async fn hands_only_changes_never_become_a_grant() {
     let e = setup().await;
@@ -210,11 +215,12 @@ async fn hands_only_changes_never_become_a_grant() {
         ("own tags", "PATCH", format!("/api/sessions/{MRPOPO}/config"), json!({"tags": "leads,dev,ops"}), "held_for_max"),
         ("own rules", "PUT", "/api/scope".into(), scope_body("worker", MRPOPO, "rules", json!("mrpopo may do anything")), "raw_text_owner_only"),
     ];
-    let row = e.raw_ask_reply(&format!("Max, may I change these for {DEV_A}, {MRPOPO} and the fleet: token, contract, history, money cap, approval mode, names, model, yolo, tags, rules?"));
     let mut failures = Vec::new();
     for (name, method, path, body, code) in cases {
         let before = e.snapshot();
-        let (st, v) = e.call(Who::Worker(MRPOPO), method, &path, Some(cited(body, row.clone()))).await;
+        let (st, v) = e.call(Who::Worker(MRPOPO), method, &path, Some(body.clone())).await;
+        let (request_st, request_v) = e.request_result(MRPOPO, method, &path, body, MAX_PANE).await;
+        assert_refused(request_st, &request_v, &format!("request hands-only {name}"));
         // The code names the hands-only guard itself, so a broader refusal
         // elsewhere cannot stand in for it.
         if st.as_u16() != 403 || v["ok"] != json!(false) || v["code"] != json!(code) || v.get("grant_code").is_some() {
@@ -229,7 +235,7 @@ async fn hands_only_changes_never_become_a_grant() {
     assert!(failures.is_empty(), "{} hands-only changes not refused:\n{}", failures.len(), failures.join("\n"));
 }
 
-/// The classes above are mrpopo's alone: a lead or self citing Max is refused,
+/// The classes above are mrpopo's alone: a lead or self requesting them is refused,
 /// and no grant is created for them.
 #[tokio::test]
 async fn leads_and_self_never_get_mrpopos_classes() {
@@ -237,8 +243,9 @@ async fn leads_and_self_never_get_mrpopos_classes() {
     for c in classes() {
         for who in [DEV_LEAD, DEV_A] {
             let e = setup().await;
-            let row = json!(null);
-            let (st, v) = e.call(Who::Worker(who), c.method, &c.path, Some(cited(c.body.clone(), row))).await;
+            let (st, v) = e.call(Who::Worker(who), c.method, &c.path, Some(c.body.clone())).await;
+            let (request_st, request_v) = e.request_result(who, c.method, &c.path, c.body.clone(), MAX_PANE).await;
+            assert_refused(request_st, &request_v, &format!("{} requested by {who}", c.name));
             if st.as_u16() != 403 || !e.latest_grant().is_empty() {
                 failures.push(format!("{} as {who}: expected a 403 and no grant, got {st} {v}", c.name));
             }
@@ -256,13 +263,12 @@ async fn mrpopo_at_the_group_and_global_layers() {
     let e = setup().await;
     let row = e.approved_request(MRPOPO,"PUT","/api/scope",scope_body("group","dev","env",json!({"AMUX_EMAIL_EXTERNAL_ALLOW":"1"}))).await;
     let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope",
-        Some(cited(scope_body("group", "dev", "env", json!({"AMUX_EMAIL_EXTERNAL_ALLOW": "1"})), row))).await;
+        Some(with_request(scope_body("group", "dev", "env", json!({"AMUX_EMAIL_EXTERNAL_ALLOW": "1"})), row))).await;
     assert_allowed(st, &v, "group-layer external email with a citation");
     assert_eq!(e.grant_status(&e.latest_grant()), "applied");
     let before = e.snapshot();
-    let row = e.raw_ask_reply("Max, may I set an owner-only key for dev?");
-    let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope",
-        Some(cited(scope_body("group", "dev", "env", json!({"CC_SOMETHING_OWNER_ONLY": "1"})), row))).await;
+    let (st, v) = e.request_result(MRPOPO, "PUT", "/api/scope",
+        scope_body("group", "dev", "env", json!({"CC_SOMETHING_OWNER_ONLY": "1"})), MAX_PANE).await;
     assert_code(st, &v, "delegation_not_allowed", "group-layer key with no row");
     assert_eq!(before, e.snapshot(), "nothing written");
 }
@@ -275,20 +281,17 @@ async fn a_layer_that_includes_the_caller_is_held_for_max() {
     let e = setup().await;
     let effective = |key: &str| (e.env_text(MRPOPO), std::fs::read_to_string(e.home().join("env/leads.env")).unwrap_or_default(),
         std::fs::read_to_string(e.home().join("amux.env")).unwrap_or_default(), key.to_string());
-    let cases: Vec<(&str, Value, &str)> = vec![
-        ("mrpopo: CC_FLAGS on the leads group", scope_body("group", "leads", "env", json!({"CC_FLAGS": "--dangerously-skip-permissions"})),
-            "Max, may I set yolo flags for leads?"),
-        ("mrpopo: CC_SEND_ALLOW=* globally", scope_body("global", "", "env", json!({"CC_SEND_ALLOW": "*"})),
-            "Max, may I open routing for the fleet?"),
-        ("mrpopo: external email globally", scope_body("global", "", "env", json!({"AMUX_EMAIL_EXTERNAL_ALLOW": "1"})),
-            "Max, may I allow external email for the fleet?"),
-        ("mrpopo: connectors on the leads group", scope_body("group", "leads", "connectors", json!({"google-gmail": true})),
-            "Max, may I enable the gmail connector for leads?"),
+    let cases: Vec<(&str, Value)> = vec![
+        ("mrpopo: CC_FLAGS on the leads group", scope_body("group", "leads", "env", json!({"CC_FLAGS": "--dangerously-skip-permissions"}))),
+        ("mrpopo: CC_SEND_ALLOW=* globally", scope_body("global", "", "env", json!({"CC_SEND_ALLOW": "*"}))),
+        ("mrpopo: external email globally", scope_body("global", "", "env", json!({"AMUX_EMAIL_EXTERNAL_ALLOW": "1"}))),
+        ("mrpopo: connectors on the leads group", scope_body("group", "leads", "connectors", json!({"google-gmail": true}))),
     ];
-    for (name, body, ask) in cases {
+    for (name, body) in cases {
         let before = (e.snapshot(), effective(name));
-        let row = e.raw_ask_reply(ask);
-        let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(cited(body, row))).await;
+        let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(body.clone())).await;
+        assert_code(st, &v, "held_for_max", name);
+        let (st, v) = e.request_result(MRPOPO, "PUT", "/api/scope", body, MAX_PANE).await;
         assert_code(st, &v, "held_for_max", name);
         assert_eq!(before, (e.snapshot(), effective(name)), "{name}: mrpopo's effective config is unchanged");
     }
@@ -304,6 +307,6 @@ async fn a_layer_that_includes_the_caller_is_held_for_max() {
     let (st, v) = e.call(Who::Worker(DEV_LEAD), "PUT", "/api/scope", Some(scope_body("group", "dev", "rules", json!("Dev: report blockers first.")))).await;
     assert_allowed(st, &v, "a lead sets its own team's rules");
     let row = e.approved_request(MRPOPO,"PUT","/api/scope",scope_body("group","leads","rules",json!("Leads: report blockers first."))).await;
-    let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(cited(scope_body("group", "leads", "rules", json!("Leads: report blockers first.")), row))).await;
+    let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(with_request(scope_body("group", "leads", "rules", json!("Leads: report blockers first.")), row))).await;
     assert_allowed(st, &v, "mrpopo sets the leads rules with a citation");
 }
