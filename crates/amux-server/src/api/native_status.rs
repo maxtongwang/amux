@@ -49,6 +49,20 @@ fn valid_name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Export the server's authoritative owner key, following its current alias.
+pub(crate) fn owner_worker() -> String {
+    super::rename_identity::current_name(&crate::config::amux_home(), super::delegation::OWNER_AGENT)
+        .unwrap_or_else(|| super::delegation::OWNER_AGENT.into())
+}
+
+pub(crate) fn observer_env(name: &str, run: &str) -> String {
+    use super::session_verbs::sh_quote;
+    format!("AMUX_STATUS_OWNER={} AMUX_STATUS_WORKER={} AMUX_STATUS_RUN_ID={} AMUX_STATUS_HOME={} AMUX_STATUS_URL={} ",
+        sh_quote(&owner_worker()), sh_quote(name), sh_quote(run),
+        sh_quote(&crate::config::amux_home().to_string_lossy()),
+        sh_quote(&format!("https://localhost:{}", crate::config::canonical_port())))
+}
+
 pub(crate) fn begin_launch(name: &str, provider: &str) -> std::io::Result<(String, f64)> {
     ensure_observer(&crate::config::amux_home())?;
     let run = format!("{:032x}", u128::from(ulid::Ulid::new()));

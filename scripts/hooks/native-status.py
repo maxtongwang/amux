@@ -17,7 +17,6 @@ import urllib.request
 
 # A complete record must fit the tail; never acknowledge a truncated message.
 ASSISTANT_TAIL_BYTES = 1_048_576
-OWNER_WORKER = 'mrpopo'
 MAX_PROMPT_CHARS = 20_000
 
 
@@ -149,7 +148,7 @@ def observe(data, root, worker, run, provider, occurred_at):
             payload['prompt_truncated'] = len(data['prompt']) > MAX_PROMPT_CHARS
         # Only the owner's own completed turn can acknowledge pane display.
         # Carry verbatim text in the durable spool, never in fleet status.
-        if worker == OWNER_WORKER and not agent and data.get('hook_event_name') == 'Stop':
+        if worker == os.environ.get('AMUX_STATUS_OWNER', '') and not agent and data.get('hook_event_name') == 'Stop':
             message = assistant_message(data, provider)
             if isinstance(message, str) and message:
                 payload['assistant_message'] = message

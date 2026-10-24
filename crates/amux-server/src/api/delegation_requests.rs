@@ -26,13 +26,16 @@ pub(crate) fn is_owner_session(name: &str) -> bool {
     name == OWNER_AGENT || name == owner || incarnation(&owner).is_some_and(|id| incarnation(name).as_deref() == Some(id.as_str()))
 }
 
-/// A peer (including mrpopo's own process or a Chat relay) is not Max's hands.
+pub(crate) const OWNER_KEYS_ALTERNATIVE: &str = "use native delivery (#67) or let the server re-arm held relays (#66)";
+
+/// A peer (including the owner's own process or a Chat relay) is not Max's hands.
 /// Apply before the general delegation policy, which can permit self/config.
 pub(crate) fn owner_keys_refusal(name: &str, headers: &HeaderMap) -> Option<Response> {
     if !is_owner_session(name) || super::session_verbs::owner_input_process_origin(headers).is_some() { return None; }
     tracing::warn!(session=name, incarnation=?incarnation(name), verdict="owner_session_keys_refused", measured=true, n_considered=1,
+        alternative=OWNER_KEYS_ALTERNATIVE,
         "non-owner raw input refused before reaching the owner pane");
-    Some(refusal("owner_session_keys_refused", "only verified owner input may inject keys into the owner session"))
+    Some(refusal("owner_session_keys_refused", &format!("only verified owner input may inject keys into the owner session; {OWNER_KEYS_ALTERNATIVE}")))
 }
 
 pub(crate) fn owner_raw_text_refusal(name: &str, headers: &HeaderMap, text: &str) -> Option<Response> {
@@ -53,8 +56,9 @@ pub(crate) fn transport_text(state: &AppState, session: &str, text: &str, owner_
     if !is_owner_session(session) { return Ok(text.into()); }
     if !owner_origin && (text.trim().is_empty() || text.chars().any(|c|c.is_control() && c!='\n' && c!='\t')) {
         tracing::warn!(session, verdict="owner_session_keys_refused", measured=true, n_considered=1,
+            alternative=OWNER_KEYS_ALTERNATIVE,
             "raw control bytes in non-owner text refused before transport");
-        return Err("owner_session_keys_refused: non-owner text may not inject raw control bytes into the owner pane".into());
+        return Err(format!("owner_session_keys_refused: non-owner text may not inject raw control bytes into the owner pane; {OWNER_KEYS_ALTERNATIVE}"));
     }
     if super::session_verbs::session_is_isolated(session) || text.is_empty() { return Ok(text.into()); }
     // A prefix changes slash-command semantics. Fail before typing rather than
@@ -92,8 +96,7 @@ fn known_transport(conn: &rusqlite::Connection, session: &str, prompt: &str, ide
         rusqlite::params![session,token,identity],|r|r.get(0))
 }
 
-/// Rejected/replayed observations of a known programmatic delivery stay
-/// non-owner too. Never turn spool replay into a human-input boundary.
+/// Replayed submissions stay non-owner and conservatively close a new window.
 pub(crate) fn discarded_native_input(state: &AppState, session: &str, event: &Value, reason: &str) -> Result<(), String> {
     let known={
         let conn=state.store.read().map_err(|e|e.to_string())?;
@@ -102,7 +105,7 @@ pub(crate) fn discarded_native_input(state: &AppState, session: &str, event: &Va
             None=>false,
         }
     };
-    if known { return Ok(()); }
+    if known { return discarded_input(state,session,"native_transport_replayed"); }
     discarded_input(state,session,reason)
 }
 
@@ -288,6 +291,14 @@ pub(crate) fn input_boundary(conn: &rusqlite::Connection, session: &str, reason:
     Ok(())
 }
 
+/// Known programmatic submission, distinct from an unverified pane author.
+pub(crate) fn non_owner_submission(conn: &rusqlite::Connection, session: &str, reason: &str) -> rusqlite::Result<()> {
+    if session != OWNER_AGENT { return Ok(()); }
+    input_boundary(conn,session,reason)?;
+    conn.execute("UPDATE cmd_history SET origin='amux' WHERE id=last_insert_rowid()",[])?;
+    Ok(())
+}
+
 pub(crate) fn discarded_send(state: &AppState, session: &str, headers: &HeaderMap, reason: &str) -> Result<(), String> {
     let session = super::chat_worker::companion_parent(session).unwrap_or(session);
     if session != OWNER_AGENT || super::session_verbs::session_is_isolated(session)
@@ -311,8 +322,8 @@ pub(crate) fn discarded_input(state: &AppState, session: &str, reason: &str) -> 
 }
 
 /// Native run/provider/sequence proof authenticates the observer, not the
-/// composer author. Transport echoes do nothing; unknown native input closes
-/// the window. Only the separately recorded owner-origin send can fund it.
+/// composer author. A submission closes the window even when its bytes came
+/// from a known delivery. Only separately recorded owner-origin input can fund.
 pub(crate) fn native_owner_input(conn: &rusqlite::Connection, session: &str, event: &Value, launch: &Value) -> rusqlite::Result<Option<i64>> {
     if session != OWNER_AGENT || super::session_verbs::session_is_isolated(session) { return Ok(None); }
     let identity=incarnation(session);
@@ -320,8 +331,9 @@ pub(crate) fn native_owner_input(conn: &rusqlite::Connection, session: &str, eve
     let proven=identity.is_some() && launch["incarnation"].as_str()==identity.as_deref();
     if proven && known_transport(conn,session,prompt,identity.as_deref().expect("proven identity"))? {
         tracing::info!(session, verdict="owner_pane_transport_observed", measured=true, n_considered=1,
-            "non-owner transport echo neither closes nor funds an approval");
-        return Ok(None);
+            "non-owner transport submission closes the approval window and funds nothing");
+        non_owner_submission(conn,session,"native_transport_non_owner")?;
+        return Ok(Some(conn.last_insert_rowid()));
     }
     input_boundary(conn,session,"native_owner_origin_unverified")?;
     Ok(Some(conn.last_insert_rowid()))
@@ -335,7 +347,7 @@ pub(crate) fn input_event(row: i64) -> crate::db::PendingEvent {
 /// Applied native Stop only: the assistant row IS the pane receipt and ordering
 /// boundary. Native sequence acceptance, this row and its binding commit together.
 pub(crate) fn native_assistant_turn(conn: &rusqlite::Connection, session: &str, event: &Value, launch: &Value) -> rusqlite::Result<()> {
-    if session != OWNER_AGENT || super::session_verbs::session_is_isolated(session) { return Ok(()); }
+    if !is_owner_session(session) || super::session_verbs::session_is_isolated(session) { return Ok(()); }
     let Some(text) = event["assistant_message"].as_str().filter(|s| !s.is_empty()) else {
         tracing::warn!(session, verdict="delegation_pane_text_unavailable", measured=false, n_considered=0,
             "native Stop has no complete assistant text; no pane receipt");
@@ -353,7 +365,7 @@ pub(crate) fn native_assistant_turn(conn: &rusqlite::Connection, session: &str, 
     let turn = conn.last_insert_rowid();
     let matches: Vec<(String,i64)> = {
         let mut st = conn.prepare("SELECT g.code,g.ask_row FROM _amux_delegation_grants g JOIN cmd_history q ON q.id=g.ask_row WHERE g.reply_session=?1 AND g.reply_incarnation=?2 AND g.status='pending' AND (g.shown_row IS NULL OR EXISTS(SELECT 1 FROM cmd_history d WHERE d.id=g.shown_row AND d.delivery='approval_display' AND d.repeat_of=g.ask_row)) AND g.resolution_row IS NULL AND g.resolution_code IS NULL AND g.expires_at>?3 AND q.text=g.ask_text AND q.session=g.reply_session AND q.delivery='approval_request' AND q.delegation_session_incarnation=g.reply_incarnation AND length(g.ask_text)>0 AND instr(?4,g.ask_text)>0 AND q.id<?5 AND q.ts<=?6")?;
-        let rows = st.query_map(rusqlite::params![OWNER_AGENT,identity,at as f64/1000.0,text,turn,at], |r| Ok((r.get(0)?,r.get(1)?)))?;
+        let rows = st.query_map(rusqlite::params![session,identity,at as f64/1000.0,text,turn,at], |r| Ok((r.get(0)?,r.get(1)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     // One turn cannot be the unique shown_row of two requests. Fail closed.

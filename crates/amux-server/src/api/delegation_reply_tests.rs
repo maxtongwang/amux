@@ -2,6 +2,7 @@
 // Only process discovery and provider execution are fixtures; recorder/resolver/router are production.
 use super::*;
 use crate::api::{process_identity::{self, test_support, Origin}, settings::test_env, chat_worker};
+use crate::api::session_verbs::sh_quote;
 use crate::db::{Store, WriteOutcome};
 use axum::http::header;
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
@@ -15,6 +16,23 @@ const FORWARDED: u16 = 42103;
 const PEER: u16 = 42104;
 const AUTOMATION: u16 = 42105;
 static SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn capture_reply_logs() -> (Arc<std::sync::Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+    #[derive(Clone)]
+    struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let bytes=Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink=Sink(bytes.clone());
+    let peer=tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let subscriber=tracing_subscriber::fmt().without_time().with_ansi(false)
+        .with_writer(move || sink.clone()).finish();
+    (bytes,tracing::subscriber::set_default(subscriber),peer)
+}
 
 struct Fixture {
     state: AppState,
@@ -160,22 +178,31 @@ impl Fixture {
 
     // Exercise the shipped hook producer before routing its exact spool payload.
     // observe() only writes private files; it starts no provider or delivery task.
-    async fn type_in_pane(&self, text: &str, session_id: &str) {
+    fn observed_payload(&self, session: &str, data: Value) -> Value {
         let seq=SEQ.fetch_add(1,Ordering::SeqCst);
-        let folder=self.home.path().join(format!("status-events/{OWNER_AGENT}/reply-run"));
+        let folder=self.home.path().join(format!("status-events/{session}/reply-run"));
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("counter.json"),json!({"sequence":seq-1}).to_string()).unwrap();
         let hook=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/hooks/native-status.py");
         let code="import importlib.util,json,sys,time; from pathlib import Path; s=importlib.util.spec_from_file_location('observer',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); assert m.observe(json.load(sys.stdin),Path(sys.argv[2]),sys.argv[3],'reply-run','claude',time.time())";
+        // The SAME env prefix the real provider inherits, including owner config.
+        let command=format!("{}exec python3 -B -c {} {} {} {}",
+            crate::api::native_status::observer_env(session,"reply-run"),
+            sh_quote(code),sh_quote(&hook.to_string_lossy()),
+            sh_quote(&self.home.path().to_string_lossy()),sh_quote(session));
         use std::io::Write;
-        let mut process=std::process::Command::new("python3").args(["-B","-c",code])
-            .arg(hook).arg(self.home.path()).arg(OWNER_AGENT).stdin(std::process::Stdio::piped())
+        let mut process=std::process::Command::new("sh").args(["-c",&command])
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn().unwrap();
-        process.stdin.take().unwrap().write_all(json!({"hook_event_name":"UserPromptSubmit",
-            "prompt":text,"session_id":session_id}).to_string().as_bytes()).unwrap();
+        process.stdin.take().unwrap().write_all(data.to_string().as_bytes()).unwrap();
         let output=process.wait_with_output().unwrap();
         assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
-        let payload:Value=serde_json::from_slice(&std::fs::read(folder.join(format!("{seq:020}.json"))).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(folder.join(format!("{seq:020}.json"))).unwrap()).unwrap()
+    }
+
+    async fn type_in_pane(&self, text: &str, session_id: &str) {
+        let payload=self.observed_payload(OWNER_AGENT,json!({"hook_event_name":"UserPromptSubmit",
+            "prompt":text,"session_id":session_id}));
         assert_eq!(payload["session_id"],session_id);
         accepted(self.hook(OWNER_AGENT,payload).await);
     }
@@ -580,20 +607,25 @@ async fn remote_control_reply_requires_pane_or_messages_receipt() {
 }
 
 #[tokio::test]
-async fn verified_owner_yes_is_not_reclassified_by_peer_text() {
+async fn peer_yes_submission_is_not_a_verified_owner_reply() {
     for port in [OUTSIDE, REMOTE, FORWARDED] {
         let f=Fixture::new(); let id=f.ask().await;
-        accepted(f.send(OWNER_AGENT,PEER,"yes","pre-echo-yes").await);
-        f.peer_recorded("yes","session");
+        accepted(f.send(OWNER_AGENT,PEER,"yep","pre-echo-yes").await);
+        f.peer_recorded("yep","session");
+        // The fake pane now FIRES the shipped native producer and report route.
+        // Opus N1b: these submitted bytes came from the lead, never Max.
+        let typed=crate::api::worker_exec::fake_pane::typed(OWNER_AGENT);
+        f.type_in_pane(&typed.last().unwrap().0,"peer-delivery-submit").await;
+        assert_eq!(f.request_resolution(&id),(None,Some("request_reply_not_owner_input".into())));
+        assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
         accepted(f.send(OWNER_AGENT,port,"yes","proven-yes").await);
-        f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
-        accepted(f.apply(&id).await);
+        f.resolution(OWNER_AGENT,"request_no_candidate",None);
+        // An actual owner send of the same words still funds a fresh display.
+        let next=f.ask().await;
+        accepted(f.send(OWNER_AGENT,port,"yep","fresh-owner-yes").await);
+        f.resolution(OWNER_AGENT,"request_resolved",Some(&next));
+        accepted(f.apply(&next).await);
     }
-    let f=Fixture::new(); let id=f.ask().await;
-    accepted(f.send(OWNER_AGENT,PEER,"yes","pane-pre-echo-yes").await);
-    accepted(f.owner_reply("yes").await);
-    f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
-    accepted(f.apply(&id).await);
 }
 
 #[tokio::test]
@@ -1237,20 +1269,27 @@ async fn display_requires_a_bound_render_preparation_row() {
 // Round 2 (final): Sonnet's e0ef6497 key injection, through the shipped routes.
 #[tokio::test]
 async fn probe_r8_peer_keys_y_enter_into_owner_pane() {
+    let (logs,_scope,_peer)=capture_reply_logs();
     for prefix in ["sessions", "workers"] {
         let f=Fixture::new(); let id=f.ask().await;
         let before:i64=f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history",[],|r|r.get(0)).unwrap();
+        let before_keys=crate::api::worker_exec::fake_pane::keys(OWNER_AGENT);
         for key in ["y", "Enter", "Space", "C-c"] {
             let (st,v)=f.call(Some(PEER),None,&format!("/api/{prefix}/{OWNER_AGENT}/keys"),json!({"keys":key})).await;
             assert_eq!(st,StatusCode::FORBIDDEN,"{prefix}/{key}: {v}");
             assert_eq!(v["code"],"owner_session_keys_refused","{v}");
+            assert!(v.to_string().contains("use native delivery (#67) or let the server re-arm held relays (#66)"),"{v}");
         }
         assert_eq!(f.request_resolution(&id),(None,None),"refused peer keys leave the question open");
+        assert_eq!(crate::api::worker_exec::fake_pane::keys(OWNER_AGENT),before_keys,"the route must refuse before execution");
         assert_eq!(before,f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history",[],|r|r.get::<_,i64>(0)).unwrap(),"refused keys must leave no input boundary");
+        assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN,"peer y/Enter never funds");
         accepted(f.send(OWNER_AGENT,OUTSIDE,"yes","max-after-refused-keys").await);
         f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
         accepted(f.apply(&id).await);
     }
+    let logs=String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("WARN") && logs.contains("owner_session_keys_refused") && logs.contains("use native delivery (#67) or let the server re-arm held relays (#66)"),"{logs}");
 }
 
 #[tokio::test]
@@ -1336,6 +1375,13 @@ async fn raw_send_control_and_workspace_shell_cannot_bypass_owner_key_boundary()
 }
 
 impl Fixture {
+    async fn send_flags(&self, prefix: &str, history: Option<bool>, now: Option<bool>, text: &str) -> (StatusCode,Value) {
+        let mut body=json!({"text":text,"no_board":true,"msg_id":format!("flag-send-{}",SEQ.fetch_add(1,Ordering::SeqCst))});
+        if let Some(v)=history { body["record_history"]=json!(v); }
+        if let Some(v)=now { body["deliver_now"]=json!(v); }
+        self.call(Some(PEER),None,&format!("/api/{prefix}/{OWNER_AGENT}/send"),body).await
+    }
+
     fn transported(&self) -> String {
         let typed=crate::api::worker_exec::fake_pane::typed(OWNER_AGENT);
         let text=typed.last().expect("producer must reach the fake pane").0.clone();
@@ -1343,27 +1389,50 @@ impl Fixture {
         text
     }
 
-    async fn echo_leaves_open(&self, id: &str) {
+    async fn echo_closes_without_funding(&self, id: &str) {
         let text=self.transported();
-        let report=self.report(&text);
-        accepted(self.hook(OWNER_AGENT,report.clone()).await);
-        assert_eq!(self.request_resolution(id),(None,None),"non-owner echo neither funds nor closes");
-        accepted(self.hook_with_applied(OWNER_AGENT,report,false).await);
-        assert_eq!(self.request_resolution(id),(None,None),"duplicate transport echo remains non-owner");
+        self.type_in_pane(&text,"non-owner-delivery").await;
+        assert_eq!(self.request_resolution(id),(None,Some("request_reply_not_owner_input".into())),"submitted delivery closes without funding");
+        let row=self.resolution(OWNER_AGENT,"request_reply_not_owner_input",None);
+        let boundary=max_ref::one(&self.state,row).unwrap().unwrap();
+        assert_eq!(boundary.source,None);
+        assert_eq!(self.state.store.read().unwrap().query_row("SELECT origin FROM cmd_history WHERE id=?1",[row],|r|r.get::<_,String>(0)).unwrap(),"amux","known receipt must retain explicit non-owner origin");
         accepted(self.owner_reply("yes").await);
-        self.resolution(OWNER_AGENT,"request_resolved",Some(id));
-        accepted(self.apply(id).await);
+        self.resolution(OWNER_AGENT,"request_no_candidate",None);
+        assert_eq!(self.apply(id).await.0,StatusCode::FORBIDDEN);
     }
 }
 
 #[tokio::test]
 async fn peer_paste_and_chat_relay_echoes_are_recorded_non_owner() {
-    for (actor,text) in [(None,"y".to_string()),(None,"yes\n".repeat(300)),(Some("mrpopo@chat"),"yes".into()),(Some(OWNER_AGENT),"yes".into())] {
+    for (actor,text,isolated) in [(None,"y".to_string(),false),(None,"yes\n".repeat(300),false),(Some("mrpopo@chat"),"yes".into(),false),(Some(OWNER_AGENT),"yes".into(),false),(Some("mrpopo@chat"),"yes".into(),true)] {
         let f=Fixture::new(); let id=f.ask().await;
+        if isolated {
+            let path=f.home.path().join(format!("sessions/{OWNER_AGENT}.env"));
+            std::fs::write(&path,std::fs::read_to_string(&path).unwrap()+"CC_ISOLATED=1\n").unwrap();
+        }
+        if actor==Some("mrpopo@chat") {
+            let dir=f.home.path().join("chat/companions");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{OWNER_AGENT}.meta.json")),json!({"chat_inflight_turn":"owner-turn","chat_inflight_origin":"owner","chat_inflight_text":"relay this"}).to_string()).unwrap();
+            assert!(crate::api::session_verbs::owner_relay_quote("mrpopo@chat",OWNER_AGENT).is_some(),"exercise the active owner companion exception");
+        }
         let (port,actor)=if actor.is_some() { (None,actor) } else { (Some(PEER),None) };
         accepted(f.call(port,actor,&format!("/api/sessions/{OWNER_AGENT}/send"),json!({"text":text,"record_history":true,"no_board":true,"msg_id":"non-owner-echo"})).await);
         f.peer_recorded(&text,"session");
-        f.echo_leaves_open(&id).await;
+        let sender=actor.unwrap_or(LEAD);
+        if isolated {
+            let typed=crate::api::worker_exec::fake_pane::typed(OWNER_AGENT);
+            let (text,origin)=typed.last().unwrap();
+            assert_eq!(*origin,"owner","Chat speaks for the owner into isolated workers");
+            assert!(text.starts_with(&format!("[amux-origin: the owner, relayed by {sender}")));
+            f.type_in_pane(text,"isolated-chat-relay").await;
+            assert_eq!(f.request_resolution(&id),(None,None),"isolated native hooks remain status-only");
+            continue;
+        }
+        assert!(f.transported().contains(&format!("[amux-origin: {sender} —")),"self and active Chat relays also need a worker stamp");
+        assert_eq!(crate::api::worker_exec::fake_pane::typed(OWNER_AGENT).last().unwrap().1,"amux");
+        f.echo_closes_without_funding(&id).await;
     }
 }
 
@@ -1374,7 +1443,8 @@ async fn peer_steer_delivery_echo_is_recorded_non_owner() {
     f.write(|c| { c.execute("UPDATE steering_queue SET deliver_at=0 WHERE session=?1",[OWNER_AGENT])?; Ok(()) });
     assert!(crate::api::session_verbs::steer_deliver_for_session(&f.state,OWNER_AGENT).await,"real idle consumer must deliver the peer queue row");
     assert_eq!(f.request_resolution(&id),(None,None));
-    f.echo_leaves_open(&id).await;
+    assert!(f.transported().contains(&format!("[amux-origin: {LEAD} —")),"steer queue must carry its sender's stamp");
+    f.echo_closes_without_funding(&id).await;
 }
 
 #[tokio::test]
@@ -1399,7 +1469,7 @@ async fn schedule_and_goal_configuration_are_not_max_typing_now() {
                 assert_eq!(typed.last().unwrap(), &("yes".into(),"owner"),"configured exception preserves owner transport and bytes");
                 accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
                 assert_eq!(f.request_resolution(&id),(None,None),"status-only observer cannot close or fund an isolated approval");
-            } else { f.echo_leaves_open(&id).await; }
+            } else { f.echo_closes_without_funding(&id).await; }
         }
     }
 }
@@ -1441,7 +1511,8 @@ async fn transport_receipt_write_failure_refuses_before_owner_pane() {
 }
 
 #[tokio::test]
-async fn transport_echo_spool_recovery_preserves_the_question_across_replay() {
+async fn transport_echo_spool_recovery_closes_the_question_across_replay() {
+    let (logs,_scope,_peer)=capture_reply_logs();
     let f=Fixture::new();
     accepted(f.hook(OWNER_AGENT,f.report("initialize run")).await);
     let id=f.ask().await;
@@ -1450,14 +1521,18 @@ async fn transport_echo_spool_recovery_preserves_the_question_across_replay() {
     let dir=f.home.path().join(format!("status-events/{OWNER_AGENT}/reply-run"));
     std::fs::create_dir_all(&dir).unwrap();
     let path=dir.join(format!("{:020}.json",report["sequence"].as_u64().unwrap()));
-    for _ in 0..2 {
+    for replay in 0..2 {
+        let request=if replay==0 { id.clone() } else { f.ask().await };
         std::fs::write(&path,report.to_string()).unwrap();
         crate::api::native_status::replay(&f.state);
         assert!(!path.exists(),"receipt ACK only after replay completes");
-        assert_eq!(f.request_resolution(&id),(None,None));
+        assert_eq!(f.request_resolution(&request),(None,Some("request_reply_not_owner_input".into())));
+        accepted(f.owner_reply("yes").await);
+        f.resolution(OWNER_AGENT,"request_no_candidate",None);
+        assert_eq!(f.apply(&request).await.0,StatusCode::FORBIDDEN);
     }
-    accepted(f.owner_reply("yes").await);
-    f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
+    let logs=String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("native_transport_replayed"),"replay must retain transport classification: {logs}");
 }
 
 #[tokio::test]
@@ -1467,9 +1542,10 @@ async fn incomplete_transport_echo_is_still_non_owner_and_never_an_approval() {
     let mut report=f.report(&f.transported());
     report["prompt_truncated"]=json!(true);
     accepted(f.hook(OWNER_AGENT,report).await);
-    assert_eq!(f.request_resolution(&id),(None,None),"receipt identifies transport even when body is incomplete");
+    assert_eq!(f.request_resolution(&id),(None,Some("request_reply_not_owner_input".into())),"incomplete submitted transport closes without funding");
     accepted(f.owner_reply("yes").await);
-    f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+    assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -1508,7 +1584,8 @@ async fn project_peer_send_preserves_non_owner_provenance() {
     assert_eq!(max_ref::one(&f.state,row).unwrap().unwrap().source,None);
     // The real idle-hook delivery consumer, including project claim admission.
     assert!(crate::api::session_verbs::steer_deliver_for_session(&f.state,OWNER_AGENT).await);
-    f.echo_leaves_open(&id).await;
+    assert!(f.transported().contains(&format!("[amux-origin: {LEAD} —")),"project queue must carry its sender's stamp");
+    f.echo_closes_without_funding(&id).await;
 }
 
 #[tokio::test]
@@ -1516,7 +1593,8 @@ async fn raw_internal_owner_key_writers_refuse_before_execution() {
     let f=Fixture::new(); let id=f.ask().await;
     let before=crate::api::worker_exec::fake_pane::keys(OWNER_AGENT);
     let (ok,message)=crate::api::session_verbs::send_keys_op(OWNER_AGENT,"Enter").await;
-    assert!(!ok); assert_eq!(message,"owner_session_keys_refused");
+    assert!(!ok); assert!(message.starts_with("owner_session_keys_refused:"));
+    assert!(message.contains("use native delivery (#67) or let the server re-arm held relays (#66)"));
     assert!(!crate::api::session_verbs::send_literal(OWNER_AGENT,"y").await);
     crate::api::session_verbs::send_key(OWNER_AGENT,"Enter").await;
     assert_eq!(before,crate::api::worker_exec::fake_pane::keys(OWNER_AGENT),"no raw key writer may reach execution without owner/transport proof");
@@ -1549,7 +1627,7 @@ async fn schedule_run_route_echo_is_non_owner() {
         assert!(crate::api::session_verbs::steer_deliver_for_session(&f.state,OWNER_AGENT).await);
     }
     assert_eq!(f.request_resolution(&id),(None,None));
-    f.echo_leaves_open(&id).await;
+    f.echo_closes_without_funding(&id).await;
 }
 
 #[tokio::test]
@@ -1563,7 +1641,8 @@ async fn transport_receipt_from_old_launch_is_unverified_and_closes_window() {
     launch["incarnation"]=json!("old-launch");
     std::fs::write(&path,launch.to_string()).unwrap();
     accepted(f.hook(OWNER_AGENT,f.report(&f.transported())).await);
-    f.resolution(OWNER_AGENT,"request_reply_not_owner_input",None);
+    let row=f.resolution(OWNER_AGENT,"request_reply_not_owner_input",None);
+    assert_eq!(f.state.store.read().unwrap().query_row("SELECT origin FROM cmd_history WHERE id=?1",[row],|r|r.get::<_,String>(0)).unwrap(),"pane","old launch cannot authenticate even a non-owner receipt");
     assert_eq!(f.request_resolution(&id),(None,Some("request_reply_not_owner_input".into())));
 }
 
@@ -1588,7 +1667,7 @@ async fn server_owned_text_producers_are_not_owner_typing() {
         let f=Fixture::new(); let id=f.ask().await;
         let (ok,message)=send_text(&f.state,OWNER_AGENT,"yes",false,origin).await;
         assert!(ok,"{message}");
-        f.echo_leaves_open(&id).await;
+        f.echo_closes_without_funding(&id).await;
     }
 }
 
@@ -1642,7 +1721,7 @@ async fn server_shell_schedule_send_is_not_current_owner_input() {
     assert_eq!(f.request_resolution(&id),(None,None));
     let (st,v)=f.call(Some(AUTOMATION),None,&format!("/api/workers/{OWNER_AGENT}/keys"),json!({"keys":"Enter"})).await;
     assert_eq!(st,StatusCode::FORBIDDEN,"{v}"); assert_eq!(v["code"],"owner_session_keys_refused");
-    f.echo_leaves_open(&id).await;
+    f.echo_closes_without_funding(&id).await;
 }
 
 #[tokio::test]
@@ -1658,7 +1737,7 @@ async fn reparented_schedule_cli_marker_keeps_outside_send_non_owner() {
     assert!(response.status().is_success());
     f.peer_recorded("yes","session");
     assert_eq!(f.request_resolution(&id),(None,None));
-    f.echo_leaves_open(&id).await;
+    f.echo_closes_without_funding(&id).await;
 }
 
 #[tokio::test]
@@ -1686,4 +1765,125 @@ async fn shell_schedule_run_route_exports_automation_origin() {
     assert_eq!(f.request_resolution(&id),(None,None));
     accepted(f.owner_reply("yes").await);
     f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
+}
+
+// Opus N1/N1b/N2/N4: flags cannot promote peer bytes into Max's input.
+#[tokio::test]
+async fn opus_peer_send_flag_matrix_fires_native_hook_and_never_funds() {
+    for prefix in ["sessions","workers"] {
+        for history in [None,Some(false),Some(true)] {
+            for now in [None,Some(false),Some(true)] {
+                for held in [false,true] {
+                    let f=Fixture::new(); let id=f.ask().await;
+                    let before=crate::api::worker_exec::fake_pane::typed(OWNER_AGENT).len();
+                    let path=f.home.path().join(format!("sessions/{OWNER_AGENT}.env"));
+                    let original=std::fs::read_to_string(&path).unwrap();
+                    if held { std::fs::write(&path,original.clone()+"CC_PAUSED=1\nAMUX_SEND_QUEUE_FOR_PAUSED=1\n").unwrap(); }
+                    let reply=if now==Some(true) { "approved" } else { "yep" };
+                    let (status,value)=f.send_flags(prefix,history,now,reply).await;
+                    assert!(status.is_success(),"{prefix}/{history:?}/{now:?}/held={held}: {value}");
+                    assert_eq!(f.request_resolution(&id),(None,None),"delivery alone is not a submission");
+                    if held {
+                        assert_eq!(crate::api::worker_exec::fake_pane::typed(OWNER_AGENT).len(),before,"held relay must really queue");
+                        std::fs::write(path,original).unwrap();
+                        assert!(crate::api::session_verbs::steer_deliver_for_session(&f.state,OWNER_AGENT).await,"real held-queue drain");
+                    }
+                    let typed=crate::api::worker_exec::fake_pane::typed(OWNER_AGENT);
+                    assert_eq!(typed.len(),before+1,"exactly one pane delivery per flag case");
+                    let (text,origin)=typed.last().unwrap();
+                    // Fire first: on e0ef6497 this is the lead approving itself.
+                    f.type_in_pane(text,"opus-peer-yep").await;
+                    assert_eq!(f.request_resolution(&id),(None,Some("request_reply_not_owner_input".into())),"Opus self-approval: {history:?}/{now:?}/held={held}");
+                    assert_eq!(*origin,"amux","peer dispatch must use Automation for every flag combination");
+                    assert!(text.contains(&format!("[amux-origin: {LEAD} —")),"peer delivery must always be stamped: {text}");
+                    assert!(text.starts_with("[amux-input-receipt:"),"durable non-owner receipt: {text}");
+                    accepted(f.owner_reply("yes").await);
+                    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+                    assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn opus_empty_peer_send_flag_matrix_never_submits_owner_draft() {
+    let (logs,_scope,_peer)=capture_reply_logs();
+    for prefix in ["sessions","workers"] {
+        for history in [None,Some(false),Some(true)] {
+            for now in [None,Some(false),Some(true)] {
+                for text in [""," \t","[no-board]"] {
+                    let f=Fixture::new(); let id=f.ask().await;
+                    let before=crate::api::worker_exec::fake_pane::typed(OWNER_AGENT).len();
+                    let keys=crate::api::worker_exec::fake_pane::keys(OWNER_AGENT);
+                    let (status,value)=f.send_flags(prefix,history,now,text).await;
+                    assert_eq!(status,StatusCode::FORBIDDEN,"{history:?}/{now:?}: {value}");
+                    assert_eq!(value["code"],"owner_session_keys_refused");
+                    assert_eq!(crate::api::worker_exec::fake_pane::typed(OWNER_AGENT).len(),before,"Max's unsent draft must not be submitted");
+                    assert_eq!(crate::api::worker_exec::fake_pane::keys(OWNER_AGENT),keys);
+                    assert_eq!(f.request_resolution(&id),(None,None),"no actual submission, so window stays open");
+                }
+            }
+        }
+    }
+    let logs=String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("WARN") && logs.contains("owner_session_keys_refused"),"empty peer refusal must be logged: {logs}");
+}
+
+#[tokio::test]
+async fn non_default_owner_launch_config_reaches_native_report_route() {
+    let f=Fixture::new(); let renamed="review-configured-owner";
+    std::fs::rename(f.home.path().join(format!("sessions/{OWNER_AGENT}.env")),f.home.path().join(format!("sessions/{renamed}.env"))).unwrap();
+    crate::api::rename_identity::record(f.home.path(),OWNER_AGENT,renamed,&format!("inc-{OWNER_AGENT}")).unwrap();
+    assert_eq!(crate::api::native_status::owner_worker(),renamed);
+    let payload=f.observed_payload(renamed,json!({"hook_event_name":"Stop","last_assistant_message":"Configured owner turn"}));
+    assert_eq!(payload["assistant_message"],"Configured owner turn","server launch env must configure the shipped hook");
+    accepted(f.hook(renamed,payload).await);
+    let row:(String,String)=f.state.store.read().unwrap().query_row("SELECT text,origin FROM cmd_history WHERE session=?1 AND delivery='native_assistant'",[renamed],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(row,("Configured owner turn".into(),renamed.into()));
+    let other=f.observed_payload(LEAD,json!({"hook_event_name":"Stop","last_assistant_message":"Peer turn"}));
+    assert!(other.get("assistant_message").is_none(),"config must not promote peer output");
+}
+
+#[tokio::test]
+async fn server_held_relay_submit_closes_without_funding_and_peer_keys_stay_refused() {
+    let (logs,_scope,_peer)=capture_reply_logs();
+    let f=Fixture::new(); let id=f.ask().await;
+    accepted(f.send(OWNER_AGENT,PEER,"yep","held-relay").await);
+    let before=crate::api::worker_exec::fake_pane::keys(OWNER_AGENT);
+    let (status,value)=f.call(Some(PEER),None,&format!("/api/workers/{OWNER_AGENT}/keys"),json!({"keys":"Enter"})).await;
+    assert_eq!(status,StatusCode::FORBIDDEN,"{value}");
+    assert_eq!(f.request_resolution(&id),(None,None));
+    let (ok,message)=crate::api::session_verbs::submit_held_relay_non_owner(&f.state,OWNER_AGENT).await;
+    assert!(ok,"server re-arm must work without any peer keystroke: {message}");
+    let keys=crate::api::worker_exec::fake_pane::keys(OWNER_AGENT);
+    assert_eq!(&keys[..before.len()],before.as_slice());
+    assert_eq!(&keys[before.len()..],["Enter"],"only the server submitted the held relay");
+    // Must already be closed even if the native hook is lost at this boundary.
+    assert_eq!(f.request_resolution(&id),(None,Some("request_reply_not_owner_input".into())));
+    let row=f.resolution(OWNER_AGENT,"request_reply_not_owner_input",None);
+    assert_eq!(max_ref::one(&f.state,row).unwrap().unwrap().source,None);
+    f.type_in_pane(&f.transported(),"server-held-relay-submit").await;
+    accepted(f.owner_reply("yes").await);
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+    assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
+    // A relay submission remains durably non-owner with no open approval too.
+    let before:i64=f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history WHERE origin='amux' AND delivery='approval_input_uncertain'",[],|r|r.get(0)).unwrap();
+    assert!(crate::api::session_verbs::submit_held_relay_non_owner(&f.state,OWNER_AGENT).await.0);
+    assert_eq!(f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history WHERE origin='amux' AND delivery='approval_input_uncertain'",[],|r|r.get::<_,i64>(0)).unwrap(),before+1);
+    let logs=String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("held_relay_server_submit_non_owner") && logs.contains("held_relay_server_submit"),"{logs}");
+}
+
+#[tokio::test]
+async fn server_held_relay_boundary_failure_never_presses_enter() {
+    let f=Fixture::new(); let id=f.ask().await;
+    let before=crate::api::worker_exec::fake_pane::keys(OWNER_AGENT);
+    f.write(|c|c.execute_batch("CREATE TRIGGER fail_relay_boundary BEFORE INSERT ON cmd_history WHEN NEW.delivery='approval_input_uncertain' BEGIN SELECT RAISE(ABORT,'boundary unavailable'); END;"));
+    let (ok,message)=crate::api::session_verbs::submit_held_relay_non_owner(&f.state,OWNER_AGENT).await;
+    assert!(!ok && message.starts_with("held_relay_boundary_failed"),"{message}");
+    assert_eq!(crate::api::worker_exec::fake_pane::keys(OWNER_AGENT),before);
+    assert_eq!(f.request_resolution(&id),(None,None));
+    let (ok,_)=crate::api::session_verbs::submit_held_relay_non_owner(&f.state,TARGET).await;
+    assert!(!ok,"seam must not become a generic key writer");
 }

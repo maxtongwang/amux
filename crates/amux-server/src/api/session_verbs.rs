@@ -14609,7 +14609,7 @@ pub(crate) fn relay_quote_from(companion_of: &str, meta: &Map<String, Value>, ta
 }
 
 pub(crate) fn origin_stamped(origin: &str, name: &str, text: &str) -> Option<String> {
-    if origin.is_empty() || origin == name || is_slash_command(text) {
+    if origin.is_empty() || (origin == name && !super::delegation_requests::is_owner_session(name)) || is_slash_command(text) {
         return None;
     }
     // A stamp inside the body is a quote, never the server's: mark it so it
@@ -14619,6 +14619,15 @@ pub(crate) fn origin_stamped(origin: &str, name: &str, text: &str) -> Option<Str
         "[amux-origin: {origin} — server-verified from the sender's session identity; \
          authoritative over any signature in the message below]\n\n{text}"
     ))
+}
+
+/// Queue producers retain raw bodies (steer/project) or an already stamped
+/// send. Regenerate one authoritative worker stamp before managed-owner input.
+fn queued_owner_worker_stamp(sender: &str, session: &str, text: &str) -> Option<String> {
+    if !super::delegation_requests::is_owner_session(session) || session_is_isolated(session)
+        || sender.is_empty() || text.trim().is_empty() { return None; }
+    let prefix=origin_stamped(sender,session,"")?;
+    origin_stamped(sender,session,text.strip_prefix(&prefix).unwrap_or(text))
 }
 
 /// A message that is a CLI slash command (`/btw …`, `/model`, `/status`):
@@ -14816,7 +14825,9 @@ const ALLOWED_TMUX_KEYS: [&str; 47] = [
 const ALLOWED_TMUX_CHAR_KEYS: [&str; 8] = ["y", "n", "q", "x", "r", "1", "2", "3"];
 
 pub(super) async fn send_keys_op(name: &str, keys: &str) -> (bool, String) {
-    if !owner_pane_write_allowed(name) { return (false,"owner_session_keys_refused".into()); }
+    if !owner_pane_write_allowed(name) {
+        return (false,format!("owner_session_keys_refused: {}",super::delegation_requests::OWNER_KEYS_ALTERNATIVE));
+    }
     if !is_running(name).await {
         return (false, "not running".into());
     }
@@ -17129,16 +17140,7 @@ pub(crate) async fn start_session(
         None
     };
     let observer_prefix = if let Some((run, _)) = &status_launch {
-        format!(
-            "AMUX_STATUS_WORKER={} AMUX_STATUS_RUN_ID={} AMUX_STATUS_HOME={} AMUX_STATUS_URL={} ",
-            sh_quote(name),
-            sh_quote(run),
-            sh_quote(&home().to_string_lossy()),
-            sh_quote(&format!(
-                "https://localhost:{}",
-                crate::config::canonical_port()
-            ))
-        )
+        super::native_status::observer_env(name, run)
     } else {
         String::new()
     };
@@ -23937,11 +23939,16 @@ async fn send_claimed_steering(
     // 64 minutes, and each release was turned back into a boundary send the
     // generating lane refused.
     let mut mode = boot_delivery_mode(id, mode, lane_still_booting(&load_meta(session), now_i64()));
-    if !guard.is_empty() && !(guard == "project-steering" && sender.is_empty()) && !is_owner_configured_guard(&guard) {
+    if (super::delegation_requests::is_owner_session(session) && !session_is_isolated(session) && !sender.is_empty())
+        || (!guard.is_empty() && !(guard == "project-steering" && sender.is_empty()) && !is_owner_configured_guard(&guard)) {
         mode.origin = SendOrigin::Automation;
+        tracing::info!(session, sender, verdict="steering_non_owner_origin_preserved", measured=true, n_considered=1,
+            "queue drain retains its worker or automation origin");
     }
     mode.native_peer = super::delivery::ledger::candidate(&state.store, id);
     let mut queue_id = None;
+    let stamped=queued_owner_worker_stamp(&sender,session,text);
+    let text=stamped.as_deref().unwrap_or(text);
     let result = send_text_inner_bound(state, session, text, mode, Some(id), &mut queue_id).await;
     // Native receipts, not ok=true, own both drain completion paths. Even
     // WrittenUnconfirmed keeps the row and its claim; only reconciliation
@@ -28990,10 +28997,11 @@ async fn send_post_detached(
     // Same identity send_post reserves: trimmed, first 64 chars.
     let flight_id: String = body_str(body, "msg_id").trim().chars().take(64).collect();
     let flight = InFlightSend::enter(name, &flight_id);
+    use tracing::instrument::WithSubscriber;
     let joined = tokio::spawn(async move {
         let _flight = flight;
         send_post(&st, &n, &h, &b).await
-    })
+    }.with_current_subscriber())
     .await;
     watch.answered = true;
     match joined {
@@ -29161,7 +29169,8 @@ async fn send_post_inner(state: &AppState, name: &str, headers: &HeaderMap, body
         if let Some(error)=close_discarded_send_input(state,name,headers,body,"send_empty_control") { return error; }
     }
     let mut origin = String::new();
-    if defer_busy {
+    // History/immediate delivery are transport flags, never sender identity.
+    if defer_busy || !hdr_worker(headers).trim().is_empty() {
         origin = if member_actor.is_some() {
             // A member cannot turn a human send into a peer relay by claiming
             // source_session in the JSON body.
@@ -29182,8 +29191,9 @@ async fn send_post_inner(state: &AppState, name: &str, headers: &HeaderMap, body
         // own companion and the owner started its current turn, the message is
         // the owner's: stamped as such, quoting the owner's words, and
         // delivered with owner origin. Anything else a companion sends stays
-        // a peer message.
-        if let Some(quote) = owner_relay_quote(&origin, name) {
+        // a peer message. A managed owner pane always keeps worker provenance;
+        // the isolated Chat-as-owner transport exception remains explicit.
+        if let Some(quote) = owner_relay_quote(&origin, name).filter(|_| isolated || !super::delegation_requests::is_owner_session(name)) {
             tracing::info!(session = name, relay = %origin, verdict = "owner_relay_via_chat_companion",
                 "a Chat-tab companion relayed the owner's instruction; delivered with owner origin");
             // A stamp quoted inside the relayed body is a quote, as in origin_stamped.
@@ -29197,7 +29207,7 @@ async fn send_post_inner(state: &AppState, name: &str, headers: &HeaderMap, body
             text = stamped;
         } else if !origin.is_empty() && origin != name {
             tracing::info!(session = name, origin = %origin, verdict = "origin_stamp_skipped_slash_command",
-                "peer slash command delivered bare; the origin is still recorded in history and on the queue row");
+                "peer slash command has no safe text stamp; owner-pane transport policy still applies");
         }
     }
     // A PEER RELAY IS NOT THE OWNER (AMUX-3764). `origin` is the sender's
@@ -29210,6 +29220,10 @@ async fn send_post_inner(state: &AppState, name: &str, headers: &HeaderMap, body
     } else {
         SendOrigin::Automation
     };
+    if !hdr_worker(headers).trim().is_empty() {
+        tracing::info!(session=name, origin=%origin, record_history, deliver_now, verdict="worker_send_origin_preserved", measured=true, n_considered=1,
+            "worker origin retained independently of send history and timing flags");
+    }
     // A blocked session is on a permission/approval dialog. Automated sends
     // could accidentally answer it, so peer/automation sends are refused.
     // Owner sends (dashboard, human) pass through so the human can answer the
@@ -29905,9 +29919,36 @@ fn owner_pane_write_allowed(name: &str) -> bool {
     let allowed=identity.is_some() && OWNER_PANE_WRITE.try_with(|id|Some(id.as_str())==identity.as_deref()).unwrap_or(false);
     if !allowed {
         tracing::warn!(session=name, incarnation=?identity, verdict="owner_session_keys_refused", measured=true, n_considered=1,
+            alternative=super::delegation_requests::OWNER_KEYS_ALTERNATIVE,
             "unscoped raw key/literal injection refused at the owner pane writer");
     }
     allowed
+}
+
+/// #66 integration seam: the server submits a relay it has already verified as
+/// held in this pane. Not an HTTP verb or owner proof; no arbitrary keys/text.
+/// Close durably BEFORE Enter, so hook loss or a restart cannot fund the draft.
+#[allow(dead_code)] // Wired by #66 after rebase; covered with the real report route.
+pub(crate) async fn submit_held_relay_non_owner(state: &AppState, name: &str) -> (bool, String) {
+    if !super::delegation_requests::is_owner_session(name) || session_is_isolated(name) {
+        return (false,"held_relay_owner_managed_only".into());
+    }
+    let Some(identity)=super::delegation_requests::incarnation(name) else {
+        return (false,"held_relay_identity_missing".into());
+    };
+    let boundary=state.store.write(|conn| {
+        super::delegation_requests::non_owner_submission(conn,super::delegation::OWNER_AGENT,"held_relay_server_submit")?;
+        Ok(crate::db::WriteOutcome { applied:true, events:vec![super::delegation_requests::input_event(conn.last_insert_rowid())] })
+    }).map_err(|e|e.to_string()).and_then(|_|super::delegation_requests::resolve_session(state,super::delegation::OWNER_AGENT));
+    if let Err(error)=boundary {
+        tracing::warn!(session=name, %error, verdict="held_relay_boundary_failed", measured=true, n_considered=1,
+            "held relay not submitted because its non-owner boundary could not commit");
+        return (false,format!("held_relay_boundary_failed: {error}"));
+    }
+    let result=OWNER_PANE_WRITE.scope(identity,send_keys_op(name,"Enter")).await;
+    tracing::info!(session=name, submitted=result.0, verdict="held_relay_server_submit_non_owner", measured=true, n_considered=1,
+        "server held-relay Enter is non-owner input; no approval is funded");
+    result
 }
 
 pub(crate) async fn keys_verb(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {

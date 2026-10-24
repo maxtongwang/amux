@@ -19,6 +19,27 @@ observer = module('observer', 'native-status.py')
 installer = module('installer', 'install-native-status-hooks.py')
 
 class NativeStatus(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        self.owner_env = patch.dict('os.environ', AMUX_STATUS_OWNER='mrpopo')
+        self.owner_env.start()
+        self.addCleanup(self.owner_env.stop)
+
+    def test_configured_owner_name_controls_stop_receipt(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp, patch.dict('os.environ', AMUX_STATUS_OWNER='review-owner'):
+            root = Path(tmp)
+            for worker in ['review-owner', 'mrpopo']:
+                self.assertTrue(observer.observe({'hook_event_name':'Stop',
+                    'last_assistant_message':'Exact question? Request REQ1'}, root, worker, 'abc', 'claude', 1.0))
+                value = json.loads(next((root/'status-events'/worker/'abc').glob('0*.json')).read_text())
+                self.assertEqual('assistant_message' in value, worker == 'review-owner', value)
+            with patch.dict('os.environ', AMUX_STATUS_OWNER=''):
+                observer.observe({'hook_event_name':'Stop', 'last_assistant_message':'no config'},
+                                 root, 'review-owner', 'missing', 'claude', 2.0)
+                value = json.loads(next((root/'status-events/review-owner/missing').glob('0*.json')).read_text())
+                self.assertNotIn('assistant_message', value)
+
     def test_stop_transcript_fallback_uses_only_complete_latest_assistant_text(self):
         for provider, records in [
             ('claude', [{'type':'assistant', 'message':{'role':'assistant', 'content':[

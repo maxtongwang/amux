@@ -35,6 +35,75 @@ def shell_function(name):
 
 
 class OwnerOrigin(unittest.TestCase):
+    def test_peer_stamp_and_dispatch_ignore_history_and_immediate_flags(self):
+        path = SOURCE / 'crates/amux-server/src/api/session_verbs.rs'
+        source = path.read_text()
+        start = source.index('    let mut origin = String::new();', source.index('async fn send_post_inner('))
+        end = source.index('    // A blocked session', start)
+        drain_start = source.index('\n    if ', source.index('    let mut mode = boot_delivery_mode('))
+        drain_end = source.index('    let result = send_text_inner_bound(', drain_start)
+        drain = source[drain_start:drain_end]
+        self.assertEqual(drain.count('    let mut queue_id = None;'), 1)
+        drain = drain.replace('    let mut queue_id = None;', '')  # Unused boundary output in this extraction.
+        queue_helper = (function(path, 'queued_owner_worker_stamp')
+                        if 'fn queued_owner_worker_stamp(' in source else '')
+        # Compile the ACTUAL dispatch block and stamp function, not a second
+        # implementation. External identity/Chat lookups alone are fixtures.
+        code = '''
+#[macro_export] macro_rules! quiet { ($($t:tt)*) => {} }
+mod tracing { pub(crate) use crate::quiet as info; }
+mod api {
+pub mod delegation_requests { pub fn is_owner_session(s:&str)->bool { s=="configured-owner" } }
+pub mod session_verbs {
+use crate::tracing;
+#[derive(Debug,PartialEq)] pub enum SendOrigin { Owner, Automation }
+fn hdr_worker(headers:&str)->String { headers.into() }
+fn body_str(_body:&str,_key:&str)->String { String::new() }
+fn owner_relay_quote(_origin:&str,_name:&str)->Option<String> { None }
+fn session_is_isolated(_session:&str)->bool { false }
+''' + function(path, 'is_slash_command') + '\n' + function(path, 'origin_stamped') + '''
+pub fn dispatch(defer_busy:bool, headers:&str)->(String,SendOrigin) {
+    let name="configured-owner";
+    let isolated=false;
+    let member_actor=None::<()>;
+    let body="";
+    let mut text="yep".to_string();
+''' + source[start:end] + '''
+    (text,send_origin)
+}
+''' + function(path, 'is_schedule_guard') + '\n' + function(path, 'is_owner_configured_guard') + '\n' + queue_helper + '''
+pub fn drain_origin(session:&str, sender:&str, guard:&str)->(SendOrigin,String) {
+    struct Mode { origin:SendOrigin }
+    let mut mode=Mode { origin:SendOrigin::Owner };
+    let text="yep";
+''' + drain + '''
+    (mode.origin,text.into())
+}
+}}
+#[test] fn flags_never_promote_peer_input() {
+    use api::session_verbs::{dispatch,drain_origin,SendOrigin};
+    for defer in [false,true] {
+        for peer in ["lead","configured-owner"] {
+            let (text,origin)=dispatch(defer,peer);
+            assert_eq!(origin,SendOrigin::Automation,"defer={defer} peer={peer}");
+            assert!(text.starts_with(&format!("[amux-origin: {peer} —")),"{text}");
+        }
+    }
+    for guard in ["","project-steering","sched:owner-config","goal:owner-config"] {
+        let (origin,text)=drain_origin("configured-owner","lead",guard);
+        assert_eq!(origin,SendOrigin::Automation,"worker sender guard={guard}");
+        assert!(text.starts_with("[amux-origin: lead —"),"queued worker stamp: {text}");
+        assert_eq!(drain_origin("configured-owner","",guard),(SendOrigin::Owner,"yep".into()),"configured owner transport guard={guard}");
+    }
+    assert_eq!(drain_origin("isolated-peer","lead",""),(SendOrigin::Owner,"yep".into()),"preserve other lanes' admitted Chat-as-owner transport");
+}
+'''
+        with tempfile.TemporaryDirectory(prefix='owner-dispatch-') as tmp:
+            src, binary = Path(tmp)/'check.rs', Path(tmp)/'check'
+            src.write_text(code)
+            subprocess.run(['rustc','--edition','2021','--test',str(src),'-o',str(binary)],check=True)
+            subprocess.run([str(binary)],check=True)
+
     def test_pane_requires_recorded_owner_process_origin(self):
         with tempfile.TemporaryDirectory(prefix="owner-origin-") as tmp:
             tmp = Path(tmp)

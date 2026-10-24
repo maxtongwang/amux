@@ -45,6 +45,10 @@ forwards the owner's `Stop.last_assistant_message` verbatim, falling back to the
 latest complete assistant text in the hook's transcript (Claude or Codex).
 It never uses reasoning, tool output, partial records or text before a newer
 user message. Only the configured owner worker carries assistant text.
+The server exports `AMUX_STATUS_OWNER` in its existing native-observer launch
+environment, resolving `delegation::OWNER_AGENT` through the current rename
+alias. The hook has no separate owner-name default; missing config carries no
+assistant receipt.
 `POST /api/sessions/{owner}/report` → `native_status::apply` →
 `delegation_requests::native_assistant_turn` records the assistant message in
 `cmd_history`, after native run/sequence/provider validation. Only a self-report
@@ -133,9 +137,14 @@ a typed approval. A preceding display receipt remains mandatory.
 Every programmatic text delivery into the managed owner pane records an
 incarnation-bound `approval_transport` receipt before transport. The pane
 receives `[amux-input-receipt:<nonce>]` followed by the delivered text. The
-native observer's exact receipt identifies a non-owner transport echo: it
-neither closes nor funds a question, including on direct/spool replay, after a
-restart, and with an incomplete body. Body text, recent-message similarity and
+native observer's exact receipt identifies a non-owner submission: it closes
+the window and never funds a question, including on direct/spool replay, after
+a restart, and with an incomplete body. Delivery alone leaves the window open.
+Worker sends carry the origin stamp and Automation transport regardless of
+`record_history` or `deliver_now`, including self-sends and active Chat relays
+into the owner pane. Empty/whitespace/stripped peer sends are refused before
+transport, so Enter cannot submit the owner's unsent draft.
+Body text, recent-message similarity and
 absence of a worker header never establish human authorship. An unknown,
 malformed or wrong-incarnation receipt closes the window without funding it.
 A receipt write failure refuses transport; the failure is logged and retained.
@@ -183,7 +192,7 @@ manufacture one from an input row.
 
 | Entry point | Evidence |
 | --- | --- |
-| Native pane/provider Remote Control/raw terminal input | Unknown author closes without funding; a valid programmatic receipt does neither |
+| Native pane/provider Remote Control/raw terminal input | Unknown author and valid programmatic receipt submissions close without funding |
 | Dashboard, phone/Remote, owner CLI `/send`; worker-ID alias | Verified owner direct/queued history, including chat-type workers |
 | Chat tab `{worker}@chat/send` | `chat` row in the parent worker's history with verified owner provenance |
 | Recorded `/steer` | Queued owner provenance |
@@ -202,6 +211,8 @@ Raw key injection into the owner session requires verified owner process
 origin, even for its own worker process, same-group leads and Chat relays.
 `owner_session_keys_refused` is returned before general delegation and logged
 at WARN. The legacy session route and worker-ID route share this boundary.
+The refusal and log name the supported alternative: "use native delivery (#67)
+or let the server re-arm held relays (#66)".
 Bash `amux send --keys` uses the attributed API, with no tmux fallback or control
 retry after an uncertain ACK. Low-level key/literal writers require a matching
 incarnation scope from verified owner input or a recorded text transport.
@@ -211,9 +222,19 @@ origin so a peer cannot use a server-side shell to drive the owner pane.
 Server-descended API clients are classified as automation, including workerless
 shell schedules. Scheduled shells also export `AMUX_INPUT_SOURCE=automation`;
 the CLI forwards this demotion on every request, including after server restart
-or shell reparenting. Neither origin can fund or close a question. Verified
+or shell reparenting. Neither origin funds a question; its eventual managed
+pane submission closes the window. Verified
 owner-created Workspace PTYs preserve the owner's CLI origin; any worker
 ancestry still takes precedence. A client hint can only remove owner proof.
+
+The #66 held-relay recovery implementation is absent on this branch. Its rebase
+integration point is `session_verbs::submit_held_relay_non_owner(state, name)`.
+After #66 verifies that a relay is held in the managed owner pane, call this
+server-only seam instead of the raw key writer. It durably closes the approval
+window before sending exactly Enter with an incarnation-bound write scope.
+A failed boundary write prevents Enter; the later native hook remains
+non-owner input. This seam grants no peer key permission and does not expose
+an HTTP action. It cannot bypass #66's held-relay eligibility/recovery checks.
 
 Sweep regressions are in `api/delegation_reply_tests.rs`. No-Cargo checks:
 `python3 -B scripts/test-owner-input-origin.py` executes the shipped CLI functions
