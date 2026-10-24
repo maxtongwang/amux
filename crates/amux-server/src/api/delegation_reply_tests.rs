@@ -67,12 +67,31 @@ impl Fixture {
         (st,serde_json::from_slice(&bytes).unwrap_or(Value::Null))
     }
 
-    async fn ask(&self) -> String {
+    async fn ask_hidden(&self) -> String {
         let (st,v) = self.call(None,Some(LEAD),"/api/delegation/requests",json!({
             "method":"PATCH","path":format!("/api/sessions/{TARGET}/config"),"body":{"tags":""}})).await;
         assert_eq!(st,StatusCode::ACCEPTED,"{v}");
         assert_eq!(v["reply_session"],OWNER_AGENT);
         v["request_id"].as_str().unwrap().into()
+    }
+
+    async fn display(&self, id: &str) {
+        let (ask,text): (i64,String) = self.state.store.read().unwrap().query_row(
+            "SELECT ask_row,ask_text FROM _amux_delegation_grants WHERE code=?1", [id], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        let after_row = self.prepare_display().await;
+        accepted(self.call(Some(OUTSIDE),None,&format!("/api/delegation/questions/{ask}/display"),
+            json!({"surface":"owner-messages","text":text,"after_row":after_row})).await);
+    }
+
+    async fn prepare_display(&self) -> i64 {
+        let (st,v)=self.call(Some(OUTSIDE),None,"/api/delegation/questions/render",json!({"surface":"owner-messages"})).await;
+        assert!(st.is_success(),"{v}"); v["after_row"].as_i64().unwrap()
+    }
+
+    async fn ask(&self) -> String {
+        let id=self.ask_hidden().await;
+        self.display(&id).await;
+        id
     }
 
     async fn send(&self, session: &str, port: u16, text: &str, id: &str) -> (StatusCode,Value) {
@@ -126,7 +145,7 @@ impl Fixture {
     fn report(&self, text: &str) -> Value {
         let seq = SEQ.fetch_add(1,Ordering::SeqCst);
         json!({"native_status":true,"event":"UserPromptSubmit","state":"active","run_id":"reply-run",
-            "provider":"claude","sequence":seq,"event_ts":crate::config::now_f64()-0.5,"turn_id":format!("reply-{seq}"),"prompt":text})
+            "provider":"claude","sequence":seq,"event_ts":crate::config::now_f64(),"turn_id":format!("reply-{seq}"),"prompt":text})
     }
 
     async fn hook(&self, session: &str, report: Value) -> (StatusCode,Value) {
@@ -313,11 +332,11 @@ async fn clock_reversal_and_expiry_refuse_even_with_increasing_row_ids() {
 }
 
 #[tokio::test]
-async fn intervening_question_is_ambiguous_but_peer_notice_is_not() {
+async fn latest_display_wins_but_peer_notice_does_not_close_it() {
     let f=Fixture::new(); let a=f.ask().await; let b=f.ask().await;
     accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
-    f.resolution(OWNER_AGENT,"request_ambiguous",None);
-    for id in [a,b] { assert_eq!(f.request_resolution(&id),(None,Some("request_ambiguous".into()))); }
+    f.resolution(OWNER_AGENT,"request_resolved",Some(&b));
+    assert_eq!(f.request_resolution(&a),(None,None));
     let id=f.ask().await;
     accepted(f.send(OWNER_AGENT,PEER,"status notice","peer-notice").await);
     f.peer_recorded("status notice","user");
@@ -359,7 +378,7 @@ async fn forwarded_remote_owner_send_keeps_owner_session_boundary() {
 async fn equal_clock_uses_strict_row_order() {
     let f=Fixture::new(); let id=f.ask().await;
     // Simulate the ordinary millisecond tie without replacing the recorder.
-    f.write(|c| { c.execute_batch("CREATE TRIGGER tie_question_clock BEFORE INSERT ON cmd_history WHEN NEW.origin='pane' BEGIN UPDATE cmd_history SET ts=NEW.ts WHERE delivery='approval_request'; END;")?; Ok(()) });
+    f.write(|c| { c.execute_batch("CREATE TRIGGER tie_question_clock BEFORE INSERT ON cmd_history WHEN NEW.origin='pane' BEGIN UPDATE cmd_history SET ts=NEW.ts WHERE delivery='approval_display'; END;")?; Ok(()) });
     accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
     let reply=f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
     let c=f.state.store.read().unwrap();
@@ -394,7 +413,7 @@ async fn peer_echo_after_owner_no_never_reopens_the_window_through_routes() {
 async fn future_or_stale_recorded_reply_never_funds() {
     for delta_ms in [60_000i64,-86_401_000] {
         let f=Fixture::new(); let id=f.ask().await;
-        f.write(move|c| { c.execute_batch(&format!("CREATE TRIGGER skew_reply_clock AFTER INSERT ON cmd_history WHEN NEW.origin='pane' BEGIN UPDATE cmd_history SET ts=NEW.ts+{delta_ms}-1000 WHERE delivery='approval_request'; UPDATE cmd_history SET ts=ts+{delta_ms} WHERE id=NEW.id; END;"))?; Ok(()) });
+        f.write(move|c| { c.execute_batch(&format!("CREATE TRIGGER skew_reply_clock AFTER INSERT ON cmd_history WHEN NEW.origin='pane' BEGIN UPDATE cmd_history SET ts=NEW.ts+{delta_ms}-1000 WHERE delivery='approval_display'; UPDATE cmd_history SET ts=ts+{delta_ms} WHERE id=NEW.id; END;"))?; Ok(()) });
         accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
         f.resolution(OWNER_AGENT,"request_reply_outside_window",None);
         assert_eq!(f.request_resolution(&id),(None,Some("request_reply_outside_window".into())));
@@ -463,4 +482,161 @@ async fn owner_cli_default_does_not_promote_worker_or_relay_input() {
         accepted(f.hook(OWNER_AGENT,f.report("approve")).await);
         f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
     }
+}
+
+// Sonnet review of 04c2138d B1/B2: preserve both failing probes as specimens.
+#[tokio::test]
+async fn probe_unrelated_yes_without_display_evidence_funds_hidden_request() {
+    let f=Fixture::new(); let id=f.ask_hidden().await;
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    assert_eq!(f.request_resolution(&id).0,None,"a stored question was never displayed");
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+}
+
+#[tokio::test]
+async fn probe_unprocessed_intervening_owner_row_does_not_leave_window_open() {
+    let f=Fixture::new(); let id=f.ask().await;
+    f.write(|c| {
+        c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts,delegation_session_incarnation) VALUES(?1,'what is the build status?','user','pane','pane',?2,?3)",
+            rusqlite::params![OWNER_AGENT,(crate::config::now_f64()*1000.0) as i64,format!("inc-{OWNER_AGENT}")])?;
+        Ok(())
+    });
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    assert_eq!(f.request_resolution(&id).0,None,"unprocessed owner row closes the window");
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+}
+
+#[tokio::test]
+async fn yes_immediately_after_render_receipt_funds_exact_request() {
+    let f=Fixture::new(); let id=f.ask_hidden().await;
+    assert_eq!(f.state.store.read().unwrap().query_row("SELECT shown_row FROM _amux_delegation_grants WHERE code=?1",[&id],|r|r.get::<_,Option<i64>>(0)).unwrap(),None);
+    f.display(&id).await;
+    let c=f.state.store.read().unwrap();
+    let (ask,shown,ts,delivered,source):(i64,i64,i64,i64,i64)=c.query_row("SELECT g.ask_row,g.shown_row,h.ts,h.delivered_at,h.repeat_of FROM _amux_delegation_grants g JOIN cmd_history h ON h.id=g.shown_row WHERE g.code=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+    assert!(shown>ask); assert_eq!(source,ask); assert_eq!(ts,delivered); drop(c);
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
+}
+
+#[tokio::test]
+async fn owner_output_between_display_and_yes_closes_window() {
+    for ty in ["assistant","session"] {
+        let f=Fixture::new(); let id=f.ask().await;
+        f.write(move|c| { c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts) VALUES(?1,'shall I check the build?',?2,?1,'direct',?3)",
+            rusqlite::params![OWNER_AGENT,ty,(crate::config::now_f64()*1000.0) as i64])?; Ok(()) });
+        accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+        assert_eq!(f.request_resolution(&id).0,None);
+        f.resolution(OWNER_AGENT,"request_no_candidate",None);
+    }
+}
+
+#[tokio::test]
+async fn two_displays_and_intervening_input_fund_neither() {
+    let f=Fixture::new(); let a=f.ask().await; let b=f.ask().await;
+    accepted(f.hook(OWNER_AGENT,f.report("status please")).await);
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+    assert_eq!(f.request_resolution(&a).0,None); assert_eq!(f.request_resolution(&b).0,None);
+}
+
+#[tokio::test]
+async fn unsupported_surface_and_worker_display_claims_are_refused() {
+    let f=Fixture::new(); let id=f.ask_hidden().await;
+    let (ask,text):(i64,String)=f.state.store.read().unwrap().query_row("SELECT ask_row,ask_text FROM _amux_delegation_grants WHERE code=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    let after_row=f.prepare_display().await;
+    for surface in ["pane","cli","phone-notification","chat"] {
+        let (st,v)=f.call(Some(OUTSIDE),None,&format!("/api/delegation/questions/{ask}/display"),json!({"surface":surface,"text":text,"after_row":after_row})).await;
+        assert_eq!(st,StatusCode::FORBIDDEN); assert_eq!(v["code"],"request_display_surface_unsupported");
+    }
+    let (st,v)=f.call(Some(PEER),None,&format!("/api/delegation/questions/{ask}/display"),json!({"surface":"owner-messages","text":text,"after_row":after_row})).await;
+    assert_eq!(st,StatusCode::FORBIDDEN); assert_eq!(v["code"],"request_display_not_owner");
+    let (st,v)=f.call(Some(OUTSIDE),None,&format!("/api/delegation/questions/{ask}/display"),json!({"surface":"owner-messages","text":"different question","after_row":after_row})).await;
+    assert_eq!(st,StatusCode::FORBIDDEN); assert_eq!(v["code"],"request_display_ineligible");
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    assert_eq!(f.request_resolution(&id).0,None);
+}
+
+#[tokio::test]
+async fn duplicate_display_receipt_cannot_reopen_closed_window() {
+    let f=Fixture::new(); let id=f.ask().await;
+    f.write(|c| { c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts) VALUES(?1,'another question','assistant',?1,'direct',?2)",rusqlite::params![OWNER_AGENT,(crate::config::now_f64()*1000.0) as i64])?; Ok(()) });
+    f.display(&id).await;
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+    assert_eq!(f.request_resolution(&id).0,None);
+}
+
+#[tokio::test]
+async fn delayed_display_receipt_cannot_move_past_owner_input() {
+    let f=Fixture::new(); let id=f.ask_hidden().await;
+    let (ask,text):(i64,String)=f.state.store.read().unwrap().query_row("SELECT ask_row,ask_text FROM _amux_delegation_grants WHERE code=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    let after_row=f.prepare_display().await;
+    accepted(f.hook(OWNER_AGENT,f.report("another question")).await);
+    let (st,v)=f.call(Some(OUTSIDE),None,&format!("/api/delegation/questions/{ask}/display"),json!({"surface":"owner-messages","text":text,"after_row":after_row})).await;
+    assert_eq!(st,StatusCode::FORBIDDEN); assert_eq!(v["code"],"request_display_ineligible");
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    assert_eq!(f.request_resolution(&id).0,None);
+}
+
+#[tokio::test]
+async fn native_owner_output_edge_closes_display_window_before_yes() {
+    let f=Fixture::new(); let id=f.ask().await;
+    let mut output=f.report(""); output["event"]=json!("PostToolUse");
+    accepted(f.hook(OWNER_AGENT,output).await);
+    assert_eq!(f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history WHERE delivery='approval_output'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+    assert_eq!(f.request_resolution(&id).0,None);
+}
+
+#[tokio::test]
+async fn chat_and_companion_output_close_owner_window_once_per_display() {
+    for session in [OWNER_AGENT, "mrpopo@chat"] {
+        let f=Fixture::new(); let id=f.ask().await;
+        observe_output(&f.state,session).unwrap();
+        observe_output(&f.state,session).unwrap();
+        assert_eq!(f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history WHERE delivery='approval_output'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+        f.resolution(OWNER_AGENT,"request_no_candidate",None);
+        assert_eq!(f.request_resolution(&id).0,None);
+    }
+}
+
+#[tokio::test]
+async fn legacy_question_row_is_not_display_evidence_at_application() {
+    let f=Fixture::new(); let id=f.ask_hidden().await; let code=id.clone();
+    f.write(move|c| { c.execute("UPDATE _amux_delegation_grants SET shown_row=ask_row WHERE code=?1",[code])?; Ok(()) });
+    let (ask,text):(i64,String)=f.state.store.read().unwrap().query_row("SELECT ask_row,ask_text FROM _amux_delegation_grants WHERE code=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    let after_row=f.prepare_display().await;
+    let (st,v)=f.call(Some(OUTSIDE),None,&format!("/api/delegation/questions/{ask}/display"),json!({"surface":"owner-messages","text":text,"after_row":after_row})).await;
+    assert_eq!(st,StatusCode::FORBIDDEN); assert_eq!(v["code"],"request_display_ineligible");
+    let (st,v)=f.apply(&id).await;
+    assert_eq!(st,StatusCode::FORBIDDEN); assert_eq!(v["code"],"request_not_shown");
+}
+
+#[tokio::test]
+async fn refused_latest_display_never_falls_back_to_older_question() {
+    let f=Fixture::new(); let a=f.ask().await; let b=f.ask().await; let code=b.clone();
+    f.write(move|c| { c.execute("UPDATE _amux_delegation_grants SET resolution_code='request_reply_not_affirmative' WHERE code=?1",[code])?; Ok(()) });
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+    assert_eq!(f.request_resolution(&a).0,None); assert_eq!(f.request_resolution(&b).0,None);
+}
+
+#[tokio::test]
+async fn render_prepare_closes_old_window_before_new_question_is_visible() {
+    let f=Fixture::new(); let old=f.ask().await;
+    let _new=f.ask_hidden().await;
+    f.prepare_display().await;
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+    assert_eq!(f.request_resolution(&old).0,None);
+}
+
+#[tokio::test]
+async fn display_requires_a_bound_render_preparation_row() {
+    let f=Fixture::new(); let id=f.ask_hidden().await;
+    let (ask,text):(i64,String)=f.state.store.read().unwrap().query_row("SELECT ask_row,ask_text FROM _amux_delegation_grants WHERE code=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    let (st,v)=f.call(Some(OUTSIDE),None,&format!("/api/delegation/questions/{ask}/display"),json!({"surface":"owner-messages","text":text,"after_row":ask})).await;
+    assert_eq!(st,StatusCode::FORBIDDEN); assert_eq!(v["code"],"request_display_ineligible");
 }

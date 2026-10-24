@@ -1,3 +1,4 @@
+// Chat worker execution — records output boundaries before streaming to the owner.
 //! Chat worker execution adapter (ACW-4/7/8).
 //!
 //! A chat worker is a normal amux worker (env file, board identity, message
@@ -432,6 +433,16 @@ impl Lane {
         let s = j.push(ev);
         let _ = self.tx.send(s);
     }
+}
+
+/// All conversational output (including errors) shares the same ledger barrier.
+fn publish_output(state: &AppState, name: &str, lane: &Lane, event: Value) -> Result<(), String> {
+    if let Err(error) = super::delegation_requests::observe_output(state, name) {
+        tracing::warn!(session=name, %error, verdict="delegation_output_unrecorded", "refusing unrecorded owner output");
+        return Err(error);
+    }
+    lane.publish(event);
+    Ok(())
 }
 
 /// Per-process epoch: a cursor from a previous server process cannot be
@@ -904,6 +915,10 @@ async fn finish_turn(
     out: TurnOutcome,
     duration_ms: u64,
 ) {
+    if let Err(error) = super::delegation_requests::observe_output(state, name) {
+        tracing::warn!(session=name, %error, verdict="delegation_output_unrecorded", "retaining unfinished owner reply for recovery");
+        return;
+    }
     let turn_id = turn_id.to_string();
     let interrupted = lane.interrupt.swap(false, Ordering::SeqCst);
     if !out.conversation_id.is_empty() {
@@ -978,7 +993,7 @@ async fn finish_turn(
     for attempt in 0..=1 {
         TurnFiles::new(&turn_id, attempt).remove();
     }
-    lane.publish(json!({"type": "done", "turn_id": turn_id, "message": msg}));
+    let _ = publish_output(state, name, lane, json!({"type": "done", "turn_id": turn_id, "message": msg}));
     match &error {
         None => tracing::info!(session = %name, turn = %turn_id, duration_ms,
             chars = a.text.len(), tools = a.tools.len(), interrupted, measured = true,
@@ -1536,7 +1551,7 @@ async fn execute(
         Ok(p) => p,
         Err(why) => {
             files.remove();
-            lane.publish(json!({"type": "error", "turn_id": turn_id, "text": why}));
+            let _ = publish_output(state, name, lane, json!({"type": "error", "turn_id": turn_id, "text": why}));
             return TurnOutcome::failed(turn_id, why);
         }
     };
@@ -1705,7 +1720,7 @@ async fn follow_turn(
         *lane.pid.lock().unwrap() = None;
         signal_turn(pgid);
         let why = format!("{provider} did not start (no output file)");
-        lane.publish(json!({"type": "error", "turn_id": turn_id, "text": why}));
+        let _ = publish_output(state, name, lane, json!({"type": "error", "turn_id": turn_id, "text": why}));
         out.asm.error = Some(why);
         return out;
     };
@@ -1723,7 +1738,7 @@ async fn follow_turn(
     // Set when the final result arrived and the process is still running.
     let mut ended_at: Option<std::time::Instant> = None;
     let mut lingering = false;
-    loop {
+    'follow: loop {
         let mut buf = String::new();
         match reader.read_line(&mut buf).await {
             Ok(0) => {
@@ -1756,7 +1771,7 @@ async fn follow_turn(
                 if last_output.elapsed() >= TURN_IDLE_TIMEOUT {
                     signal_turn(pgid);
                     let why = format!("no output for {}s; turn killed", TURN_IDLE_TIMEOUT.as_secs());
-                    lane.publish(json!({"type": "error", "turn_id": turn_id, "text": why}));
+                    let _ = publish_output(state, name, lane, json!({"type": "error", "turn_id": turn_id, "text": why}));
                     out.asm.error = Some(why);
                     break;
                 }
@@ -1796,12 +1811,15 @@ async fn follow_turn(
                         }
                         _ => {}
                     }
-                    lane.publish(ev);
+                    if let Err(error) = publish_output(state, name, lane, ev) {
+                        out.asm.error = Some(error);
+                        break 'follow;
+                    }
                 }
             }
             Err(e) => {
                 let why = format!("could not read the turn's output: {e}");
-                lane.publish(json!({"type": "error", "turn_id": turn_id, "text": why}));
+                let _ = publish_output(state, name, lane, json!({"type": "error", "turn_id": turn_id, "text": why}));
                 out.asm.error = Some(why);
                 break;
             }
@@ -1813,7 +1831,7 @@ async fn follow_turn(
     let err_text = std::fs::read_to_string(files.path("err")).unwrap_or_default();
     let code = files.exit_code();
     if lane.interrupt.load(Ordering::SeqCst) {
-        lane.publish(json!({"type": "interrupted", "turn_id": turn_id}));
+        let _ = publish_output(state, name, lane, json!({"type": "interrupted", "turn_id": turn_id}));
     } else if out.asm.error.is_none() && code != Some(0) && !lingering {
         let tail: String = err_text
             .lines()
@@ -1831,7 +1849,7 @@ async fn follow_turn(
         } else {
             format!("{provider} exited with {code:?}")
         };
-        lane.publish(json!({"type": "error", "turn_id": turn_id, "text": why}));
+        let _ = publish_output(state, name, lane, json!({"type": "error", "turn_id": turn_id, "text": why}));
         out.asm.error = Some(why);
     }
     out
@@ -2356,6 +2374,50 @@ fn interrupt_turn(name: &str) -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn display_window_state(dir: &std::path::Path) -> AppState {
+        let state = AppState { store: Arc::new(crate::db::Store::open(&dir.join("display.db")).unwrap()),
+            started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
+            reconciled: Arc::new(AtomicBool::new(true)) };
+        state.store.write(|c| {
+            c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts) VALUES('mrpopo','question','session','lead','approval_display',1)",[])?;
+            let shown = c.last_insert_rowid();
+            c.execute("INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,status,reply_session,shown_row) VALUES('DISP','lead','lead','config','worker','PATCH','/config','{}','question',1,9999999999,'pending','mrpopo',?1)",[shown])?;
+            Ok(crate::db::WriteOutcome { applied:true, events:vec![] })
+        }).unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn chat_stream_output_records_approval_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = display_window_state(tmp.path());
+        let files = TurnFiles { stem:tmp.path().join("stream") };
+        std::fs::write(files.path("out"), "{\"type\":\"item.completed\",\"item\":{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"another question\"}}\n").unwrap();
+        std::fs::write(files.path("exit"), "0").unwrap();
+        let _turn = hold_test_turn("mrpopo@chat");
+        let lane = lane("mrpopo@chat");
+        let out = follow_turn(&state,"mrpopo@chat","codex",&lane,"display-stream",&files,0).await;
+        assert_eq!(out.asm.text,"another question"); assert!(out.asm.error.is_none());
+        assert_eq!(state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history WHERE delivery='approval_output'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[tokio::test]
+    async fn finished_chat_reply_records_approval_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(tmp.path());
+        let state = display_window_state(tmp.path());
+        state.store.write(|c| {
+            c.execute_batch("CREATE TRIGGER require_output_boundary BEFORE INSERT ON session_events WHEN NEW.type='chat.message' AND json_extract(NEW.data,'$.role')='assistant' AND NOT EXISTS(SELECT 1 FROM cmd_history WHERE delivery='approval_output') BEGIN SELECT RAISE(ABORT,'assistant output missing approval boundary'); END;")?;
+            Ok(crate::db::WriteOutcome { applied:true, events:vec![] })
+        }).unwrap();
+        let _turn = hold_test_turn("mrpopo@chat");
+        let lane = lane("mrpopo@chat");
+        finish_turn(&state,"mrpopo@chat",&lane,"display-finish","claude",TurnOutcome::new("display-finish"),0).await;
+        assert_eq!(state.store.read().unwrap().query_row("SELECT COUNT(*) FROM session_events WHERE type='chat.message' AND json_extract(data,'$.role')='assistant'",[],|r|r.get::<_,i64>(0)).unwrap(),1,"boundary must precede persistence, not just the final SSE publish");
+        assert_eq!(state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history WHERE delivery='approval_output'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
 
     #[test]
     fn chat_tab_key_belongs_to_its_worker_and_no_worker_can_own_it() {

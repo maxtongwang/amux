@@ -187,7 +187,30 @@ impl Env {
     pub async fn request(&self, actor: &str, method: &str, path: &str, body: Value) -> String {
         let (st,v) = self.request_result(actor, method, path, body).await;
         assert_eq!(st, StatusCode::ACCEPTED, "explicit request: {v}");
-        v["request_id"].as_str().expect("request_id").into()
+        let id = v["request_id"].as_str().expect("request_id").to_string();
+        self.display_request(&id).await;
+        id
+    }
+
+    pub async fn display_request(&self, id: &str) {
+        let (ask,text):(i64,String)=self.store.read().unwrap().query_row(
+            "SELECT ask_row,ask_text FROM _amux_delegation_grants WHERE code=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        // A non-loopback ConnectInfo exercises the production Remote proof
+        // without OS process discovery, live sockets or a cfg(test) API.
+        let mut prepare=Request::builder().method("POST").uri("/api/delegation/questions/render")
+            .header(header::CONTENT_TYPE,"application/json")
+            .body(Body::from(json!({"surface":"owner-messages"}).to_string())).unwrap();
+        prepare.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([192,0,2,1],42105))));
+        let res=self.app.clone().oneshot(prepare).await.unwrap(); assert!(res.status().is_success());
+        let bytes=axum::body::to_bytes(res.into_body(),usize::MAX).await.unwrap();
+        let after_row=serde_json::from_slice::<Value>(&bytes).unwrap()["after_row"].as_i64().unwrap();
+        let mut req=Request::builder().method("POST").uri(format!("/api/delegation/questions/{ask}/display"))
+            .header(header::CONTENT_TYPE,"application/json")
+            .body(Body::from(json!({"surface":"owner-messages","text":text,"after_row":after_row}).to_string())).unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([192,0,2,1],42105))));
+        let res=self.app.clone().oneshot(req).await.unwrap();
+        let st=res.status(); let bytes=axum::body::to_bytes(res.into_body(),usize::MAX).await.unwrap();
+        assert!(st.is_success(),"display receipt: {}",String::from_utf8_lossy(&bytes));
     }
 
     /// Exercise request creation without assuming that the change is delegable.

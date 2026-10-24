@@ -23447,7 +23447,7 @@ function _msgDeliveryChip(e) {
   // busy->boundary hop and saying "0s" about them is noise.
   const waitTxt = wait > 1500 ? ' ' + _fmtDur(wait) : '';
   let label, color, bg, title;
-  const notices = { approval_request: ['approval request', 'Shown in this session’s Messages. Reply in this session to approve the exact stored change.'] };
+  const notices = { approval_request: ['approval request', 'Open owner Messages to display this question; only the very next owner input can approve it.'] };
   const notice = Object.hasOwn(notices, rec) ? notices[rec] : null;
   if (notice) {
     [label, title] = notice; color = 'var(--accent)'; bg = 'var(--bg)';
@@ -23735,7 +23735,7 @@ function _msgCardChips(message) {
 // exactly what Ethan reported. Normalize once, at every fetch, and set BOTH names
 // so nothing downstream has to know which surface it came from.
 function _msgCtxPeek() {
-  return { sel: _pmSel, key: _pmKey, toggle: '_pmSelToggle', resend: '_pmResend',
+  return { approvalDisplay:true, sel: _pmSel, key: _pmKey, toggle: '_pmSelToggle', resend: '_pmResend',
            searchId: 'peek-messages-search', rowClass: '',
            target: () => (typeof peekSession !== 'undefined' ? peekSession : '') };
 }
@@ -23906,11 +23906,83 @@ function _msgContextOpen(enc) {
   document.body.appendChild(o);
 }
 
+// Receipt only after an expanded question is painted in the visible owner
+// Messages tab. Fetching history, hidden tabs and collapsed rows never arm it.
+const _approvalRenderTickets = new WeakMap();
+async function _approvalRender(list, html) {
+  const ticket = {};
+  _approvalRenderTickets.set(list, ticket);
+  if (!html.includes('data-approval-ask=')) { list.innerHTML = html; return; }
+  try {
+    // Close the previous window BEFORE another question reaches the screen.
+    // Replies arriving before its render receipt then fund neither question.
+    const r = await fetch(API + '/api/delegation/questions/render', {method:'POST',
+      headers:{..._authHeaders(), 'Content-Type':'application/json'}, body:JSON.stringify({surface:'owner-messages'})});
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.code || 'request_display_prepare_failed');
+    if (_approvalRenderTickets.get(list) !== ticket) return;
+    list.innerHTML = html;
+    list.querySelectorAll('[data-approval-ask]').forEach(row => { row.dataset.approvalAfter = String(d.after_row); });
+    _approvalObserve(list);
+  } catch (error) { showToast('Approval display refused: ' + error.message); }
+}
+const _approvalDisplaySeen = new Set();
+let _approvalDisplayQueue = Promise.resolve();
+let _approvalDisplayObserver = null;
+function _approvalObserve(list) {
+  if (!list) return;
+  if (typeof IntersectionObserver === 'undefined') {
+    if (list.querySelector('[data-approval-ask]')) showToast('request_display_surface_unsupported: this browser cannot record approval display');
+    return;
+  }
+  if (_approvalDisplayObserver) _approvalDisplayObserver.disconnect();
+  const observer = new IntersectionObserver(entries => {
+    const visible = entries.filter(e => e.isIntersecting && e.intersectionRatio === 1 && document.visibilityState === 'visible')
+      .sort((a,b) => Number(a.target.dataset.approvalAsk) - Number(b.target.dataset.approvalAsk)).slice(-1);
+    for (const entry of visible) {
+      const row = entry.target, body = row.querySelector('.msg-body');
+      const id = row.dataset.approvalAsk;
+      if (!body || body.classList.contains('collapsed') || _approvalDisplaySeen.has(id)) continue;
+      _approvalDisplaySeen.add(id);
+      observer.unobserve(row);
+      const text = body.textContent;
+      _approvalDisplayQueue = _approvalDisplayQueue.then(async () => {
+        // A tab switch while queued must not claim a display on a hidden view.
+        if (document.visibilityState !== 'visible' || !row.isConnected || !row.getClientRects().length) {
+          _approvalDisplaySeen.delete(id); return;
+        }
+        const r = await fetch(API + '/api/delegation/questions/' + encodeURIComponent(id) + '/display', {
+          method: 'POST', headers: {..._authHeaders(), 'Content-Type':'application/json'},
+          body: JSON.stringify({surface:'owner-messages', text, after_row:Number(row.dataset.approvalAfter)}) });
+        const d = await r.json();
+        if (!r.ok || !d.ok) throw new Error(d.code || 'request_display_failed');
+      }).catch(error => { _approvalDisplaySeen.delete(id); showToast('Approval display refused: ' + error.message); });
+    }
+  }, {threshold:1});
+  _approvalDisplayObserver = observer;
+  list.querySelectorAll('[data-approval-ask]').forEach(row => observer.observe(row));
+  // Re-observe after expanding a row or returning to the page. Receipts are
+  // server-idempotent, so a remount/reload can never rearm a closed question.
+  list.addEventListener('click', () => list.querySelectorAll('[data-approval-ask]').forEach(row => observer.observe(row)), {once:true});
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && list.isConnected) _approvalObserve(list);
+    observer.disconnect();
+  }, {once:true});
+}
+
+function _approvalQuestionText(e, canDisplay) {
+  if (e.delivery === 'approval_request' && !canDisplay) {
+    return 'request_display_surface_unsupported: Open the owner worker’s Messages tab to display this approval question.';
+  }
+  return typeof e === 'string' ? e : e.text;
+}
+
 function _cmdHistItemHTML(e, ctx) {
   ctx = ctx || _msgCtxPeek();
   const _pk = ctx.key(e), _psel = ctx.sel.has(_pk);
-  const text = typeof e === 'string' ? e : e.text;
   const session = typeof e === 'string' ? '' : (e.session || '');
+  const canDisplayApproval = !!ctx.approvalDisplay && typeof peekSession !== 'undefined' && peekSession === session;
+  const text = _approvalQuestionText(e, canDisplayApproval);
   const origin = typeof e === 'string' ? '' : (e.origin || '');
   const ts = typeof e === 'string' ? '' : (e.time ? new Date(e.time).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '');
   const safe = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -23967,8 +24039,10 @@ function _cmdHistItemHTML(e, ctx) {
   // search restores it on the next render.
   const _matches = _mq && safe.toLowerCase().includes(_mq.trim().toLowerCase());
   const _collapsed = _msgCollapsed.has(_pk) && !_matches;
+  const approvalAsk = canDisplayApproval && e.delivery === 'approval_request' && Number.isSafeInteger(Number(e.id))
+    ? ` data-approval-ask="${Number(e.id)}"` : '';
   const caret = `<button class="msg-caret" aria-expanded="${!_collapsed}" title="${_collapsed ? 'Expand message' : 'Collapse message'}" onclick="_msgToggleCollapse(this,&#39;${escJs(_pk)}&#39;,event)">${_collapsed ? '&#9656;' : '&#9662;'}</button>`;
-  return `<div class="${ctx.rowClass||''}" data-msg-key="${esc(_pk)}" onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend">${caret}<div style="flex:1;min-width:0;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}<div class="msg-body${_collapsed?' collapsed':''}" style="white-space:pre-wrap;word-break:break-word;line-height:1.45;">${_hlSearch(_linkifyScheduleIds(_linkifyCardIds(safe)), _mq)}</div></div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button>${locSess ? `<button onclick="event.stopPropagation();_msgLocate(&#39;${escJs(locSess)}&#39;,&#39;${enc}&#39;)" title="Open that worker's peek and scroll to where this was sent">Find in ${esc(locSess)}</button>` : ''}</div></div></div>`;
+  return `<div class="${ctx.rowClass||''}" data-msg-key="${esc(_pk)}"${approvalAsk} onclick="${ctx.onOpen ? ctx.onOpen(e, enc) : `_pickCmdHistory(decodeURIComponent('${enc}'))`}" title="Click to insert into the composer" style="cursor:pointer;padding:8px 12px;background:${km.bg};border:1px solid var(--border);border-left:3px solid ${km.color};border-radius:6px;font-size:0.85rem;color:var(--text);transition:border-color 0.15s;display:flex;gap:6px;align-items:flex-start;position:relative;" onmouseenter="this.style.borderColor='${km.color}'" onmouseleave="this.style.borderColor='var(--border)'"><input type="checkbox" class="pm-check" ${_psel?"checked":""} onclick="${ctx.toggle}(&#39;${escJs(_pk)}&#39;,event)" title="Select for bulk resend">${caret}<div style="flex:1;min-width:0;">${meta?`<div style="margin-bottom:4px;">${meta}</div>`:''}<div class="msg-body${_collapsed?' collapsed':''}" style="white-space:pre-wrap;word-break:break-word;line-height:1.45;">${_hlSearch(_linkifyScheduleIds(_linkifyCardIds(safe)), _mq)}</div></div><div class="pm-actions"><button class="btn pm-dots" onclick="_msgMenu(this,event)" title="Actions">&#x22ef;</button><div class="msg-menu"><button onclick="event.stopPropagation();${ctx.resend}([&#39;${escJs(_pk)}&#39;])">Resend to ${esc(_target || 'session')}</button><button onclick="event.stopPropagation();_msgCopyBtn(this,&#39;${enc}&#39;)">Copy text</button><button onclick="event.stopPropagation();_ttsSpeak(decodeURIComponent(&#39;${enc}&#39;),this)">Read aloud</button>${locSess ? `<button onclick="event.stopPropagation();_msgLocate(&#39;${escJs(locSess)}&#39;,&#39;${enc}&#39;)" title="Open that worker's peek and scroll to where this was sent">Find in ${esc(locSess)}</button>` : ''}</div></div></div>`;
 }
 // The sender half of "owner → cowork-bot". `owner` is the server's own login
 // (no team-member or gateway identity on the send); the tooltip says so, and
@@ -24205,8 +24279,8 @@ function _peekMessagesRender() {
               '<br><button class="btn" style="margin-top:10px;min-height:36px;" ' +
               'onclick="_peekMessagesLoad(false)">Retry</button>')
       : _note(_empty);
-  list.innerHTML = (_body || _placeholder)
-    + (!_body && !_loaded ? '' : moreHTML);
+  _approvalRender(list, (_body || _placeholder)
+    + (!_body && !_loaded ? '' : moreHTML));
   _peekMessagesBadge();
 }
 // Jump the per-worker Messages list to a chosen day. Unlike the global timeline

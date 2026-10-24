@@ -1,16 +1,16 @@
 # Delegation approval requests
 
-Max 2026-10-23: approval identity resolution (refs maxtongwang/ai-config#160).
+Max 2026-10-23; Sonnet review of 04c2138d B1/B2, refs maxtongwang/ai-config#160.
 
-## Create and apply
+## Create, display, apply
 
-An asking worker explicitly creates a request. The server derives the action
-through the existing mutation handler and permission table, stores the exact
-change, and adds a generated question to the owner session's **Messages**
-(`OWNER_AGENT`, currently mrpopo), bound to its stable incarnation.
-The question includes the request ID and all structured operands. Its delivery
-label is **approval request**; this does not inject a prompt into the terminal.
-No card is created. Raw questions and legacy citation pairs carry no authority.
+An asking worker creates an explicit request. The server derives the action
+through the actual mutation handler and permission table and stores its exact
+change, actor/target incarnations and current owner incarnation (`OWNER_AGENT`).
+The generated question includes the request ID and every structured operand.
+Creation records a question in owner Messages; **it does not establish display**.
+Raw questions, terminal injections, notifications and old citation pairs carry
+no approval authority. Asker-selected `reply_session` is an unknown field.
 
 ```sh
 amux grant request --stdin <<'JSON'
@@ -19,155 +19,147 @@ JSON
 amux grant requests --json
 ```
 
-The owner session must already exist with a stable incarnation. The asker
-cannot choose where a reply is read: `reply_session` is no longer an input
-and is rejected as an unknown field. Asker-selected-session descriptions and
-free-text citation workflows from earlier revisions are superseded. Request creation returns HTTP 202,
-`request_id`, `grant_code` (the same ID), `reply_session`, and `sentence`.
-It does not perform the proposed mutation. After Max approves, repeat the exact
-method/path/body, adding `"request_id":"ID"` to its JSON body. Request metadata
-(`request_id`, `why`, and retired `cite`) is excluded from the stored change.
-An applied request returns its code in `X-Amux-Grant-Code` as before.
+The owner opens the owner worker's Messages tab (dashboard or phone web UI).
+Before inserting questions into the DOM, `_approvalRender` calls the owner-only
+render preparation endpoint. Its `approval_render_pending` row closes the old
+window and supplies the render watermark. A yes while the new display receipt
+is in flight therefore cannot fund the old question. Failed preparation leaves
+the new questions off screen. After DOM insertion, `_approvalObserve` records
+only an expanded question fully
+intersecting the visible viewport. Hidden, collapsed, partial and detached rows
+produce no receipt. The renderer sends the exact rendered text, question row ID
+and render watermark. The server verifies owner process provenance, current
+incarnation, unchanged question text, pending/unrefused status and expiry.
+History changes after the render watermark refuse a delayed receipt; simultaneous
+render receipts alone may serialize without invalidating each other.
+
+The receipt transaction inserts a separate `cmd_history` row with
+`delivery='approval_display'`, server millisecond `ts`/`delivered_at`, and
+`repeat_of=ask_row`; then it sets the request's `shown_row` to that receipt.
+The question remains `ask_row`. Repeated acknowledgments are idempotent and
+cannot move the display or reopen its window. Pre-fix rows that merely used
+the question as `shown_row` are ineligible; create a new request.
+
+Only the scoped Messages tab has this render hook. CLI output, native panes,
+Chat, the global history views and push/phone notifications cannot display
+approvals. A claimed unsupported surface returns
+`request_display_surface_unsupported`; a browser without IntersectionObserver
+shows that code and records nothing. Reading request/history APIs never arms a
+request. No terminal prompt or board card is injected.
+
+After approval, repeat the exact method/path/body with `request_id` in its JSON.
+Metadata (`request_id`, `why`, retired `cite`) is excluded from the stored change.
+Application rechecks identities, display receipt, action/target/operands and
+method/path/body. It spends the reply once in the existing grant transaction.
 
 | API | Input or result |
 | --- | --- |
-| `POST /api/delegation/requests` | `{method, path, body}`; unknown fields and legacy approval metadata refuse |
-| `GET /api/delegation/requests` | `{requests, grants, resolutions, mode, measured, n_considered}`; requests and grants are the same records |
-| `GET /api/delegation/requests/{id}` | `{request, measured, n_considered}` |
-| `GET /api/delegation/grants` | Same list, preserving the existing dashboard and CLI contract |
-| `POST /api/delegation/grants/{id}/approve` | Existing direct Remote owner proof; apply the selected stored request |
-| `POST /api/delegation/grants/{id}/deny` | Existing owner gate; deny the selected request |
-| `POST /api/delegation/grants/{id}/undo` | Existing owner/mrpopo gate; restore that applied request's original delta, subject to identity/current-state checks |
+| `POST /api/delegation/requests` | `{method,path,body}` → HTTP 202, `request_id`, `grant_code`, `reply_session`, `sentence`, `how` |
+| `POST /api/delegation/questions/{ask_row}/display` | Owner renderer only: `{surface:"owner-messages",text,after_row}` → `{ok,ask_row,surface}` or a structured refusal |
+| `POST /api/delegation/questions/render` | Owner renderer: `{surface:"owner-messages"}` → `{ok,after_row}`; closes previous window before DOM insertion |
+| `GET /api/delegation/requests` | `{requests,grants,resolutions,mode,measured,n_considered}` |
+| `GET /api/delegation/requests/{id}` | `{request,measured,n_considered}` |
+| `GET /api/delegation/grants` | Same list, preserving dashboard/CLI contracts |
+| `POST /api/delegation/grants/{id}/approve` | Separate direct Remote proof; apply the selected displayed request |
+| `POST /api/delegation/grants/{id}/deny` | Existing owner gate |
+| `POST /api/delegation/grants/{id}/undo` | Existing owner/mrpopo gate; restore original delta subject to identity/current-state checks |
 
-## Resolve typed replies
+## The next-input window
 
-A reply must have existing server-recorded owner provenance, an explicit
-allowlisted affirmative (`max_ref::AFFIRMATIVE_REPLIES`), and the same **current
-owner-session incarnation** as the question. Input in a worker pane, another
-session's Remote Control, or another Chat tab funds nothing and records
-`request_reply_not_owner_session`. Peer echoes and automation carry no owner
-provenance; skipped hook copies emit `pane_prompt_skipped`. The server orders messages by their durable row IDs.
-Each processed owner reply permanently closes a question window, using
-`MAX(reply_row)` from the stored resolution ledger, never a later classification
-of its text. Eligible requests are pending records with **no resolution_code** shown **after the previous owner reply and before this reply,
-in this same owner session**, across every asking actor. A non-request peer
-notice does not close the window. Any owner input (including a new question or
-wait) closes it; two explicit unanswered requests make it ambiguous.
+Only the **single latest display** can receive a reply. That reply must be the
+very next owner input, with no intervening owner-session output. The resolver
+reads the maximum preceding relevant **cmd_history row ID**, not a previously
+processed resolution. Relevant rows are display receipts, pane/owner-send input
+with recorded owner provenance, assistant output, and session output originating
+from the owner session. A peer delivery is neither owner input nor owner output.
+Missing or out-of-order resolver hooks cannot erase a stored owner boundary.
 
-- Exactly one: bind this reply to that request. Its actor and proposed change
-  cannot be substituted later.
-- More than one: `request_ambiguous`; fund nothing and leave all pending with a
-  note to ask separately. The server cannot choose the latest of two questions
-  in one unanswered window.
-- None: `request_no_candidate`; fund nothing. The standalone reply refusal is
-  durable and appears in the list, even when there is no request to annotate.
-- Nonaffirmative: `request_reply_not_affirmative`; leave requests pending. An
-  older pending request from this closed window cannot catch a later yes.
+The pending request must point to that latest event row, have no resolution row
+or refusal code, and precede the reply strictly. Two displayed questions select
+only the latest; an intervening owner question, wait, no or output means neither
+can receive a later yes. A refused latest request never exposes an older one.
+The former “since previous reply” scan and multi-request ambiguity decision have
+been removed. The resolutions table records outcomes and replay protection only.
 
-Replies must be no earlier than the shown question's recorded millisecond clock,
-within two hours of it, not in the future, and at most one day old when resolved.
-Strict row order breaks equal-clock ties: `previous_reply_row < shown_row < reply_row`.
-A shown row at or after the reply is ineligible. Recorder timestamps retain
-milliseconds so same-second questions and answers keep their actual order.
-The old own-lane citation exception is superseded for explicit requests:
-mrpopo may ask, but only Max's own recorded owner-session input can answer.
-Passkey mode still requires direct Remote owner proof for every application;
-a pane reply alone does not apply it. `amux grant CODE` is not an affirmative
-or an approval selector.
+The reply needs the same current owner incarnation and a full allowlisted
+phrase (`max_ref::AFFIRMATIVE_REPLIES`). Questions, negations and qualifications
+refuse. Recorded display/reply clocks must be ordered, within two hours, not in
+the future and no more than one day old. Equal clocks use strict row order.
+A missing eligible display records `request_no_candidate`; a nonaffirmative
+records `request_reply_not_affirmative`. Both outcomes are durable.
+
+Server-owned chat output, including the owner companion, records an
+`approval_output` boundary before publishing provider output or the finished
+reply. Applied native lifecycle events other than `UserPromptSubmit` also close
+windows conservatively in their transaction. These markers store no provider
+text and emit `delegation_request_output_boundary`. Native pane display itself
+is unsupported: no lifecycle event is claimed as a render acknowledgment.
 
 ## Owner input routes
 
-All recorded replies converge on `cmd_hist_record_with_id` →
+Recorded replies converge on `cmd_hist_record_with_id` →
 `delegation_grants::on_row` → `delegation_requests::resolve_observed`.
-The resolution transaction reserves each reply once, including no-candidate
-outcomes. Reading a request can reconcile a missed resolution, so hook tests
-check the committed resolution before any API read can repair it.
+Each requires a prior owner Messages display; none can manufacture it.
 
-| Entry point | Recording and resolution |
+| Entry point | Evidence |
 | --- | --- |
-| Native pane input, provider Remote Control, raw terminal/keys input | Applied `UserPromptSubmit` on `/api/sessions/{name}/report` → `pane_prompts::record`; human pane provenance resolves only in the bound owner session. The hook must include `state="active"`; HTTP 200 with `applied=false` is an ignored observation. Disabled pane history and isolated status-only hooks intentionally do not record input |
-| Dashboard, phone/Remote, owner CLI `/send`; worker-ID send alias | Recorded direct/queued sends retain verified owner process provenance and resolve; chat-type workers use this path too |
-| Chat tab `/api/sessions/{worker}@chat/send` | Records a `chat` row in the parent worker's Messages with direct delivery and verified owner provenance; resolves only when that parent is the bound owner session |
-| Owner `/steer`, including next-turn UI replies | With history recording enabled, records queued owner provenance and resolves |
-| Project executor `/send` | Records queued owner provenance before the project steering projection; resolves. Peer input retains session-message provenance |
-| Approve button `/api/delegation/grants/{id}/approve` | Applies the selected request through its separate direct Remote proof gate; does not synthesize a typed reply |
+| Native pane/provider Remote Control/raw terminal input | Applied `UserPromptSubmit` → `pane_prompts::record`; only bound owner-session provenance can answer |
+| Dashboard, phone/Remote, owner CLI `/send`; worker-ID alias | Verified owner direct/queued history, including chat-type workers |
+| Chat tab `{worker}@chat/send` | `chat` row in the parent worker's history with verified owner provenance |
+| Recorded `/steer` | Queued owner provenance |
+| Project executor `/send` | Original owner provenance preserved across steering projection |
+| Approve button | Separate direct Remote proof; does not synthesize a typed reply |
 
-Process provenance is taken only from server-attributed owner requests.
-Workers and invited members receive no owner proof. The Bash owner CLI posts
-text/msg_id to the worker-ID alias without a history flag: verified owner input
-with no relay source defaults to recorded history. Explicit `record_history:false`
-opts out; missing proof never enables this default. The default emits
-`owner_send_history_defaulted`. `outside`, `remote`, and
-`remote-forwarded` owner replies can correlate; only `remote` proves direct
-Remote application. No-history sends, board intake, failed/stuck sends,
-automation and peer messages cannot supply typed approval evidence.
+Workers and invited members receive no owner proof. Owner CLI sends without a
+history flag default to recording only with verified owner process provenance
+and no relay source (`owner_send_history_defaulted`). Explicit
+`record_history:false`, disabled pane history, isolated status-only hooks,
+automation and failed/board-routed sends cannot supply approval replies.
+Passkey mode still requires direct Remote proof at application; pane approval
+alone cannot apply it. `amux grant CODE` is not a reply selector.
 
-## Records and refusals
+## Storage and recovery
 
-Migration **0129** extends `_amux_delegation_grants`; its primary-key `code` is
-the unique request ID. It adds actor/reply incarnation bindings, reply session,
-shown message row, structured change JSON, resolved reply row, refusal code/note.
-`target_incarnation` and `created_at` already exist. The JSON includes the typed
-action (tag before/after sets), typed target, exact body, and effective toggle
-values. Method and path are stored separately and must also match exactly.
-`created_at`, `expires_at`, `cite_spent_at` and resolution `created_at` use Unix
-seconds. `cmd_history.ts` uses Unix milliseconds; strict row IDs establish ordering, with millisecond clock bounds refusing reversed
-or stale timestamps. Equal millisecond clocks use strict row order.
-
-`cmd_history.delegation_session_incarnation` records the receiving incarnation at
-message creation. `delegation_message_type` retains the original message type
-when project execution projects an owner row to `steering`; peer steering rows
-retain their original session-message provenance and cannot become approvals. `_amux_delegation_resolutions` records every owner reply's
-outcome: `reply_row` primary key, unique nullable `request_id`, session, code,
-note and creation time. Unique indexes reserve shown rows and resolved replies.
-The existing 0127/0128 evidence-row reservation remains the final grant-spending
-constraint, including failed and undone grants and legacy duplicate evidence.
-0124–0128 are unchanged. Old grants without explicit bindings cannot acquire
-new approval or replay authority through this mechanism. Undo keeps its existing
-original-target check and does not depend on the asking worker still being live.
+No migration is added: existing `ask_row`, `shown_row`, `repeat_of`, `ts` and
+`delivered_at` represent distinct question/display rows. Migration numbering
+remains dense through 0129; 0130 is unused here. Incarnation and original message
+type columns remain from 0129. Existing unique indexes protect shown/resolution
+rows, and 0127/0128 reserve spent replies, including failed and undone grants.
+The display receipt and binding commit together, as do resolution and request
+binding. Duplicate receipts adopt committed evidence without inserting a new
+row. Missed resolution hooks reconcile in row order on read/list/application;
+window closure does not depend on that reconciliation running first.
 
 | Refusal | Meaning |
 | --- | --- |
-| `request_id_required` | The mutation has no explicit request ID |
-| `request_not_found` | The cited ID does not exist |
-| `request_not_shown` | No surviving generated question in the bound session |
-| `request_unresolved` | No reply has resolved this request |
-| `request_ambiguous` / `request_no_candidate` | Distinct correlation refusals described above |
-| `request_change_mismatch` | Different action, target, setting, value, direction, effective toggle, body, method or path |
-| `request_actor_identity_changed` | Different asking actor/name/incarnation |
-| `request_target_identity_changed` | Different target incarnation |
-| `request_reply_identity_changed` | Different receiving incarnation |
-| `request_reply_not_owner_session` | Typed input or a legacy request bound outside the current owner session |
-| `request_reply_outside_window` | Reply failed the freshness bounds |
-| `request_passkey_required` | The current approval mode requires the Remote proof |
-| `cite_pair_spent` | The reply already reserved a grant; no second application |
+| `request_display_surface_unsupported` | No approval render hook for the claimed surface |
+| `request_display_not_owner` | No verified owner process provenance |
+| `request_display_ineligible` | Changed/missing/refused/expired/legacy question, wrong incarnation, or stale render watermark |
+| `request_display_prepare_failed` | Pre-render barrier transaction failed; new questions stay off screen |
+| `request_display_failed` | Receipt transaction failed; no authority assumed |
+| `request_not_shown` | No surviving bound render receipt |
+| `request_no_candidate` / `request_unresolved` | No eligible immediately preceding display / request has no resolved reply |
+| `request_reply_not_affirmative` | Input is outside the complete affirmative allowlist |
+| `request_reply_outside_window` | Display/reply freshness or clock ordering failed |
+| `request_reply_not_owner_session` | Input or legacy request bound outside the owner session |
+| `request_reply_identity_changed` | Receiving incarnation changed |
+| `request_actor_identity_changed` / `request_target_identity_changed` | Actor/target binding changed |
+| `request_change_mismatch` | Proposed mutation differs from the stored change |
+| `request_passkey_required` | Direct Remote proof still required |
+| `cite_pair_spent` | Reply already reserved by a grant |
 
-`amux grant list`, `amux grant requests`, and Settings → Delegated changes show
-pending resolution notes and no-candidate outcomes. JSON preserves stable IDs
-and codes. WARN `delegation_request_refused` / `delegation_grant_refused` and
-`delegation_request_resolution` verdicts make correlation failures searchable.
+Settings → Delegated changes and `amux grant requests --json` retain request and
+resolution IDs/codes. `delegation_request_created` deliberately makes no display
+claim; `delegation_request_displayed` records receipt ID/time/surface. WARN
+`delegation_request_refused`/`delegation_grant_refused` makes failures searchable.
 
-## Recovery and verification
+## Verification
 
-The request and its shown question commit in the same Store transaction. A reply's
-resolution and request binding also commit together. Missed hooks are reconciled
-from the durable ledger on request read/list/application. Existing applying-grant
-crash behavior stays fail closed: side effects span SQLite/files, so an interrupted
-mutation is never automatically replayed and its approval remains reserved.
-
-Run `python3 scripts/test-delegation-request-schema.py` for SQLite-only schema,
-uniqueness and real SIGKILL boundary probes. Run the `delegation_grants`,
-`delegation_mrpopo`, `delegation_matrix`, `delegation_sweep`, `delegation_log`,
-`timestamp_units_declared` tests and the delegation/max_ref/migration lib tests
-through the repository's isolated safe-cargo runner. CLI/dashboard behavior:
-`node --test e2e/delegation-grant-failure.test.mjs e2e/board-delivery-chip.test.mjs`.
-
-## B2/B3 review coverage
-
-`.pr18-b1-notes.md` lists the complete class sweep, route tests, exact one-match
-`scripts/mutate.sh` substitutions and expected red tests. The route suite lives
-in `api/delegation_reply_tests.rs` and drives the real router with the existing
-process-identity test resolver. Paused pane delivery and a held chat turn keep
-providers and real tmux out of the fixtures. It reads committed resolution rows
-before any GET/list/application recovery can hide a severed recorder wire.
-No schema change is needed; migrations 0124–0130 are untouched.
+Run `python3 -B scripts/test-delegation-reply-window.py` and
+`python3 -B scripts/test-delegation-request-schema.py` for actual SQLite queries,
+constraints and SIGKILL rollback/receipt adoption. Rust route tests live in
+`api/delegation_reply_tests.rs`; run them and all delegation, max_ref and migration
+suites through the isolated safe-cargo runner. CLI/renderer tests:
+`node --test e2e/delegation-display.test.mjs e2e/delegation-grant-failure.test.mjs e2e/board-delivery-chip.test.mjs`.
+The untracked `.pr18-b1-notes.md` contains the class sweep, exact mutations and
+parent-owned Rust verification still required.

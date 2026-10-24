@@ -1,8 +1,8 @@
 // Explicit requests and grants for widening changes — Max 2026-10-23: approval identity resolution; refs maxtongwang/ai-config#160.
 //! POST /api/delegation/requests derives a pending request through the real
 //! authorization table, stores the exact structured change, stable actor/target
-//! and owner-session incarnations, and shows a generated question in the owner
-//! session's Messages. Asker-selected reply sessions and free-text funding are
+//! and owner-session incarnations, and queues a generated question in the owner
+//! session's Messages. A render receipt, not creation, establishes display. Asker-selected reply sessions and free-text funding are
 //! superseded (Max 2026-10-23 20:08).
 //! Its grant code is the request ID. Free text never creates requests.
 //! Typed affirmative correlation lives in delegation_requests; passkey approval
@@ -426,8 +426,8 @@ struct NewGrant<'a> {
     target_incarnation: Option<String>,
 }
 
-/// The request and its visible message commit together; a failed creation
-/// cannot leave a request that claims it was shown. Identity is read, never minted.
+/// Persist a question, not a display claim. Only the owner Messages render
+/// receipt may populate shown_row. Identity is read, never minted.
 #[allow(clippy::result_large_err)]
 fn insert(state: &AppState, g: &NewGrant, c: &Captured) -> Result<(String, String), Response> {
     let actor_id = super::delegation_requests::incarnation(g.actor)
@@ -448,11 +448,11 @@ fn insert(state: &AppState, g: &NewGrant, c: &Captured) -> Result<(String, Strin
             }
             conn.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery,delegation_session_incarnation) VALUES(?1,'session',?2,?3,?4,'approval_request',?5)",
                 rusqlite::params![question,reply_session,(created*1000.0) as i64,actor,reply_id])?;
-            let shown = conn.last_insert_rowid();
-            conn.execute("INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,why,created_at,expires_at,status,mode,target_incarnation,actor_incarnation,reply_session,reply_incarnation,shown_row,change_spec,ask_row,ask_text,resolution_note) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'pending',?13,?14,?15,?16,?17,?18,?19,?18,?20,'awaiting Max reply in the shown session')",
-                rusqlite::params![id,actor,class,action,target,method,path,body,sentence,why,created,created+GRANT_TTL_S,mode_str(mode()),target_id,actor_id,reply_session,reply_id,shown,change,question])?;
+            let ask = conn.last_insert_rowid();
+            conn.execute("INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,why,created_at,expires_at,status,mode,target_incarnation,actor_incarnation,reply_session,reply_incarnation,shown_row,change_spec,ask_row,ask_text,resolution_note) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'pending',?13,?14,?15,?16,?17,NULL,?19,?18,?20,'awaiting display in owner Messages')",
+                rusqlite::params![id,actor,class,action,target,method,path,body,sentence,why,created,created+GRANT_TTL_S,mode_str(mode()),target_id,actor_id,reply_session,reply_id,ask,change,question])?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![crate::db::PendingEvent {
-                entity_type: amux_core::revision::EntityType::Message, entity_id: format!("MSG-{shown}"),
+                entity_type: amux_core::revision::EntityType::Message, entity_id: format!("MSG-{ask}"),
                 mutation: amux_core::revision::MutationKind::Created, payload: None,
             }] })
         });
@@ -491,9 +491,9 @@ pub(crate) fn request_explicit(state: &AppState, actor: &str, class: &str, targe
         why: super::delegation::request_why(body), reply_session, change, target_incarnation: target_id }, &c) {
         Ok(x) => x, Err(r) => return r,
     };
-    tracing::info!(request_id = %code, actor, reply_session, verdict = "delegation_request_shown", measured = true, n_considered = 1, "explicit approval question is visible in Messages");
+    tracing::info!(request_id = %code, actor, reply_session, verdict = "delegation_request_created", measured = true, n_considered = 1, "approval question awaits an owner Messages render receipt");
     (StatusCode::ACCEPTED, Json(json!({"ok":true,"pending":true,"request_id":code,"grant_code":code,"sentence":text,
-        "reply_session":reply_session,"how":"Max replies yes in the shown session; apply the exact mutation with request_id"}))).into_response()
+        "reply_session":reply_session,"how":"Open owner Messages to display the question, then reply yes as the very next owner input; apply with request_id"}))).into_response()
 }
 
 /// Cite-mode applications spend the request's resolved reply; no new grant
@@ -536,8 +536,8 @@ fn validate_request_identity(state: &AppState, g: &GrantRow, actor: &str) -> Res
     }
     if g.shown_row.is_none() { return Err(("request_not_shown", "request was never shown in a reply session".into())); }
     let conn = state.store.read().map_err(|_|("request_read_failed", "request message ledger unavailable".into()))?;
-    let shown: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM cmd_history WHERE id=?1 AND session=?2 AND origin=?3 AND type='session' AND text=?4 AND delegation_session_incarnation=?5)",
-        rusqlite::params![g.shown_row,g.reply_session,g.actor,g.ask_text,g.reply_incarnation],|r|r.get(0))
+    let shown: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM cmd_history WHERE id=?1 AND session=?2 AND origin=?3 AND type='session' AND text=?4 AND delegation_session_incarnation=?5 AND delivery='approval_display' AND repeat_of=?6 AND delivered_at=ts)",
+        rusqlite::params![g.shown_row,g.reply_session,g.actor,g.ask_text,g.reply_incarnation,g.ask_row],|r|r.get(0))
         .map_err(|_|("request_read_failed", "request message ledger unavailable".into()))?;
     if !shown { return Err(("request_not_shown", "the recorded question is absent from the reply session".into())); }
     drop(conn);
@@ -1144,6 +1144,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/api/delegation/grants", get(list))
         .route("/api/delegation/requests", get(list).post(super::delegation_requests::create))
         .route("/api/delegation/requests/{code}", get(read_request))
+        .route("/api/delegation/questions/render", post(super::delegation_requests::prepare_display))
+        .route("/api/delegation/questions/{ask}/display", post(super::delegation_requests::display))
         .route("/api/delegation/whoami", get(whoami))
         .route("/api/delegation/grants/{code}/approve", post(approve))
         .route("/api/delegation/grants/{code}/deny", post(deny))
@@ -1443,11 +1445,26 @@ mod tests {
     }
 
     /// whoami reports each verdict, forwarded included.
-    async fn explicit_request(app: &Router, body: Value) -> String {
+    async fn explicit_request(app: &Router, state: &AppState, body: Value) -> String {
         let (st,v,_) = call(app,"POST","/api/delegation/requests",Some("mrpopo"),json!({
             "method":"PATCH","path":"/api/sessions/test-dev-a/config","body":body}),None).await;
         assert_eq!(st,StatusCode::ACCEPTED,"{v}");
-        v["request_id"].as_str().unwrap().to_string()
+        let id = v["request_id"].as_str().unwrap().to_string();
+        let grant = load(state, &id).unwrap();
+        let mut prepare = Request::builder().method("POST").uri("/api/delegation/questions/render")
+            .header(axum::http::header::CONTENT_TYPE,"application/json")
+            .body(Body::from(json!({"surface":"owner-messages"}).to_string())).unwrap();
+        prepare.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([192,0,2,1],41001))));
+        let res=app.clone().oneshot(prepare).await.unwrap(); assert!(res.status().is_success());
+        let bytes=axum::body::to_bytes(res.into_body(),usize::MAX).await.unwrap();
+        let after_row=serde_json::from_slice::<Value>(&bytes).unwrap()["after_row"].as_i64().unwrap();
+        let mut req = Request::builder().method("POST").uri(format!("/api/delegation/questions/{}/display",grant.ask_row.unwrap()))
+            .header(axum::http::header::CONTENT_TYPE,"application/json")
+            .body(Body::from(json!({"surface":"owner-messages","text":grant.ask_text,"after_row":after_row}).to_string())).unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([192,0,2,1],41001))));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert!(res.status().is_success(),"fixture must display request before replying");
+        id
     }
 
     #[tokio::test]
@@ -1528,7 +1545,7 @@ mod tests {
             ("user",true,"outside"), ("user",false,"remote-forwarded"),
             ("chat",false,"outside"), ("chat",false,"remote"),
         ] {
-            let id=explicit_request(&app,json!({"worktree_verify":"one"})).await;
+            let id=explicit_request(&app,&state,json!({"worktree_verify":"one"})).await;
             let meta=DeliveryMeta {
                 process_origin:Some(proof),
                 ..if queued { DeliveryMeta::queued((now()*1000.0) as i64) } else { DeliveryMeta::direct() }
@@ -1541,7 +1558,7 @@ mod tests {
                 "SELECT COUNT(*) FROM _amux_delegation_resolutions WHERE reply_row=?1",[row],|r|r.get::<_,i64>(0)).unwrap(),1);
             assert!(load(&state,&id).unwrap().evidence_row.is_none(),"correlation must not spend a grant");
         }
-        let id=explicit_request(&app,json!({"worktree_verify":"two"})).await;
+        let id=explicit_request(&app,&state,json!({"worktree_verify":"two"})).await;
         for (ctype,proof) in [("session",Some("remote")),("chat",None),("user",Some("worker"))] {
             let row=cmd_hist_record_with_id(&state,"mrpopo","approve",ctype,"peer",true,
                 DeliveryMeta { process_origin:proof, ..DeliveryMeta::direct() }).await;
@@ -1552,7 +1569,7 @@ mod tests {
         // A Chat-tab wait closes the old window for a subsequent pane/send yes.
         cmd_hist_record_with_id(&state,"mrpopo","wait","chat","",true,
             DeliveryMeta { process_origin:Some("outside"), ..DeliveryMeta::direct() }).await;
-        let next=explicit_request(&app,json!({"worktree_verify":"three"})).await;
+        let next=explicit_request(&app,&state,json!({"worktree_verify":"three"})).await;
         let row=cmd_hist_record_with_id(&state,"mrpopo","yes","user","",true,
             DeliveryMeta { process_origin:Some("outside"), ..DeliveryMeta::direct() }).await;
         assert_eq!(load(&state,&next).unwrap().resolution_row,Some(row));
@@ -1588,7 +1605,7 @@ mod tests {
                 (41002u16,super::super::process_identity::Origin::Remote{forwarded:false}),
                 (41003u16,super::super::process_identity::Origin::Remote{forwarded:true})]))));
         let app=super::super::router(state.clone());
-        let id=explicit_request(&app,json!({"worktree_verify":"one"})).await;
+        let id=explicit_request(&app,&state,json!({"worktree_verify":"one"})).await;
         for port in [41001u16,41003] {
             let (st,v,_)=call(&app,"POST",&format!("/api/delegation/grants/{id}/approve"),None,Value::Null,Some(port)).await;
             assert_eq!(st,StatusCode::FORBIDDEN,"{v}");
@@ -1597,12 +1614,12 @@ mod tests {
         let (st,v,_)=call(&app,"POST",&format!("/api/delegation/grants/{id}/approve"),None,Value::Null,Some(41002)).await;
         assert!(st.is_success(),"{v}");
         assert_eq!(load(&state,&id).unwrap().status,"applied");
-        let id2=explicit_request(&app,json!({"worktree_verify":"two"})).await;
+        let id2=explicit_request(&app,&state,json!({"worktree_verify":"two"})).await;
         record_reply(&state,"yes","pane").await;
         assert_eq!(load(&state,&id2).unwrap().status,"pending","pane lacks passkey proof");
         let (st,v,_)=call(&app,"POST",&format!("/api/delegation/grants/{id2}/approve"),None,Value::Null,Some(41002)).await;
         assert!(st.is_success(),"{v}");
-        let id3=explicit_request(&app,json!({"worktree_verify":"three"})).await;
+        let id3=explicit_request(&app,&state,json!({"worktree_verify":"three"})).await;
         let reply=record_reply(&state,"yes","remote").await;
         let row=load(&state,&id3).unwrap();
         assert_eq!(row.status,"applied");
@@ -1618,7 +1635,7 @@ mod tests {
         let _home=crate::api::settings::test_env::set_home(tmp.path());
         let state=test_state(tmp.path());
         let app=super::super::router(state.clone());
-        let id=explicit_request(&app,json!({"worktree_verify":"one"})).await;
+        let id=explicit_request(&app,&state,json!({"worktree_verify":"one"})).await;
         record_reply(&state,"yes","pane").await;
         let path=tmp.path().join("sessions/test-dev-a.env");
         let before=std::fs::read(&path).unwrap();
@@ -1643,7 +1660,7 @@ mod tests {
         let _home=crate::api::settings::test_env::set_home(tmp.path());
         let state=test_state(tmp.path());
         let app=super::super::router(state.clone());
-        let id=explicit_request(&app,json!({"worktree_verify":"one"})).await;
+        let id=explicit_request(&app,&state,json!({"worktree_verify":"one"})).await;
         let reply=record_reply(&state,"yes","pane").await;
         state.store.write(move|c| {
             c.execute("INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,status,evidence_row,legacy_duplicate) VALUES('old','old','old','old','old','PATCH','/old','{}','old',1,2,'undone',?1,1)",[reply])?;

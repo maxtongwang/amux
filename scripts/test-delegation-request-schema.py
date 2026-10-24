@@ -27,7 +27,7 @@ def source_sql(path, prefix):
 
 
 def migrate(conn):
-    conn.execute("CREATE TABLE cmd_history(id INTEGER PRIMARY KEY,session TEXT,text TEXT,type TEXT,origin TEXT,delivery TEXT,process_origin TEXT,ts INTEGER)")
+    conn.execute("CREATE TABLE cmd_history(id INTEGER PRIMARY KEY,session TEXT,text TEXT,type TEXT,origin TEXT,delivery TEXT,process_origin TEXT,ts INTEGER,repeat_of INTEGER,delivered_at INTEGER)")
     for number in range(125, 130):
         files = list(MIGRATIONS.glob(f"{number:04}_*.sql"))
         assert len(files) == 1, files
@@ -46,19 +46,26 @@ def expect_constraint(conn, query, args):
     raise AssertionError("expected a uniqueness refusal")
 
 
-def crash_probe(database, query, args, commit):
+def crash_probe(database, query, args, commit, followup=None):
     # Synchronize on a receipt from a separate real process, then SIGKILL it.
     code = """
 import json, sqlite3, sys
 conn=sqlite3.connect(sys.argv[1])
 conn.execute('BEGIN IMMEDIATE')
 conn.execute(sys.argv[2],json.loads(sys.argv[3]))
-if sys.argv[4]=='commit': conn.commit()
+if sys.argv[4]=='commit':
+    if len(sys.argv)>5:
+        query,args=json.loads(sys.argv[5])
+        args[1]=conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        conn.execute(query,args)
+    conn.commit()
 print('boundary-ready',flush=True)
 sys.stdin.readline()
 """
-    child = subprocess.Popen([sys.executable, "-c", code, str(database), query,
-                              json.dumps(args), "commit" if commit else "rollback"],
+    argv = [sys.executable, "-c", code, str(database), query, json.dumps(args), "commit" if commit else "rollback"]
+    if followup is not None:
+        argv.append(json.dumps(followup))
+    child = subprocess.Popen(argv,
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         assert child.stdout.readline().strip() == "boundary-ready"
@@ -94,12 +101,27 @@ def main():
             shown = conn.execute(message, question).lastrowid
             row = ["REQ1", "actor", "mrpopo", "set_config:send_allow", "worker", "PATCH", "/api/sessions/worker/config", '{"send_allow":"one"}', "exact change", None, 1, 86401, "cite", "inc-worker", "inc-actor", "desk", "inc-desk", shown, '{"body":{"send_allow":"one"}}', question[0]]
             conn.execute(request, row)
-            assert len(conn.execute(candidates, ["desk", 0, shown+1]).fetchall()) == 1
+            assert conn.execute(candidates, ["desk", 0, shown+1]).fetchall() == []
+            display = source_sql(requests, "INSERT INTO cmd_history(text,type,session,ts,origin,delivery,delegation_session_incarnation,repeat_of,delivered_at)")
+            conn.commit()
+        display_args = [question[0], "desk", 1500, "actor", "inc-desk", shown]
+        binding = source_sql(requests, "UPDATE _amux_delegation_grants SET shown_row=?2,resolution_note=")
+        crash_probe(database, display, display_args, False, [binding, ["REQ1", None]])
+        with sqlite3.connect(database) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM cmd_history WHERE delivery='approval_display'").fetchone()[0] == 0
+            assert conn.execute("SELECT shown_row FROM _amux_delegation_grants WHERE code='REQ1'").fetchone() == (None,)
+        crash_probe(database, display, display_args, True, [binding, ["REQ1", None]])
+        with sqlite3.connect(database) as conn:
+            displayed = conn.execute("SELECT shown_row FROM _amux_delegation_grants WHERE code='REQ1'").fetchone()[0]
+            assert conn.execute("SELECT repeat_of,ts,delivered_at FROM cmd_history WHERE id=?", [displayed]).fetchone() == (shown,1500,1500)
+            assert len(conn.execute(candidates, ["desk", displayed, displayed+1]).fetchall()) == 1
             assert conn.execute(candidates, ["elsewhere", 0, shown+1]).fetchall() == []
             assert conn.execute(candidates, ["desk", shown, shown+1]).fetchall() == []
             duplicate = row.copy()
             duplicate[0] = "REQ2"
-            expect_constraint(conn, request, duplicate)  # One shown question, one request.
+            conn.execute(request, duplicate)
+            expect_constraint(conn, "UPDATE _amux_delegation_grants SET shown_row=? WHERE code='REQ2'", [displayed])  # One render receipt, one request.
+            conn.execute("DELETE FROM _amux_delegation_grants WHERE code='REQ2'")
             reply = conn.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts,delegation_session_incarnation) VALUES('desk','yes','user','pane','pane',2000,'inc-desk')").lastrowid
             conn.commit()
         result = [reply, "REQ1", "desk", "request_resolved", "exactly one", 2]
@@ -118,7 +140,7 @@ def main():
             duplicate[17] = None
             conn.execute(request, duplicate)
             expect_constraint(conn, claim, ["actor", 3, reply, "REQ2"])
-    print("PASS: 0125-0129 schema, request/reply uniqueness, actual query boundaries and SIGKILL rollback/receipt adoption (SQLite only)")
+    print("PASS: 0125-0129 schema, request/reply uniqueness, actual query boundaries and SIGKILL question/display/resolution rollback and receipt adoption (SQLite only)")
 
 
 if __name__ == "__main__":

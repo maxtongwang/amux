@@ -190,22 +190,16 @@ async fn negated_free_text_never_creates_or_funds_a_request() {
 }
 
 #[tokio::test]
-async fn two_requests_since_last_reply_are_ambiguous_and_stay_pending_with_notes() {
+async fn two_displayed_requests_fund_only_the_latest() {
     let e=setup().await;
     let a=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
     let b=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"toggle_yolo":true})).await;
     e.seed_pane_prompt(MAX_PANE,"yes",now_s());
-    let before=e.config_snapshot();
-    for (actor,id,w,body) in [(DEV_LEAD,&a,DEV_B,json!({"tags":""})),(MRPOPO,&b,DEV_A,json!({"toggle_yolo":true}))] {
-        let (st,v)=apply(&e,actor,id,w,body).await;
-        assert_code(st,&v,"request_ambiguous","two equally eligible questions fund nothing");
-        let g=view(&e,id).await;
-        assert_eq!(g["status"],"pending");
-        assert_eq!(g["resolution_code"],"request_ambiguous");
-        assert!(g["resolution_note"].as_str().unwrap().contains("multiple"));
-        assert!(g["cited_row"].is_null());
-    }
-    assert_eq!(before,e.config_snapshot());
+    let (st,v)=apply(&e,DEV_LEAD,&a,DEV_B,json!({"tags":""})).await;
+    assert_code(st,&v,"request_unresolved","older display cannot catch the latest display's reply");
+    let (st,v)=apply(&e,MRPOPO,&b,DEV_A,json!({"toggle_yolo":true})).await;
+    assert_allowed(st,&v,"only the latest display gets the immediately following yes");
+    assert_eq!(e.grant_status(&a),"pending");
 }
 
 #[tokio::test]
