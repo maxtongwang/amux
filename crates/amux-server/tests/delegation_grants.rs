@@ -86,6 +86,79 @@ async fn newer_unanswered_request_gets_yes_and_older_window_never_does() {
 }
 
 #[tokio::test]
+async fn peer_echo_no_never_reopens_refused_request_p1() {
+    let e=setup().await;
+    let before=e.config_snapshot();
+    let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""}),MAX_PANE).await;
+    e.type_in_pane(MAX_PANE,"no").await;
+    let no=recorded_resolution(&e,"request_reply_not_affirmative");
+    // P1: the exact row shape send_post records for a peer's direct send.
+    e.seed_row(MAX_PANE,"no","session",DEV_LEAD,Some("direct"),now_s());
+    e.type_in_pane(MAX_PANE,"yes").await;
+    // Try the actual mutation before checking the no-candidate audit record:
+    // on 960da3c7 this returns 200 and removes the worker's dev tag.
+    let (st,v)=apply(&e,DEV_LEAD,&id,DEV_B,json!({"tags":""})).await;
+    assert_code(st,&v,"request_reply_not_affirmative","P1: unrelated yes cannot fund a refused request");
+    recorded_resolution(&e,"request_no_candidate");
+    assert_eq!(before,e.config_snapshot());
+    let conn=e.store.read().unwrap();
+    let refusal:(Option<i64>,String)=conn.query_row(
+        "SELECT resolution_row,resolution_code FROM _amux_delegation_grants WHERE code=?1",
+        [&id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(refusal,(None,"request_reply_not_affirmative".into()));
+    assert_eq!(conn.query_row("SELECT code FROM _amux_delegation_resolutions WHERE reply_row=?1",
+        [no],|r|r.get::<_,String>(0)).unwrap(),"request_reply_not_affirmative");
+}
+
+#[tokio::test]
+async fn peer_messages_never_close_a_pending_request_window() {
+    // Peer input must not advance the boundary either, including a projected
+    // row with a misleading process verdict but retained peer provenance.
+    for (ty,projected) in [("session",false),("chat",false),("user",false),("session",true)] {
+        let e=setup().await;
+        e.type_in_pane(MAX_PANE,"wait").await;
+        recorded_resolution(&e,"request_reply_not_affirmative");
+        let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""}),MAX_PANE).await;
+        let peer=e.seed_row(MAX_PANE,"no",ty,DEV_LEAD,Some("direct"),now_s());
+        if projected {
+            e.store.write(move|c| {
+                c.execute("UPDATE cmd_history SET type='steering',delegation_message_type='session',process_origin='remote' WHERE id=?1",[peer])?;
+                Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
+            }).unwrap();
+        }
+        e.type_in_pane(MAX_PANE,"yes").await;
+        recorded_resolution(&e,"request_resolved");
+        let (st,v)=apply(&e,DEV_LEAD,&id,DEV_B,json!({"tags":""})).await;
+        assert_allowed(st,&v,"peer input cannot close the owner's pending window");
+        let conn=e.store.read().unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM _amux_delegation_resolutions WHERE reply_row=?1",
+            [peer],|r|r.get::<_,i64>(0)).unwrap(),0,"peer must never acquire an owner resolution");
+    }
+}
+
+#[tokio::test]
+async fn refused_request_is_never_a_later_candidate_without_a_prior_boundary() {
+    // Isolate the refusal guard: no prior owner resolution exists to protect
+    // these pending rows. Any stored code must exclude the request by itself.
+    for code in ["request_reply_not_affirmative","request_ambiguous","request_reply_identity_changed","request_reply_outside_window"] {
+        let e=setup().await;
+        let before=e.config_snapshot();
+        let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""}),MAX_PANE).await;
+        let (request,refusal)=(id.clone(),code.to_string());
+        e.store.write(move|c| {
+            c.execute("UPDATE _amux_delegation_grants SET resolution_code=?2,resolution_note='stored refusal' WHERE code=?1",
+                rusqlite::params![request,refusal])?;
+            Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        e.type_in_pane(MAX_PANE,"yes").await;
+        let (st,v)=apply(&e,DEV_LEAD,&id,DEV_B,json!({"tags":""})).await;
+        assert_code(st,&v,code,"a refused pending row cannot become a candidate again");
+        recorded_resolution(&e,"request_no_candidate");
+        assert_eq!(before,e.config_snapshot());
+    }
+}
+
+#[tokio::test]
 async fn negated_free_text_never_creates_or_funds_a_request() {
     let e=setup().await;
     // Keep this specimen runnable against faba94781: seed only shipped

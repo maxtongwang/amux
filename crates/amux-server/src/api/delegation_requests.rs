@@ -109,7 +109,7 @@ pub(crate) fn resolve_session(state: &AppState, session: &str) -> Result<(), Str
 
 /// Resolving and recording candidates uses the serialized writer transaction.
 /// No actor filter: every explicit question in the reply session participates.
-fn resolve_reply(state: &AppState, row: &max_ref::Row, previous: i64) -> Result<(), String> {
+fn resolve_reply(state: &AppState, row: &max_ref::Row) -> Result<(), String> {
     let (reply, session, identity, text, ts) = (row.id, row.session.clone(), row.incarnation.clone(), row.text.clone(), row.ts);
     let affirmative = max_ref::reply_is_affirmative(&text);
     let at = crate::config::now_f64();
@@ -117,8 +117,11 @@ fn resolve_reply(state: &AppState, row: &max_ref::Row, previous: i64) -> Result<
         if conn.query_row("SELECT EXISTS(SELECT 1 FROM _amux_delegation_resolutions WHERE reply_row=?1)", [reply], |r| r.get::<_, bool>(0))? {
             return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
         }
+        // A processed owner reply permanently closes its window, whatever
+        // later peer deliveries or message projections do to cmd_history.
+        let previous: i64 = conn.query_row("SELECT COALESCE(MAX(reply_row),0) FROM _amux_delegation_resolutions WHERE session=?1 AND reply_row<?2", rusqlite::params![session, reply], |r| r.get(0))?;
         let candidates: Vec<(String, String, f64)> = {
-            let mut st = conn.prepare("SELECT code,reply_incarnation,created_at FROM _amux_delegation_grants WHERE reply_session=?1 AND shown_row>?2 AND shown_row<?3 AND status='pending' AND resolution_row IS NULL ORDER BY shown_row DESC")?;
+            let mut st = conn.prepare("SELECT code,reply_incarnation,created_at FROM _amux_delegation_grants WHERE reply_session=?1 AND shown_row>?2 AND shown_row<?3 AND status='pending' AND resolution_row IS NULL AND resolution_code IS NULL ORDER BY shown_row DESC")?;
             let rows = st.query_map(rusqlite::params![session, previous, reply], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
@@ -143,27 +146,15 @@ fn resolve_reply(state: &AppState, row: &max_ref::Row, previous: i64) -> Result<
         if affirmative && code != "request_resolved" {
             tracing::warn!(reply_row = reply, session, code, note, verdict = "delegation_request_refused", measured = true, n_considered = candidates.len(), "owner reply funded no request");
         }
-        tracing::info!(reply_row = reply, session, request_id = ?request, code, note, verdict = "delegation_request_resolution", measured = true, n_considered = candidates.len(), "owner reply correlation recorded");
+        tracing::info!(reply_row = reply, previous_reply_row = previous, session, request_id = ?request, code, note, verdict = "delegation_request_resolution", measured = true, n_considered = candidates.len(), "owner reply correlation recorded");
         Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
     }).map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Hook path also records a no-candidate reply when no request exists. The
-/// preceding owner row, not the preceding agent message, closes the window.
+/// stored owner resolution, never a reclassified message, closes the window.
 pub(crate) fn resolve_observed(state: &AppState, id: i64) -> Result<(), String> {
     let row = max_ref::one(state, id).map_err(|e| e.code().to_string())?.ok_or("request_reply_missing")?;
     if max_ref::typed_by_max(state, &row).is_none() { return Ok(()); }
-    let ids: Vec<i64> = {
-        let conn = state.store.read().map_err(|e| e.to_string())?;
-        let mut st = conn.prepare("SELECT id FROM cmd_history WHERE session=?1 AND COALESCE(delegation_message_type,type) IN ('user','chat') AND id<?2 ORDER BY id DESC LIMIT ?3").map_err(|e|e.to_string())?;
-        let rows = st.query_map(rusqlite::params![row.session,id,(RESOLUTION_SCAN_LIMIT+1) as i64], |r|r.get(0)).map_err(|e|e.to_string())?;
-        rows.collect::<rusqlite::Result<_>>().map_err(|e|e.to_string())?
-    };
-    let mut previous = 0;
-    for (n, id) in ids.iter().enumerate() {
-        if n == RESOLUTION_SCAN_LIMIT { return Err("request_resolution_scan_full".into()); }
-        let prior = max_ref::one(state,*id).map_err(|e|e.code().to_string())?.ok_or("request_reply_missing")?;
-        if max_ref::typed_by_max(state,&prior).is_some() { previous=*id; break; }
-    }
-    resolve_reply(state,&row,previous)
+    resolve_reply(state,&row)
 }
