@@ -43,7 +43,7 @@ boundary. All approval `*_at` timestamps are Unix seconds; history `ts` is ms.
 | Owner prose containing an approve word plus a code, including after a pasted snippet | Doubt (`text-between`): stays open and requires a clean coded confirmation; never approves |
 | Another plain yes after confirmation | Confirmation again; never funds |
 | Wrong, unknown or closed code | No open approval; never falls back to plain yes |
-| Non-approve text or empty Enter immediately following a display | Declines/closes, never funds |
+| Non-approve text (including malformed code or `yes please`) or empty Enter immediately following a display | Declines/closes, never funds |
 | Coded answer to another open request | Answers that request; leaves this question open |
 
 `plain_yes_without_doubt` checks every condition explicitly:
