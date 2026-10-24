@@ -458,6 +458,21 @@ fn lane(name: &str) -> Arc<Lane> {
         .clone()
 }
 
+/// Hold an already-running provider turn in route tests: real ChatAdapter
+/// enqueue/persistence runs, but no external provider process can be spawned.
+#[cfg(test)]
+pub(crate) fn hold_test_turn(name: &str) -> impl Drop {
+    struct HeldTurn(String);
+    impl Drop for HeldTurn {
+        fn drop(&mut self) {
+            LANES.lock().unwrap().remove(&self.0);
+        }
+    }
+    assert!(!lane(name).busy.swap(true, Ordering::SeqCst));
+    update_meta(name, &[("chat_running", json!(true))]);
+    HeldTurn(name.to_string())
+}
+
 /// Where a chat worker's turns run. The configured dir when there is one; a
 /// private scratch dir otherwise, so every cwd-reading path keeps working
 /// without a project or worktree.

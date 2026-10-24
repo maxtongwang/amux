@@ -52,6 +52,13 @@ fn ring() -> &'static Ring {
     RING.get_or_init(Default::default)
 }
 
+/// Each hermetic route fixture owns a new home but uses the reserved owner
+/// session name; keep its process-local delivery cache in the same scope.
+#[cfg(test)]
+pub(crate) fn reset_test_deliveries(session: &str) {
+    ring().lock().unwrap().remove(session);
+}
+
 /// Collapse whitespace so a paste that gained a trailing space (the
 /// @-mention fix) or a CRLF still matches what the hook reports.
 pub(crate) fn normalize(text: &str) -> String {
