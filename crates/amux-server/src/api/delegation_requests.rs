@@ -1,5 +1,5 @@
 // Explicit approval identity and correlation — Max 2026-10-23, refs maxtongwang/ai-config#160.
-//! Only a rendered owner Messages question opens a reply window. The very next
+//! A rendered owner Messages question or exact owner assistant turn opens a reply window. The very next
 //! owner input may answer the latest display; any intervening owner input or
 //! owner-session output closes it. cmd_history order is the authority; the
 //! resolutions table records outcomes only.
@@ -190,6 +190,49 @@ pub(crate) fn observe_output(state: &AppState, session: &str) -> Result<(), Stri
     }).map(|_| ()).map_err(|e| e.to_string())
 }
 
+/// Applied native Stop only: the assistant row IS the pane receipt and ordering
+/// boundary. Native sequence acceptance, this row and its binding commit together.
+pub(crate) fn native_assistant_turn(conn: &rusqlite::Connection, session: &str, event: &Value, launch: &Value) -> rusqlite::Result<()> {
+    if session != OWNER_AGENT || super::session_verbs::session_is_isolated(session) { return Ok(()); }
+    let Some(text) = event["assistant_message"].as_str().filter(|s| !s.is_empty()) else {
+        tracing::warn!(session, verdict="delegation_pane_text_unavailable", measured=false, n_considered=0,
+            "native Stop has no complete assistant text; no pane receipt");
+        return Ok(());
+    };
+    let identity = incarnation(session);
+    let launch_identity = launch["incarnation"].as_str();
+    if launch_identity.is_none() || launch_identity != identity.as_deref() {
+        tracing::warn!(session, verdict="delegation_pane_identity_changed", measured=true, n_considered=1,
+            "native launch is outside the current owner incarnation; no pane receipt");
+        return Ok(());
+    }
+    let at = (event["event_ts"].as_f64().unwrap_or(0.0) * 1000.0) as i64;
+    conn.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts,delegation_session_incarnation) VALUES(?1,?2,'assistant',?1,'native_assistant',?3,?4)", rusqlite::params![session,text,at,identity])?;
+    let turn = conn.last_insert_rowid();
+    let matches: Vec<(String,i64)> = {
+        let mut st = conn.prepare("SELECT g.code,g.ask_row FROM _amux_delegation_grants g JOIN cmd_history q ON q.id=g.ask_row WHERE g.reply_session=?1 AND g.reply_incarnation=?2 AND g.status='pending' AND (g.shown_row IS NULL OR EXISTS(SELECT 1 FROM cmd_history d WHERE d.id=g.shown_row AND d.delivery='approval_display' AND d.repeat_of=g.ask_row)) AND g.resolution_row IS NULL AND g.resolution_code IS NULL AND g.expires_at>?3 AND q.text=g.ask_text AND q.session=g.reply_session AND q.delivery='approval_request' AND q.delegation_session_incarnation=g.reply_incarnation AND length(g.ask_text)>0 AND instr(?4,g.ask_text)>0 AND q.id<?5 AND q.ts<=?6")?;
+        let rows = st.query_map(rusqlite::params![OWNER_AGENT,identity,at as f64/1000.0,text,turn,at], |r| Ok((r.get(0)?,r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    // One turn cannot be the unique shown_row of two requests. Fail closed.
+    if matches.len() != 1 {
+        tracing::warn!(session, assistant_row=turn, verdict="delegation_pane_no_exact_request", measured=true,
+            n_considered=matches.len(), "assistant turn matched no single request awaiting pane display");
+        return Ok(());
+    }
+    let (code,ask) = &matches[0];
+    if !text.split(|c: char| c.is_whitespace() || c.is_ascii_punctuation()).any(|token| token == code.as_str()) {
+        tracing::warn!(session, assistant_row=turn, verdict="delegation_pane_id_mismatch", measured=true,
+            n_considered=1, "assistant turn lacks the exact request ID; no pane receipt");
+        return Ok(());
+    }
+    conn.execute("UPDATE cmd_history SET delivery='approval_pane_display',repeat_of=?2,delivered_at=ts WHERE id=?1", rusqlite::params![turn,ask])?;
+    conn.execute("UPDATE _amux_delegation_grants SET resolution_note='displayed in owner assistant turn; awaiting the very next owner input',shown_row=?2 WHERE code=?1", rusqlite::params![code,turn])?;
+    tracing::info!(session, request_id=code, ask_row=ask, shown_row=turn, surface="owner-pane",
+        verdict="delegation_request_displayed", measured=true, n_considered=1, "native assistant turn recorded pane display");
+    Ok(())
+}
+
 /// Replay the durable ledger in row order, so a missed hook/restart does not
 /// change matching. Bounded reads fail closed; no truncated scan grants consent.
 pub(crate) fn resolve_session(state: &AppState, session: &str) -> Result<(), String> {
@@ -218,7 +261,7 @@ fn resolve_reply(state: &AppState, row: &max_ref::Row) -> Result<(), String> {
         }
         // Read the ledger, not processed outcomes: missed hooks cannot leave a
         // window open. Peer deliveries are not owner input or owner output.
-        let latest: i64 = conn.query_row("SELECT COALESCE(MAX(id),0) FROM cmd_history WHERE session=?1 AND id<?2 AND (delivery='approval_display' OR (COALESCE(delegation_message_type,type) IN ('user','chat') AND ((origin='pane' AND delivery='pane') OR (origin<>'pane' AND delivery IN ('direct','queued') AND process_origin IN ('outside','remote','remote-forwarded')))) OR type='assistant' OR (type='session' AND origin=session AND delivery<>'approval_request'))", rusqlite::params![session, reply], |r| r.get(0))?;
+        let latest: i64 = conn.query_row("SELECT COALESCE(MAX(id),0) FROM cmd_history WHERE session=?1 AND id<?2 AND (delivery IN ('approval_display','approval_pane_display') OR (COALESCE(delegation_message_type,type) IN ('user','chat') AND ((origin='pane' AND delivery='pane') OR (origin<>'pane' AND delivery IN ('direct','queued') AND process_origin IN ('outside','remote','remote-forwarded')))) OR type='assistant' OR (type='session' AND origin=session AND delivery<>'approval_request'))", rusqlite::params![session, reply], |r| r.get(0))?;
         let candidates: Vec<(String, String, i64)> = {
             let mut st = conn.prepare("SELECT code,reply_incarnation,(SELECT ts FROM cmd_history WHERE id=shown_row) FROM _amux_delegation_grants WHERE reply_session=?1 AND shown_row=?2 AND shown_row<?3 AND status='pending' AND resolution_row IS NULL AND resolution_code IS NULL ORDER BY shown_row DESC")?;
             let rows = st.query_map(rusqlite::params![if owner_reply { session.as_str() } else { "" }, latest, reply], |r| Ok((r.get(0)?,r.get(1)?,r.get::<_, Option<i64>>(2)?.unwrap_or(i64::MAX))))?;

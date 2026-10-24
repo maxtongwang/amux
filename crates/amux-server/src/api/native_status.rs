@@ -58,7 +58,8 @@ pub(crate) fn begin_launch(name: &str, provider: &str) -> std::io::Result<(Strin
     let temp = dir.join("current.tmp");
     std::fs::write(
         &temp,
-        json!({"run_id": run, "provider": provider, "started": ts}).to_string(),
+        json!({"run_id": run, "provider": provider, "started": ts,
+            "incarnation": super::delegation_requests::incarnation(name)}).to_string(),
     )?;
     std::fs::rename(temp, dir.join("current.json"))?;
     Ok((run, ts))
@@ -229,6 +230,10 @@ fn apply(
     if event["event"] != "UserPromptSubmit" {
         super::delegation_requests::output_boundary(conn, name)?;
     }
+    if event["event"] == "Stop" && event["subagent"] != true
+        && event["worker_type"] != amux_core::worker_type::WorkerTypeId::CHAT {
+        super::delegation_requests::native_assistant_turn(conn, name, event, launch)?;
+    }
     let prev = reports[name].clone();
     let mut report = event.clone();
     // The prompt text rides the hook only so `pane_prompts` can record a
@@ -236,6 +241,7 @@ fn apply(
     // `session_reports` blob or every status event row.
     if let Some(map) = report.as_object_mut() {
         map.remove("prompt");
+        map.remove("assistant_message");
     }
     report["ts"] = event["event_ts"].clone();
     report["received_at"] = json!(now);

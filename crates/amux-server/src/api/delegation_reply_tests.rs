@@ -156,13 +156,214 @@ impl Fixture {
         let d = self.home.path().join("status-events").join(session);
         std::fs::create_dir_all(&d).unwrap();
         if !d.join("current.json").exists() {
-            std::fs::write(d.join("current.json"),json!({"run_id":"reply-run","provider":"claude","started":crate::config::now_f64()-100.0}).to_string()).unwrap();
+            std::fs::write(d.join("current.json"),json!({"run_id":"reply-run","provider":"claude","started":crate::config::now_f64()-100.0,
+                "incarnation":incarnation(session)}).to_string()).unwrap();
         }
         let result=self.call(None,Some(session),&format!("/api/sessions/{session}/report"),report).await;
         assert!(result.0.is_success(),"hook HTTP failure: {result:?}");
         assert_eq!(result.1["applied"],applied,"hook must reach the expected observation outcome: {result:?}");
         result
     }
+}
+
+impl Fixture {
+    fn question(&self, id: &str) -> String {
+        self.state.store.read().unwrap().query_row("SELECT ask_text FROM _amux_delegation_grants WHERE code=?1",[id],|r|r.get(0)).unwrap()
+    }
+
+    fn stop(&self, text: &str) -> Value {
+        let mut event=self.report("");
+        event["event"]=json!("Stop"); event["state"]=json!("idle");
+        event["turn_id"]=json!(""); event["assistant_message"]=json!(text);
+        event.as_object_mut().unwrap().remove("prompt"); event
+    }
+
+    fn shown(&self, id: &str) -> Option<i64> {
+        self.state.store.read().unwrap().query_row("SELECT shown_row FROM _amux_delegation_grants WHERE code=?1",[id],|r|r.get(0)).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn pane_exact_assistant_turn_then_next_yes_funds() {
+    let f=Fixture::new(); let id=f.ask_hidden().await;
+    let text=format!("Please review this change:\n{}",f.question(&id));
+    accepted(f.hook(OWNER_AGENT,f.stop(&text)).await);
+    let shown=f.shown(&id).expect("native Stop must commit pane receipt before returning");
+    let c=f.state.store.read().unwrap();
+    let row:(String,String,String,i64,i64,i64)=c.query_row("SELECT h.type,h.delivery,h.text,h.repeat_of,g.ask_row,h.delivered_at-h.ts FROM cmd_history h JOIN _amux_delegation_grants g ON g.shown_row=h.id WHERE h.id=?1",[shown],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap();
+    assert_eq!((&*row.0,&*row.1,&*row.2),("assistant","approval_pane_display",text.as_str()));
+    assert_eq!(row.3,row.4); assert_eq!(row.5,0); assert!(shown>row.4);
+    let report:String=c.query_row("SELECT value FROM prefs WHERE key='session_reports'",[],|r|r.get(0)).unwrap();
+    assert!(!report.contains(&id),"assistant content must stay out of fleet reports"); drop(c);
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    let reply=f.resolution(OWNER_AGENT,"request_resolved",Some(&id)); assert!(reply>shown);
+    accepted(f.apply(&id).await);
+}
+
+#[tokio::test]
+async fn messages_display_then_next_yes_still_funds() {
+    let f=Fixture::new(); let id=f.ask().await;
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
+    accepted(f.apply(&id).await);
+}
+
+#[tokio::test]
+async fn pane_after_messages_display_then_next_yes_funds() {
+    let f=Fixture::new(); let id=f.ask().await;
+    let messages=f.shown(&id).unwrap();
+    accepted(f.hook(OWNER_AGENT,f.stop(&f.question(&id))).await);
+    assert!(f.shown(&id).unwrap()>messages);
+    let delivery:String=f.state.store.read().unwrap().query_row("SELECT delivery FROM cmd_history WHERE id=?1",[messages],|r|r.get(0)).unwrap();
+    assert_eq!(delivery,"approval_display","the original Messages receipt is preserved");
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
+    accepted(f.apply(&id).await);
+}
+
+#[tokio::test]
+async fn pane_missing_exact_question_refuses() {
+    for partial in [false,true] {
+        let f=Fixture::new(); let id=f.ask_hidden().await;
+        let text=if partial { f.question(&id).replace("Reply yes", "Reply  yes") } else { format!("Request {id}; should I proceed?") };
+        accepted(f.hook(OWNER_AGENT,f.stop(&text)).await);
+        assert_eq!(f.shown(&id),None,"partial or normalized question is not exact evidence");
+        accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+        f.resolution(OWNER_AGENT,"request_no_candidate",None);
+        assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
+async fn pane_wrong_or_missing_request_id_refuses() {
+    // Isolate the ID guard: current generated questions embed their code, so
+    // removing that guard otherwise hides behind exact-question matching.
+    for suffix in ["", " WRONG", " PREFIX", " SUFFIX"] {
+        let f=Fixture::new(); let id=f.ask_hidden().await;
+        let code=id.clone();
+        f.write(move|c| {
+            c.execute("UPDATE cmd_history SET text='Approve this exact change?' WHERE id=(SELECT ask_row FROM _amux_delegation_grants WHERE code=?1)",[&code])?;
+            c.execute("UPDATE _amux_delegation_grants SET ask_text='Approve this exact change?' WHERE code=?1",[&code])?; Ok(())
+        });
+        let suffix=match suffix { " PREFIX"=>format!(" X{id}"), " SUFFIX"=>format!(" {id}X"), s=>s.to_string() };
+        accepted(f.hook(OWNER_AGENT,f.stop(&format!("{}{suffix}",f.question(&id)))).await);
+        assert_eq!(f.shown(&id),None);
+        accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+        f.resolution(OWNER_AGENT,"request_no_candidate",None);
+        assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
+async fn pane_intervening_assistant_turn_closes_window() {
+    for repeat_question in [false,true] {
+        let f=Fixture::new(); let id=f.ask_hidden().await;
+        accepted(f.hook(OWNER_AGENT,f.stop(&f.question(&id))).await);
+        let receipt=f.shown(&id).unwrap();
+        // Any second complete turn closes it, including a repeated question.
+        let second=if repeat_question { f.question(&id) } else { "Here is the build status.".into() };
+        accepted(f.hook(OWNER_AGENT,f.stop(&second)).await);
+        assert_eq!(f.shown(&id),Some(receipt));
+        accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+        f.resolution(OWNER_AGENT,"request_no_candidate",None);
+        assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
+async fn pane_intervening_owner_row_closes_window() {
+    let f=Fixture::new(); let id=f.ask_hidden().await;
+    accepted(f.hook(OWNER_AGENT,f.stop(&f.question(&id))).await);
+    assert!(f.shown(&id).is_some());
+    // Simulate the recorder's committed owner row before its resolver callback:
+    // closure must read history, independent of processed refusal outcomes.
+    f.write(|c| { c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts) VALUES(?1,'status please','user','pane','pane',?2)",rusqlite::params![OWNER_AGENT,(crate::config::now_f64()*1000.0) as i64])?; Ok(()) });
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+    assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn pane_other_session_turn_never_records_receipt() {
+    let f=Fixture::new(); let id=f.ask_hidden().await;
+    accepted(f.hook(LEAD,f.stop(&f.question(&id))).await);
+    assert_eq!(f.shown(&id),None);
+    let turns:i64=f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history WHERE session=?1 AND type='assistant'",[LEAD],|r|r.get(0)).unwrap();
+    assert_eq!(turns,0,"non-owner turns must not enter the pane receipt recorder");
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+    assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn pane_outside_report_cannot_claim_receipt() {
+    let f=Fixture::new(); let id=f.ask_hidden().await;
+    accepted(f.hook(OWNER_AGENT,f.report("status please")).await);
+    let (st,v)=f.call(Some(OUTSIDE),None,&format!("/api/sessions/{OWNER_AGENT}/report"),f.stop(&f.question(&id))).await;
+    accepted((st,v.clone())); assert_eq!(v["applied"],true);
+    assert_eq!(f.shown(&id),None,"outside CLI report is not the owner's native hook");
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+}
+
+#[tokio::test]
+async fn pane_chat_status_cannot_claim_receipt() {
+    let f=Fixture::new(); let id=f.ask_hidden().await;
+    let mut stop=f.stop(&f.question(&id));
+    stop["worker_type"]=json!(amux_core::worker_type::WorkerTypeId::CHAT);
+    accepted(f.hook(OWNER_AGENT,stop).await);
+    assert_eq!(f.shown(&id),None,"server-owned Chat status is not native pane rendering");
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+}
+
+#[tokio::test]
+async fn pane_replaced_incarnation_cannot_render_receipt() {
+    let f=Fixture::new(); let id=f.ask_hidden().await;
+    // Bind the native launch first, then simulate replacement without touching
+    // any env file: an old durable launch ID is not the new session's identity.
+    accepted(f.hook(OWNER_AGENT,f.report("status please")).await);
+    let path=f.home.path().join("status-events").join(OWNER_AGENT).join("current.json");
+    let mut launch:Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    launch["incarnation"]=json!("old-owner-incarnation"); std::fs::write(path,launch.to_string()).unwrap();
+    accepted(f.hook(OWNER_AGENT,f.stop(&f.question(&id))).await);
+    assert_eq!(f.shown(&id),None);
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+}
+
+#[tokio::test]
+async fn pane_stop_replay_adopts_receipt_without_rearming() {
+    let f=Fixture::new(); let id=f.ask_hidden().await;
+    let stop=f.stop(&f.question(&id));
+    accepted(f.hook(OWNER_AGENT,stop.clone()).await);
+    let shown=f.shown(&id).unwrap();
+    accepted(f.hook(OWNER_AGENT,f.report("wait")).await);
+    accepted(f.hook_with_applied(OWNER_AGENT,stop,false).await);
+    assert_eq!(f.shown(&id),Some(shown));
+    let turns:i64=f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history WHERE delivery='approval_pane_display'",[],|r|r.get(0)).unwrap();
+    assert_eq!(turns,1);
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+}
+
+#[tokio::test]
+async fn pane_receipt_write_failure_rolls_back_native_observation() {
+    let f=Fixture::new(); let id=f.ask_hidden().await;
+    accepted(f.hook(OWNER_AGENT,f.report("status please")).await);
+    f.write(|c|c.execute_batch("CREATE TRIGGER fail_pane_binding BEFORE UPDATE OF shown_row ON _amux_delegation_grants BEGIN SELECT RAISE(ABORT,'pane receipt write failed'); END;"));
+    let stop=f.stop(&f.question(&id));
+    let (st,_)=f.call(None,Some(OWNER_AGENT),&format!("/api/sessions/{OWNER_AGENT}/report"),stop.clone()).await;
+    assert_eq!(st,StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(f.shown(&id),None);
+    let turns:i64=f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history WHERE delivery IN ('native_assistant','approval_pane_display')",[],|r|r.get(0)).unwrap();
+    assert_eq!(turns,0,"assistant row and native acceptance must roll back together");
+    f.write(|c|c.execute_batch("DROP TRIGGER fail_pane_binding;"));
+    accepted(f.hook(OWNER_AGENT,stop.clone()).await);
+    accepted(f.hook_with_applied(OWNER_AGENT,stop,false).await);
+    assert!(f.shown(&id).is_some());
+    accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+    f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
 }
 
 fn accepted(result: (StatusCode,Value)) {
