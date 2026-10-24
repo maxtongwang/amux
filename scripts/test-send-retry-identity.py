@@ -8,7 +8,9 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 source = (root / 'amux').read_text()
-start = source.index('_send_via_api() {')
+# Carry the shipped receipt helper as well as send/settle/poll: a stub would
+# hide regressions in the receipt branch reached by successful retries.
+start = source.index('_report_delivery_receipt() {')
 end = source.index('\ncmd_stop()', start)
 function = source[start:end]
 with tempfile.TemporaryDirectory(prefix='amux-send-retry-') as temp:

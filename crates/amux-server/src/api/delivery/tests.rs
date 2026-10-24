@@ -1137,10 +1137,25 @@ async fn idle_drain_and_queue_snapshot_keep_pending_native_lineage_and_fifo() {
 #[tokio::test]
 async fn native_prewrite_rechecks_shared_groups_isolation_pause_and_preserves_the_stamp() {
     let dir = private_dir();
-    // The existing global HomeGuard reads the real server.env to identify
-    // leaking keys. This task forbids that read: require our fixture runner.
-    let root =
-        PathBuf::from(std::env::var_os("AMUX_HOME").expect("run scripts/test-native-delivery.sh"));
+    // Serialize with HomeGuard users, but never read the real server.env.
+    // A fresh home also prevents a prior run's open beta group authorizing
+    // "outside" before this run explicitly opens it (nextest reuses AMUX_HOME).
+    let _lock = crate::api::settings::test_env::LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(home) => std::env::set_var("AMUX_HOME", home),
+                None => std::env::remove_var("AMUX_HOME"),
+            }
+        }
+    }
+    let _home = RestoreHome(std::env::var_os("AMUX_HOME"));
+    let root = dir.path();
+    std::env::set_var("AMUX_HOME", root);
+    private_file(&root.join(".native-delivery-fixture"), b"");
     let temp = std::env::temp_dir().canonicalize().unwrap();
     assert!(
         root.starts_with("/private/tmp") || root.starts_with("/tmp") || root.starts_with(&temp),
@@ -1148,7 +1163,11 @@ async fn native_prewrite_rechecks_shared_groups_isolation_pause_and_preserves_th
     );
     assert!(
         root.join(".native-delivery-fixture").is_file(),
-        "run scripts/test-native-delivery.sh"
+        "fixture home must be marked"
+    );
+    eprintln!(
+        "verdict=native_prewrite_fixture_isolated measured=true n_considered=1 home={}",
+        root.display()
     );
     let sessions = root.join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
@@ -1527,19 +1546,20 @@ fn wire_crash_child() {
     });
 }
 
-// Allow subprocess startup/SQLite coordination while keeping fixture waits bounded.
-const FIXTURE_TIMEOUT: Duration = Duration::from_secs(20);
-const FIXTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// Bound subprocess startup/SQLite coordination; a missing checkpoint is a failure.
+const FIXTURE_TIMEOUT_S: Duration = Duration::from_secs(20);
+// Poll fixture checkpoints without spinning a core while a child is scheduled.
+const FIXTURE_POLL_INTERVAL_MS: Duration = Duration::from_millis(10);
 
-fn wait_fixture(path: &Path, ready: impl Fn() -> bool) {
-    let deadline = std::time::Instant::now() + FIXTURE_TIMEOUT;
+fn wait_fixture(path: &Path, checkpoint: &str, ready: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + FIXTURE_TIMEOUT_S;
     while !ready() {
         assert!(
             std::time::Instant::now() < deadline,
-            "fixture deadline: {}",
-            path.display()
+            "verdict=native_fixture_wait_timeout measured=true n_considered=1 checkpoint={checkpoint} timeout_s={} fixture={}",
+            FIXTURE_TIMEOUT_S.as_secs(), path.display()
         );
-        std::thread::sleep(FIXTURE_POLL_INTERVAL);
+        std::thread::sleep(FIXTURE_POLL_INTERVAL_MS);
     }
 }
 
@@ -1547,7 +1567,7 @@ fn configure_blocking_fixture_stream(stream: &std::os::unix::net::UnixStream) {
     // macOS accept inherits O_NONBLOCK from the polling listener. Socket
     // timeouts alone do not clear it: read_line can race the child's first write.
     stream.set_nonblocking(false).unwrap();
-    let timeout = Some(FIXTURE_TIMEOUT);
+    let timeout = Some(FIXTURE_TIMEOUT_S);
     // macOS setsockopt(SO_RCVTIMEO/SO_SNDTIMEO) returns EINVAL once the peer has
     // already disconnected (the SIGKILL case can close before we configure). A
     // blocking read on that socket still yields the buffered bytes, then EOF.
@@ -1588,8 +1608,8 @@ fn blocking_fixture_stream_clears_inherited_nonblocking_before_io() {
         0,
         "fixture stream must block until data or its deadline"
     );
-    assert_eq!(reader.read_timeout().unwrap(), Some(FIXTURE_TIMEOUT));
-    assert_eq!(reader.write_timeout().unwrap(), Some(FIXTURE_TIMEOUT));
+    assert_eq!(reader.read_timeout().unwrap(), Some(FIXTURE_TIMEOUT_S));
+    assert_eq!(reader.write_timeout().unwrap(), Some(FIXTURE_TIMEOUT_S));
     writer.set_nonblocking(true).unwrap();
     configure_blocking_fixture_stream(&writer);
     let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
@@ -1652,7 +1672,7 @@ fn sigkill_native_wire_and_reverse_receipts_recover_without_replaying() {
         let peer_root = root.to_path_buf();
         let peer_phase = phase.to_string();
         let server = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + FIXTURE_TIMEOUT;
+            let deadline = std::time::Instant::now() + FIXTURE_TIMEOUT_S;
             let (stream, _) = loop {
                 match listener.accept() {
                     Ok(s) => break s,
@@ -1661,7 +1681,7 @@ fn sigkill_native_wire_and_reverse_receipts_recover_without_replaying() {
                             std::time::Instant::now() < deadline,
                             "fixture accept deadline"
                         );
-                        std::thread::sleep(FIXTURE_POLL_INTERVAL);
+                        std::thread::sleep(FIXTURE_POLL_INTERVAL_MS);
                     }
                     Err(e) => panic!("fixture accept: {e}"),
                 }
@@ -1674,13 +1694,15 @@ fn sigkill_native_wire_and_reverse_receipts_recover_without_replaying() {
                 .expect("fixture native frame read");
             if peer_phase == "before_write" {
                 assert_eq!(n, 0);
-                return 0;
+                return (0, None);
             }
             let frame: Value = serde_json::from_str(&line).unwrap();
             assert_eq!(frame["type"], "user");
             std::fs::write(peer_root.join("wire-observed"), b"one native frame").unwrap();
-            if peer_phase.contains("receipt") {
-                wait_fixture(&peer_root, || peer_root.join("receipt-go").is_file());
+            let callback = if peer_phase.contains("receipt") {
+                wait_fixture(&peer_root, "receipt-go", || {
+                    peer_root.join("receipt-go").is_file()
+                });
                 let reply = frame["from"]
                     .as_str()
                     .unwrap()
@@ -1692,9 +1714,16 @@ fn sigkill_native_wire_and_reverse_receipts_recover_without_replaying() {
                     writeln!(callback,"{}",json!({"type":"control","action":"peer_message_status","msgV":1,"msg_id":uuid(),
                         "orig_msg_id":frame["msg_id"],"status":state,"from":wire::address(&peer_root.join("receiver.sock")).unwrap()})).unwrap();
                 }
-                drop(callback);
+                // EOF frames the callback; keep the descriptor alive until
+                // the child dies so macOS can still attest LOCAL_PEERPID.
+                // Full close before accept can discard that kernel evidence.
+                callback.shutdown(std::net::Shutdown::Write).unwrap();
+                eprintln!("verdict=native_fixture_callback_half_closed measured=true n_considered=2 phase={peer_phase}");
                 std::fs::write(peer_root.join("receipt-sent"), b"reverse frames sent").unwrap();
-            }
+                Some(callback)
+            } else {
+                None
+            };
             // No second native user frame is allowed before the child dies.
             let mut rest = String::new();
             assert_eq!(
@@ -1703,7 +1732,9 @@ fn sigkill_native_wire_and_reverse_receipts_recover_without_replaying() {
                 "unexpected second native frame"
             );
             assert!(rest.is_empty());
-            1
+            // The JoinHandle owns the live callback until the parent joins
+            // after SIGKILL, even if this thread already observed send EOF.
+            (1, callback)
         });
         let mut child = FixtureChild(
             std::process::Command::new(std::env::current_exe().unwrap())
@@ -1721,9 +1752,11 @@ fn sigkill_native_wire_and_reverse_receipts_recover_without_replaying() {
         );
         let mut lock = None;
         if phase == "before_write" {
-            wait_fixture(root, || root.join("before-write").is_file());
+            wait_fixture(root, "before-write", || root.join("before-write").is_file());
         } else {
-            wait_fixture(root, || root.join("wire-observed").is_file());
+            wait_fixture(root, "wire-observed", || {
+                root.join("wire-observed").is_file()
+            });
             if phase.contains("receipt") {
                 if phase == "before_receipt_commit" {
                     let c = Connection::open(&path).unwrap();
@@ -1731,9 +1764,9 @@ fn sigkill_native_wire_and_reverse_receipts_recover_without_replaying() {
                     lock = Some(c);
                 }
                 std::fs::write(root.join("receipt-go"), b"send callbacks").unwrap();
-                wait_fixture(root, || root.join("receipt-sent").is_file());
+                wait_fixture(root, "receipt-sent", || root.join("receipt-sent").is_file());
                 if phase == "after_receipt_commit" {
-                    wait_fixture(root, || {
+                    wait_fixture(root, "admitted", || {
                         Connection::open(&path).unwrap().query_row("SELECT EXISTS(SELECT 1 FROM native_delivery_attempts WHERE state='admitted')",[],|r|r.get::<_,bool>(0)).unwrap()
                     });
                 }
@@ -1745,7 +1778,10 @@ fn sigkill_native_wire_and_reverse_receipts_recover_without_replaying() {
         if let Some(c) = lock {
             c.execute_batch("ROLLBACK").unwrap();
         }
-        assert_eq!(server.join().unwrap(), usize::from(phase != "before_write"));
+        assert_eq!(
+            server.join().unwrap().0,
+            usize::from(phase != "before_write")
+        );
         let c = Connection::open(&path).unwrap();
         ledger::recover(&c).unwrap();
         let id: String = c
