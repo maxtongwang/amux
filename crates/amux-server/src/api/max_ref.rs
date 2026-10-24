@@ -173,13 +173,6 @@ pub(crate) fn reply_is_affirmative(text: &str) -> bool {
     AFFIRMATIVE_REPLIES.contains(&normalized.as_str())
 }
 
-/// THE citation rule (cite mode): another lane's human row counts; in the
-/// actor's own lane only a non-local Remote owner send.
-pub(crate) fn cite_source_allowed(actor: &str, session: &str, source: HumanSource, remote: bool) -> bool {
-    let own = session == actor || super::chat_worker::companion_parent(actor) == Some(session);
-    !own || (source == HumanSource::OwnerSend && remote)
-}
-
 /// Max's own typed row in its lane: human-typed, not an amux delivery.
 pub(crate) fn typed_by_max(state: &AppState, row: &Row) -> Option<HumanSource> {
     let source = row.source?;

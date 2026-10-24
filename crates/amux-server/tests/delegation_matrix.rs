@@ -136,7 +136,7 @@ async fn cc_orchestrator_is_never_a_leads_or_a_workers_to_set() {
     for who in [DEV_LEAD, DEV_A] {
         let (st, v) = e.call(Who::Worker(who), "PUT", "/api/scope", Some(body.clone())).await;
         assert_permission_refused(st, &v, &format!("{who} sets CC_ORCHESTRATOR"));
-        let (st, v) = e.request_result(who, "PUT", "/api/scope", body.clone(), MAX_PANE).await;
+        let (st, v) = e.request_result(who, "PUT", "/api/scope", body.clone()).await;
         assert_permission_refused(st, &v, &format!("{who} requests CC_ORCHESTRATOR"));
     }
     let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(body)).await;
@@ -230,7 +230,7 @@ async fn lead_changes_tags_only_through_a_cited_grant_and_never_makes_a_lead() {
         let before = e.tags(target);
         let (st, v) = e.call(lead, "PATCH", &cfg(target), Some(json!({"tags": tags}))).await;
         assert_code(st, &v, code, &format!("lead {ctx}"));
-        let (st, v) = e.request_result(DEV_LEAD, "PATCH", &cfg(target), json!({"tags": tags}), MAX_PANE).await;
+        let (st, v) = e.request_result(DEV_LEAD, "PATCH", &cfg(target), json!({"tags": tags})).await;
         assert_code(st, &v, code, &format!("lead requests to {ctx}"));
         assert_eq!(e.tags(target), before, "lead {ctx}: refused change wrote tags");
         assert_eq!(e.latest_grant(), grant, "lead {ctx}: refused change recorded a grant");
@@ -248,7 +248,7 @@ async fn lead_changes_tags_only_through_a_cited_grant_and_never_makes_a_lead() {
         (DEV_A, "dev,ops", "peer_config_owner_only"),
     ] {
         let before = e.tags(target);
-        let (st, v) = e.request_result(DEV_LEAD, "PATCH", &cfg(target), json!({"tags": tags}), MAX_PANE).await;
+        let (st, v) = e.request_result(DEV_LEAD, "PATCH", &cfg(target), json!({"tags": tags})).await;
         assert_code(st, &v, code, &format!("lead requests forbidden tags on {target}"));
         let (st, v) = e.call(lead, "PATCH", &cfg(target), Some(with_request(json!({"tags": tags}), id.clone()))).await;
         assert_code(st, &v, "request_change_mismatch", &format!("lead repurposes approval for {target}"));
@@ -308,7 +308,7 @@ async fn lead_sets_model_and_effort_on_a_team_worker_and_nothing_else() {
         let before = e.env_text(DEV_A);
         let (st, v) = e.call(lead, "PATCH", &cfg(DEV_A), Some(body.clone())).await;
         assert_permission_refused(st, &v, &format!("lead sets {body}"));
-        let (st, v) = e.request_result(DEV_LEAD, "PATCH", &cfg(DEV_A), body.clone(), MAX_PANE).await;
+        let (st, v) = e.request_result(DEV_LEAD, "PATCH", &cfg(DEV_A), body.clone()).await;
         assert_permission_refused(st, &v, &format!("lead requests {body}"));
         assert_eq!(e.env_text(DEV_A), before, "refused {body} changed the env file");
     }
@@ -379,7 +379,7 @@ async fn self_sets_model_and_effort_but_not_owner_only_keys() {
         let before = e.env_text(DEV_A);
         let (st, v) = e.call(me, "PATCH", &cfg(DEV_A), Some(body.clone())).await;
         assert_permission_refused(st, &v, &format!("self {body}"));
-        let (st, v) = e.request_result(DEV_A, "PATCH", &cfg(DEV_A), body.clone(), MAX_PANE).await;
+        let (st, v) = e.request_result(DEV_A, "PATCH", &cfg(DEV_A), body.clone()).await;
         assert_permission_refused(st, &v, &format!("self requests {body}"));
         assert_eq!(e.env_text(DEV_A), before, "refused self {body} changed the env file");
     }
@@ -495,7 +495,7 @@ async fn secrets_are_never_delegable() {
                 let body = scope_body(level, name, "env", json!({ key: "review-secret-value" }));
                 let (st, v) = e.call(Who::Worker(who), "PUT", "/api/scope", Some(body.clone())).await;
                 assert_permission_refused(st, &v, &format!("{who} sets {level}:{name} {key}"));
-                let (st, v) = e.request_result(who, "PUT", "/api/scope", body, MAX_PANE).await;
+                let (st, v) = e.request_result(who, "PUT", "/api/scope", body).await;
                 assert_permission_refused(st, &v, &format!("{who} requests {level}:{name} {key}"));
             }
             let (st, v) = e.call(Who::Worker(who), "PATCH", &cfg(DEV_A),

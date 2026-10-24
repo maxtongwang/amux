@@ -160,7 +160,7 @@ async fn each_delegable_class_applies_with_a_citation_and_undoes() {
             failures.push(format!("{}: without a citation expected 403 {want}, got {st} {v}", c.name));
         }
         let body = if c.reaches_mrpopo {
-            let (st, v) = e.request_result(MRPOPO, c.method, &c.path, c.body.clone(), MAX_PANE).await;
+            let (st, v) = e.request_result(MRPOPO, c.method, &c.path, c.body.clone()).await;
             assert_code(st, &v, "held_for_max", c.name);
             c.body.clone()
         } else {
@@ -219,7 +219,7 @@ async fn hands_only_changes_never_become_a_grant() {
     for (name, method, path, body, code) in cases {
         let before = e.snapshot();
         let (st, v) = e.call(Who::Worker(MRPOPO), method, &path, Some(body.clone())).await;
-        let (request_st, request_v) = e.request_result(MRPOPO, method, &path, body, MAX_PANE).await;
+        let (request_st, request_v) = e.request_result(MRPOPO, method, &path, body).await;
         assert_refused(request_st, &request_v, &format!("request hands-only {name}"));
         // The code names the hands-only guard itself, so a broader refusal
         // elsewhere cannot stand in for it.
@@ -244,7 +244,7 @@ async fn leads_and_self_never_get_mrpopos_classes() {
         for who in [DEV_LEAD, DEV_A] {
             let e = setup().await;
             let (st, v) = e.call(Who::Worker(who), c.method, &c.path, Some(c.body.clone())).await;
-            let (request_st, request_v) = e.request_result(who, c.method, &c.path, c.body.clone(), MAX_PANE).await;
+            let (request_st, request_v) = e.request_result(who, c.method, &c.path, c.body.clone()).await;
             assert_refused(request_st, &request_v, &format!("{} requested by {who}", c.name));
             if st.as_u16() != 403 || !e.latest_grant().is_empty() {
                 failures.push(format!("{} as {who}: expected a 403 and no grant, got {st} {v}", c.name));
@@ -268,7 +268,7 @@ async fn mrpopo_at_the_group_and_global_layers() {
     assert_eq!(e.grant_status(&e.latest_grant()), "applied");
     let before = e.snapshot();
     let (st, v) = e.request_result(MRPOPO, "PUT", "/api/scope",
-        scope_body("group", "dev", "env", json!({"CC_SOMETHING_OWNER_ONLY": "1"})), MAX_PANE).await;
+        scope_body("group", "dev", "env", json!({"CC_SOMETHING_OWNER_ONLY": "1"}))).await;
     assert_code(st, &v, "delegation_not_allowed", "group-layer key with no row");
     assert_eq!(before, e.snapshot(), "nothing written");
 }
@@ -291,7 +291,7 @@ async fn a_layer_that_includes_the_caller_is_held_for_max() {
         let before = (e.snapshot(), effective(name));
         let (st, v) = e.call(Who::Worker(MRPOPO), "PUT", "/api/scope", Some(body.clone())).await;
         assert_code(st, &v, "held_for_max", name);
-        let (st, v) = e.request_result(MRPOPO, "PUT", "/api/scope", body, MAX_PANE).await;
+        let (st, v) = e.request_result(MRPOPO, "PUT", "/api/scope", body).await;
         assert_code(st, &v, "held_for_max", name);
         assert_eq!(before, (e.snapshot(), effective(name)), "{name}: mrpopo's effective config is unchanged");
     }

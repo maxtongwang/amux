@@ -34,7 +34,7 @@ use tower::ServiceExt;
 /// the temp home.
 pub const MRPOPO: &str = "mrpopo";
 /// The session where an explicit request is shown and Max's reply is recorded.
-pub const MAX_PANE: &str = "review-max-desk";
+pub const MAX_PANE: &str = MRPOPO;
 pub const DEV_LEAD: &str = "review-dev-lead";
 /// A second lead of team dev: a PEER lead of DEV_LEAD.
 pub const DEV_LEAD2: &str = "review-dev-lead2";
@@ -134,7 +134,6 @@ const FLEET: &[(&str, &str, bool)] = &[
     (DEV_B, "dev", false),
     (OPS_A, "ops", false),
     (MRPOPO, "leads", false),
-    (MAX_PANE, "", false),
 ];
 
 pub async fn setup() -> Env {
@@ -185,20 +184,20 @@ pub fn with_request(mut body: Value, request_id: Value) -> Value {
 static PANE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Env {
-    pub async fn request(&self, actor: &str, method: &str, path: &str, body: Value, reply_session: &str) -> String {
-        let (st,v) = self.request_result(actor, method, path, body, reply_session).await;
+    pub async fn request(&self, actor: &str, method: &str, path: &str, body: Value) -> String {
+        let (st,v) = self.request_result(actor, method, path, body).await;
         assert_eq!(st, StatusCode::ACCEPTED, "explicit request: {v}");
         v["request_id"].as_str().expect("request_id").into()
     }
 
     /// Exercise request creation without assuming that the change is delegable.
-    pub async fn request_result(&self, actor: &str, method: &str, path: &str, body: Value, reply_session: &str) -> (StatusCode, Value) {
+    pub async fn request_result(&self, actor: &str, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
         self.call(Who::Worker(actor), "POST", "/api/delegation/requests",
-            Some(json!({"method":method,"path":path,"body":body,"reply_session":reply_session}))).await
+            Some(json!({"method":method,"path":path,"body":body}))).await
     }
 
     pub async fn approved_request(&self, actor: &str, method: &str, path: &str, body: Value) -> Value {
-        let id=self.request(actor,method,path,body,MAX_PANE).await;
+        let id=self.request(actor,method,path,body).await;
         self.seed_pane_prompt(MAX_PANE,"yes",now_s());
         json!(id)
     }

@@ -35,7 +35,7 @@ fn recorded_resolution(e: &Env, code: &str) -> i64 {
 async fn explicit_request_is_shown_with_stable_identities_and_structured_change() {
     let e=setup().await;
     let before=e.config_snapshot();
-    let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""}),MAX_PANE).await;
+    let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
     assert_eq!(before,e.config_snapshot(),"creation must not execute the mutation");
     let g=view(&e,&id).await;
     assert_eq!(g["request_id"],id);
@@ -54,29 +54,28 @@ async fn explicit_request_is_shown_with_stable_identities_and_structured_change(
 #[tokio::test]
 async fn approval_yes_is_bound_to_the_shown_session_and_requesting_actor() {
     let e=setup().await;
-    let foreign=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""}),DEV_LEAD).await;
-    let local=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"toggle_yolo":true}),MAX_PANE).await;
-    e.seed_pane_prompt(MAX_PANE,"yes",now_s());
-    let (st,v)=apply(&e,DEV_LEAD,&foreign,DEV_B,json!({"tags":""})).await;
-    assert_code(st,&v,"request_unresolved","yes elsewhere cannot fund the foreign request");
-    let (st,v)=apply(&e,DEV_LEAD,&local,DEV_A,json!({"toggle_yolo":true})).await;
+    let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
+    e.type_in_pane(DEV_A,"yes").await;
+    let (st,v)=apply(&e,DEV_LEAD,&id,DEV_B,json!({"tags":""})).await;
+    assert_code(st,&v,"request_unresolved","another session cannot fund an owner-session question");
+    e.type_in_pane(MAX_PANE,"approve").await;
+    recorded_resolution(&e,"request_resolved");
+    let (st,v)=apply(&e,MRPOPO,&id,DEV_B,json!({"tags":""})).await;
     assert_code(st,&v,"request_actor_identity_changed","another actor cannot cite the request");
-    let (st,v)=apply(&e,MRPOPO,&local,DEV_A,json!({"toggle_yolo":true})).await;
-    assert_allowed(st,&v,"yes in S funds only the request shown in S");
-    assert_eq!(e.grant_status(&foreign),"pending");
-    assert_eq!(e.tags(DEV_B),std::collections::BTreeSet::from(["dev".to_string()]));
+    let (st,v)=apply(&e,DEV_LEAD,&id,DEV_B,json!({"tags":""})).await;
+    assert_allowed(st,&v,"Max's owner-session reply funds its asking actor only");
 }
 
 #[tokio::test]
 async fn newer_unanswered_request_gets_yes_and_older_window_never_does() {
     let e=setup().await;
-    let old=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""}),MAX_PANE).await;
+    let old=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
     let wait=e.seed_pane_prompt(MAX_PANE,"wait",now_s());
     e.store.write(move|c| {
         c.execute("UPDATE cmd_history SET type='steering',delegation_message_type='user' WHERE id=?1",[wait])?;
         Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
     }).unwrap();
-    let new=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"toggle_yolo":true}),MAX_PANE).await;
+    let new=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"toggle_yolo":true})).await;
     e.seed_pane_prompt(MAX_PANE,"yes",now_s());
     let (st,v)=apply(&e,DEV_LEAD,&old,DEV_B,json!({"tags":""})).await;
     assert_code(st,&v,"request_reply_not_affirmative","old unanswered question cannot catch a later yes");
@@ -89,7 +88,7 @@ async fn newer_unanswered_request_gets_yes_and_older_window_never_does() {
 async fn peer_echo_no_never_reopens_refused_request_p1() {
     let e=setup().await;
     let before=e.config_snapshot();
-    let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""}),MAX_PANE).await;
+    let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
     e.type_in_pane(MAX_PANE,"no").await;
     let no=recorded_resolution(&e,"request_reply_not_affirmative");
     // P1: the exact row shape send_post records for a peer's direct send.
@@ -118,7 +117,7 @@ async fn peer_messages_never_close_a_pending_request_window() {
         let e=setup().await;
         e.type_in_pane(MAX_PANE,"wait").await;
         recorded_resolution(&e,"request_reply_not_affirmative");
-        let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""}),MAX_PANE).await;
+        let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
         let peer=e.seed_row(MAX_PANE,"no",ty,DEV_LEAD,Some("direct"),now_s());
         if projected {
             e.store.write(move|c| {
@@ -143,7 +142,7 @@ async fn refused_request_is_never_a_later_candidate_without_a_prior_boundary() {
     for code in ["request_reply_not_affirmative","request_ambiguous","request_reply_identity_changed","request_reply_outside_window"] {
         let e=setup().await;
         let before=e.config_snapshot();
-        let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""}),MAX_PANE).await;
+        let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
         let (request,refusal)=(id.clone(),code.to_string());
         e.store.write(move|c| {
             c.execute("UPDATE _amux_delegation_grants SET resolution_code=?2,resolution_note='stored refusal' WHERE code=?1",
@@ -193,8 +192,8 @@ async fn negated_free_text_never_creates_or_funds_a_request() {
 #[tokio::test]
 async fn two_requests_since_last_reply_are_ambiguous_and_stay_pending_with_notes() {
     let e=setup().await;
-    let a=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""}),MAX_PANE).await;
-    let b=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"toggle_yolo":true}),MAX_PANE).await;
+    let a=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
+    let b=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"toggle_yolo":true})).await;
     e.seed_pane_prompt(MAX_PANE,"yes",now_s());
     let before=e.config_snapshot();
     for (actor,id,w,body) in [(DEV_LEAD,&a,DEV_B,json!({"tags":""})),(MRPOPO,&b,DEV_A,json!({"toggle_yolo":true}))] {
@@ -219,7 +218,7 @@ async fn yes_with_no_shown_candidate_funds_nothing_and_is_observable() {
     let (st,v)=e.call(Who::Worker(MRPOPO),"GET","/api/delegation/requests",None).await;
     assert_allowed(st,&v,"list no-candidate outcome");
     assert!(v["resolutions"].as_array().unwrap().iter().any(|r|r["code"]=="request_no_candidate"),"{v}");
-    let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"toggle_yolo":true}),MAX_PANE).await;
+    let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"toggle_yolo":true})).await;
     let (st,v)=apply(&e,MRPOPO,&id,DEV_A,json!({"toggle_yolo":true})).await;
     assert_code(st,&v,"request_unresolved","an earlier yes cannot approve a question shown later");
 }
@@ -256,7 +255,7 @@ async fn replay_and_undo_never_release_the_reply_or_request() {
     assert_allowed(st,&v,"undo");
     let (st,v)=apply(&e,MRPOPO,id,DEV_A,json!({"worktree_verify":"one"})).await;
     assert_code(st,&v,"cite_pair_spent","undo does not release approval");
-    let next=e.request(MRPOPO,"PATCH",&cfg(DEV_B),json!({"worktree_verify":"two"}),MAX_PANE).await;
+    let next=e.request(MRPOPO,"PATCH",&cfg(DEV_B),json!({"worktree_verify":"two"})).await;
     let (st,v)=apply(&e,MRPOPO,&next,DEV_B,json!({"worktree_verify":"two"})).await;
     assert_code(st,&v,"request_unresolved","same reply cannot fund a subsequent request");
     let conn=e.store.read().unwrap();
@@ -266,19 +265,19 @@ async fn replay_and_undo_never_release_the_reply_or_request() {
 
 #[tokio::test]
 async fn request_actor_target_and_reply_incarnations_never_follow_reused_names() {
-    for worker in [MRPOPO,DEV_A,MAX_PANE] {
+    for worker in [DEV_LEAD,DEV_B,MAX_PANE] {
         let e=setup().await;
-        let id=e.approved_request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"})).await;
+        let id=e.approved_request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
         let id=id.as_str().unwrap();
         let path=e.env_path(worker);
         let original=std::fs::read_to_string(&path).unwrap();
         std::fs::rename(&path,e.env_path(&format!("renamed-{worker}"))).unwrap();
         std::fs::write(&path,original.replace(&format!("inc-{worker}"),"replacement-incarnation")).unwrap();
-        let (st,v)=apply(&e,MRPOPO,id,DEV_A,json!({"worktree_verify":"one"})).await;
-        let expected=if worker==MRPOPO {"request_actor_identity_changed"} else if worker==DEV_A {"request_target_identity_changed"} else {"request_reply_identity_changed"};
+        let (st,v)=apply(&e,DEV_LEAD,id,DEV_B,json!({"tags":""})).await;
+        let expected=if worker==DEV_LEAD {"request_actor_identity_changed"} else if worker==DEV_B {"request_target_identity_changed"} else {"request_reply_identity_changed"};
         assert_code(st,&v,expected,"a replacement name cannot inherit a request");
-        if worker==DEV_A {
-            let (st,v)=apply(&e,MRPOPO,id,&format!("renamed-{worker}"),json!({"worktree_verify":"one"})).await;
+        if worker==DEV_B {
+            let (st,v)=apply(&e,DEV_LEAD,id,&format!("renamed-{worker}"),json!({"tags":""})).await;
             assert_code(st,&v,"request_target_identity_changed","renamed target cannot redirect an existing request path");
         }
         assert_eq!(e.grant_status(id),"pending");
@@ -289,7 +288,7 @@ async fn request_actor_target_and_reply_incarnations_never_follow_reused_names()
 async fn lead_requests_retain_team_only_own_groups_and_leads_exclusion() {
     let e=setup().await;
     for (w,tags,code) in [(OPS_A,"dev,ops","peer_config_owner_only"),(DEV_A,"dev,ops","peer_config_owner_only"),(DEV_A,"dev,leads","worker_group_membership_refused")] {
-        let (st,v)=e.call(Who::Worker(DEV_LEAD),"POST","/api/delegation/requests",Some(json!({"reply_session":MAX_PANE,"method":"PATCH","path":cfg(w),"body":{"tags":tags}}))).await;
+        let (st,v)=e.call(Who::Worker(DEV_LEAD),"POST","/api/delegation/requests",Some(json!({"method":"PATCH","path":cfg(w),"body":{"tags":tags}}))).await;
         assert_code(st,&v,code,"stored change must pass the lead membership table");
     }
     let id=e.approved_request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
@@ -301,13 +300,13 @@ async fn lead_requests_retain_team_only_own_groups_and_leads_exclusion() {
 async fn nonaffirmative_replies_and_unshown_requests_never_fund() {
     for text in ["no","wait","yes?","yes, don't proceed","yes but not yet"] {
         let e=setup().await;
-        let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"}),MAX_PANE).await;
+        let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"})).await;
         e.seed_pane_prompt(MAX_PANE,text,now_s());
         let (st,v)=apply(&e,MRPOPO,&id,DEV_A,json!({"worktree_verify":"one"})).await;
         assert_code(st,&v,"request_reply_not_affirmative",text);
     }
     let e=setup().await;
-    let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"}),MAX_PANE).await;
+    let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"})).await;
     let i=id.clone();
     e.store.write(move|c| {c.execute("UPDATE _amux_delegation_grants SET shown_row=NULL WHERE code=?1",[i])?;Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})}).unwrap();
     e.seed_pane_prompt(MAX_PANE,"yes",now_s());
@@ -321,7 +320,7 @@ async fn request_creation_never_dispatches_send_or_an_ordinary_allowed_mutation(
     let before=e.config_snapshot();
     for (method,path,body,code) in [("POST",format!("/api/sessions/{DEV_A}/send"),json!({"text":"hello"}),"request_route_invalid"),
         ("PATCH",cfg(DEV_A),json!({"model":"sonnet"}),"request_not_required")] {
-        let (st,v)=e.call(Who::Worker(DEV_LEAD),"POST","/api/delegation/requests",Some(json!({"reply_session":MAX_PANE,"method":method,"path":path,"body":body}))).await;
+        let (st,v)=e.call(Who::Worker(DEV_LEAD),"POST","/api/delegation/requests",Some(json!({"method":method,"path":path,"body":body}))).await;
         assert!(st.is_client_error(),"{v}");
         assert_eq!(v["code"],code);
     }
@@ -332,7 +331,7 @@ async fn request_creation_never_dispatches_send_or_an_ordinary_allowed_mutation(
 #[tokio::test]
 async fn shown_message_must_still_exist_in_the_bound_reply_session() {
     let e=setup().await;
-    let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"}),MAX_PANE).await;
+    let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"})).await;
     e.seed_row(MAX_PANE,"non-request receipt","session",MRPOPO,Some("direct"),now_s());
     let i=id.clone();
     e.store.write(move|c| {
@@ -408,7 +407,7 @@ async fn owner_undo_is_not_stranded_when_the_asking_worker_retires() {
 #[tokio::test]
 async fn project_steering_projection_preserves_owner_but_never_peer_authorship() {
     let e=setup().await;
-    let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"}),MAX_PANE).await;
+    let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"})).await;
     let (st,v)=e.type_in_pane(MAX_PANE,"approve").await;
     assert_allowed(st,&v,"record actual owner reply through the hook");
     let row=recorded_resolution(&e,"request_resolved");
@@ -426,7 +425,7 @@ async fn project_steering_projection_preserves_owner_but_never_peer_authorship()
     let (st,v)=apply(&e,MRPOPO,&id,DEV_A,json!({"worktree_verify":"one"})).await;
     assert_allowed(st,&v,"owner authorship survives the project projection");
 
-    let next=e.request(MRPOPO,"PATCH",&cfg(DEV_B),json!({"worktree_verify":"two"}),MAX_PANE).await;
+    let next=e.request(MRPOPO,"PATCH",&cfg(DEV_B),json!({"worktree_verify":"two"})).await;
     let peer=e.seed_row(MAX_PANE,"yes","session",MRPOPO,Some("direct"),now_s());
     e.store.write(move|c| {
         c.execute("UPDATE cmd_history SET type='steering',delegation_message_type='session',process_origin='remote' WHERE id=?1",[peer])?;

@@ -7012,7 +7012,7 @@ cmd_grant() {
   case "$sub" in
     help|--help|-h)
       echo 'Usage: amux grant list|requests [--json]; amux grant request --stdin'
-      echo 'Request JSON: {"reply_session":"...","method":"PATCH","path":"/api/sessions/.../config","body":{...}}'
+      echo 'Request JSON: {"method":"PATCH","path":"/api/sessions/.../config","body":{...}}'
       echo 'Apply the exact mutation with {"request_id":"ID",...} after Max replies in the shown session.'
       return 0 ;;
     request)
