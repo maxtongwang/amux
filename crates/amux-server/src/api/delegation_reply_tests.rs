@@ -638,13 +638,30 @@ async fn native_subagent_and_chat_input_close_window_without_owner_proof() {
 
 #[tokio::test]
 async fn rejected_owner_send_closes_window_before_later_yes() {
-    for route in [format!("{OWNER_AGENT}/send"),format!("{OWNER_AGENT}/steer"),format!("{OWNER_AGENT}@chat/send")] {
+    // /send accepts empty owner input as an Enter control. Steer and Chat
+    // require text; their actual rejection still consumes the owner window.
+    for route in [format!("{OWNER_AGENT}/steer"),format!("{OWNER_AGENT}@chat/send")] {
         let f=Fixture::new(); let id=f.ask().await;
-        let (st,_)=f.call(Some(OUTSIDE),None,&format!("/api/sessions/{route}"),
+        let (st,v)=f.call(Some(OUTSIDE),None,&format!("/api/sessions/{route}"),
             json!({"text":"","record_history":true,"msg_id":"empty-owner"})).await;
-        assert!(!st.is_success());
+        assert_eq!(st,StatusCode::BAD_REQUEST,"{route}: {v}");
         accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
         f.resolution(OWNER_AGENT,"request_no_candidate",None);
+        assert_eq!(f.request_resolution(&id),(None,Some("request_reply_not_owner_input".into())));
+        assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
+async fn empty_owner_send_control_closes_window_before_later_yes() {
+    for text in ["", "[no-board]"] {
+        let f=Fixture::new(); let id=f.ask().await;
+        // The fake execution adapter accepts Enter. Do not change the route's
+        // control contract to make the old rejected-send fixture pass.
+        accepted(f.send(OWNER_AGENT,OUTSIDE,text,"empty-owner-control").await);
+        accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
+        f.resolution(OWNER_AGENT,"request_no_candidate",None);
+        assert_eq!(f.request_resolution(&id),(None,Some("request_reply_not_owner_input".into())));
         assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
     }
 }
@@ -1038,6 +1055,12 @@ async fn owner_cli_default_does_not_promote_worker_or_relay_input() {
         accepted(f.call(Some(if relay { OUTSIDE } else { PEER }),None,
             &format!("/api/workers/{OWNER_AGENT}/send"),body).await);
         f.peer_recorded("yes","session");
+        // A repeated transport ID must not reclassify the relay as discarded
+        // owner input either (the same provenance rule as disabled history).
+        let mut retry=json!({"text":"yes","msg_id":"peer-cli","no_board":true});
+        if relay { retry["source_session"]=json!(LEAD); }
+        accepted(f.call(Some(if relay { OUTSIDE } else { PEER }),None,
+            &format!("/api/workers/{OWNER_AGENT}/send"),retry).await);
         assert_eq!(f.request_resolution(&id),(None,None));
         accepted(f.hook(OWNER_AGENT,f.report("approve")).await);
         f.resolution(OWNER_AGENT,"request_resolved",Some(&id));

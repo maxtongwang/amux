@@ -99,6 +99,25 @@ class ReplyWindowStorage(unittest.TestCase):
                 self.conn.execute("UPDATE _amux_delegation_grants SET resolution_code=NULL WHERE shown_row=?", [shown])
                 self.assertEqual(len(self.conn.execute(self.candidates,["desk",shown,reply]).fetchall()), 1)
 
+    def test_future_display_row_cannot_hide_current_input_from_reconciliation(self):
+        query = schema.source_sql(REQUESTS, "SELECT id FROM cmd_history WHERE session=?1 AND id >= COALESCE")
+        for offset in [0, 1]:
+            with self.subTest(offset=offset):
+                self.conn.execute("DELETE FROM _amux_delegation_grants")
+                self.conn.execute("DELETE FROM cmd_history")
+                shown = self.request("FUTURE" + str(offset))
+                reply = self.message("yes")
+                self.conn.execute("UPDATE _amux_delegation_grants SET shown_row=? WHERE shown_row=?", [reply + offset, shown])
+                self.assertIn((reply,), self.conn.execute(query, ["desk", 501]).fetchall())
+                self.assertEqual(self.eligible(reply), [])
+
+    def test_native_owner_authorship_survives_steering_projection(self):
+        self.conn.execute("ALTER TABLE cmd_history ADD COLUMN submit_verdict TEXT")
+        query = schema.source_sql(REQUESTS, "INSERT INTO cmd_history(session,text,type,origin,delivery,ts,delivered_at,submit_verdict,delegation_session_incarnation")
+        reply = self.conn.execute(query, ["desk", "yes", 2000, "inc-desk"]).lastrowid
+        self.conn.execute("UPDATE cmd_history SET type='steering' WHERE id=?", [reply])
+        self.assertEqual(self.conn.execute("SELECT delegation_message_type FROM cmd_history WHERE id=?", [reply]).fetchone(), ("user",))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

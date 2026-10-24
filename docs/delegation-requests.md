@@ -100,6 +100,15 @@ with recorded owner provenance, assistant output, and session output originating
 from the owner session. A peer delivery is neither owner input nor owner output.
 Missing or out-of-order resolver hooks cannot erase a stored owner boundary.
 
+An empty owner `/send` is an Enter control, not a rejected text message. It
+closes the window without funding a request even if the control succeeds.
+Steer and Chat still reject empty text and retain the same nonfunding boundary.
+Default CLI `source_session` relays keep peer provenance through history opt-out,
+refusal and duplicate transport IDs; they do not consume an owner reply window.
+Native input retains its original `delegation_message_type='user'` when project
+execution projects its display type to `steering`. A future display row cannot
+skip current input reconciliation or satisfy the strict reply row ordering.
+
 Owner input with missing/uncertain provenance also closes the window, without
 funding. Discarded, empty, injected, truncated, disabled-history and duplicate
 submissions leave an `approval_input_uncertain` row when a window is open.

@@ -7741,6 +7741,21 @@ pub(crate) fn close_discarded_owner_input(state: &AppState, name: &str, headers:
         super::delegation_requests::refusal("request_input_boundary_failed",&error))
 }
 
+// Default CLI relays are peer deliveries even through an outside process.
+// Match the deferred-send branch; explicit owner history/immediate controls
+// retain their conservative owner boundary on every outcome.
+fn close_discarded_send_input(state: &AppState, name: &str, headers: &HeaderMap, body: &Value, reason: &str) -> Option<Response> {
+    let relay = !body.get("record_history").map(py_truthy).unwrap_or(false)
+        && !body.get("deliver_now").map(py_truthy).unwrap_or(false)
+        && !body_str(body,"source_session").trim().is_empty();
+    if relay {
+        tracing::info!(session=name, reason, verdict="delegation_peer_relay_preserved", measured=true, n_considered=1,
+            "peer relay does not consume the owner's reply window");
+        return None;
+    }
+    close_discarded_owner_input(state,name,headers,reason)
+}
+
 pub(crate) async fn cmd_hist_record_full(
     state: &AppState,
     session: &str,
@@ -28810,7 +28825,7 @@ async fn send_post_detached(
 pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
     let response=send_post_inner(state,name,headers,body).await;
     if !response.status().is_success() {
-        return close_discarded_owner_input(state,name,headers,"send_refused").unwrap_or(response);
+        return close_discarded_send_input(state,name,headers,body,"send_refused").unwrap_or(response);
     }
     response
 }
@@ -28901,7 +28916,7 @@ async fn send_post_inner(state: &AppState, name: &str, headers: &HeaderMap, body
     }
     let msg_id: String = body_str(body, "msg_id").trim().chars().take(64).collect();
     if let Some(response) = send_dedup_gate(state, name, &msg_id).await {
-        return close_discarded_owner_input(state,name,headers,"send_deduplicated").unwrap_or(response);
+        return close_discarded_send_input(state,name,headers,body,"send_deduplicated").unwrap_or(response);
     }
     if text.trim().starts_with("/compact") {
         let n = name.to_string();
@@ -28915,7 +28930,7 @@ async fn send_post_inner(state: &AppState, name: &str, headers: &HeaderMap, body
         && body_str(body, "source_session").trim().is_empty();
     let record_history = body.get("record_history").map(py_truthy).unwrap_or(owner_history_default);
     if !record_history {
-        if let Some(error)=close_discarded_owner_input(state,name,headers,"send_history_disabled") { return error; }
+        if let Some(error)=close_discarded_send_input(state,name,headers,body,"send_history_disabled") { return error; }
     }
     if body.get("record_history").is_none() && owner_history_default {
         tracing::info!(session = name, verdict = "owner_send_history_defaulted", measured = true,
@@ -28944,6 +28959,11 @@ async fn send_post_inner(state: &AppState, name: &str, headers: &HeaderMap, body
         text = no_board_re().replace(&text, "").trim().to_string();
     }
     let orig_text = text.clone();
+    // Empty owner input is an Enter control, including successful/no-op sends.
+    // Its unknown composer contents cannot leave an old approval window open.
+    if orig_text.trim().is_empty() {
+        if let Some(error)=close_discarded_send_input(state,name,headers,body,"send_empty_control") { return error; }
+    }
     let mut origin = String::new();
     if defer_busy {
         origin = if member_actor.is_some() {
@@ -29094,7 +29114,7 @@ async fn send_post_inner(state: &AppState, name: &str, headers: &HeaderMap, body
                     )
                     .await;
                     link_queued_message(state, name, row_id, &result.id).await;
-                } else if let Some(error)=close_discarded_owner_input(state,name,headers,"project_send_deduplicated") {
+                } else if let Some(error)=close_discarded_send_input(state,name,headers,body,"project_send_deduplicated") {
                     return error;
                 }
                 send_dedup_accept(state, name, &msg_id, &result.id).await;
@@ -29321,8 +29341,10 @@ async fn send_post_inner(state: &AppState, name: &str, headers: &HeaderMap, body
             };
             // Explicit history does not turn a peer into uncertain owner input.
             let caller=hdr_worker(headers);
+            let history_type=if caller.is_empty() { "user" } else { "session" };
+            let history_origin=if caller.is_empty() { author } else { &caller };
             let row_id =
-                cmd_hist_record_with_id(state, name, &orig_text, if caller.is_empty() { "user" } else { "session" }, if caller.is_empty() { author } else { &caller }, skip_board, meta)
+                cmd_hist_record_with_id(state, name, &orig_text, history_type, history_origin, skip_board, meta)
                     .await;
             note_history_msg_id(state, row_id, &msg_id).await;
             if let Some(id) = queue_id.as_deref() {
