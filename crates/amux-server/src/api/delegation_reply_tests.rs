@@ -40,8 +40,11 @@ impl Fixture {
         ]))));
         std::fs::create_dir_all(home.path().join("sessions")).unwrap();
         for (name,tags,orch) in [(OWNER_AGENT,"leads",false),(LEAD,"leads,dev",true),(TARGET,"dev",false)] {
+            // Production lane_lifecycle reads active when no pause/archive/review flag is set.
+            // The fake execution adapter supplies liveness, not a lifecycle-gate bypass.
             std::fs::write(home.path().join(format!("sessions/{name}.env")),format!(
-                "CC_DIR=\"/tmp\"\nCC_INCARNATION=\"inc-{name}\"\nCC_TAGS=\"{tags}\"\nCC_ORCHESTRATOR=\"{}\"\nCC_PAUSED=\"1\"\nCC_TEST_FAKE_PANE=\"1\"\n", u8::from(orch))).unwrap();
+                "CC_DIR=\"/tmp\"\nCC_INCARNATION=\"inc-{name}\"\nCC_TAGS=\"{tags}\"\nCC_ORCHESTRATOR=\"{}\"\nCC_TEST_FAKE_PANE=\"1\"\n", u8::from(orch))).unwrap();
+            assert_eq!(crate::api::session_verbs::lane_lifecycle(name),"active","reply fixture {name}");
         }
         let state = AppState { store: Arc::new(Store::open(&home.path().join("test.db")).unwrap()),
             started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
@@ -87,6 +90,19 @@ impl Fixture {
             |r|Ok((r.get(0)?,r.get(1)?))).unwrap()
     }
 
+    fn peer_recorded(&self, text: &str, message_type: &str) {
+        let c = self.state.store.read().unwrap();
+        let (row,actual,ty,delivery): (i64,String,String,String) = c.query_row(
+            "SELECT id,text,COALESCE(delegation_message_type,type),delivery FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1",
+            [OWNER_AGENT],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!((actual,ty,delivery),(text.into(),message_type.into(),"direct".into()),"peer must reach the recorder");
+        assert_eq!(c.query_row("SELECT COUNT(*) FROM _amux_delegation_resolutions WHERE reply_row=?1",[row],|r|r.get::<_,i64>(0)).unwrap(),0,"peer row must not become an owner reply");
+        drop(c);
+        // Even an explicit record_history=true cannot supply owner process proof.
+        let row = max_ref::one(&self.state,row).unwrap().unwrap();
+        assert_eq!(row.source,None,"peer row must be refused by the owner-input classifier");
+    }
+
     // No API GET/list/apply: those can hide a severed recorder wire by reconciling it.
     fn resolution(&self, session: &str, code: &str, request: Option<&str>) -> i64 {
         let c = self.state.store.read().unwrap();
@@ -114,6 +130,10 @@ impl Fixture {
     }
 
     async fn hook(&self, session: &str, report: Value) -> (StatusCode,Value) {
+        self.hook_with_applied(session,report,true).await
+    }
+
+    async fn hook_with_applied(&self, session: &str, report: Value, applied: bool) -> (StatusCode,Value) {
         let d = self.home.path().join("status-events").join(session);
         std::fs::create_dir_all(&d).unwrap();
         if !d.join("current.json").exists() {
@@ -121,6 +141,7 @@ impl Fixture {
         }
         let result=self.call(None,Some(session),&format!("/api/sessions/{session}/report"),report).await;
         assert!(result.0.is_success(),"hook HTTP failure: {result:?}");
+        assert_eq!(result.1["applied"],applied,"hook must reach the expected observation outcome: {result:?}");
         result
     }
 }
@@ -169,7 +190,7 @@ async fn chat_companion_send_resolves_in_owner_session() {
 async fn chat_type_worker_send_resolves_in_owner_session() {
     let f=Fixture::new(); let id=f.ask().await;
     let p=f.home.path().join(format!("sessions/{OWNER_AGENT}.env"));
-    let env=std::fs::read_to_string(&p).unwrap().replace("CC_TEST_FAKE_PANE=\"1\"","CC_WORKER_TYPE=\"chat\"").replace("CC_PAUSED=\"1\"","CC_PAUSED=\"0\"");
+    let env=std::fs::read_to_string(&p).unwrap().replace("CC_TEST_FAKE_PANE=\"1\"","CC_WORKER_TYPE=\"chat\"");
     std::fs::write(p,env).unwrap();
     let _turn=chat_worker::hold_test_turn(OWNER_AGENT);
     accepted(f.send(OWNER_AGENT,OUTSIDE,"yes","chat-worker-reply").await);
@@ -225,10 +246,12 @@ async fn peer_echo_and_same_text_rows_never_become_owner_replies() {
     for text in ["yes","no"] {
         let f=Fixture::new(); let id=f.ask().await;
         accepted(f.send(OWNER_AGENT,PEER,text,&format!("peer-{text}")).await);
+        f.peer_recorded(text,"user");
         assert_eq!(f.request_resolution(&id),(None,None));
         assert_eq!(f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM _amux_delegation_resolutions",[],|r|r.get::<_,i64>(0)).unwrap(),0);
         // A re-recorded hook copy of the peer's words is rejected by the production classifier.
         accepted(f.hook(OWNER_AGENT,f.report(text)).await);
+        f.peer_recorded(text,"user");
         assert_eq!(f.request_resolution(&id),(None,None));
         accepted(f.hook(OWNER_AGENT,f.report("go ahead")).await);
         f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
@@ -256,7 +279,7 @@ async fn replayed_hook_event_cannot_fund_a_second_request() {
     accepted(f.hook(OWNER_AGENT,report.clone()).await);
     f.resolution(OWNER_AGENT,"request_resolved",Some(&first));
     let second=f.ask().await;
-    accepted(f.hook(OWNER_AGENT,report).await);
+    accepted(f.hook_with_applied(OWNER_AGENT,report,false).await);
     assert_eq!(f.request_resolution(&second),(None,None));
 }
 
@@ -297,6 +320,8 @@ async fn intervening_question_is_ambiguous_but_peer_notice_is_not() {
     for id in [a,b] { assert_eq!(f.request_resolution(&id),(None,Some("request_ambiguous".into()))); }
     let id=f.ask().await;
     accepted(f.send(OWNER_AGENT,PEER,"status notice","peer-notice").await);
+    f.peer_recorded("status notice","user");
+    assert_eq!(f.request_resolution(&id),(None,None));
     accepted(f.hook(OWNER_AGENT,f.report("approve")).await);
     f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
 }
@@ -359,6 +384,7 @@ async fn peer_echo_after_owner_no_never_reopens_the_window_through_routes() {
     accepted(f.hook(OWNER_AGENT,f.report("no")).await);
     f.resolution(OWNER_AGENT,"request_reply_not_affirmative",None);
     accepted(f.send(OWNER_AGENT,PEER,"no","peer-echo-no").await);
+    f.peer_recorded("no","user");
     accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
     f.resolution(OWNER_AGENT,"request_no_candidate",None);
     assert_eq!(f.request_resolution(&id),(None,Some("request_reply_not_affirmative".into())));
@@ -432,11 +458,8 @@ async fn owner_cli_default_does_not_promote_worker_or_relay_input() {
         if relay { body["source_session"]=json!(LEAD); }
         accepted(f.call(Some(if relay { OUTSIDE } else { PEER }),None,
             &format!("/api/workers/{OWNER_AGENT}/send"),body).await);
+        f.peer_recorded("yes","session");
         assert_eq!(f.request_resolution(&id),(None,None));
-        let c=f.state.store.read().unwrap();
-        let ty:String=c.query_row("SELECT COALESCE(delegation_message_type,type) FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1",[OWNER_AGENT],|r|r.get(0)).unwrap();
-        assert_eq!(ty,"session","CLI default must preserve peer provenance");
-        drop(c);
         accepted(f.hook(OWNER_AGENT,f.report("approve")).await);
         f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
     }
