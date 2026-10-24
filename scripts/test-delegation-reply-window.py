@@ -3,6 +3,8 @@
 import importlib.util
 from pathlib import Path
 import sqlite3
+import re
+import tempfile
 import unittest
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -57,6 +59,54 @@ class ApprovalStorage(unittest.TestCase):
         self.assertEqual(len(self.conn.execute(query,[100,501]).fetchall()),1)
         self.conn.execute('UPDATE _amux_delegation_grants SET approval_closed_at=100')
         self.assertEqual(self.conn.execute(query,[100,501]).fetchall(),[])
+
+    def reshow_queries(self):
+        job=ROOT/'crates/amux-server/src/runtime_jobs/approval_reshow.rs'
+        opened=schema.source_sql(job,"status='pending'")
+        candidate=schema.source_sql(job,'SELECT code,short_code,reply_session,reply_incarnation FROM')
+        stamp=schema.source_sql(job,'UPDATE _amux_delegation_grants SET {column}')
+        minutes=re.findall(r'CONFIRM_RESHOW_MIN: i64 = (\d+);',job.read_text())
+        self.assertEqual(len(minutes),1)
+        return (candidate.replace('{OPEN_REQUEST}',opened),
+                stamp.replace('{OPEN_REQUEST}',opened),int(minutes[0]))
+
+    def test_confirm_clock_first_doubt_is_retained(self):
+        self.add()
+        query=schema.source_sql(API/'delegation_approval.rs','UPDATE _amux_delegation_grants SET confirm_required=1,')
+        self.conn.execute(query,['dlg_one','unverifiable',100])
+        self.conn.execute(query,['dlg_one','text-between',150])
+        self.assertEqual(self.conn.execute('SELECT confirm_needed_at FROM _amux_delegation_grants').fetchone(),(100,))
+
+    def test_reshow_due_and_once_receipts(self):
+        self.add();candidate,stamp,minutes=self.reshow_queries()
+        self.conn.execute('UPDATE _amux_delegation_grants SET confirm_required=1,confirm_needed_at=100')
+        self.assertEqual(self.conn.execute(candidate,[1899-minutes*60,1899,100]).fetchall(),[])
+        self.assertEqual(len(self.conn.execute(candidate,[1900-minutes*60,1900,100]).fetchall()),1)
+        for column in ['confirm_reshow_at','confirm_reshow_push_at','confirm_reshow_notice_at']:
+            query=stamp.replace('{column}',column)
+            self.assertEqual(self.conn.execute(query,['dlg_one',1900]).rowcount,1,column)
+            self.assertEqual(self.conn.execute(query,['dlg_one',1960]).rowcount,0,column)
+        self.assertEqual(self.conn.execute(candidate,[1960-minutes*60,1960,100]).fetchall(),[])
+
+    def test_closed_request_has_no_reshow_or_push_reservation(self):
+        self.add();candidate,stamp,minutes=self.reshow_queries()
+        self.conn.execute('UPDATE _amux_delegation_grants SET confirm_required=1,confirm_needed_at=100,approval_closed_at=150')
+        self.assertEqual(self.conn.execute(candidate,[1900-minutes*60,1900,100]).fetchall(),[])
+        for column in ['confirm_reshow_at','confirm_reshow_push_at','confirm_reshow_notice_at']:
+            self.assertEqual(self.conn.execute(stamp.replace('{column}',column),['dlg_one',1900]).rowcount,0)
+
+    def test_reshow_sigkill_reservation_rollback_and_adoption(self):
+        self.add();_,stamp,_=self.reshow_queries()
+        query=stamp.replace('{column}','confirm_reshow_push_at')
+        self.conn.commit()
+        with tempfile.TemporaryDirectory() as folder:
+            db=Path(folder)/'reshow.db'
+            with sqlite3.connect(db) as c: self.conn.backup(c)
+            for commit in [False,True]:
+                schema.crash_probe(db,query,['dlg_one',1900],commit)
+                with sqlite3.connect(db) as c:
+                    self.assertEqual(c.execute('SELECT confirm_reshow_push_at FROM _amux_delegation_grants').fetchone(),(1900 if commit else None,))
+                    if commit: self.assertEqual(c.execute(query,['dlg_one',1960]).rowcount,0)
 
     def test_reserved_prompt_is_not_an_intervening_boundary(self):
         query=schema.source_sql(API/'delegation_approval.rs','SELECT COALESCE(MAX(id),0)')

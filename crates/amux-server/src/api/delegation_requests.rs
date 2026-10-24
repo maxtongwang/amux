@@ -382,12 +382,12 @@ pub(crate) fn approval_block(id: &str, question: &str) -> String {
 }
 
 pub(crate) fn confirm_block(code: &str, question: &str) -> String {
-    format!("To confirm, reply: yes {code}\n{question}")
+    format!("Not approved yet. To confirm, reply: yes {code}\n{question}")
 }
 
 fn receipt_matches(text: &str, short: &str, question: &str, confirmed: bool) -> bool {
     (text == approval_block(short,question) && text.lines().filter(|line| line.starts_with(APPROVAL_HEADING)).count() == 1)
-        || (confirmed && text == confirm_block(short,question) && text.lines().filter(|line| line.starts_with("To confirm, reply: yes ")).count() == 1 && !text.lines().any(|line|line.starts_with(APPROVAL_HEADING)))
+        || (confirmed && text == confirm_block(short,question) && text.lines().filter(|line| line.starts_with("Not approved yet. To confirm, reply: yes ")).count() == 1 && !text.lines().any(|line|line.starts_with(APPROVAL_HEADING)))
 }
 
 pub(crate) fn render_request(state: &AppState, id: &str) -> Option<String> {

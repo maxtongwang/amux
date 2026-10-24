@@ -10,6 +10,12 @@
 -- ADDCOL: _amux_delegation_grants approval_closed_at REAL
 -- ADDCOL: _amux_delegation_grants shown_snapshot TEXT
 -- ADDCOL: _amux_delegation_grants confirm_required INTEGER NOT NULL DEFAULT 0
+-- v3.2: first confirmation clock and durable once-only reminder receipts.
+-- ADDCOL: _amux_delegation_grants confirm_needed_at REAL
+-- ADDCOL: _amux_delegation_grants confirm_reshow_at REAL
+-- ADDCOL: _amux_delegation_grants confirm_reshow_notice_at REAL
+-- ADDCOL: _amux_delegation_grants confirm_reshow_push_at REAL
+-- ADDCOL: _amux_delegation_grants confirm_reshow_push_result TEXT
 -- ADDCOL: _amux_delegation_resolutions approval_context TEXT
 CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_open_short_code
     ON _amux_delegation_grants(short_code COLLATE NOCASE)

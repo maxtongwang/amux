@@ -138,6 +138,7 @@ pub mod ids {
     pub const RECORDINGS_TRANSCRIBE: &str = "recordings-transcribe";
     pub const MODEL_CATALOG_REFRESH: &str = "model-catalog-refresh";
     pub const CAPTURE_RECONCILE: &str = "capture-reconcile";
+    pub const APPROVAL_RESHOW: &str = "approval-reshow";
     pub const EMAIL_APPROVAL_DIGEST: &str = "email-approval-digest";
     pub const NEEDS_INPUT_AUTO: &str = "needs-input-auto";
     pub const CONTRACT_WATCH: &str = "contract-watch";
@@ -200,6 +201,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::MODEL_CATALOG_REFRESH,
     ids::CAPTURE_RECONCILE,
     ids::EMAIL_APPROVAL_DIGEST,
+    ids::APPROVAL_RESHOW,
     ids::NEEDS_INPUT_AUTO,
     ids::CONTRACT_WATCH,
     ids::LAND_QUEUE,
@@ -937,6 +939,14 @@ pub const CATALOG: &[Doc] = &[
         ],
         pref: None,
         detail: None,
+    },
+    Doc {
+        id: ids::APPROVAL_RESHOW,
+        name: "Approval confirmation reshow",
+        purpose: "After 30 minutes of unanswered confirmation, queues one stamped native owner notice and attempts one Web Push per open request.",
+        env: &[EnvControl { var: "AMUX_APPROVAL_RESHOW_SECS", effect: "0 disables the job", off: Some("0") }],
+        pref: None,
+        detail: Some("/api/delegation/requests"),
     },
     Doc {
         id: ids::EMAIL_APPROVAL_DIGEST,

@@ -659,6 +659,7 @@ async fn async_main() {
     drop(runtime_jobs::capture_reconcile::spawn(state.clone()));
     // AMUX-5240: one daily owner digest of pending outbound-email approvals.
     drop(runtime_jobs::email_approval_digest::spawn(state.clone()));
+    drop(runtime_jobs::approval_reshow::spawn(state.clone()));
     // AMUX-5301: approve new needs-input items the owner's policy covers.
     drop(runtime_jobs::needs_input_auto::spawn(state.clone()));
     // AMUX-5239: a lane that pushed and said "live in ~40 min" was never told

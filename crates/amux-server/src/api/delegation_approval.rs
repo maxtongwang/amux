@@ -153,7 +153,7 @@ pub(super) fn resolve(conn: &Connection, row: &max_ref::Row, owner_input: bool) 
                         lines.push(context("approved",&q.short));
                     },
                     Err(reason)=> {
-                        conn.execute("UPDATE _amux_delegation_grants SET confirm_required=1,resolution_code='request_confirm_needed',resolution_note=?2 WHERE code=?1",params![q.id,reason.as_str()])?;
+                        conn.execute("UPDATE _amux_delegation_grants SET confirm_required=1,confirm_needed_at=COALESCE(confirm_needed_at,?3),resolution_code='request_confirm_needed',resolution_note=?2 WHERE code=?1",params![q.id,reason.as_str(),now_s])?;
                         verdict="request_confirm_needed";note=reason.as_str().into();
                         lines.push(confirm(&q.short,reason));
                     },

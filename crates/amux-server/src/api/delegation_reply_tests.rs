@@ -1822,7 +1822,7 @@ async fn v31_confirm_reply_stop_binds_before_coded_yes() {
     let f=Fixture::new();let id=f.ask_hidden().await;
     f.expect_confirm(&id,"yes","unverifiable").await;
     let block=confirm_block(&f.short(&id),&f.question(&id));
-    assert_eq!(block,format!("To confirm, reply: yes {}\n{}",f.short(&id),f.question(&id)));
+    assert_eq!(block,format!("Not approved yet. To confirm, reply: yes {}\n{}",f.short(&id),f.question(&id)));
     accepted(f.hook(OWNER_AGENT,f.stop(&block)).await);
     assert!(f.shown(&id).is_some());
     f.expect_confirm(&id,"yes","text-between").await;
@@ -1901,4 +1901,193 @@ async fn v31_rejected_submit_order_is_doubt_not_closure() {
         assert_eq!(v["approval_context"],format!("[amux approval] confirm needed {} (reason: unverifiable)",f.short(&id)));
         assert!(f.open(&id));assert_eq!(f.request_resolution(&id).0,None);
     }
+}
+
+// v3.2: exercise the real periodic tick and native approval router; only the
+// external notification effects are substituted (no live fleet or phone).
+#[derive(Default)]
+struct ReshowDelivery {
+    notices: std::sync::Mutex<Vec<String>>,
+    pushes: std::sync::Mutex<Vec<String>>,
+    hold_notice: bool,
+}
+#[async_trait::async_trait]
+impl crate::runtime_jobs::approval_reshow::Delivery for ReshowDelivery {
+    async fn notice(&self, _: &AppState, r: &crate::runtime_jobs::approval_reshow::Reminder) -> Result<(),String> {
+        if self.hold_notice { return Err("native delivery unavailable".into()); }
+        self.notices.lock().unwrap().push(r.notice()); Ok(())
+    }
+    async fn push(&self, _: &AppState, r: &crate::runtime_jobs::approval_reshow::Reminder) -> Result<(),String> {
+        self.pushes.lock().unwrap().push(r.id.clone()); Ok(())
+    }
+}
+impl Fixture {
+    fn confirmation_at(&self, id: &str) -> f64 {
+        self.state.store.read().unwrap().query_row("SELECT confirm_needed_at FROM _amux_delegation_grants WHERE code=?1",[id],|r|r.get(0)).unwrap()
+    }
+    fn reshow_at(&self, id: &str) -> Option<f64> {
+        self.state.store.read().unwrap().query_row("SELECT confirm_reshow_at FROM _amux_delegation_grants WHERE code=?1",[id],|r|r.get(0)).unwrap()
+    }
+    async fn reshow_tick(&self, at: f64, d: &ReshowDelivery) {
+        crate::runtime_jobs::approval_reshow::tick_with(&self.state,at,d).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn v32_confirm_wording_is_shown_and_mangled_first_line_is_not() {
+    for mangled in [false,true] {
+        let f=Fixture::new();let id=f.ask_hidden().await;
+        f.expect_confirm(&id,"yes","unverifiable").await;
+        let exact=format!("Not approved yet. To confirm, reply: yes {}\n{}",f.short(&id),f.question(&id));
+        assert_eq!(confirm_block(&f.short(&id),&f.question(&id)),exact);
+        let text=if mangled {exact.replacen(&format!("{}\n",f.short(&id)),&format!("{} extra\n",f.short(&id)),1)} else {exact};
+        accepted(f.hook(OWNER_AGENT,f.stop(&text)).await);
+        assert_eq!(f.shown(&id).is_some(),!mangled,"mangled={mangled}");
+        let (_,v)=f.owner_reply(&format!("yes {}",f.short(&id))).await;
+        if mangled {
+            assert!(v["approval_context"].as_str().unwrap().contains("confirm needed"));
+            assert!(f.open(&id));assert_eq!(f.request_resolution(&id).0,None);
+        } else { accepted(f.apply(&id).await); }
+    }
+}
+
+#[tokio::test]
+async fn v32_timer_fires_once_at_30_minutes() {
+    let f=Fixture::new();let id=f.ask_hidden().await;
+    f.expect_confirm(&id,"yes","unverifiable").await;
+    let first=f.confirmation_at(&id);
+    // Repeated uncertainty cannot postpone an unanswered request indefinitely.
+    f.expect_confirm(&id,"yes","unverifiable").await;
+    assert_eq!(f.confirmation_at(&id),first);
+    let d=ReshowDelivery {hold_notice:true,..Default::default()};
+    let due=first+30.0*60.0;
+    f.reshow_tick(due-0.001,&d).await;
+    assert_eq!(f.reshow_at(&id),None);assert!(d.pushes.lock().unwrap().is_empty());
+    f.reshow_tick(due,&d).await;
+    assert_eq!(f.reshow_at(&id),Some(due));
+    // A held native channel keeps the request in the recovery population.
+    f.reshow_tick(due+60.0,&d).await;
+    assert_eq!(f.reshow_at(&id),Some(due));
+}
+
+#[tokio::test]
+async fn v32_exactly_one_push_despite_notice_retries_and_restart() {
+    let f=Fixture::new();let id=f.ask_hidden().await;
+    f.expect_confirm(&id,"yes","unverifiable").await;
+    let due=f.confirmation_at(&id)+1800.0;
+    let d=ReshowDelivery {hold_notice:true,..Default::default()};
+    f.reshow_tick(due,&d).await;f.reshow_tick(due+60.0,&d).await;
+    assert_eq!(*d.pushes.lock().unwrap(),vec![id.clone()]);
+    let restarted=AppState {store:Arc::new(Store::open(&f.home.path().join("test.db")).unwrap()),..f.state.clone()};
+    let resumed=ReshowDelivery::default();
+    crate::runtime_jobs::approval_reshow::tick_with(&restarted,due+120.0,&resumed).await.unwrap();
+    assert!(resumed.pushes.lock().unwrap().is_empty());
+    assert_eq!(resumed.notices.lock().unwrap().len(),1);
+    let result:String=restarted.store.read().unwrap().query_row("SELECT confirm_reshow_push_result FROM _amux_delegation_grants WHERE code=?1",[&id],|r|r.get(0)).unwrap();
+    assert_eq!(result,"sent");
+    let req=Request::builder().uri(format!("/api/delegation/requests/{id}"))
+        .header("x-amux-session",LEAD).body(Body::empty()).unwrap();
+    let res=f.app.clone().oneshot(req).await.unwrap();assert!(res.status().is_success());
+    let v:Value=serde_json::from_slice(&axum::body::to_bytes(res.into_body(),usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(v["request"]["confirm_reshow_push_result"],"sent");
+    assert_eq!(v["request"]["confirm_reshow_at"],due);
+    assert_eq!(v["request"]["confirm_block"],confirm_block(&f.short(&id),&f.question(&id)));
+}
+
+#[tokio::test]
+async fn v32_reshow_notice_is_not_shown_plain_yes_takes_doubt() {
+    let f=Fixture::new();let id=f.ask_hidden().await;
+    f.expect_confirm(&id,"yes","unverifiable").await;
+    let d=ReshowDelivery::default();f.reshow_tick(f.confirmation_at(&id)+1800.0,&d).await;
+    let notice=d.notices.lock().unwrap()[0].clone();
+    assert!(notice.starts_with("<amux-native-delivery "));
+    assert!(notice.contains(&format!("\n[amux approval] reshow {}\n",f.short(&id))));
+    // Even an assistant echo of the notice cannot become the confirmation block.
+    accepted(f.hook(OWNER_AGENT,f.stop(&notice)).await);
+    assert_eq!(f.shown(&id),None);
+    f.expect_confirm(&id,"yes","unverifiable").await;
+}
+
+#[tokio::test]
+async fn v32_reshow_notice_is_not_owner_prompt_closes_and_funds_nothing() {
+    let f=Fixture::new();let id=f.ask().await;
+    accepted(f.hook(OWNER_AGENT,f.stop("intervening reply")).await);
+    f.expect_confirm(&id,"yes","text-between").await;
+    accepted(f.hook(OWNER_AGENT,f.stop(&confirm_block(&f.short(&id),&f.question(&id)))).await);
+    let shown=f.shown(&id);
+    let d=ReshowDelivery::default();f.reshow_tick(f.confirmation_at(&id)+1800.0,&d).await;
+    let notice=d.notices.lock().unwrap()[0].clone();
+    assert!(prompt_wrapped(&notice));
+    let (_,v)=f.owner_reply(&notice).await;
+    assert_eq!(v["approval_context"],"[amux approval] ignored reserved marker in prompt");
+    assert!(f.open(&id));assert_eq!(f.request_resolution(&id).0,None);assert_eq!(f.shown(&id),shown);
+    f.expect_confirm(&id,"yes","text-between").await;
+}
+
+#[tokio::test]
+async fn v32_closed_request_has_no_reshow() {
+    let f=Fixture::new();let id=f.ask().await;
+    accepted(f.hook(OWNER_AGENT,f.stop("intervening reply")).await);
+    f.expect_confirm(&id,"yes","text-between").await;
+    let due=f.confirmation_at(&id)+1800.0;
+    accepted(f.hook(OWNER_AGENT,f.stop(&confirm_block(&f.short(&id),&f.question(&id)))).await);
+    accepted(f.owner_reply("no").await);assert!(!f.open(&id));
+    let d=ReshowDelivery::default();f.reshow_tick(due,&d).await;
+    assert_eq!(f.reshow_at(&id),None);
+    assert!(d.notices.lock().unwrap().is_empty());assert!(d.pushes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn v32_native_notice_enqueue_adopts_stable_id_after_lost_ack() {
+    use crate::runtime_jobs::approval_reshow::{Delivery,NativeAndWebPush,Reminder};
+    let f=Fixture::new();let id=f.ask_hidden().await;
+    let r=Reminder {id:id.clone(),code:f.short(&id),session:OWNER_AGENT.into(),incarnation:incarnation(OWNER_AGENT).unwrap()};
+    // Repeating enqueue models a process dying after the queue commit but
+    // before the request's notice receipt; it cannot add a second queue item.
+    NativeAndWebPush.notice(&f.state,&r).await.unwrap();
+    NativeAndWebPush.notice(&f.state,&r).await.unwrap();
+    let c=f.state.store.read().unwrap();
+    let (count,text):(i64,String)=c.query_row("SELECT COUNT(*),COALESCE(MIN(text),'') FROM steering_queue WHERE session=?1 AND guard='approval-reshow'",[OWNER_AGENT],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!(count,1);assert_eq!(text,r.notice());assert!(prompt_wrapped(&text));
+    drop(c);
+    assert_eq!(f.shown(&id),None);assert_eq!(f.request_resolution(&id).0,None);
+}
+
+struct ReshowSwitch(Option<std::ffi::OsString>);
+impl Drop for ReshowSwitch {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(v)=>std::env::set_var("AMUX_APPROVAL_RESHOW_SECS",v),
+            None=>std::env::remove_var("AMUX_APPROVAL_RESHOW_SECS"),
+        }
+    }
+}
+#[tokio::test]
+async fn v32_reshow_honors_job_and_owner_isolation() {
+    let f=Fixture::new();let id=f.ask_hidden().await;
+    f.expect_confirm(&id,"yes","unverifiable").await;
+    let d=ReshowDelivery::default();let due=f.confirmation_at(&id)+1800.0;
+    let switch=ReshowSwitch(std::env::var_os("AMUX_APPROVAL_RESHOW_SECS"));
+    std::env::set_var("AMUX_APPROVAL_RESHOW_SECS","0");
+    f.reshow_tick(due,&d).await;
+    assert_eq!(f.reshow_at(&id),None);assert!(d.pushes.lock().unwrap().is_empty());
+    drop(switch);
+    let path=f.home.path().join(format!("sessions/{OWNER_AGENT}.env"));
+    let env=std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path,format!("{env}\nCC_ISOLATED=1\n")).unwrap();
+    f.reshow_tick(due,&d).await;
+    assert_eq!(f.reshow_at(&id),None);assert!(d.notices.lock().unwrap().is_empty());assert!(d.pushes.lock().unwrap().is_empty());
+    std::fs::write(path,env).unwrap();
+    f.reshow_tick(due,&d).await;
+    assert_eq!(d.notices.lock().unwrap().len(),1);assert_eq!(d.pushes.lock().unwrap().len(),1);
+}
+
+#[tokio::test]
+async fn v32_reshow_retired_owner_incarnation_is_held() {
+    let f=Fixture::new();let id=f.ask_hidden().await;
+    f.expect_confirm(&id,"yes","unverifiable").await;
+    let due=f.confirmation_at(&id)+1800.0;let request=id.clone();
+    f.write(move |c| {c.execute("UPDATE _amux_delegation_grants SET reply_incarnation='retired' WHERE code=?1",[request])?;Ok(())});
+    let d=ReshowDelivery::default();f.reshow_tick(due,&d).await;
+    assert_eq!(f.reshow_at(&id),None);assert!(d.notices.lock().unwrap().is_empty());assert!(d.pushes.lock().unwrap().is_empty());
 }

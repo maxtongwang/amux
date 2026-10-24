@@ -605,15 +605,20 @@ pub(crate) struct GrantRow {
     pub short_code: Option<String>,
     pub approval_closed_at: Option<f64>,
     pub confirm_required: bool,
+    pub confirm_needed_at: Option<f64>,
+    pub confirm_reshow_at: Option<f64>,
+    pub confirm_reshow_notice_at: Option<f64>,
+    pub confirm_reshow_push_at: Option<f64>,
+    pub confirm_reshow_push_result: Option<String>,
 }
 
-const COLS: &str = "code, actor, class, action, target, method, path, body, sentence, status, expires_at, evidence_row, cited_excerpt, changes, ask_row, ask_text, reply_text, target_incarnation, cite_spent_at, actor_incarnation, reply_session, reply_incarnation, shown_row, change_spec, resolution_row, resolution_code, resolution_note, created_at, short_code, approval_closed_at, confirm_required";
+const COLS: &str = "code, actor, class, action, target, method, path, body, sentence, status, expires_at, evidence_row, cited_excerpt, changes, ask_row, ask_text, reply_text, target_incarnation, cite_spent_at, actor_incarnation, reply_session, reply_incarnation, shown_row, change_spec, resolution_row, resolution_code, resolution_note, created_at, short_code, approval_closed_at, confirm_required, confirm_needed_at, confirm_reshow_at, confirm_reshow_notice_at, confirm_reshow_push_at, confirm_reshow_push_result";
 
 fn map_row(r: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
     Ok(GrantRow {
         code: r.get(0)?, actor: r.get(1)?, class: r.get(2)?, action: r.get(3)?, target: r.get(4)?, method: r.get(5)?,
         path: r.get(6)?, body: r.get(7)?, sentence: r.get(8)?, status: r.get(9)?, expires_at: r.get(10)?, evidence_row: r.get(11)?,
-        cited_excerpt: r.get(12)?, changes: r.get(13)?, ask_row: r.get(14)?, ask_text: r.get(15)?, reply_text: r.get(16)?, target_incarnation: r.get(17)?, cite_spent_at: r.get(18)?, actor_incarnation: r.get(19)?, reply_session: r.get(20)?, reply_incarnation: r.get(21)?, shown_row: r.get(22)?, change_spec: r.get(23)?, resolution_row: r.get(24)?, resolution_code: r.get(25)?, resolution_note: r.get(26)?, created_at:r.get(27)?, short_code:r.get(28)?, approval_closed_at:r.get(29)?, confirm_required:r.get(30)?,
+        cited_excerpt: r.get(12)?, changes: r.get(13)?, ask_row: r.get(14)?, ask_text: r.get(15)?, reply_text: r.get(16)?, target_incarnation: r.get(17)?, cite_spent_at: r.get(18)?, actor_incarnation: r.get(19)?, reply_session: r.get(20)?, reply_incarnation: r.get(21)?, shown_row: r.get(22)?, change_spec: r.get(23)?, resolution_row: r.get(24)?, resolution_code: r.get(25)?, resolution_note: r.get(26)?, created_at:r.get(27)?, short_code:r.get(28)?, approval_closed_at:r.get(29)?, confirm_required:r.get(30)?, confirm_needed_at:r.get(31)?, confirm_reshow_at:r.get(32)?, confirm_reshow_notice_at:r.get(33)?, confirm_reshow_push_at:r.get(34)?, confirm_reshow_push_result:r.get(35)?,
     })
 }
 
@@ -1088,6 +1093,9 @@ fn request_view(g: &GrantRow) -> Value {
             "shown_row":g.shown_row, "change":g.change_spec.as_deref().and_then(|s|serde_json::from_str::<Value>(s).ok()),
             "short_code":g.short_code,"open":status=="pending" && g.approval_closed_at.is_none() && g.resolution_row.is_none(),
             "approval_closed_at":g.approval_closed_at,"confirm_required":g.confirm_required,
+            "confirm_needed_at":g.confirm_needed_at,"confirm_reshow_at":g.confirm_reshow_at,
+            "confirm_reshow_notice_at":g.confirm_reshow_notice_at,"confirm_reshow_push_at":g.confirm_reshow_push_at,
+            "confirm_reshow_push_result":g.confirm_reshow_push_result,
             "confirm_block":g.ask_text.as_deref().zip(g.short_code.as_deref()).filter(|_|g.confirm_required).map(|(question,code)|super::delegation_requests::confirm_block(code,question)),
             "approval_block":g.ask_text.as_deref().zip(g.short_code.as_deref()).map(|(question,code)| super::delegation_requests::approval_block(code,question)),
             "resolution_row":g.resolution_row,"resolution_code":g.resolution_code,"resolution_note":g.resolution_note,

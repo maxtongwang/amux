@@ -1,6 +1,6 @@
 # Delegated change requests
 
-Session approvals v3.1, dev-lead answers 2026-10-24 (a-f), refs
+Session approvals v3.2, dev-lead answers 2026-10-24 (a-f), refs
 maxtongwang/ai-config#160. Max answers normally in mrpopo's native session,
 including provider Remote Control. Messages and all other surfaces close only.
 
@@ -63,7 +63,7 @@ fund and returns confirmation. Other unverifiable text remains close-only.
 
 ## Hook output and owner behavior
 
-Only the synchronous `UserPromptSubmit` response can supply approval context.
+Only the synchronous `UserPromptSubmit` response can supply approval decision context.
 The observer emits Claude Code's stdout JSON shape:
 
 ```json
@@ -92,7 +92,7 @@ text. On `confirm needed`, it replies ONCE with the exact server confirmation
 format, one request per reply:
 
 ```text
-To confirm, reply: yes A7K2
+Not approved yet. To confirm, reply: yes A7K2
 <the exact stored question again>
 ```
 
@@ -109,6 +109,53 @@ wrapped and truncated variants neither fund nor close nor consume the window.
 The hook detects this before truncation; the server records an ignored decision.
 Ordinary pasted quotes containing other envelope markers mid-text remain owner
 text. They are not approve words, so immediately following a display they decline.
+
+## Unanswered confirmation reminder
+
+`runtime_jobs::approval_reshow` ticks every 60 seconds through the registered
+periodic-job runner. After `CONFIRM_RESHOW_MIN = 30` minutes from the first
+confirm-needed decision, an open, unexpired request fires once. Repeated doubt
+does not reset its clock. Fleet `AMUX_ISOLATED=1` / `AMUX_NO_FLEET=1`, the job's
+`AMUX_APPROVAL_RESHOW_SECS=0`, and isolated owner workers suppress the job.
+The original owner incarnation must still match.
+
+The timer queues one stamped native-delivery notice under the stable ID
+`approval-reshow-<request_id>`:
+
+```text
+<amux-native-delivery kind="approval-reshow" id="dlg_…">
+[amux approval] reshow A7K2
+</amux-native-delivery>
+```
+
+mrpopo handles this notice by checking the code is still open and re-showing
+the exact confirmation block ONCE, with the verbatim question. The notice is
+neither a SHOWN block nor an owner prompt: it closes nothing and funds nothing.
+Without mrpopo's completed confirmation reply, a plain yes still takes the
+doubt path. The reshow line never goes in hook `additionalContext`; that
+channel remains reserved for decisions. The trusted reminder source is the
+server's stamped native delivery, not a typed or pasted imitation.
+
+The timer reuses the existing durable steering queue and common owner delivery
+dispatcher, with no paste or keys. **This branch lacks #67's native transport:**
+`owner_native_delivery_held` retains queued notices until that dependency lands;
+queue acceptance does not claim mrpopo received the notice. Retry after a lost
+enqueue ACK adopts the same stable queue/history ID. No replacement transport
+was added.
+
+One phone notification uses the existing Web Push `push::send_all` path and its
+subscription/VAPID handling, with a per-request tag. The durable push reservation
+is written before the external call, so a timeout, restart or failed result
+cannot send another notification. This guarantees at most one call, not phone
+receipt: a crash between reservation and completion leaves an unknown result
+and is never reported as sent. It is visible in the API as
+`confirm_reshow_push_at != null` with `confirm_reshow_push_result == null`.
+
+Request views expose `confirm_needed_at`, `confirm_reshow_at`,
+`confirm_reshow_notice_at` (queue receipt), `confirm_reshow_push_at` (attempt
+reservation) and `confirm_reshow_push_result`. Timer firing, enqueue failure,
+identity hold, push outcome and tick failure have `approval_reshow_*` log
+verdicts. Closed requests receive no new reminder or push reservation.
 
 ## Delivery and recovery boundaries
 
@@ -145,7 +192,7 @@ receipt/snapshot binding is atomic with its accepted sequence too.
 
 Migration 0130 is extended in place; numbering remains dense. It adds native
 run/sequence, short codes, closure timestamps, snapshots, sticky confirmation and
-context audit storage. Legacy NULLs cannot prove funding. Unique indexes protect
+context audit storage, plus v3.2 confirmation/reminder receipts. Legacy NULLs cannot prove funding. Unique indexes protect
 open short codes, display rows and spent replies. Approval closes the code even
 before application; a failed application or undo never restores the spent reply.
 Application still rechecks the exact mutation and stable actor/target identities.
@@ -158,7 +205,7 @@ these hooks remain an OS boundary; this does not authenticate physical hands.
 | --- | --- |
 | `python3 -B scripts/test-native-status.py` | Producer, synchronous response, additionalContext, unreachable endpoint, reserved prefix before truncation |
 | `python3 -B scripts/test-delegation-request-schema.py` | Actual schema/SQL, SIGKILL rollback/adoption |
-| `python3 -B scripts/test-delegation-reply-window.py` | Actual code uniqueness/reuse, snapshots, confirmation and ignored-input queries |
+| `python3 -B scripts/test-delegation-reply-window.py` | Actual code uniqueness/reuse, snapshots, confirmation/reminder clocks, once-only reservations, SIGKILL rollback/adoption and ignored-input queries |
 | `python3 -B scripts/test-owner-input-guard.py` | Raw tmux refusal, audit, installer wiring |
 | `scripts/test-contended.sh -p amux-server api::delegation_requests` | Actual report/router behavior, individual doubt conditions and coded/decline matrices (parent executes Rust) |
 
