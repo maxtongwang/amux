@@ -79,8 +79,15 @@ class ReplyWindowStorage(unittest.TestCase):
 
     def test_peer_notice_does_not_close_window(self):
         self.request()
-        self.message("notice", "user", "lead", "direct", process="worker")
+        self.message("notice", "session", "lead", "direct", process="worker")
         self.assertEqual([r[0] for r in self.eligible(self.message("yes"))], ["REQ1"])
+
+    def test_uncertain_or_discarded_owner_input_closes_window_without_resolution(self):
+        for delivery in ["approval_input_uncertain", "direct", "queued", "unknown"]:
+            with self.subTest(delivery=delivery):
+                self.request("UNCERTAIN" + delivery)
+                self.message("discarded", delivery=delivery, origin="", process=None)
+                self.assertEqual(self.eligible(self.message("yes")), [])
 
     def test_refused_request_is_never_a_candidate_without_a_boundary(self):
         for index, code in enumerate(["request_reply_not_affirmative", "request_ambiguous", "request_reply_identity_changed", "request_reply_outside_window", ""]):

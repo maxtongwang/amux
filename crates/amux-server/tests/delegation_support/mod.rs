@@ -409,11 +409,12 @@ impl Env {
         std::fs::create_dir_all(&dir).unwrap();
         let run = format!("review-run-{lane}");
         if !dir.join("current.json").exists() {
-            std::fs::write(dir.join("current.json"), json!({"run_id": run, "provider": "claude", "started": now - 100.0}).to_string()).unwrap();
+            std::fs::write(dir.join("current.json"), json!({"run_id": run, "provider": "claude", "started": now - 100.0,
+                "incarnation":format!("inc-{lane}")}).to_string()).unwrap();
         }
         let seq = PANE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let report = json!({"native_status": true, "event": "UserPromptSubmit", "state": "active", "run_id": run, "provider": "claude",
-            "sequence": seq, "event_ts": now - 0.5, "turn_id": format!("t{seq}"), "prompt": text});
+            "sequence": seq, "event_ts": now, "turn_id": format!("t{seq}"), "prompt": text,"prompt_truncated":false});
         let reply = self.call(Who::Worker(lane), "POST", &format!("/api/sessions/{lane}/report"), Some(report)).await;
         assert!(reply.0.is_success() && reply.1["applied"] == true,
             "native hook report must be applied before it can record owner input: {reply:?}");

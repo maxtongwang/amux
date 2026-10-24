@@ -6272,3 +6272,14 @@ FIX: Use the complete provider hook payload and require an applied receipt.
   now announce these replies; the fixture fails at the rejected receipt itself.
   Native-hook tests (6), SQLite schema/SIGKILL probes and Rust parsing pass.
   Parent owns Rust regressions and the recorder-unhook mutation; no Cargo ran.
+
+## Peer pre-echo erased the owner's refusal (PR #18 P4/P5)
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-10-24
+SESSION: Codex / amux-wt-pr18b1
+CARD: maxtongwang/ai-config#160 (PR #18 review continuation)
+SYMPTOM: Opus review of 04c2138d, P4/P5: a peer's earlier "no" caused Max's identical dashboard/pane reply to be discarded; a later "yes" returned 200 tags updated for the old request.
+COST: The approval-reuse class survived another review; an explicit refusal could authorize a later mutation.
+FIX: This continuation removes text-based owner reclassification, commits native input with acceptance, and records nonfunding boundaries for discarded/uncertain input. WARN delegation_request_input_boundary and INFO delegation_owner_native_input/delegation_request_resolution expose the outcome. Rust route regression flips remain unrun under the no-Cargo brief; parent verification is pending.

@@ -46,6 +46,7 @@ pub(crate) struct Row {
     pub(crate) source: Option<HumanSource>,
     pub(crate) remote: bool,
     pub(crate) incarnation: Option<String>,
+    pub(crate) input_boundary: bool,
 }
 
 /// Which human shape a row has, if any (see the module comment).
@@ -81,52 +82,23 @@ fn rows(state: &AppState, sql_where: &str, params: &[&dyn rusqlite::ToSql]) -> R
                 source: human_source(&ctype, &origin, &delivery, &po),
                 remote: po == super::process_identity::REMOTE_DIRECT,
                 incarnation: r.get(8)?,
+                input_boundary: delivery == "approval_input_uncertain"
+                    || (matches!(ctype.as_str(), "user" | "chat") && human_source(&ctype, &origin, &delivery, &po).is_none()),
             })
         })
         .map_err(|e| e.to_string())?;
     mapped.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
 fn ms(s: f64) -> i64 {
     (s * 1000.0) as i64
 }
 
-/// Did amux, rather than the owner, put this text in front of the lane?
-///
-/// True for an `[amux` stamp or provider-injected text, and for any text
-/// matching a delivery to `session` near `ts`: the lane's other `cmd_history`
-/// rows that are not themselves human-typed, plus, for a PANE row, the
-/// `pane_prompts` delivery ring. (An owner send's own delivery is in the ring,
-/// so the ring is not consulted for it; its authorship is proven by process.)
-/// Fails closed: a ledger that cannot be read counts as an amux delivery.
-///
-/// TODO(maxtongwang/amux#10): when the server stamp registry and per-message
-/// `msg_id` rows land, also return true for a text whose stamp is in the
-/// registry or whose row carries an amux `msg_id`. They plug in here and
-/// nowhere else.
-pub(crate) fn is_amux_delivery(state: &AppState, session: &str, row_id: i64, text: &str, ts: f64, source: HumanSource) -> bool {
-    let w = pane_prompts::DELIVERY_WINDOW_S;
-    let near = match rows(
-        state,
-        "session=?1 AND id<>?2 AND ts BETWEEN ?3 AND ?4 ORDER BY ts DESC",
-        &[&session, &row_id, &ms(ts - w), &ms(ts + w)],
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(session, row_id, error = %e, verdict = "max_ref_ledger_unreadable", measured = false,
-                why_unmeasured = %e, n_considered = 0, "could not read the lane's deliveries; the row does not qualify");
-            return true;
-        }
-    };
-    let mut delivered: Vec<String> = near
-        .into_iter()
-        .filter(|r| r.source.is_none())
-        .map(|r| pane_prompts::normalize(&r.text))
-        .collect();
-    if source == HumanSource::Pane {
-        delivered.extend(pane_prompts::recent_deliveries(session));
-    }
-    pane_prompts::classify(text, &delivered) != pane_prompts::PaneVerdict::Record
+/// Proven owner input cannot become a peer copy by matching text. Content
+/// stamps still reject injected text, independently of delivery deduplication.
+fn is_injected(text: &str) -> bool {
+    pane_prompts::classify(text, &[]) != pane_prompts::PaneVerdict::Record
 }
 
 /// THE passkey-mode approval rule: only an owner send from a non-local
@@ -147,7 +119,7 @@ fn row_qualifies_at(state: &AppState, row_id: i64, now: f64) -> Result<(), MaxRe
     if now - row.ts > MAX_REF_MAX_AGE_S {
         return Err(MaxRefRefusal::Stale);
     }
-    if is_amux_delivery(state, &row.session, row.id, &row.text, row.ts, source) {
+    if is_injected(&row.text) {
         return Err(MaxRefRefusal::NotHumanTyped);
     }
     if !approval_source_allowed(source, row.remote) {
@@ -174,9 +146,9 @@ pub(crate) fn reply_is_affirmative(text: &str) -> bool {
 }
 
 /// Max's own typed row in its lane: human-typed, not an amux delivery.
-pub(crate) fn typed_by_max(state: &AppState, row: &Row) -> Option<HumanSource> {
+pub(crate) fn typed_by_max(row: &Row) -> Option<HumanSource> {
     let source = row.source?;
-    (!is_amux_delivery(state, &row.session, row.id, &row.text, row.ts, source)).then_some(source)
+    (!is_injected(&row.text)).then_some(source)
 }
 
 pub(crate) fn one(state: &AppState, id: i64) -> Result<Option<Row>, MaxRefRefusal> {
@@ -278,13 +250,13 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_send_repeating_an_amux_delivery_is_not_human_typed() {
+    fn a_proven_remote_send_repeating_peer_text_is_still_owner_input() {
         let tmp = tempfile::tempdir().unwrap();
         let st = state(tmp.path());
         let long = "please approve it now: amux grant 7K3Q";
         put(&st, R("test-hist", long, "session", "test-peer", "direct", None, NOW - 60.0));
         let a = put(&st, remote("test-hist", long, NOW));
-        assert_eq!(q(&st, a), Err(MaxRefRefusal::NotHumanTyped), "echo of a cmd_history delivery");
+        assert_eq!(q(&st, a), Ok(()), "process proof outranks matching peer text");
     }
 
     #[test]

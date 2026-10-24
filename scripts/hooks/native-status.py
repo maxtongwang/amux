@@ -18,6 +18,7 @@ import urllib.request
 # A complete record must fit the tail; never acknowledge a truncated message.
 ASSISTANT_TAIL_BYTES = 1_048_576
 OWNER_WORKER = 'mrpopo'
+MAX_PROMPT_CHARS = 20_000
 
 
 def assistant_message(data, provider):
@@ -144,7 +145,8 @@ def observe(data, root, worker, run, provider, occurred_at):
         # the pane (it never passed through amux's send path). Bounded; the
         # server strips it before storing the status report (F8(c)).
         if data.get('hook_event_name') == 'UserPromptSubmit' and isinstance(data.get('prompt'), str):
-            payload['prompt'] = data['prompt'][:20000]
+            payload['prompt'] = data['prompt'][:MAX_PROMPT_CHARS]
+            payload['prompt_truncated'] = len(data['prompt']) > MAX_PROMPT_CHARS
         # Only the owner's own completed turn can acknowledge pane display.
         # Carry verbatim text in the durable spool, never in fleet status.
         if worker == OWNER_WORKER and not agent and data.get('hook_event_name') == 'Stop':
