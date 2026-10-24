@@ -51,8 +51,12 @@ async fn each_allowed_delegated_change_appends_exactly_one_entry() {
     assert!(m["evidence_row"].as_i64().is_some(), "Max's reply is the evidence: {m}");
     assert_eq!(m["why"], json!("Max asked for a second lead"), "{m}");
     assert_eq!(entries[3]["action"], json!("grant:applied"), "{}", entries[3]);
-    assert_eq!(entries[3]["after"]["cited_excerpt"], json!("yes"), "{}", entries[3]);
-    assert!(entries[3]["after"]["ask_text"].as_str().is_some_and(|x| x.contains(DEV_B) && x.contains(row.as_str().unwrap())), "{}", entries[3]);
+    let id=row.as_str().unwrap();
+    assert_eq!(entries[3]["after"]["cited_excerpt"], json!(format!("yes {}",e.short_code(id))), "{}", entries[3]);
+    let question: String=e.store.read().unwrap().query_row(
+        "SELECT ask_text FROM _amux_delegation_grants WHERE code=?1",[id],|r|r.get(0)).unwrap();
+    assert_eq!(entries[3]["after"]["ask_text"],json!(question),"the audit retains the exact question");
+    assert!(question.contains(DEV_B) && question.contains("dev,leads"),"the question retains the exact change: {question}");
 }
 
 #[tokio::test]

@@ -445,7 +445,7 @@ fn insert(state: &AppState, g: &NewGrant, c: &Captured) -> Result<(String, Strin
         let code = format!("dlg_{nonce}");
         let text = sentence(&code, g.actor, g.action, g.target, c);
         // The whole structured change is visible, without truncating operands.
-        let question = format!("Approval request {code} from {}: {} {} {}. Reply yes to approve this exact change.", g.actor, c.method, c.path, g.change);
+        let question = format!("Approval request from {}: {} {} {}.", g.actor, c.method, c.path, g.change);
         let (id, actor, class, action, target, why, method, path, body, sentence, reply_session, change, actor_id, reply_id, target_id) =
             (code.clone(), g.actor.to_string(), g.class.to_string(), g.action.to_string(), g.target.to_string(), g.why.clone(), c.method.clone(), c.path.clone(), change_body(&c.body).to_string(), text.clone(), g.reply_session.to_string(), g.change.to_string(), actor_id.clone(), reply_id.clone(), g.target_incarnation.clone());
         let stored = state.store.write(move |conn| {

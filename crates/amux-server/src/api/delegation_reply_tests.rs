@@ -1053,7 +1053,8 @@ async fn schedule_run_route_echo_is_non_owner() {
         assert!(crate::api::session_verbs::steer_deliver_for_session(&f.state,OWNER_AGENT).await);
     }
     assert_eq!(f.request_resolution(&id),(None,None));
-    f.echo_never_funds(&id,"request_confirm_needed").await;
+    // The schedule's stamped multi-line body is transport input, not a reply.
+    f.echo_never_funds(&id,"request_reply_not_owner_input").await;
 }
 
 #[tokio::test]
@@ -1336,7 +1337,7 @@ async fn session_exact_block_next_prompt_funds_allowlist_only() {
 
 #[tokio::test]
 async fn session_nonaffirmative_and_empty_enter_close_without_funding() {
-    for text in ["no", "yes please", "", "\n", "okay", "yep", "approved", "go ahead"] {
+    for text in ["no", "yes please wait", "", "\n", "okay", "yep", "approved", "go ahead"] {
         let f=Fixture::new(); let id=f.ask().await;
         f.type_in_pane(text,"owner-native-session").await;
         f.resolution(OWNER_AGENT,"request_reply_not_affirmative",None);
@@ -1764,12 +1765,22 @@ async fn v31_stop_submit_sequence_tie_or_unknown_never_funds() {
 }
 #[tokio::test]
 async fn v31_wrong_unknown_and_closed_codes_never_fall_back() {
-    for kind in ["wrong","unknown","closed"] {
+    for kind in ["wrong","INVALID","a7k","A7K23","A0K2","please","ab","123456789012","closed"] {
         let f=Fixture::new();let id=f.ask().await;
-        let code=if kind=="closed" {let code=f.short(&id);accepted(f.owner_reply("no").await);code} else {"INVALID".into()};
-        let (_,v)=f.owner_reply(&format!("yes {code}")).await;
-        assert_eq!(v["approval_context"],format!("[amux approval] no open approval {code}"));
+        let code=match kind {
+            "closed"=>{let code=f.short(&id);accepted(f.owner_reply("no").await);code},
+            "wrong"=>{let mut code=f.short(&id);let last=code.pop().unwrap();code.push(if last=='2' {'3'} else {'2'});code},
+            _=>kind.into(),
+        };
+        let before=f.request_resolution(&id);
+        let suffix=if kind=="INVALID" {""} else {"."};
+        let (_,v)=f.owner_reply(&format!("yes {code}{suffix}")).await;
+        assert_eq!(v["approval_context"],format!("[amux approval] no open approval {}",code.to_ascii_uppercase()));
+        f.resolution(OWNER_AGENT,"request_no_open_code",None);
+        assert_eq!(f.request_resolution(&id),before,"unknown/malformed code cannot change the shown request");
+        assert_eq!(f.open(&id),kind!="closed","a failed code attempt must not close or reopen a request");
         assert_eq!(f.request_resolution(&id).0,None);
+        assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN,"unknown/malformed code funds nothing");
     }
 }
 #[tokio::test]

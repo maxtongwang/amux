@@ -9,6 +9,9 @@ const SHORT_CODE_ATTEMPTS: usize = 128;
 pub(super) const PLAIN_YES_WINDOW_MIN: i64 = 30;
 const SECONDS_PER_MINUTE: f64 = 60.0;
 const RESERVED_MARKER: &str = "[amux approval]";
+// Bound attempted codes separately from the four-character allocated alphabet.
+const CODE_TOKEN_MIN_LEN: usize = 2;
+const CODE_TOKEN_MAX_LEN: usize = 12;
 
 /// Allocator's clock and entropy seams are explicit. Expiry closes at its
 /// original Unix-second deadline, so delayed housekeeping cannot extend reuse.
@@ -81,12 +84,14 @@ fn open_requests(conn: &Connection, now_s: f64) -> rusqlite::Result<Vec<Request>
     Ok(rows)
 }
 
+/// One approve word plus a 2–12 ASCII alphanumeric token is a coded attempt,
+/// including malformed/unknown codes. Normalize case and one final period.
 fn approve_reply(text: &str) -> Option<Option<String>> {
     let mut words=text.split_whitespace();
     let word=words.next()?;
     if !max_ref::reply_is_affirmative(word) { return None; }
     let code=words.next().map(|s|s.strip_suffix('.').unwrap_or(s).to_ascii_uppercase());
-    if words.next().is_some() || code.as_deref().is_some_and(|value| !super::super::delegation_grants::valid_short_code(value)) { return None; }
+    if words.next().is_some() || code.as_deref().is_some_and(|value| !(CODE_TOKEN_MIN_LEN..=CODE_TOKEN_MAX_LEN).contains(&value.len()) || !value.bytes().all(|b| b.is_ascii_alphanumeric())) { return None; }
     Some(code)
 }
 
@@ -150,6 +155,7 @@ pub(super) fn resolve(conn: &Connection, row: &max_ref::Row, owner_input: bool) 
         if let Some(code)=coded.filter(|_|candidates.is_empty()) {
             lines.push(context("no open approval",code));
             verdict="request_no_open_code";
+            note=format!("no open approval {code}");
         } else {
             for q in candidates {
                 let ordered=q.run.is_some() && q.run==run && q.seq.zip(seq).is_some_and(|(stop,submit)|stop<submit)
@@ -234,11 +240,17 @@ mod tests {
         }
     }
     #[test]
-    fn approve_reply_requires_a_well_formed_code_or_plain_allowlisted_word() {
-        assert_eq!(approve_reply("yes"),Some(None));
-        assert_eq!(approve_reply("Ok a7k2."),Some(Some("A7K2".into())));
-        for text in ["yes please","yes A7K","yes A7K23","yes A0K2","yes A7K2!","yes A7K2 extra"] {
-            assert_eq!(approve_reply(text),None,"non-code prose or malformed code must remain non-approve: {text}");
+    fn approve_reply_recognizes_bounded_code_attempts_and_plain_allowlist() {
+        for word in ["yes","y","approve","ok","YES."] {
+            assert_eq!(approve_reply(word),Some(None));
+            for token in ["a7k2","INVALID","A7K","A7K23","A0K2","please","ab","123456789012"] {
+                for suffix in ["","."] {
+                    assert_eq!(approve_reply(&format!(" {word} {token}{suffix} ")),Some(Some(token.to_ascii_uppercase())),"code attempt: {word} {token}{suffix}");
+                }
+            }
+        }
+        for text in ["yes A","yes 1234567890123","yes A7K2!","yes A_K2","yes Å7K2","yes A7K2 extra","maybe A7K2"] {
+            assert_eq!(approve_reply(text),None,"outside the code-attempt grammar: {text}");
         }
     }
     #[test] fn decision_lines_are_byte_exact() {
