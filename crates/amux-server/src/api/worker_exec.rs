@@ -177,6 +177,15 @@ pub(crate) mod fake_pane {
     pub(crate) struct FakePane;
     pub(crate) static FAKE: FakePane = FakePane;
     static TYPED: Mutex<Vec<(String, String, &'static str)>> = Mutex::new(Vec::new());
+    static KEYS: Mutex<Vec<(String,String)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn note_key(name: &str, key: &str) {
+        KEYS.lock().unwrap().push((name.into(),key.into()));
+    }
+
+    pub(crate) fn keys(name: &str) -> Vec<String> {
+        KEYS.lock().unwrap().iter().filter(|(n,_)|n==name).map(|(_,k)|k.clone()).collect()
+    }
 
     /// Every `(text, origin)` delivered to `name` so far.
     pub(crate) fn typed(name: &str) -> Vec<(String, &'static str)> {
@@ -210,7 +219,7 @@ pub(crate) mod fake_pane {
                 .unwrap_or_else(|e| e.into_inner())
                 .push((name.to_string(), text.to_string(), origin));
             let cfg=super::parse_env(name);
-            Dispatch::Handled((true, cfg.get("CC_TEST_FAKE_SEND_RESULT").unwrap_or("sent").to_string()))
+            Dispatch::Handled((cfg.get("CC_TEST_FAKE_SEND_OK") != Some("0"), cfg.get("CC_TEST_FAKE_SEND_RESULT").unwrap_or("sent").to_string()))
         }
         fn running(&self, _: &str) -> Dispatch<bool> {
             Dispatch::Handled(true)

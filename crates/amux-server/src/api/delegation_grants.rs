@@ -1532,6 +1532,7 @@ mod tests {
         headers.remove("x-amux-session");
         headers.insert("x-amux-local-member-verified","1".parse().unwrap());
         assert_eq!(owner_input_process_origin(&headers),None,"even a missing member actor must fail closed");
+        assert_eq!(super::super::session_verbs::input_history_type(&headers,"chat"),"session","a verified member is known non-owner input, not an uncertain owner");
     }
 
     #[tokio::test]
@@ -1637,7 +1638,7 @@ mod tests {
         let state=test_state(tmp.path());
         let app=super::super::router(state.clone());
         let id=explicit_request(&app,&state,json!({"worktree_verify":"one"})).await;
-        record_reply(&state,"yes","pane").await;
+        record_reply(&state,"yes","outside").await;
         let path=tmp.path().join("sessions/test-dev-a.env");
         let before=std::fs::read(&path).unwrap();
         let body=json!({"worktree_verify":"one","request_id":id});
@@ -1662,7 +1663,7 @@ mod tests {
         let state=test_state(tmp.path());
         let app=super::super::router(state.clone());
         let id=explicit_request(&app,&state,json!({"worktree_verify":"one"})).await;
-        let reply=record_reply(&state,"yes","pane").await;
+        let reply=record_reply(&state,"yes","outside").await;
         state.store.write(move|c| {
             c.execute("INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,status,evidence_row,legacy_duplicate) VALUES('old','old','old','old','old','PATCH','/old','{}','old',1,2,'undone',?1,1)",[reply])?;
             Ok(crate::db::WriteOutcome{applied:true,events:vec![]})

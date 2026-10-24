@@ -1543,10 +1543,22 @@ async fn tmux_alt_screen(name: &str) -> bool {
 }
 
 pub(crate) async fn send_key(name: &str, key: &str) {
+    if !owner_pane_write_allowed(name) { return; }
+    #[cfg(test)]
+    if parse_env(name).get(super::worker_exec::fake_pane::ENV_KEY) == Some("1") {
+        super::worker_exec::fake_pane::note_key(name,key);
+        return;
+    }
     let pt = pt(name);
     let _ = tmux(&["send-keys", "-t", &pt, key]).await;
 }
-async fn send_literal(name: &str, text: &str) -> bool {
+pub(super) async fn send_literal(name: &str, text: &str) -> bool {
+    if !owner_pane_write_allowed(name) { return false; }
+    #[cfg(test)]
+    if parse_env(name).get(super::worker_exec::fake_pane::ENV_KEY) == Some("1") {
+        super::worker_exec::fake_pane::note_key(name,text);
+        return true;
+    }
     let pt = pt(name);
     matches!(tmux(&["send-keys", "-t", &pt, "-l", text]).await, Some(o) if o.status.success())
 }
@@ -7736,12 +7748,27 @@ fn prior_delivered(
     .ok()
 }
 
+pub(crate) fn automated_input(headers: &HeaderMap) -> bool {
+    [super::process_identity::PROCESS_ORIGIN_HEADER,"x-amux-input-source"].iter()
+        .any(|key|headers.get(*key).and_then(|v|v.to_str().ok())==Some("automation"))
+}
+
 /// Only server-attributed owner requests may carry proof into the recorder.
 pub(crate) fn owner_input_process_origin(headers: &HeaderMap) -> Option<&str> {
-    if super::org::is_verified_local_member(headers) || !hdr_worker(headers).trim().is_empty() {
+    if automated_input(headers) || super::org::is_verified_local_member(headers) || !hdr_worker(headers).trim().is_empty() {
         return None;
     }
     headers.get(super::process_identity::PROCESS_ORIGIN_HEADER).and_then(|v| v.to_str().ok())
+        .filter(|origin|matches!(*origin,"outside" | "remote" | "remote-forwarded"))
+}
+
+/// Known peers/members remain non-owner on success, refusal and every typed
+/// input surface. Missing proof for an otherwise owner-shaped input stays
+/// uncertain; it must not be silently reclassified as a peer.
+pub(crate) fn input_history_type(headers: &HeaderMap, owner_type: &'static str) -> &'static str {
+    if automated_input(headers) || !hdr_worker(headers).trim().is_empty() || super::org::is_verified_local_member(headers) {
+        "session"
+    } else { owner_type }
 }
 
 pub(crate) fn close_discarded_owner_input(state: &AppState, name: &str, headers: &HeaderMap, reason: &str) -> Option<Response> {
@@ -11404,6 +11431,7 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
     if m.starts_with(super::delivery::QUARANTINE_PREFIX) {
         return (StatusCode::CONFLICT, Some("Inspect the native delivery receipt and endpoint identity; policy or identity refusals cannot use paste fallback."));
     }
+    if let Some((_,hint))=owner_input_refusal(m) { return (StatusCode::FORBIDDEN,Some(hint)); }
     if msg.contains("durable owner input remains queued") {
         return (StatusCode::CONFLICT,Some("Owner input is held for the current authorized working claim; inspect the project hold and use explicit retry/resume when permitted."));
     }
@@ -11587,8 +11615,18 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
 /// and `send_failure_code` so the status and the code cannot drift apart.
 pub(crate) const ISOLATED_REFUSAL_PREFIX: &str = "target is an isolated (raw-agent) worker";
 
+const OWNER_INPUT_REFUSALS: [(&str,&str);2] = [
+    ("owner_session_keys_refused","Use verified owner input; peer key injection into the owner pane is refused."),
+    ("owner_session_unverified_command_refused","Use the owner's native terminal for a bare command without current owner-origin proof."),
+];
+
+fn owner_input_refusal(message: &str) -> Option<(&'static str,&'static str)> {
+    OWNER_INPUT_REFUSALS.iter().copied().find(|(code,_)|message.starts_with(*code))
+}
+
 /// A machine-readable code for a send refusal, beside the HTTP status.
 ///
+/// Policy refusals retain the same code at the HTTP and transport boundaries.
 /// Isolation retains the SAME `isolated_target` code as the peer gate, and
 /// native identity refusals have their own stable quarantine code, so a caller
 /// can branch on one field no matter which layer refused (AMUX-5241). The
@@ -11597,6 +11635,7 @@ pub(crate) const ISOLATED_REFUSAL_PREFIX: &str = "target is an isolated (raw-age
 pub(crate) fn send_failure_code(msg: &str) -> Option<&'static str> {
     let m = msg.trim();
     let m = m.strip_prefix("auto-wake failed: ").unwrap_or(m);
+    if let Some((code,_))=owner_input_refusal(m) { return Some(code); }
     if m == "worker_group_boundary" || m == "peer_receive_denied" { return Some(if m == "worker_group_boundary" { "worker_group_boundary" } else { "peer_receive_denied" }); }
     [
         (ISOLATED_REFUSAL_PREFIX, "isolated_target"),
@@ -12780,6 +12819,10 @@ pub(crate) async fn deliver_automated(
     text: &str,
     guard: &str,
 ) -> AutoDelivery {
+    if is_owner_configured_guard(guard) {
+        tracing::info!(session=name, guard, verdict="owner_configuration_not_typed_approval", measured=true, n_considered=1,
+            "standing owner configuration is transport authority, never current owner approval input");
+    }
     // A schedule into an isolated worker is delivered as owner input; see
     // `is_schedule_guard` and the queue's isolation gate.
     let origin = if is_owner_configured_guard(guard) && session_is_isolated(name) {
@@ -13356,6 +13399,19 @@ async fn send_text_inner_bound(
     delivery: Option<&str>,
     queue_id: &mut Option<String>,
 ) -> (bool, String) {
+    let owner_origin=OWNER_PANE_WRITE.try_with(|id|Some(id.as_str())==super::delegation_requests::incarnation(name).as_deref()).unwrap_or(false);
+    let transported=match super::delegation_requests::transport_text(state,name,text,owner_origin) {
+        Ok(text)=>text,
+        Err(error)=>{
+            tracing::warn!(session=name, %error, verdict="owner_pane_transport_refused", measured=true, n_considered=1,
+                "owner pane input refused before unrecorded transport");
+            return (false,error);
+        },
+    };
+    let write_identity=if transported != text { super::delegation_requests::incarnation(name).unwrap_or_default() }
+        else { OWNER_PANE_WRITE.try_with(Clone::clone).unwrap_or_default() };
+    let text=transported.as_str();
+    OWNER_PANE_WRITE.scope(write_identity, async {
     // Serialise per lane. Taken before any pane state is read, because the
     // decisions below (is it generating? is a picker up?) are read-then-act on
     // the same composer this is about to clear.
@@ -14487,6 +14543,7 @@ pub(super) async fn send_text_paste_bound(ctx:&mut super::delivery::DeliveryCont
         return send_outcome(second, generating, true);
     }
     send_outcome(first, generating, retried)
+    }).await
 }
 
 /// Lanes with a direct message waiting in the composer for its idle Enter.
@@ -14758,12 +14815,18 @@ const ALLOWED_TMUX_KEYS: [&str; 47] = [
 // directory without persisting a provider preference.
 const ALLOWED_TMUX_CHAR_KEYS: [&str; 8] = ["y", "n", "q", "x", "r", "1", "2", "3"];
 
-async fn send_keys_op(name: &str, keys: &str) -> (bool, String) {
+pub(super) async fn send_keys_op(name: &str, keys: &str) -> (bool, String) {
+    if !owner_pane_write_allowed(name) { return (false,"owner_session_keys_refused".into()); }
     if !is_running(name).await {
         return (false, "not running".into());
     }
     if !ALLOWED_TMUX_KEYS.contains(&keys) && !ALLOWED_TMUX_CHAR_KEYS.contains(&keys) {
         return (false, format!("key '{keys}' not in allowed set"));
+    }
+    #[cfg(test)]
+    if parse_env(name).get(super::worker_exec::fake_pane::ENV_KEY) == Some("1") {
+        super::worker_exec::fake_pane::note_key(name,keys);
+        return (true,"sent".into());
     }
     let ptq = pt(name);
     match tmux(&["send-keys", "-t", &ptq, keys]).await {
@@ -27110,6 +27173,9 @@ pub(crate) async fn steer_mutate(
     headers: &HeaderMap,
     body: &Value,
 ) -> Response {
+    if *method == Method::POST {
+        if let Some(refusal)=super::delegation_requests::owner_raw_text_refusal(name,headers,&body_str(body,"text")) { return refusal; }
+    }
     let response=steer_mutate_inner(state,name,method,headers,body).await;
     if *method == Method::POST && !response.status().is_success() {
         return close_discarded_owner_input(state,name,headers,"steer_refused").unwrap_or(response);
@@ -27398,7 +27464,7 @@ async fn steer_mutate_inner(state: &AppState, name: &str, method: &Method, heade
                 .get("x-amux-user-email")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
-            let history_type = if sender.is_empty() { "user" } else { "session" };
+            let history_type = input_history_type(headers,"user");
             let history_origin = if sender.is_empty() { email } else { &sender };
             // QUEUED, not direct (AF-159). `steer_enqueue` above put this on the
             // steering queue; nothing has been submitted to the lane. Recording
@@ -27517,6 +27583,9 @@ async fn post_dispatch(
     headers: &HeaderMap,
     body: &Value,
 ) -> Response {
+    if action == "keys" {
+        if let Some(refusal)=super::delegation_requests::owner_keys_refusal(name,headers) { return refusal; }
+    }
     // The verbs that rewrite who a worker is (its name, its instructions, its
     // memory) follow the peer-config rule; the rename alias and PATCH config
     // must not differ.
@@ -27571,7 +27640,7 @@ async fn post_dispatch_inner(
         },
         "send" => send_post_detached(state, name, headers, body).await,
         "instructions" => instructions_post_verb(state, name, body).await,
-        "keys" => keys_verb(name, headers, body).await,
+        "keys" => keys_verb(state, name, headers, body).await,
         "resize" => resize_verb(name, body).await,
         // "agent-nav" DELETED (ARE-7): it drove Claude Code's subagents panel
         // by pane-verified keystrokes, keyed on a "⏺ main" row the TUI no
@@ -28943,7 +29012,10 @@ async fn send_post_detached(
 }
 
 pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
-    let response=send_post_inner(state,name,headers,body).await;
+    if let Some(refusal)=super::delegation_requests::owner_raw_text_refusal(name,headers,&body_str(body,"text")) { return refusal; }
+    let response=if owner_input_process_origin(headers).is_some() {
+        OWNER_PANE_WRITE.scope(super::delegation_requests::incarnation(name).unwrap_or_default(),send_post_inner(state,name,headers,body)).await
+    } else { send_post_inner(state,name,headers,body).await };
     if !response.status().is_success() {
         return close_discarded_send_input(state,name,headers,body,"send_refused").unwrap_or(response);
     }
@@ -29085,6 +29157,7 @@ async fn send_post_inner(state: &AppState, name: &str, headers: &HeaderMap, body
     // Empty owner input is an Enter control, including successful/no-op sends.
     // Its unknown composer contents cannot leave an old approval window open.
     if orig_text.trim().is_empty() {
+        if let Some(refusal)=super::delegation_requests::owner_keys_refusal(name,headers) { return refusal; }
         if let Some(error)=close_discarded_send_input(state,name,headers,body,"send_empty_control") { return error; }
     }
     let mut origin = String::new();
@@ -29233,7 +29306,7 @@ async fn send_post_inner(state: &AppState, name: &str, headers: &HeaderMap, body
                         state,
                         name,
                         &orig_text,
-                        if caller.is_empty() && origin.is_empty() { "user" } else { "session" },
+                        if origin.is_empty() { input_history_type(headers,"user") } else { "session" },
                         member_actor.as_deref().unwrap_or(if caller.is_empty() { &origin } else { &caller }),
                         true,
                         DeliveryMeta {
@@ -29511,7 +29584,7 @@ async fn send_post_inner(state: &AppState, name: &str, headers: &HeaderMap, body
             };
             // Explicit history does not turn a peer into uncertain owner input.
             let caller=hdr_worker(headers);
-            let history_type=if caller.is_empty() { "user" } else { "session" };
+            let history_type=input_history_type(headers,"user");
             let history_origin=if caller.is_empty() { author } else { &caller };
             let row_id =
                 cmd_hist_record_with_id(state, name, &orig_text, history_type, history_origin, skip_board, meta)
@@ -29607,7 +29680,10 @@ async fn send_post_inner(state: &AppState, name: &str, headers: &HeaderMap, body
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
                 let author = member_actor.as_deref().unwrap_or(email);
-                let row_id = cmd_hist_record_with_id(state, name, &orig_text, "user", author, skip_board, meta).await;
+                let caller=hdr_worker(headers);
+                let history_type=input_history_type(headers,"user");
+                let history_origin=if caller.is_empty() { author } else { &caller };
+                let row_id = cmd_hist_record_with_id(state, name, &orig_text, history_type, history_origin, skip_board, meta).await;
                 note_history_msg_id(state, row_id, &msg_id).await;
             } else if !origin.is_empty() && origin == name {
                 // Same gap on the failure side (AMUX-5030): a self-send that
@@ -29821,7 +29897,21 @@ pub(crate) async fn resize_verb(name: &str, body: &Value) -> Response {
 /// `keys` as a callable verb, so the promoted `/api/workers/{id}/keys`
 /// route and the legacy `/api/sessions/{name}/keys` spelling run ONE
 /// implementation instead of a route alias and a re-implementation (AF-288).
-pub(crate) async fn keys_verb(name: &str, headers: &HeaderMap, body: &Value) -> Response {
+tokio::task_local! { static OWNER_PANE_WRITE: String; }
+
+fn owner_pane_write_allowed(name: &str) -> bool {
+    if !super::delegation_requests::is_owner_session(name) { return true; }
+    let identity=super::delegation_requests::incarnation(name);
+    let allowed=identity.is_some() && OWNER_PANE_WRITE.try_with(|id|Some(id.as_str())==identity.as_deref()).unwrap_or(false);
+    if !allowed {
+        tracing::warn!(session=name, incarnation=?identity, verdict="owner_session_keys_refused", measured=true, n_considered=1,
+            "unscoped raw key/literal injection refused at the owner pane writer");
+    }
+    allowed
+}
+
+pub(crate) async fn keys_verb(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
+    if let Some(refusal)=super::delegation_requests::owner_keys_refusal(name,headers) { return refusal; }
     if let Some(refusal) = peer_input_gate(headers, name, "keys") {
         return refusal;
     }
@@ -29844,7 +29934,12 @@ pub(crate) async fn keys_verb(name: &str, headers: &HeaderMap, body: &Value) -> 
             );
         }
     }
-    let (ok, msg) = send_keys_op(name, &keys).await;
+    if keys == "Enter" {
+        if let Some(error)=close_discarded_owner_input(state,name,headers,"owner_keys_enter") { return error; }
+    }
+    let (ok, msg) = if super::delegation_requests::is_owner_session(name) {
+        OWNER_PANE_WRITE.scope(super::delegation_requests::incarnation(name).unwrap_or_default(),send_keys_op(name,&keys)).await
+    } else { send_keys_op(name, &keys).await };
     // A key press had no log line at all, so "no Enter in the log" could not
     // tell a press that never arrived from one the TUI ignored (2026-09-24).
     tracing::info!(
@@ -37848,7 +37943,7 @@ mod tests {
         let (_state, dir) = state();
         let _g = crate::api::settings::test_env::set_home(dir.path());
         lanes(dir.path());
-        let r = keys_verb("outsider", &worker_headers("caller"), &json!({"keys": "rm -rf ~ Enter"})).await;
+        let r = keys_verb(&_state, "outsider", &worker_headers("caller"), &json!({"keys": "rm -rf ~ Enter"})).await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
         let body: Value = serde_json::from_slice(&axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(body["code"], json!("worker_group_boundary"), "{body}");

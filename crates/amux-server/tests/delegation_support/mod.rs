@@ -221,7 +221,7 @@ impl Env {
 
     pub async fn approved_request(&self, actor: &str, method: &str, path: &str, body: Value) -> Value {
         let id=self.request(actor,method,path,body).await;
-        self.seed_pane_prompt(MAX_PANE,"yes",now_s());
+        self.seed_owner_send(MAX_PANE,"yes",now_s(),Some("outside"));
         json!(id)
     }
 

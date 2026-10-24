@@ -1880,6 +1880,7 @@ impl LiveDeliverer {
                     for (k, v) in vault_vals.iter() {
                         command.env(k, v);
                     }
+                    command.env("AMUX_INPUT_SOURCE","automation");
                     if owner.is_empty() {
                         command.env_remove("AMUX_SESSION");
                     } else {

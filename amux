@@ -368,6 +368,8 @@ _curl() {
   # Kept out of "$@" so the transport breadcrumb below never writes it to disk.
   local _id=()
   [[ -n "${AMUX_WORKER_TOKEN:-}" ]] && _id=(-H "X-Amux-Worker-Token: ${AMUX_WORKER_TOKEN}")
+  # A standing shell schedule is not Max typing, including after a server restart.
+  [[ "${AMUX_INPUT_SOURCE:-}" == automation ]] && _id+=(-H "X-Amux-Input-Source: automation")
   command curl --connect-timeout "${AMUX_CURL_CONNECT_TIMEOUT:-10}" ${_id[@]+"${_id[@]}"} "$@" || rc=$?
   if [[ "$rc" -ne 0 ]]; then _transport_breadcrumb "$rc" "$@"; fi
   return "$rc"
@@ -1887,21 +1889,12 @@ cmd_send() {
   # heard of it. Consumed in a loop so it works before or after --stdin/--file.
   local _nb=""
   while [[ "${1:-}" == "--no-board" ]]; do _nb=1; shift; done
-  # herdr sessions deliver through the server API; tmux is only needed for the raw
-  # fallback path on tmux-backed sessions. BOTH sides of this conflict are wanted:
-  # main added the --no-board loop, #80 made need_tmux conditional on the backend.
-  if [[ "$(session_backend "$name")" != "herdr" ]]; then
-    need_tmux
-  fi
-
-  local tname
-  tname=$(tmux_name "$name")
   # NO LOCAL is_running GATE for a message (AMUX-5237). This used to die with
   # "worker 'X' is not running" before the server was asked, so mixpeek-general's
   # follow-ups to paused mixpeek-observability and backend were dropped on the
   # floor. The server decides now: a paused or stopped lane gets the message
   # QUEUED for resume and the reply says the sender owns the outcome meanwhile.
-  # Raw --keys still needs a live pane, so the check stays on that branch.
+  # Keys also go through the attributed server boundary; never raw tmux.
 
   # ── Payload via --stdin / --file: the text NEVER transits a shell-evaluated
   # string (AMUX-1888). Passing a message as a double-quoted argument lets the
@@ -1954,9 +1947,7 @@ cmd_send() {
   # Check for --keys flag
   if [[ "${1:-}" == "--keys" ]]; then
     shift
-    is_running "$name" || die "worker '$name' is not running"
-    tmux send-keys -t "=$tname:" "$@"
-    echo "${GREEN}sent keys${RESET} to $name"
+    _send_keys_via_api "$name" "$@"
   else
     local text="$*"
     [[ -n "$text" ]] || { _send_usage; return 1; }
@@ -1971,6 +1962,26 @@ cmd_send() {
     fi
     _send_via_api "$name" "$text" "$_nb"
   fi
+}
+
+# Key injection must use the same process-attributed boundary as API callers.
+# Never retry a raw control or fall back to tmux: a lost ACK is uncertain.
+_send_keys_via_api() {
+  local name="$1"; shift
+  [[ $# -gt 0 ]] || { _send_usage; return 1; }
+  local key body out code
+  for key in "$@"; do
+    body=$(python3 -c 'import json,sys; print(json.dumps({"keys":sys.argv[1]}))' "$key") || return 1
+    out=$(_curl -sk -m 15 -w $'\n%{http_code}' -X POST -H 'Content-Type: application/json' \
+      -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d "$body" \
+      "${AMUX_API:-https://localhost:8824}/api/workers/$name/keys") || out=""
+    code="${out##*$'\n'}"; out="${out%$'\n'*}"
+    if [[ "$code" != 2?? ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if d.get("ok") is True and d.get("accepted") is True else 1)' "$out"; then
+      echo "keys to $name refused or unconfirmed (HTTP ${code:-none}): $out" >&2
+      return 1
+    fi
+  done
+  echo "keys accepted for $name; foreground effect unverified"
 }
 
 # Deliver a message through the server: SERVER-VERIFIED origin stamp

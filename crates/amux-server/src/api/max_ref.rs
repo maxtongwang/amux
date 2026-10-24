@@ -54,7 +54,7 @@ fn human_source(ctype: &str, origin: &str, delivery: &str, process_origin: &str)
     if !matches!(ctype, "user" | "chat") {
         return None;
     }
-    if ctype == "user" && delivery == "pane" && origin == "pane" {
+    if ctype == "user" && delivery == "pane" && origin == "pane" && matches!(process_origin, "outside" | "remote" | "remote-forwarded") {
         return Some(HumanSource::Pane);
     }
     // `origin='pane'` is the recorder's alone (the PANE shape); a direct or
@@ -230,7 +230,7 @@ mod tests {
         let queued = put(&st, R("test-desk2", ASK, "user", "", "queued", Some("remote"), NOW));
         assert_eq!(q(&st, queued), Ok(()), "Remote queued owner send");
         let p = put(&st, pane("test-desk3", ASK, NOW));
-        assert_eq!(q(&st, p), Err(MaxRefRefusal::NotRemoteOwnerSend), "a pane row in another lane");
+        assert_eq!(q(&st, p), Err(MaxRefRefusal::NotHumanTyped), "a pane row has no recorded author proof");
         let mac = put(&st, R("test-mac", ASK, "user", "", "direct", Some("outside"), NOW));
         assert_eq!(q(&st, mac), Err(MaxRefRefusal::NotRemoteOwnerSend), "Outside (launchctl reaches it)");
         assert_eq!(q(&st, phone + 999), Err(MaxRefRefusal::NoSuchRow));
@@ -310,7 +310,7 @@ mod tests {
         let now = crate::config::now_f64();
         pane_prompts::record(&st, "test-rc", "please go ahead: amux grant 7K3Q").await;
         let id: i64 = st.store.read().unwrap().query_row("SELECT MAX(id) FROM cmd_history WHERE session='test-rc'", [], |r| r.get(0)).unwrap();
-        assert_eq!(row_qualifies_at(&st, id, now), Err(MaxRefRefusal::NotRemoteOwnerSend));
+        assert_eq!(row_qualifies_at(&st, id, now), Err(MaxRefRefusal::NotHumanTyped));
     }
 
     #[test]

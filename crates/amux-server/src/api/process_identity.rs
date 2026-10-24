@@ -80,7 +80,7 @@ use std::time::{Duration, Instant};
 /// Internal proof header: set only by [`attribute`], stripped from every
 /// inbound request first, so a client cannot assert it.
 pub(crate) const PROCESS_WORKER_HEADER: &str = "x-amux-process-worker";
-/// Internal verdict header (ai-config#160): `outside`, `remote` or `worker`,
+/// Internal verdict header (ai-config#160): `outside`, `remote`, `worker` or `automation`,
 /// set only by [`attribute`] and stripped from every inbound request first.
 /// The send path records it on the owner's Messages row so `max_ref::row_qualifies` can tell
 /// a send the owner's own browser or phone made from one a worker made with
@@ -112,6 +112,8 @@ pub(crate) enum Origin {
     Worker(String),
     /// A local process whose whole ancestry is outside every amux pane.
     Outside,
+    /// Server-owned jobs are not current human input, even without a worker.
+    Automation,
     /// The owner's remote device: no local process owns the client end and the
     /// peer is not loopback (`forwarded: false`, owner proof), or the
     /// connection was forwarded by this host's root `tailscaled` (tailscale
@@ -134,6 +136,14 @@ pub(crate) trait PeerResolver: Send + Sync {
     fn resolve(&self, conn: Conn) -> Origin;
 }
 
+/// A fresh snapshot of server-owned process boundaries. Workspace PTYs are
+/// created and written only by verified owner input, unlike scheduled shells.
+#[derive(Default)]
+pub(crate) struct InputBoundaries {
+    server_pid: Option<u32>,
+    owner_shells: Vec<u32>,
+}
+
 /// The pane inventory: worker sessions by pane shell pid, and by pane tty.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Panes {
@@ -147,27 +157,43 @@ pub(crate) struct Panes {
 /// shell. A pane of a tmux session NOT named `amux-*` is the owner's own tmux
 /// and the walk continues past it. A chain that breaks, or runs out of steps,
 /// is unattributed, never outside: outside must be proven.
+#[cfg(test)]
 pub(crate) fn classify(
     owners: &[u32],
     panes: &Panes,
     ppid_of: &dyn Fn(u32) -> Option<u32>,
     tty_of: &dyn Fn(u32) -> Option<u64>,
 ) -> Origin {
+    classify_with_server(owners,panes,ppid_of,tty_of,&InputBoundaries::default())
+}
+
+fn classify_with_server(
+    owners: &[u32],
+    panes: &Panes,
+    ppid_of: &dyn Fn(u32) -> Option<u32>,
+    tty_of: &dyn Fn(u32) -> Option<u64>,
+    boundaries: &InputBoundaries,
+) -> Origin {
     if owners.is_empty() {
         return Origin::Unattributed("no local process owns the client socket".into());
     }
     let worker_of = |session: &String| session.strip_prefix("amux-").filter(|w| !w.is_empty()).map(str::to_string);
     let mut broken = None;
+    let mut automation = false;
     for &owner in owners {
         if let Some(worker) = tty_of(owner).and_then(|t| panes.by_tty.get(&t)).and_then(worker_of) {
             return Origin::Worker(worker);
         }
         let mut cur = owner;
         let mut proven = false;
+        let mut server_input=false;
+        let mut owner_shell=false;
         for _ in 0..4096 {
             if let Some(worker) = panes.by_pid.get(&cur).and_then(worker_of) {
                 return Origin::Worker(worker);
             }
+            if Some(cur) == boundaries.server_pid { server_input = true; }
+            if boundaries.owner_shells.contains(&cur) { owner_shell = true; }
             if cur <= 1 {
                 proven = true;
                 break;
@@ -177,12 +203,14 @@ pub(crate) fn classify(
                 _ => break,
             }
         }
+        automation |= server_input && !owner_shell;
         if !proven {
             broken = Some(format!("ancestry of pid {owner} could not be walked to the root (stopped at pid {cur})"));
         }
     }
     match broken {
         Some(why) => Origin::Unattributed(why),
+        None if automation => Origin::Automation,
         None => Origin::Outside,
     }
 }
@@ -203,6 +231,7 @@ pub(crate) struct Scan {
 /// The lookups [`decide`] consults, behind a trait so every branch, including
 /// the failure and forwarding ones, is tested through the shipped decision.
 pub(crate) trait Lookups {
+    fn input_boundaries(&self) -> InputBoundaries { InputBoundaries::default() }
     fn scan(&self, client: SocketAddr, server: SocketAddr, door: &FrontDoor) -> Result<Scan, os::LookupError>;
     /// This host's own interface addresses.
     fn own_addresses(&self) -> Result<Vec<std::net::IpAddr>, String>;
@@ -309,17 +338,17 @@ fn decide(conn: Conn, l: &dyn Lookups) -> Origin {
         return forwarded(peer, &scan, l);
     }
     match needs_inventory(&scan.holders, l) {
-        Ok(false) => return classify(&scan.holders, &Panes::default(), &|p| l.ppid_of(p), &|p| l.tty_of(p)),
+        Ok(false) => return classify_with_server(&scan.holders, &Panes::default(), &|p| l.ppid_of(p), &|p| l.tty_of(p), &l.input_boundaries()),
         Ok(true) => {}
         Err(why) => return Origin::Unattributed(why),
     }
     if let Ok(panes) = l.panes(false) {
-        if let worker @ Origin::Worker(_) = classify(&scan.holders, &panes, &|p| l.ppid_of(p), &|p| l.tty_of(p)) {
+        if let worker @ Origin::Worker(_) = classify_with_server(&scan.holders, &panes, &|p| l.ppid_of(p), &|p| l.tty_of(p), &l.input_boundaries()) {
             return worker;
         }
     }
     match l.panes(true) {
-        Ok(panes) => classify(&scan.holders, &panes, &|p| l.ppid_of(p), &|p| l.tty_of(p)),
+        Ok(panes) => classify_with_server(&scan.holders, &panes, &|p| l.ppid_of(p), &|p| l.tty_of(p), &l.input_boundaries()),
         Err(why) => inventory_failed(peer, scan.holders.len(), &why),
     }
 }
@@ -347,7 +376,7 @@ fn forwarded(peer: SocketAddr, scan: &Scan, l: &dyn Lookups) -> Origin {
             Err(why) => return inventory_failed(peer, scan.front_door.len(), &why),
         };
         for &pid in &scan.front_door {
-            let origin = classify(&[pid], &panes, &|p| l.ppid_of(p), &|p| l.tty_of(p));
+            let origin = classify_with_server(&[pid], &panes, &|p| l.ppid_of(p), &|p| l.tty_of(p), &l.input_boundaries());
             if origin != Origin::Outside {
                 tracing::warn!(%peer, front_door_pid = pid, origin = ?origin, verdict = "tailscale_forward_ambiguous",
                     measured = true, n_considered = scan.front_door.len(),
@@ -366,6 +395,9 @@ fn forwarded(peer: SocketAddr, scan: &Scan, l: &dyn Lookups) -> Origin {
 struct OsLookups;
 
 impl Lookups for OsLookups {
+    fn input_boundaries(&self) -> InputBoundaries {
+        InputBoundaries { server_pid:Some(std::process::id()),owner_shells:super::terminal::owner_shell_pids() }
+    }
     fn scan(&self, client: SocketAddr, server: SocketAddr, door: &FrontDoor) -> Result<Scan, os::LookupError> {
         os::scan(client, server, door)
     }
@@ -418,7 +450,7 @@ impl PeerResolver for OsResolver {
             if let Some(holders) = memo {
                 if !holders.is_empty() && holders.iter().all(|&p| os::holds(p, conn.peer, server)) {
                     if let Ok(panes) = pane_map(false) {
-                        if let worker @ Origin::Worker(_) = classify(&holders, &panes, &os::ppid_of, &os::tty_of) {
+                        if let worker @ Origin::Worker(_) = classify_with_server(&holders, &panes, &os::ppid_of, &os::tty_of, &OsLookups.input_boundaries()) {
                             return worker;
                         }
                     }
@@ -773,6 +805,12 @@ pub async fn attribute(mut req: Request, next: Next) -> Response {
                     why_unmeasured = why, n_considered = 0,
                     "local requests are attributed by headers only on this platform");
             });
+            next.run(req).await
+        }
+        Origin::Automation => {
+            req.headers_mut().insert(PROCESS_ORIGIN_HEADER,HeaderValue::from_static("automation"));
+            tracing::info!(verdict="server_automation_origin", measured=true, n_considered=1,
+                "server-descended request is automation, never current owner typing");
             next.run(req).await
         }
         Origin::Outside => {
@@ -1359,6 +1397,19 @@ mod tests {
         assert_eq!(classify(&[201], &p, &chain, &tty), Origin::Outside, "the owner's own tmux is not a worker");
         assert_eq!(classify(&[301], &p, &chain, &tty), Origin::Outside);
         assert_eq!(classify(&[301, 101], &p, &chain, &tty), Origin::Worker("dev-a".into()), "any worker holder");
+    }
+
+    #[test]
+    fn server_shells_are_automation_but_verified_owner_ptys_keep_their_origin() {
+        let mut p = panes();
+        let boundaries = InputBoundaries { server_pid: Some(300), owner_shells: vec![] };
+        assert_eq!(classify_with_server(&[301], &p, &chain, &tty, &boundaries), Origin::Automation);
+        assert_eq!(classify_with_server(&[301, 201], &p, &chain, &tty, &boundaries), Origin::Automation);
+        assert!(matches!(classify_with_server(&[401], &p, &chain, &tty, &boundaries), Origin::Unattributed(_)));
+        let owner_pty = InputBoundaries { server_pid: Some(300), owner_shells: vec![301] };
+        assert_eq!(classify_with_server(&[301], &p, &chain, &tty, &owner_pty), Origin::Outside);
+        p.by_pid.insert(300, "amux-dev-a".into());
+        assert_eq!(classify_with_server(&[301], &p, &chain, &tty, &owner_pty), Origin::Worker("dev-a".into()), "worker identity outranks an owner shell");
     }
 
     /// Review N1: `amux send &` from a one-shot shell is reparented to launchd,

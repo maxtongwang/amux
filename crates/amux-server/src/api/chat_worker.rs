@@ -213,7 +213,7 @@ pub(crate) async fn companion_route(
     // be recorded as the owner's, so a helper's test message drew an
     // "[amux accountability] ... no board card" nudge as if Ethan had asked.
     // The dashboard sends with no session header and stays the owner's.
-    let from_owner = caller.trim().is_empty();
+    let from_owner = caller.trim().is_empty() && !super::org::is_verified_local_member(headers) && !super::session_verbs::automated_input(headers);
     let origin = if from_owner { SendOrigin::Owner } else { SendOrigin::Automation };
     if !from_owner {
         tracing::info!(session = %key, caller, verdict = "chat_companion_send_from_lane",
@@ -238,7 +238,7 @@ pub(crate) async fn companion_route(
         state,
         worker,
         &text,
-        "chat",
+        super::session_verbs::input_history_type(headers,"chat"),
         if from_owner { "chat-companion" } else { caller },
         true,
         super::session_verbs::DeliveryMeta {

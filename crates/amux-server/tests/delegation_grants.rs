@@ -17,13 +17,27 @@ async fn apply(e: &Env, actor: &str, id: &str, worker: &str, body: Value) -> (ax
     e.call(Who::Worker(actor),"PATCH",&cfg(worker),Some(with_request(body,json!(id)))).await
 }
 
+// A native hook authenticates the provider session, not the composer author.
+// Exercise the owner's actual attributed queued-input route for grant tests.
+async fn owner_reply(e: &Env, text: &str) -> (axum::http::StatusCode,Value) {
+    use tower::ServiceExt;
+    use axum::{body::Body,http::{Request,header}};
+    let mut req=Request::builder().method("POST").uri(format!("/api/sessions/{MAX_PANE}/steer"))
+        .header(header::CONTENT_TYPE,"application/json")
+        .body(Body::from(json!({"text":text,"record_history":true,"no_board":true,"delay_s":3600}).to_string())).unwrap();
+    req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([192,0,2,1],42105))));
+    let res=e.app.clone().oneshot(req).await.unwrap(); let status=res.status();
+    let bytes=axum::body::to_bytes(res.into_body(),usize::MAX).await.unwrap();
+    (status,serde_json::from_slice(&bytes).unwrap())
+}
+
 // Read the recorder's result directly: GET request/list reconciles missed
 // replies and would hide a disconnected post-recording resolver.
 fn recorded_resolution(e: &Env, code: &str) -> i64 {
     let conn=e.store.read().unwrap();
     let row: i64=conn.query_row(
-        "SELECT id FROM cmd_history WHERE session=?1 AND delivery='pane' ORDER BY id DESC LIMIT 1",
-        [MAX_PANE],|r|r.get(0)).expect("applied owner hook must record a pane message");
+        "SELECT id FROM cmd_history WHERE session=?1 AND COALESCE(delegation_message_type,type)='user' ORDER BY id DESC LIMIT 1",
+        [MAX_PANE],|r|r.get(0)).expect("verified owner route must record a message");
     let (count,actual):(i64,Option<String>)=conn.query_row(
         "SELECT COUNT(*),MIN(code) FROM _amux_delegation_resolutions WHERE reply_row=?1",
         [row],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
@@ -58,7 +72,7 @@ async fn approval_yes_is_bound_to_the_shown_session_and_requesting_actor() {
     e.type_in_pane(DEV_A,"yes").await;
     let (st,v)=apply(&e,DEV_LEAD,&id,DEV_B,json!({"tags":""})).await;
     assert_code(st,&v,"request_unresolved","another session cannot fund an owner-session question");
-    e.type_in_pane(MAX_PANE,"approve").await;
+    owner_reply(&e,"approve").await;
     recorded_resolution(&e,"request_resolved");
     let (st,v)=apply(&e,MRPOPO,&id,DEV_B,json!({"tags":""})).await;
     assert_code(st,&v,"request_actor_identity_changed","another actor cannot cite the request");
@@ -70,13 +84,13 @@ async fn approval_yes_is_bound_to_the_shown_session_and_requesting_actor() {
 async fn newer_unanswered_request_gets_yes_and_older_window_never_does() {
     let e=setup().await;
     let old=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
-    let wait=e.seed_pane_prompt(MAX_PANE,"wait",now_s());
+    let wait=e.seed_owner_send(MAX_PANE,"wait",now_s(),Some("outside"));
     e.store.write(move|c| {
         c.execute("UPDATE cmd_history SET type='steering',delegation_message_type='user' WHERE id=?1",[wait])?;
         Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
     }).unwrap();
     let new=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"toggle_yolo":true})).await;
-    e.seed_pane_prompt(MAX_PANE,"yes",now_s());
+    e.seed_owner_send(MAX_PANE,"yes",now_s(),Some("outside"));
     let (st,v)=apply(&e,DEV_LEAD,&old,DEV_B,json!({"tags":""})).await;
     assert_code(st,&v,"request_reply_not_affirmative","old unanswered question cannot catch a later yes");
     let (st,v)=apply(&e,MRPOPO,&new,DEV_A,json!({"toggle_yolo":true})).await;
@@ -89,11 +103,11 @@ async fn peer_echo_no_never_reopens_refused_request_p1() {
     let e=setup().await;
     let before=e.config_snapshot();
     let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
-    e.type_in_pane(MAX_PANE,"no").await;
+    owner_reply(&e,"no").await;
     let no=recorded_resolution(&e,"request_reply_not_affirmative");
     // P1: the exact row shape send_post records for a peer's direct send.
     e.seed_row(MAX_PANE,"no","session",DEV_LEAD,Some("direct"),now_s());
-    e.type_in_pane(MAX_PANE,"yes").await;
+    owner_reply(&e,"yes").await;
     // Try the actual mutation before checking the no-candidate audit record:
     // on 960da3c7 this returns 200 and removes the worker's dev tag.
     let (st,v)=apply(&e,DEV_LEAD,&id,DEV_B,json!({"tags":""})).await;
@@ -115,7 +129,7 @@ async fn peer_rows_preserve_windows_but_uncertain_user_shapes_close_them() {
     // Legacy user/chat rows without owner proof are uncertain input boundaries.
     for (ty,projected) in [("session",false),("chat",false),("user",false),("session",true)] {
         let e=setup().await;
-        e.type_in_pane(MAX_PANE,"wait").await;
+        owner_reply(&e,"wait").await;
         recorded_resolution(&e,"request_reply_not_affirmative");
         let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
         let peer=e.seed_row(MAX_PANE,"no",ty,DEV_LEAD,Some("direct"),now_s());
@@ -125,7 +139,7 @@ async fn peer_rows_preserve_windows_but_uncertain_user_shapes_close_them() {
                 Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
             }).unwrap();
         }
-        e.type_in_pane(MAX_PANE,"yes").await;
+        owner_reply(&e,"yes").await;
         recorded_resolution(&e,if ty == "session" { "request_resolved" } else { "request_no_candidate" });
         let (st,v)=apply(&e,DEV_LEAD,&id,DEV_B,json!({"tags":""})).await;
         if ty == "session" {
@@ -153,7 +167,7 @@ async fn refused_request_is_never_a_later_candidate_without_a_prior_boundary() {
                 rusqlite::params![request,refusal])?;
             Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
         }).unwrap();
-        e.type_in_pane(MAX_PANE,"yes").await;
+        owner_reply(&e,"yes").await;
         let (st,v)=apply(&e,DEV_LEAD,&id,DEV_B,json!({"tags":""})).await;
         assert_code(st,&v,code,"a refused pending row cannot become a candidate again");
         recorded_resolution(&e,"request_no_candidate");
@@ -198,7 +212,7 @@ async fn two_displayed_requests_fund_only_the_latest() {
     let e=setup().await;
     let a=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
     let b=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"toggle_yolo":true})).await;
-    e.seed_pane_prompt(MAX_PANE,"yes",now_s());
+    e.seed_owner_send(MAX_PANE,"yes",now_s(),Some("outside"));
     let (st,v)=apply(&e,DEV_LEAD,&a,DEV_B,json!({"tags":""})).await;
     assert_code(st,&v,"request_unresolved","older display cannot catch the latest display's reply");
     let (st,v)=apply(&e,MRPOPO,&b,DEV_A,json!({"toggle_yolo":true})).await;
@@ -209,8 +223,8 @@ async fn two_displayed_requests_fund_only_the_latest() {
 #[tokio::test]
 async fn yes_with_no_shown_candidate_funds_nothing_and_is_observable() {
     let e=setup().await;
-    // Actual hook path invokes the resolver even with no existing requests.
-    let (st,v)=e.type_in_pane(MAX_PANE,"yes").await;
+    // Actual attributed owner route invokes the resolver even with no requests.
+    let (st,v)=owner_reply(&e,"yes").await;
     assert_allowed(st,&v,"record human yes");
     recorded_resolution(&e,"request_no_candidate");
     let (st,v)=e.call(Who::Worker(MRPOPO),"GET","/api/delegation/requests",None).await;
@@ -299,7 +313,7 @@ async fn nonaffirmative_replies_and_unshown_requests_never_fund() {
     for text in ["no","wait","yes?","yes, don't proceed","yes but not yet"] {
         let e=setup().await;
         let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"})).await;
-        e.seed_pane_prompt(MAX_PANE,text,now_s());
+        e.seed_owner_send(MAX_PANE,text,now_s(),Some("outside"));
         let (st,v)=apply(&e,MRPOPO,&id,DEV_A,json!({"worktree_verify":"one"})).await;
         assert_code(st,&v,"request_reply_not_affirmative",text);
     }
@@ -307,7 +321,7 @@ async fn nonaffirmative_replies_and_unshown_requests_never_fund() {
     let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"})).await;
     let i=id.clone();
     e.store.write(move|c| {c.execute("UPDATE _amux_delegation_grants SET shown_row=NULL WHERE code=?1",[i])?;Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})}).unwrap();
-    e.seed_pane_prompt(MAX_PANE,"yes",now_s());
+    e.seed_owner_send(MAX_PANE,"yes",now_s(),Some("outside"));
     let (st,v)=apply(&e,MRPOPO,&id,DEV_A,json!({"worktree_verify":"one"})).await;
     assert_code(st,&v,"request_not_shown","no shown message means no authority");
 }
@@ -336,7 +350,7 @@ async fn shown_message_must_still_exist_in_the_bound_reply_session() {
         c.execute("DELETE FROM cmd_history WHERE id=(SELECT shown_row FROM _amux_delegation_grants WHERE code=?1)",[i])?;
         Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
     }).unwrap();
-    e.seed_pane_prompt(MAX_PANE,"yes",now_s());
+    e.seed_owner_send(MAX_PANE,"yes",now_s(),Some("outside"));
     let (st,v)=apply(&e,MRPOPO,&id,DEV_A,json!({"worktree_verify":"one"})).await;
     assert_code(st,&v,"request_not_shown","a dangling shown-row reference is not a visible question");
     assert_eq!(e.grant_status(&id),"pending");
@@ -406,8 +420,8 @@ async fn owner_undo_is_not_stranded_when_the_asking_worker_retires() {
 async fn project_steering_projection_preserves_owner_but_never_peer_authorship() {
     let e=setup().await;
     let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"})).await;
-    let (st,v)=e.type_in_pane(MAX_PANE,"approve").await;
-    assert_allowed(st,&v,"record actual owner reply through the hook");
+    let (st,v)=owner_reply(&e,"approve").await;
+    assert_allowed(st,&v,"record actual owner reply through the attributed route");
     let row=recorded_resolution(&e,"request_resolved");
     assert_eq!(view(&e,&id).await["resolution_row"],row);
     {
@@ -431,7 +445,7 @@ async fn project_steering_projection_preserves_owner_but_never_peer_authorship()
     }).unwrap();
     let (st,v)=apply(&e,MRPOPO,&next,DEV_B,json!({"worktree_verify":"two"})).await;
     assert_code(st,&v,"request_unresolved","peer steering is still not owner input");
-    let (st,v)=e.type_in_pane(MAX_PANE,"go ahead").await;
+    let (st,v)=owner_reply(&e,"go ahead").await;
     assert_allowed(st,&v,"record the actual owner control");
     recorded_resolution(&e,"request_resolved");
     let (st,v)=apply(&e,MRPOPO,&next,DEV_B,json!({"worktree_verify":"two"})).await;

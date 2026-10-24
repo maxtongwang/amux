@@ -2534,6 +2534,7 @@ pub async fn keys_worker(
         Ok(n) => n,
         Err(r) => return r,
     };
+    if let Some(refusal)=crate::api::delegation_requests::owner_keys_refusal(&name,&headers) { return refusal; }
     let body = match crate::api::fs::parse_body(&body_bytes) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
@@ -2545,7 +2546,7 @@ pub async fn keys_worker(
         Ok(g) => g,
         Err(r) => return r,
     };
-    let resp = crate::api::session_verbs::keys_verb(&name, &headers, &body).await;
+    let resp = crate::api::session_verbs::keys_verb(&state, &name, &headers, &body).await;
     if let Some(g) = grant.filter(|_| resp.status().is_success()) {
         g.commit(&state, json!({"name": name}), json!({"keys": body.get("keys")}));
     }

@@ -105,8 +105,8 @@ closes the window without funding a request even if the control succeeds.
 Steer and Chat still reject empty text and retain the same nonfunding boundary.
 Default CLI `source_session` relays keep peer provenance through history opt-out,
 refusal and duplicate transport IDs; they do not consume an owner reply window.
-Native input retains its original `delegation_message_type='user'` when project
-execution projects its display type to `steering`. A future display row cannot
+Owner sends retain their original `delegation_message_type='user'` when project
+execution projects their display type to `steering`. A future display row cannot
 skip current input reconciliation or satisfy the strict reply row ordering.
 
 Owner input with missing/uncertain provenance also closes the window, without
@@ -116,20 +116,40 @@ Such input records `request_reply_not_owner_input`; a later yes cannot reuse
 the display. Verified peer history retains `type=session`, including when its
 sender explicitly requests history. Legacy user/chat rows lacking owner proof
 are treated conservatively as uncertain input rather than silently ignored.
+Known peers/members use session provenance on success, failed sends and direct
+Chat-tab sends. A recorded owner-worker self-send remains non-owner input:
+its original delegation_message_type prevents misclassifying it as output.
+Refused or empty owner input reconciles its closing boundary before the route
+returns; a later GET or native hook is not needed to publish the closure.
 
-Verified owner process input never becomes a peer copy by matching message
-text. Native owner input commits with native run/provider/sequence acceptance,
-using the current launch incarnation and an explicit `prompt_truncated:false`
-from the hook. The hook preserves the native `session_id` for both terminal
-and provider Remote Control submissions; both use the same submit route and
-require a preceding pane or Messages receipt. Old hooks without truncation
-evidence close the window and fund nothing. The bundled observer is adopted
-by the existing native-status recovery path. Accepted input and discarded
-markers publish Message events, so the Messages view can show the boundary.
-Spool replay records input in the acceptance transaction before ACK deletion;
-failed input writes roll back acceptance, and failed reconciliation retains
-the spool. Replayed/rejected submit observations can close a newly opened
-window but cannot fund it or rearm an old receipt.
+Verified owner process input never becomes a peer copy by matching text.
+A native hook proves which provider session submitted, not who supplied its
+composer bytes. **Native terminal and provider Remote Control input alone
+cannot approve a request.** Unknown native input commits an
+`approval_input_uncertain` boundary with native acceptance and funds nothing.
+Use a verified owner Messages, CLI, phone, Chat-tab or recorded steer send for
+a typed approval. A preceding display receipt remains mandatory.
+
+Every programmatic text delivery into the managed owner pane records an
+incarnation-bound `approval_transport` receipt before transport. The pane
+receives `[amux-input-receipt:<nonce>]` followed by the delivered text. The
+native observer's exact receipt identifies a non-owner transport echo: it
+neither closes nor funds a question, including on direct/spool replay, after a
+restart, and with an incomplete body. Body text, recent-message similarity and
+absence of a worker header never establish human authorship. An unknown,
+malformed or wrong-incarnation receipt closes the window without funding it.
+A receipt write failure refuses transport; the failure is logged and retained.
+Non-owner bare slash commands into the managed owner pane are refused because
+prefixing a receipt would change command semantics. A directly verified owner
+send retains bare-command behavior; queued commands without fresh owner proof
+must use the owner's native terminal.
+
+Schedules and the goal keeper still reach isolated workers verbatim using
+Owner **transport**. Their passive hooks are status only; neither the transport
+label nor their standing owner configuration is approval provenance. They
+cannot close or fund an approval. Managed deliveries use the non-owner receipt.
+Accepted unknown-input markers publish Message events. Reconciliation failure
+retains the spool; replay cannot fund twice or rearm a display.
 
 The pending request must point to that latest event row, have no resolution row
 or refusal code, and precede the reply strictly. Two displayed questions select
@@ -163,7 +183,7 @@ manufacture one from an input row.
 
 | Entry point | Evidence |
 | --- | --- |
-| Native pane/provider Remote Control/raw terminal input | Applied `UserPromptSubmit` → `pane_prompts::record`; only bound owner-session provenance can answer |
+| Native pane/provider Remote Control/raw terminal input | Unknown author closes without funding; a valid programmatic receipt does neither |
 | Dashboard, phone/Remote, owner CLI `/send`; worker-ID alias | Verified owner direct/queued history, including chat-type workers |
 | Chat tab `{worker}@chat/send` | `chat` row in the parent worker's history with verified owner provenance |
 | Recorded `/steer` | Queued owner provenance |
@@ -177,6 +197,30 @@ and no relay source (`owner_send_history_defaulted`). Explicit
 automation and failed/board-routed sends cannot supply approval replies.
 Passkey mode still requires direct Remote proof at application; pane approval
 alone cannot apply it. `amux grant CODE` is not a reply selector.
+
+Raw key injection into the owner session requires verified owner process
+origin, even for its own worker process, same-group leads and Chat relays.
+`owner_session_keys_refused` is returned before general delegation and logged
+at WARN. The legacy session route and worker-ID route share this boundary.
+Bash `amux send --keys` uses the attributed API, with no tmux fallback or control
+retry after an uncertain ACK. Low-level key/literal writers require a matching
+incarnation scope from verified owner input or a recorded text transport.
+Owner Enter records a nonfunding boundary; refused peer Enter leaves the
+question open. The Workspace shell create/input routes also require owner
+origin so a peer cannot use a server-side shell to drive the owner pane.
+Server-descended API clients are classified as automation, including workerless
+shell schedules. Scheduled shells also export `AMUX_INPUT_SOURCE=automation`;
+the CLI forwards this demotion on every request, including after server restart
+or shell reparenting. Neither origin can fund or close a question. Verified
+owner-created Workspace PTYs preserve the owner's CLI origin; any worker
+ancestry still takes precedence. A client hint can only remove owner proof.
+
+Sweep regressions are in `api/delegation_reply_tests.rs`. No-Cargo checks:
+`python3 -B scripts/test-owner-input-origin.py` executes the shipped CLI functions
+with transport fixtures and compiles the actual pure provenance predicate with
+rustc. `python3 -B scripts/test-delegation-reply-window.py` executes actual SQL,
+including receipt identity and SIGKILL durability. They do not replace Rust
+router tests or workspace checks.
 
 ## Storage and recovery
 

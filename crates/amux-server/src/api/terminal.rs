@@ -30,7 +30,7 @@
 
 use super::AppState;
 use axum::extract::{Path as AxPath, Query};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -71,6 +71,20 @@ struct Shared {
 fn store() -> &'static Mutex<HashMap<String, Session>> {
     static S: OnceLock<Mutex<HashMap<String, Session>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Only this owner-only API can create or feed these PTYs. Their CLI calls
+/// retain owner transport; a server shell schedule has no entry in this set.
+pub(crate) fn owner_shell_pids() -> Vec<u32> {
+    match store().lock() {
+        Ok(sessions)=>sessions.values().filter(|s|s.shared.alive.load(Ordering::SeqCst))
+            .filter_map(|s|s.child.process_id()).collect(),
+        Err(_)=>{
+            tracing::warn!(verdict="owner_shell_identity_unavailable", measured=false, n_considered=0,
+                "owner PTY inventory unavailable; server ancestry cannot establish owner input");
+            vec![]
+        },
+    }
 }
 
 /// Monotonic id counter — the id only needs to be unique + unguessable-enough
@@ -121,7 +135,25 @@ fn def_rows() -> u16 {
     30
 }
 
-async fn create(body: Option<Json<CreateBody>>) -> Response {
+#[cfg(test)]
+static TEST_NO_PTY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(super) struct NoPtyGuard;
+
+#[cfg(test)]
+pub(super) fn deny_test_spawn() -> NoPtyGuard {
+    assert!(!TEST_NO_PTY.swap(true,Ordering::SeqCst));
+    NoPtyGuard
+}
+
+#[cfg(test)]
+impl Drop for NoPtyGuard {
+    fn drop(&mut self) { TEST_NO_PTY.store(false,Ordering::SeqCst); }
+}
+
+async fn create(headers: HeaderMap, body: Option<Json<CreateBody>>) -> Response {
+    if let Some(refusal)=super::delegation_requests::owner_keys_refusal(super::delegation::OWNER_AGENT,&headers) { return refusal; }
     let CreateBody { cols, rows } = body.map(|Json(b)| b).unwrap_or(CreateBody {
         cols: def_cols(),
         rows: def_rows(),
@@ -143,6 +175,8 @@ async fn create(body: Option<Json<CreateBody>>) -> Response {
 }
 
 fn spawn_pty(cols: u16, rows: u16) -> Result<String, String> {
+    #[cfg(test)]
+    if TEST_NO_PTY.load(Ordering::SeqCst) { return Err("test fixture forbids real PTY creation".into()); }
     let size = PtySize {
         rows: rows.max(1),
         cols: cols.max(1),
@@ -220,7 +254,8 @@ struct InputBody {
     data: String,
 }
 
-async fn input(AxPath(id): AxPath<String>, body: Option<Json<InputBody>>) -> Response {
+async fn input(AxPath(id): AxPath<String>, headers: HeaderMap, body: Option<Json<InputBody>>) -> Response {
+    if let Some(refusal)=super::delegation_requests::owner_keys_refusal(super::delegation::OWNER_AGENT,&headers) { return refusal; }
     let data = body.map(|Json(b)| b.data).unwrap_or_default();
     let res = tokio::task::spawn_blocking(move || -> Result<bool, String> {
         let bytes = crate::integrations::email::base64url_decode(&data)

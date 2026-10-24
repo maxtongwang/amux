@@ -18,6 +18,94 @@ pub(crate) fn incarnation(name: &str) -> Option<String> {
     super::rename_identity::incarnation(&crate::config::amux_home(), name)
 }
 
+/// Names route requests; the current stable incarnation identifies the owner
+/// even through a rename alias. Missing identity never exempts the reserved name.
+pub(crate) fn is_owner_session(name: &str) -> bool {
+    let home = crate::config::amux_home();
+    let owner = super::rename_identity::current_name(&home, OWNER_AGENT).unwrap_or_else(|| OWNER_AGENT.into());
+    name == OWNER_AGENT || name == owner || incarnation(&owner).is_some_and(|id| incarnation(name).as_deref() == Some(id.as_str()))
+}
+
+/// A peer (including mrpopo's own process or a Chat relay) is not Max's hands.
+/// Apply before the general delegation policy, which can permit self/config.
+pub(crate) fn owner_keys_refusal(name: &str, headers: &HeaderMap) -> Option<Response> {
+    if !is_owner_session(name) || super::session_verbs::owner_input_process_origin(headers).is_some() { return None; }
+    tracing::warn!(session=name, incarnation=?incarnation(name), verdict="owner_session_keys_refused", measured=true, n_considered=1,
+        "non-owner raw input refused before reaching the owner pane");
+    Some(refusal("owner_session_keys_refused", "only verified owner input may inject keys into the owner session"))
+}
+
+pub(crate) fn owner_raw_text_refusal(name: &str, headers: &HeaderMap, text: &str) -> Option<Response> {
+    if text.trim().is_empty() || text.chars().any(|c|c.is_control() && c!='\n' && c!='\t') {
+        return owner_keys_refusal(name,headers);
+    }
+    None
+}
+
+const TRANSPORT_RECEIPT_PREFIX: &str = "[amux-input-receipt:";
+/// rename_identity::new_incarnation encodes a 128-bit random nonce as hex.
+const TRANSPORT_RECEIPT_HEX_CHARS: usize = 32;
+
+/// Every programmatic delivery into the managed owner pane carries a durable,
+/// incarnation-bound receipt. It identifies a transport echo, never
+/// a human reply. No text/history similarity participates in this decision.
+pub(crate) fn transport_text(state: &AppState, session: &str, text: &str, owner_origin: bool) -> Result<String, String> {
+    if !is_owner_session(session) { return Ok(text.into()); }
+    if !owner_origin && (text.trim().is_empty() || text.chars().any(|c|c.is_control() && c!='\n' && c!='\t')) {
+        tracing::warn!(session, verdict="owner_session_keys_refused", measured=true, n_considered=1,
+            "raw control bytes in non-owner text refused before transport");
+        return Err("owner_session_keys_refused: non-owner text may not inject raw control bytes into the owner pane".into());
+    }
+    if super::session_verbs::session_is_isolated(session) || text.is_empty() { return Ok(text.into()); }
+    // A prefix changes slash-command semantics. Fail before typing rather than
+    // deliver an unidentifiable native submission or silently alter a command.
+    if super::session_verbs::is_slash_command(text) {
+        if owner_origin { return Ok(text.into()); }
+        tracing::warn!(session, verdict="owner_session_unverified_command_refused", measured=true, n_considered=1,
+            "owner pane slash command has no origin-preserving transport");
+        return Err("owner_session_unverified_command_refused: use the owner's native terminal for slash commands".into());
+    }
+    let identity=incarnation(session).ok_or("owner input transport incarnation missing")?;
+    let token=super::rename_identity::new_incarnation().map_err(|e|e.to_string())?;
+    let (lane,nonce)=(session.to_string(),token.clone());
+    state.store.write(move |conn| {
+        super::session_verbs::ensure_fleet_tables(conn)?;
+        conn.execute("INSERT INTO cmd_history(session,msg_id,text,type,origin,delivery,ts,delegation_session_incarnation,delegation_message_type) VALUES(?1,?2,'Programmatic pane input: not an approval','session','amux','approval_transport',?3,?4,'session')",
+            rusqlite::params![lane,nonce,(crate::config::now_f64()*1000.0) as i64,identity])?;
+        Ok(crate::db::WriteOutcome { applied:true, events:vec![] })
+    }).map_err(|e|e.to_string())?;
+    tracing::info!(session, verdict="owner_pane_transport_non_owner", measured=true, n_considered=1,
+        "programmatic pane delivery recorded as non-owner before transport");
+    Ok(format!("{TRANSPORT_RECEIPT_PREFIX}{token}]\n\n{text}"))
+}
+
+fn known_transport(conn: &rusqlite::Connection, session: &str, prompt: &str, identity: &str) -> rusqlite::Result<bool> {
+    // Provider paste wrapping is transport, not provenance. Accept a receipt
+    // only as the first body line, never from quoted text further down.
+    let prompt=prompt.trim_start();
+    let prompt=if prompt.starts_with("<pasted_content ") {
+        prompt.split_once('>').map(|(_,p)|p.trim_start()).unwrap_or("")
+    } else { prompt };
+    let Some((token,_))=prompt.strip_prefix(TRANSPORT_RECEIPT_PREFIX).and_then(|s|s.split_once(']')) else { return Ok(false); };
+    if token.len()!=TRANSPORT_RECEIPT_HEX_CHARS || !token.bytes().all(|b|b.is_ascii_hexdigit()) { return Ok(false); }
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM cmd_history WHERE session=?1 AND msg_id=?2 AND delivery='approval_transport' AND delegation_session_incarnation=?3)",
+        rusqlite::params![session,token,identity],|r|r.get(0))
+}
+
+/// Rejected/replayed observations of a known programmatic delivery stay
+/// non-owner too. Never turn spool replay into a human-input boundary.
+pub(crate) fn discarded_native_input(state: &AppState, session: &str, event: &Value, reason: &str) -> Result<(), String> {
+    let known={
+        let conn=state.store.read().map_err(|e|e.to_string())?;
+        match incarnation(session) {
+            Some(identity)=>known_transport(&conn,session,event["prompt"].as_str().unwrap_or(""),&identity).map_err(|e|e.to_string())?,
+            None=>false,
+        }
+    };
+    if known { return Ok(()); }
+    discarded_input(state,session,reason)
+}
+
 /// Structured operands, including the effective direction of toggles. Metadata
 /// is excluded; paths and methods are also compared at the captured boundary.
 pub(crate) fn change(target: &Target, action: &Action, body: Option<&Value>) -> Value {
@@ -209,41 +297,33 @@ pub(crate) fn discarded_send(state: &AppState, session: &str, headers: &HeaderMa
 
 pub(crate) fn discarded_input(state: &AppState, session: &str, reason: &str) -> Result<(), String> {
     if session != OWNER_AGENT || super::session_verbs::session_is_isolated(session) { return Ok(()); }
+    let owner=session;
     let (session,reason)=(session.to_string(),reason.to_string());
     state.store.write(move |conn| {
         let open:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM _amux_delegation_grants WHERE reply_session=?1 AND shown_row IS NOT NULL AND status='pending' AND resolution_row IS NULL AND resolution_code IS NULL)",[&session],|r|r.get(0))?;
         if !open { return Ok(crate::db::WriteOutcome { applied:false, events:vec![] }); }
         input_boundary(conn,&session,&reason)?;
         Ok(crate::db::WriteOutcome { applied:true, events:vec![input_event(conn.last_insert_rowid())] })
-    }).map(|_| ()).map_err(|e| e.to_string())
+    }).map_err(|e| e.to_string())?;
+    // The refused/empty owner route must publish its closure before returning;
+    // a later send must not have to recover this marker to make it observable.
+    resolve_session(state,owner)
 }
 
-/// Native run/provider/sequence validation has already succeeded. Owner input
-/// and native acceptance commit together, including on spool recovery. Never
-/// compare a proven owner prompt with delivery/history text (P5 pre-echo).
+/// Native run/provider/sequence proof authenticates the observer, not the
+/// composer author. Transport echoes do nothing; unknown native input closes
+/// the window. Only the separately recorded owner-origin send can fund it.
 pub(crate) fn native_owner_input(conn: &rusqlite::Connection, session: &str, event: &Value, launch: &Value) -> rusqlite::Result<Option<i64>> {
     if session != OWNER_AGENT || super::session_verbs::session_is_isolated(session) { return Ok(None); }
     let identity=incarnation(session);
     let prompt=event["prompt"].as_str().unwrap_or("");
-    let verdict=super::pane_prompts::classify(prompt,&[]);
-    let proven=identity.is_some() && launch["incarnation"].as_str()==identity.as_deref()
-        && event["subagent"] != true && event["worker_type"] != amux_core::worker_type::WorkerTypeId::CHAT
-        && event["prompt_truncated"].as_bool() == Some(false);
-    if !proven || !super::session_verbs::scoped_gate_on(session,super::pane_prompts::GATE_KEY)
-        || verdict != super::pane_prompts::PaneVerdict::Record
-        || prompt.chars().count()>super::pane_prompts::MAX_PROMPT_CHARS {
-        let reason=if event["prompt_truncated"].as_bool() != Some(false) { "prompt_incomplete" }
-            else if !proven { "native_owner_proof_missing" }
-            else if prompt.chars().count()>super::pane_prompts::MAX_PROMPT_CHARS { "prompt_too_large" }
-            else if verdict == super::pane_prompts::PaneVerdict::Record { "history_disabled" }
-            else { verdict.as_str() };
-        input_boundary(conn,session,reason)?;
-        return Ok(Some(conn.last_insert_rowid()));
+    let proven=identity.is_some() && launch["incarnation"].as_str()==identity.as_deref();
+    if proven && known_transport(conn,session,prompt,identity.as_deref().expect("proven identity"))? {
+        tracing::info!(session, verdict="owner_pane_transport_observed", measured=true, n_considered=1,
+            "non-owner transport echo neither closes nor funds an approval");
+        return Ok(None);
     }
-    let text=super::session_verbs::redact_secrets(prompt.trim());
-    conn.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts,delivered_at,submit_verdict,delegation_session_incarnation,delegation_message_type) VALUES(?1,?2,'user','pane','pane',?3,?3,'confirmed',?4,'user')", rusqlite::params![session,text,(event["event_ts"].as_f64().unwrap_or(0.0)*1000.0) as i64,identity])?;
-    tracing::info!(session,reply_row=conn.last_insert_rowid(),message_type="user",verdict="delegation_owner_native_input",measured=true,n_considered=1,
-        "native owner input retained independently of matching peer text");
+    input_boundary(conn,session,"native_owner_origin_unverified")?;
     Ok(Some(conn.last_insert_rowid()))
 }
 
@@ -325,7 +405,7 @@ fn resolve_reply(state: &AppState, row: &max_ref::Row, owner_input: bool) -> Res
         }
         // Read the ledger, not processed outcomes: missed hooks cannot leave a
         // window open. Peer deliveries are not owner input or owner output.
-        let latest: i64 = conn.query_row("SELECT COALESCE(MAX(id),0) FROM cmd_history WHERE session=?1 AND id<?2 AND (delivery IN ('approval_display','approval_pane_display') OR COALESCE(delegation_message_type,type) IN ('user','chat') OR type='assistant' OR (type='session' AND origin=session AND delivery<>'approval_request'))", rusqlite::params![session, reply], |r| r.get(0))?;
+        let latest: i64 = conn.query_row("SELECT COALESCE(MAX(id),0) FROM cmd_history WHERE session=?1 AND id<?2 AND (delivery IN ('approval_display','approval_pane_display') OR COALESCE(delegation_message_type,type) IN ('user','chat') OR type='assistant' OR (type='session' AND delegation_message_type IS NULL AND origin=session AND delivery<>'approval_request'))", rusqlite::params![session, reply], |r| r.get(0))?;
         let candidates: Vec<(String, String, i64)> = {
             let mut st = conn.prepare("SELECT code,reply_incarnation,(SELECT ts FROM cmd_history WHERE id=shown_row) FROM _amux_delegation_grants WHERE reply_session=?1 AND shown_row=?2 AND shown_row<?3 AND status='pending' AND resolution_row IS NULL AND resolution_code IS NULL ORDER BY shown_row DESC")?;
             let rows = st.query_map(rusqlite::params![if owner_reply || (!owner_input && session == OWNER_AGENT) { session.as_str() } else { "" }, latest, reply], |r| Ok((r.get(0)?,r.get(1)?,r.get::<_, Option<i64>>(2)?.unwrap_or(i64::MAX))))?;

@@ -82,6 +82,12 @@ class ReplyWindowStorage(unittest.TestCase):
         self.message("notice", "session", "lead", "direct", process="worker")
         self.assertEqual([r[0] for r in self.eligible(self.message("yes"))], ["REQ1"])
 
+    def test_recorded_owner_worker_self_send_is_non_owner_input(self):
+        self.request()
+        row=self.message("yes","session","desk","direct")
+        self.conn.execute("UPDATE cmd_history SET delegation_message_type='session' WHERE id=?",[row])
+        self.assertEqual([r[0] for r in self.eligible(self.message("yes"))],["REQ1"])
+
     def test_uncertain_or_discarded_owner_input_closes_window_without_resolution(self):
         for delivery in ["approval_input_uncertain", "direct", "queued", "unknown"]:
             with self.subTest(delivery=delivery):
@@ -111,12 +117,44 @@ class ReplyWindowStorage(unittest.TestCase):
                 self.assertIn((reply,), self.conn.execute(query, ["desk", 501]).fetchall())
                 self.assertEqual(self.eligible(reply), [])
 
-    def test_native_owner_authorship_survives_steering_projection(self):
-        self.conn.execute("ALTER TABLE cmd_history ADD COLUMN submit_verdict TEXT")
-        query = schema.source_sql(REQUESTS, "INSERT INTO cmd_history(session,text,type,origin,delivery,ts,delivered_at,submit_verdict,delegation_session_incarnation")
-        reply = self.conn.execute(query, ["desk", "yes", 2000, "inc-desk"]).lastrowid
-        self.conn.execute("UPDATE cmd_history SET type='steering' WHERE id=?", [reply])
-        self.assertEqual(self.conn.execute("SELECT delegation_message_type FROM cmd_history WHERE id=?", [reply]).fetchone(), ("user",))
+    def test_transport_receipt_is_non_owner_and_incarnation_bound(self):
+        for col in ["msg_id TEXT", "submit_verdict TEXT"]:
+            self.conn.execute("ALTER TABLE cmd_history ADD COLUMN " + col)
+        query = schema.source_sql(REQUESTS, "INSERT INTO cmd_history(session,msg_id,text,type,origin,delivery,ts,delegation_session_incarnation,delegation_message_type)")
+        known = schema.source_sql(REQUESTS, "SELECT EXISTS(SELECT 1 FROM cmd_history WHERE session=?1 AND msg_id=?2 AND delivery='approval_transport'")
+        self.request()
+        token = "a" * 32
+        row = self.conn.execute(query, ["desk", token, 2000, "inc-desk"]).lastrowid
+        self.assertEqual(self.conn.execute(known, ["desk",token,"inc-desk"]).fetchone(), (1,))
+        for args in [["desk",token,"old-inc"], ["other",token,"inc-desk"], ["desk","b"*32,"inc-desk"]]:
+            self.assertEqual(self.conn.execute(known,args).fetchone(), (0,))
+        self.assertEqual(self.conn.execute("SELECT delegation_message_type,process_origin FROM cmd_history WHERE id=?",[row]).fetchone(), ("session",None))
+        self.assertEqual([r[0] for r in self.eligible(self.message("yes"))], ["REQ1"])
+
+    def test_unverified_native_boundary_cannot_fund_or_leave_window_open(self):
+        query = schema.source_sql(REQUESTS, "INSERT INTO cmd_history(session,text,type,origin,delivery,ts) VALUES(?1,'Discarded or uncertain owner input'")
+        self.request()
+        self.conn.execute(query, ["desk",2000])
+        self.assertEqual(self.eligible(self.message("yes")), [])
+
+    def test_transport_receipt_survives_sigkill_without_owner_provenance(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="owner-transport-crash-") as tmp:
+            database = Path(tmp) / "receipt.db"
+            with sqlite3.connect(database) as conn:
+                schema.migrate(conn)
+                conn.execute("ALTER TABLE cmd_history ADD COLUMN msg_id TEXT")
+            query = schema.source_sql(REQUESTS, "INSERT INTO cmd_history(session,msg_id,text,type,origin,delivery,ts,delegation_session_incarnation,delegation_message_type)")
+            known = schema.source_sql(REQUESTS, "SELECT EXISTS(SELECT 1 FROM cmd_history WHERE session=?1 AND msg_id=?2 AND delivery='approval_transport'")
+            args = ["desk", "a"*32, 2000, "inc-desk"]
+            schema.crash_probe(database,query,args,False)
+            with sqlite3.connect(database) as conn:
+                self.assertEqual(conn.execute(known,["desk",args[1],"inc-desk"]).fetchone(),(0,))
+            schema.crash_probe(database,query,args,True)
+            with sqlite3.connect(database) as conn:
+                for _ in range(2):
+                    self.assertEqual(conn.execute(known,["desk",args[1],"inc-desk"]).fetchone(),(1,))
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM cmd_history WHERE type='user' OR process_origin IS NOT NULL").fetchone(),(0,))
 
 
 if __name__ == "__main__":

@@ -380,7 +380,7 @@ pub(crate) async fn post(state: &AppState, name: &str, body: &Value) -> Response
             }
             if event["event"] == "UserPromptSubmit" && worker == super::delegation::OWNER_AGENT {
                 let boundary=if out.applied { Ok(()) } else {
-                    super::delegation_requests::discarded_input(state,&worker,"native_submit_rejected_or_deduplicated")
+                    super::delegation_requests::discarded_native_input(state,&worker,&event,"native_submit_rejected_or_deduplicated")
                 };
                 if let Err(error) = boundary.and_then(|_|super::delegation_requests::resolve_session(state, &worker)) {
                     tracing::warn!(session=worker,%error,verdict="delegation_request_resolution_failed",
@@ -457,6 +457,7 @@ fn replay_run(state: &AppState, name: &str, dir: &Path) {
         let worker = name.to_owned();
         let prompt = submitted_prompt(&body);
         let submitted=body["event"] == "UserPromptSubmit";
+        let rejection_event=body.clone();
         let current = dir.parent().unwrap_or(dir).join("current.json");
         if let Ok(reply) = state.store.write(move |conn| {
             let launch = std::fs::read_to_string(current)
@@ -470,7 +471,7 @@ fn replay_run(state: &AppState, name: &str, dir: &Path) {
             // the ledger once the spool is replayed (F8(c)).
             if name == super::delegation::OWNER_AGENT {
                 let boundary=if reply.applied || !submitted { Ok(()) } else {
-                    super::delegation_requests::discarded_input(state,name,"native_spool_submit_rejected_or_deduplicated")
+                    super::delegation_requests::discarded_native_input(state,name,&rejection_event,"native_spool_submit_rejected_or_deduplicated")
                 };
                 if let Err(error) = boundary.and_then(|_|super::delegation_requests::resolve_session(state,name)) {
                     tracing::warn!(session=name,%error,verdict="delegation_request_resolution_failed",
