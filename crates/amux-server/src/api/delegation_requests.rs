@@ -241,8 +241,8 @@ pub(crate) fn native_owner_input(conn: &rusqlite::Connection, session: &str, eve
         return Ok(Some(conn.last_insert_rowid()));
     }
     let text=super::session_verbs::redact_secrets(prompt.trim());
-    conn.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts,delivered_at,submit_verdict,delegation_session_incarnation) VALUES(?1,?2,'user','pane','pane',?3,?3,'confirmed',?4)", rusqlite::params![session,text,(event["event_ts"].as_f64().unwrap_or(0.0)*1000.0) as i64,identity])?;
-    tracing::info!(session,reply_row=conn.last_insert_rowid(),verdict="delegation_owner_native_input",measured=true,n_considered=1,
+    conn.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts,delivered_at,submit_verdict,delegation_session_incarnation,delegation_message_type) VALUES(?1,?2,'user','pane','pane',?3,?3,'confirmed',?4,'user')", rusqlite::params![session,text,(event["event_ts"].as_f64().unwrap_or(0.0)*1000.0) as i64,identity])?;
+    tracing::info!(session,reply_row=conn.last_insert_rowid(),message_type="user",verdict="delegation_owner_native_input",measured=true,n_considered=1,
         "native owner input retained independently of matching peer text");
     Ok(Some(conn.last_insert_rowid()))
 }
@@ -300,7 +300,9 @@ pub(crate) fn native_assistant_turn(conn: &rusqlite::Connection, session: &str, 
 pub(crate) fn resolve_session(state: &AppState, session: &str) -> Result<(), String> {
     let ids: Vec<i64> = {
         let conn = state.store.read().map_err(|e| e.to_string())?;
-        let mut st = conn.prepare("SELECT id FROM cmd_history WHERE session=?1 AND id >= COALESCE((SELECT MIN(shown_row) FROM _amux_delegation_grants WHERE reply_session=?1 AND status='pending'), (SELECT MAX(id) FROM cmd_history WHERE session=?1)) AND COALESCE(delegation_message_type,type) IN ('user','chat') AND NOT EXISTS(SELECT 1 FROM _amux_delegation_resolutions dr WHERE dr.reply_row=cmd_history.id) ORDER BY id LIMIT ?2").map_err(|e| e.to_string())?;
+        // A corrupt/future display cannot move reconciliation beyond the
+        // current input. It still cannot pass the strict candidate row order.
+        let mut st = conn.prepare("SELECT id FROM cmd_history WHERE session=?1 AND id >= COALESCE((SELECT MIN(shown_row) FROM _amux_delegation_grants WHERE reply_session=?1 AND status='pending' AND shown_row<=(SELECT MAX(id) FROM cmd_history WHERE session=?1)), (SELECT MAX(id) FROM cmd_history WHERE session=?1)) AND COALESCE(delegation_message_type,type) IN ('user','chat') AND NOT EXISTS(SELECT 1 FROM _amux_delegation_resolutions dr WHERE dr.reply_row=cmd_history.id) ORDER BY id LIMIT ?2").map_err(|e| e.to_string())?;
         let rows = st.query_map(rusqlite::params![session, (RESOLUTION_SCAN_LIMIT + 1) as i64], |r| r.get(0)).map_err(|e| e.to_string())?;
         rows.collect::<rusqlite::Result<_>>().map_err(|e| e.to_string())?
     };
