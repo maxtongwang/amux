@@ -23447,7 +23447,17 @@ function _msgDeliveryChip(e) {
   // busy->boundary hop and saying "0s" about them is noise.
   const waitTxt = wait > 1500 ? ' ' + _fmtDur(wait) : '';
   let label, color, bg, title;
-  if (rec === 'fallback') {
+  if (e.delivery_receipt?.transport === 'claude_uds_v1') {
+    const receipt = e.delivery_receipt;
+    const labels = {reserved:'native reserved', written_unconfirmed:'native unconfirmed', held:'held by Claude',
+      admitted:'admitted to Claude queue', consumed:'received by Claude', denied:'denied by Claude', refused:'refused by Claude',
+      expired:'expired in Claude', dropped:'dropped by Claude', unknown:'native delivery unknown', uncertain:'may have been delivered'};
+    const confirmed = receipt.state === 'admitted' || receipt.state === 'consumed';
+    label = labels[receipt.state] || 'native delivery unknown';
+    color = confirmed ? '#3fb950' : '#d29922'; bg = confirmed ? 'rgba(63,185,80,0.14)' : 'rgba(210,153,34,0.16)';
+    title = 'Native Claude delivery: ' + String(receipt.reason || receipt.state).replace(/[&"<>]/g, c => ({'&':'&amp;', '"':'&quot;', '<':'&lt;', '>':'&gt;'}[c])) + '. '
+      + (confirmed ? 'Queue admission does not prove model consumption.' : 'No automatic resend or paste is permitted.');
+  } else if (rec === 'fallback') {
     // The degraded path: no origin stamp, no audit row, arrival unverified.
     // Deliberately the loudest chip on the row — a message that arrived this
     // way must never read as an audited one.
@@ -23756,6 +23766,7 @@ function _msgNorm(x) {
            ...(x.sender ? {sender: x.sender} : {}),
            queued: x.queued, delivery: x.delivery, queued_at: x.queued_at,
            delivered_at: x.delivered_at, queue_wait_ms: x.queue_wait_ms,
+           delivery_receipt: x.delivery_receipt,
            submit_verdict: x.submit_verdict, card_id: x.card_id || '',
            card_title: x.card_title, card_status: x.card_status,
            card_archived: x.card_archived, card_deleted: x.card_deleted,

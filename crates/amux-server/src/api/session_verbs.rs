@@ -1543,7 +1543,7 @@ pub(crate) fn backend_from(cc_backend: Option<&str>) -> String {
     }
 }
 
-fn backend_of_cfg(cfg: &EnvFile) -> String {
+pub(super) fn backend_of_cfg(cfg: &EnvFile) -> String {
     backend_from(cfg.get("CC_BACKEND"))
 }
 fn session_backend(name: &str) -> String {
@@ -3567,6 +3567,7 @@ pub const SESSION_SCOPED_FIELDS: &[(&str, RenameDisposition)] = &[
     ("session_gates", RenameDisposition::Migrate),
     ("saved_messages", RenameDisposition::Migrate),
     ("steering_queue", RenameDisposition::Migrate),
+    ("native_delivery_attempts", RenameDisposition::Migrate),
     ("steering_history", RenameDisposition::Migrate),
     ("share_tokens", RenameDisposition::Migrate),
     ("cmd_history", RenameDisposition::Migrate),
@@ -3605,6 +3606,13 @@ pub const SESSION_SCOPED_FIELDS: &[(&str, RenameDisposition)] = &[
         RenameDisposition::Migrate,
     ),
     // -- history written under the old name: keeps it, on purpose --
+    (
+        "native_delivery_attempts.endpoint_session",
+        RenameDisposition::KeepForAudit(
+            "the receiver's Claude conversation ID binds exact receipt evidence; \
+             it is not an amux worker name and must survive a worker rename unchanged",
+        ),
+    ),
     (
         "session_events",
         RenameDisposition::KeepForAudit(
@@ -7962,7 +7970,9 @@ pub(crate) async fn cmd_hist_record_with_id(
     // AMUX-3541 defect (a column populated 100% of the time is believable, and
     // wrong) reintroduced through a new door. The verdict is what says whether
     // the text landed, so it decides this column too.
-    let landed = !matches!(submit_verdict.as_deref(), Some("stuck"));
+    let native = submit_verdict.as_deref().and_then(super::delivery::ReceiptState::from_str);
+    let landed = !matches!(submit_verdict.as_deref(), Some("stuck"))
+        && native.is_none_or(|state| state.admitted());
     let delivered_at_ms = match meta.delivery {
         Some(Delivery::Queued | Delivery::Board) => None,
         _ if !landed => None,
@@ -9578,8 +9588,8 @@ async fn send_dedup_gate(state: &AppState, name: &str, msg_id: &str) -> Option<R
             })();
             match row {
                 Ok((Some(id), _)) => {
-                    return Some(j200(json!({"ok":true,"deduped":true,"id":id,
-                    "message":"duplicate retry ignored (previous acceptance confirmed)"})))
+                    return Some(j200(send_receipt_body(state, name, msg_id, json!({"ok":true,"deduped":true,"id":id,
+                    "message":"duplicate retry ignored (previous acceptance confirmed)"}))))
                 }
                 Ok((None, ts)) => {
                     let uncertain = now_i64().saturating_sub(ts) > 120;
@@ -9612,6 +9622,16 @@ async fn send_dedup_gate(state: &AppState, name: &str, msg_id: &str) -> Option<R
 
 // Read the durable acceptance fact without repeating the send or waiting for
 // downstream semantic board intake to finish the original HTTP request.
+fn send_receipt_body(state: &AppState, name: &str, msg_id: &str, mut body: Value) -> Value {
+    if let Ok(conn) = state.store.read() {
+        if let Ok(Some(receipt)) = super::delivery::ledger::receipt(&conn, name, msg_id, None) {
+            body["delivered"] = receipt["admitted"].clone();
+            body["delivery_receipt"] = receipt;
+        }
+    }
+    body
+}
+
 fn send_receipt(state: &AppState, name: &str, msg_id: &str) -> Response {
     if msg_id.is_empty() || msg_id.len() > 256 {
         return jresp(
@@ -9634,14 +9654,14 @@ fn send_receipt(state: &AppState, name: &str, msg_id: &str) -> Response {
         Ok(Some(id)) => {
             tracing::info!(target:"amux::message_acceptance", session=name, verdict="acceptance_receipt_read",
                 "confirmed durable receipt independently of the original send response");
-            j200(json!({"ok":true,"accepted":true,"id":id,"msg_id":msg_id}))
+            j200(send_receipt_body(state, name, msg_id, json!({"ok":true,"accepted":true,"id":id,"msg_id":msg_id})))
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => j200(json!({
             "ok":true,"accepted":false,"released":true,"delivered":false,"msg_id":msg_id
         })),
         Ok(None) => jresp(
             StatusCode::ACCEPTED,
-            json!({"ok":true,"accepted":false,"msg_id":msg_id}),
+            send_receipt_body(state, name, msg_id, json!({"ok":true,"accepted":false,"msg_id":msg_id})),
         ),
         Err(_) => jresp(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -9707,6 +9727,12 @@ async fn send_receipt_resolving(
     // A row without this ID never confirms anything; no evidence reads
     // pending, then expired, never "delivered". `text` is accepted for old
     // clients and ignored.
+    if let Ok(conn) = state.store.read() {
+        if let Ok(Some(receipt)) = super::delivery::ledger::receipt(&conn, name, msg_id, None) {
+            return stranded_answer(json!({"ok":true,"accepted":true,"msg_id":msg_id,
+                "delivered":receipt["admitted"],"delivery_receipt":receipt}));
+        }
+    }
     let base = send_receipt(state, name, msg_id);
     let receipted = state.store.read().ok().is_some_and(|c| {
         c.query_row(
@@ -9880,7 +9906,7 @@ pub(crate) async fn reconcile_stuck_on_submit(state: &AppState, session: &str, p
             let mut st = c
                 .prepare(
                     "SELECT id, text FROM cmd_history WHERE session=?1 \
-                     AND (submit_verdict='stuck' OR (delivery='queued' AND delivered_at IS NULL)) \
+                     AND NOT EXISTS (SELECT 1 FROM native_delivery_attempts n WHERE n.session=cmd_history.session AND (n.message_id=cmd_history.msg_id OR n.queue_id=cmd_history.queue_id)) AND (submit_verdict='stuck' OR (delivery='queued' AND delivered_at IS NULL)) \
                      AND ts>?2 ORDER BY id DESC LIMIT 16",
                 )
                 .ok()?;
@@ -9902,7 +9928,7 @@ pub(crate) async fn reconcile_stuck_on_submit(state: &AppState, session: &str, p
             for id in &write_ids {
                 let n = conn.execute(
                     "UPDATE cmd_history SET submit_verdict='confirmed', delivered_at=COALESCE(delivered_at, ?2), \
-                     reconciled_at=?2 WHERE id=?1 AND (submit_verdict='stuck' OR (delivery='queued' AND delivered_at IS NULL))",
+                     reconciled_at=?2 WHERE id=?1 AND NOT EXISTS (SELECT 1 FROM native_delivery_attempts n WHERE n.session=cmd_history.session AND (n.message_id=cmd_history.msg_id OR n.queue_id=cmd_history.queue_id)) AND (submit_verdict='stuck' OR (delivery='queued' AND delivered_at IS NULL))",
                     rusqlite::params![id, at],
                 )?;
                 if n == 1 {
@@ -10019,6 +10045,23 @@ async fn live_claude_conversation(name: &str) -> Option<String> {
     String::from_utf8_lossy(&kids.stdout)
         .split_whitespace()
         .find_map(|pid| claude_session_file_id(&claude_home().join("sessions").join(format!("{pid}.json"))))
+}
+
+/// Bind native registry discovery to descendants of this worker's actual pane.
+/// Tests inject the process inventory instead of inspecting the live tmux.
+pub(super) async fn native_target_pids(name: &str) -> Option<Vec<u32>> {
+    let pt = pt(name);
+    let pane = tmux(&["display-message", "-p", "-t", &pt, "#{pane_pid}"]).await?;
+    if !pane.status.success() { return None; }
+    let root: i32 = String::from_utf8_lossy(&pane.stdout).lines().next()?.trim().parse().ok()?;
+    let out = run_cmd("ps", &["-A", "-o", "pid=,ppid="], OP_TIMEOUT).await?;
+    if !out.status.success() { return None; }
+    let rows: Vec<(i32,i32)> = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| {
+        let mut p=l.split_whitespace(); Some((p.next()?.parse().ok()?,p.next()?.parse().ok()?))
+    }).collect();
+    let mut pids=vec![u32::try_from(root).ok()?];
+    pids.extend(descendant_pids(root,&rows).into_iter().filter_map(|p|u32::try_from(p).ok()));
+    Some(pids)
 }
 
 /// `sessionId` from one Claude Code process file.
@@ -10691,7 +10734,7 @@ fn held_amux_delivery(state: &AppState, name: &str, draft: &str) -> Option<Strin
             let mut st = c
                 .prepare(
                     "SELECT text, origin FROM cmd_history WHERE session=?1 AND ts>?2 \
-                     AND (submit_verdict IN ('stuck','deferred','unverified') OR (delivery='queued' AND delivered_at IS NULL)) \
+                     AND NOT EXISTS (SELECT 1 FROM native_delivery_attempts n WHERE n.session=cmd_history.session AND (n.message_id=cmd_history.msg_id OR n.queue_id=cmd_history.queue_id)) AND (submit_verdict IN ('stuck','deferred','unverified') OR (delivery='queued' AND delivered_at IS NULL)) \
                      ORDER BY id DESC LIMIT 32",
                 )
                 .ok()?;
@@ -11263,6 +11306,9 @@ fn bg_view_refusal(generating: bool) -> String {
 /// added later cannot silently land in the 500 bucket.
 pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str>) {
     let m = msg.trim();
+    if m.starts_with(super::delivery::QUARANTINE_PREFIX) {
+        return (StatusCode::CONFLICT, Some("Inspect the native delivery receipt and endpoint identity; policy or identity refusals cannot use paste fallback."));
+    }
     if msg.contains("durable owner input remains queued") {
         return (StatusCode::CONFLICT,Some("Owner input is held for the current authorized working claim; inspect the project hold and use explicit retry/resume when permitted."));
     }
@@ -11448,16 +11494,19 @@ pub(crate) const ISOLATED_REFUSAL_PREFIX: &str = "target is an isolated (raw-age
 
 /// A machine-readable code for a send refusal, beside the HTTP status.
 ///
-/// Only isolation has one today, and it is the SAME `isolated_target` code the
-/// peer gate (`isolated_peer_refusal`) has always returned, so a caller can
-/// branch on one field no matter which layer refused (AMUX-5241). The
+/// Isolation retains the SAME `isolated_target` code as the peer gate, and
+/// native identity refusals have their own stable quarantine code, so a caller
+/// can branch on one field no matter which layer refused (AMUX-5241). The
 /// "auto-wake failed: " wrapper is unwrapped the same way
 /// `send_failure_status` unwraps it.
 pub(crate) fn send_failure_code(msg: &str) -> Option<&'static str> {
     let m = msg.trim();
     let m = m.strip_prefix("auto-wake failed: ").unwrap_or(m);
     if m == "worker_group_boundary" || m == "peer_receive_denied" { return Some(if m == "worker_group_boundary" { "worker_group_boundary" } else { "peer_receive_denied" }); }
-    m.starts_with(ISOLATED_REFUSAL_PREFIX).then_some("isolated_target")
+    [
+        (ISOLATED_REFUSAL_PREFIX, "isolated_target"),
+        (super::delivery::QUARANTINE_PREFIX, super::delivery::QUARANTINE_CODE),
+    ].into_iter().find_map(|(prefix,code)|m.starts_with(prefix).then_some(code))
 }
 
 /// A verb's `(ok, msg)` rendered as its HTTP answer, classified by
@@ -11854,6 +11903,7 @@ pub(crate) fn read_frame(raw: &str, tail_sq: &str) -> FrameRead {
 /// Returns None only for inputs that are not send outcomes at all (the steering
 /// deliverer, schedules). None means "not verified", never "failed".
 pub(crate) fn submit_verdict_of(msg: &str) -> Option<&'static str> {
+    if let Some(state) = super::delivery::ReceiptState::from_result(msg) { return Some(state.as_str()); }
     let m = msg.trim();
     if matches!(m, "sent (waiting for in-flight boot)" | "sent (auto-woke)") {
         return None;
@@ -12537,25 +12587,6 @@ pub(crate) async fn send_text(
     .await
 }
 
-async fn send_text_with_queue_id(
-    state: &AppState,
-    name: &str,
-    text: &str,
-    defer_if_busy: bool,
-    origin: SendOrigin,
-) -> ((bool, String), Option<String>) {
-    let mut queue_id = None;
-    let result = send_text_inner(
-        state,
-        name,
-        text,
-        SendMode::deferring(defer_if_busy, origin),
-        &mut queue_id,
-    )
-    .await;
-    (result, queue_id)
-}
-
 /// WHAT "sent" MEANS, as a pure function of the send's own verdict string.
 ///
 /// `send_post` derived `submitted`/`submission` inline, and the scheduler now
@@ -12565,6 +12596,9 @@ async fn send_text_with_queue_id(
 /// it. Returns `(submitted, submission)`; `None` is the honest third state, not
 /// a failure (ethos rule 3).
 pub(crate) fn submission_verdict(ok: bool, msg: &str) -> (Option<bool>, &'static str) {
+    if let Some(state) = super::delivery::ReceiptState::from_result(msg) {
+        return (state.submitted(), state.as_str());
+    }
     if ok && msg == "no suggestion found" {
         // An empty composer submit is a probe for a suggested prompt. Finding
         // none means the probe ran and changed nothing; it is not a confirmed
@@ -12760,6 +12794,7 @@ pub(crate) async fn deliver_automated(
             from_steering: true,
             allow_mid_turn: false,
             hook_confirmed_idle: false,
+            native_peer: None,
             origin,
         };
         let mut queue_id = None;
@@ -12808,7 +12843,9 @@ pub(crate) async fn deliver_automated(
 /// bools (AMUX-3764). Four adjacent bare `false`s at a call site is how the
 /// wrong flag gets passed, and `allow_mid_turn` in particular decides whether
 /// amux types into a RUNNING turn — not a flag to hand to argument order.
+#[derive(Clone)]
 pub(crate) struct SendMode {
+    pub native_peer: Option<super::delivery::VerifiedPeer>,
     pub defer_if_busy: bool,
     pub from_steering: bool,
     /// OVERDUE delivery (AMUX-2642): the message has waited past
@@ -12831,6 +12868,7 @@ impl SendMode {
             from_steering: false,
             allow_mid_turn: false,
             hook_confirmed_idle: false,
+            native_peer: None,
             origin,
         }
     }
@@ -12848,6 +12886,7 @@ impl SendMode {
             from_steering: true,
             allow_mid_turn,
             hook_confirmed_idle,
+            native_peer: None,
             origin: SendOrigin::Owner,
         }
     }
@@ -12924,7 +12963,39 @@ fn lane_send_lock(name: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     guard.entry(name.to_string()).or_default().clone()
 }
 
-fn project_delivery_claim(
+/// Recheck server-owned semantic gates after native discovery/connect and
+/// before reserving write intent. Holds never select another transport.
+pub(super) fn native_prewrite_hold(ctx:&super::delivery::DeliveryContext<'_>) -> Option<String> {
+    let (state,name,delivery,origin,admitted_claim)=(ctx.state,ctx.name,ctx.delivery,ctx.mode.origin,&ctx.admitted_claim);
+    let Some(peer)=ctx.mode.native_peer.as_ref() else {return Some("native sender identity unavailable".into());};
+    let sender=peer.sender.as_str();
+    if meta_i64(&load_meta(name), RECYCLE_IN_PROGRESS_KEY)>0 {
+        return Some("worker is still starting (conversation recycle pending)".into());
+    }
+    if session_op_lock(name).try_lock().is_err() {
+        return Some("worker is still starting; native delivery remains queued".into());
+    }
+    if lane_is_blocked(state,name) {return Some("target is blocked on a permission dialog; native delivery remains queued".into());}
+    if let Some(reason)=isolation_refusal(name,origin) {return Some(reason.into());}
+    if lane_is_paused(name) {return Some("target is paused; native delivery remains queued".into());}
+    if let Some((_,reason))=send_group_refusal(sender,name) {return Some(reason);}
+    if let Some(id)=delivery {
+        let row=state.store.read().ok().and_then(|c|c.query_row(
+            "SELECT session,native_sender,COALESCE(deliver_at,0) FROM steering_queue WHERE id=?1",[id],
+            |r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,f64>(2)?))).ok());
+        match row {
+            Some((target,Some(peer),due)) if target==name && peer==sender && due<=now_f64()=>{},
+            _=>return Some("native queue identity changed or delivery is not due; retained without write".into()),
+        }
+    }
+    if let Some(reason)=project_send_hold(state,name,delivery) {return Some(reason);}
+    if *admitted_claim!=project_delivery_claim(state,name,delivery) {
+        return Some("project_claim_changed; durable owner input remains queued".into());
+    }
+    None
+}
+
+pub(super) fn project_delivery_claim(
     state: &AppState,
     name: &str,
     delivery: Option<&str>,
@@ -12940,7 +13011,7 @@ fn project_delivery_claim(
     Some((task, e.generation, e.input_hash))
 }
 
-fn project_send_hold(state: &AppState, name: &str, delivery: Option<&str>) -> Option<String> {
+pub(super) fn project_send_hold(state: &AppState, name: &str, delivery: Option<&str>) -> Option<String> {
     if session_is_isolated(name)
         || (delivery.is_none() && parse_env(name).get("CC_PROJECT").is_none())
     {
@@ -13214,12 +13285,10 @@ async fn send_text_inner_bound(
         return (false, "worker is still starting (conversation recycle pending)".into());
     }
     let SendMode {
-        defer_if_busy,
         from_steering,
-        allow_mid_turn,
-        hook_confirmed_idle,
         origin,
-    } = mode;
+        ..
+    } = mode.clone();
     // ZERO AMUX HARNESS INTO AN ISOLATED LANE, AT THE LAYER THAT ACTUALLY TYPES
     // (AMUX-3764). The gate on `steer_enqueue` is correct and complete for the
     // QUEUE, and three producers never touch the queue: `deliver_hot_config`
@@ -13269,9 +13338,23 @@ async fn send_text_inner_bound(
         adapter.deliver(state, name, text, origin).await
     {
         crate::api::worker_exec::note_dispatch(name, "deliver", adapter.worker_type());
-        let _ = admitted_claim;
         return r;
     }
+    super::delivery::dispatch(&mut super::delivery::DeliveryContext {
+        state, name, text, cfg: &cfg, mode: &mode, delivery, queue_id, admitted_claim,
+        payload_kind: if mode.native_peer.is_some() { super::delivery::PayloadKind::PeerProse } else { super::delivery::PayloadKind::TerminalInput },
+        sender_permission_class: None,
+    }).await
+}
+
+/// TmuxPaste owns the complete legacy composer pipeline. Native prose never
+/// enters this function, including its captures, Escape, C-u, paste and Enter.
+pub(super) async fn send_text_paste_bound(ctx:&mut super::delivery::DeliveryContext<'_>) -> (bool, String) {
+    let (state,name,text,mode,delivery)=(ctx.state,ctx.name,ctx.text,ctx.mode.clone(),ctx.delivery);
+    let admitted_claim=ctx.admitted_claim.clone();
+    let queue_id=&mut *ctx.queue_id;
+    let SendMode { defer_if_busy, from_steering, allow_mid_turn, hook_confirmed_idle, origin, .. } = mode;
+    let cfg = parse_env(name);
     if backend_of_cfg(&cfg) == "herdr" {
         return herdr_send(name, text).await;
     }
@@ -22463,6 +22546,7 @@ async fn capture_delivered_steering(
 }
 
 pub async fn steer_deliver_tick(state: &AppState) -> usize {
+    super::delivery::ledger::reconcile(state).await;
     // Reconcile superseded project packets before liveness/boundary checks:
     // an old unsent packet must not block retirement forever. All proof and
     // settlement share one writer transaction with the delivery claim gate.
@@ -22516,7 +22600,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
             "SELECT id, session, text, queued_at, COALESCE(guard,''), COALESCE(sender,''), \
                     COALESCE(precond_card,''), COALESCE(precond_rev,-1), \
                     COALESCE(deliver_at,0) \
-             FROM steering_queue WHERE delivering_since IS NULL AND COALESCE(deliver_at,0) <= ?1 \
+             FROM steering_queue WHERE delivering_since IS NULL AND NOT EXISTS (SELECT 1 FROM native_delivery_pending_queue p WHERE p.session=steering_queue.session AND p.queued_at<=steering_queue.queued_at) AND COALESCE(deliver_at,0) <= ?1 \
              ORDER BY queued_at ASC",
         ) else {
             return 0;
@@ -22996,7 +23080,9 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
             }
         }
         let age = now_f64() - due_at;
-        let decision = steer_delivery_for(state, &session, age).await;
+        let decision = if super::delivery::enabled() && super::delivery::ledger::candidate(&state.store, &id).is_some() {
+            SteerDelivery::AtBoundary
+        } else { steer_delivery_for(state, &session, age).await };
         let mid_turn = match decision {
             SteerDelivery::Hold if guard == "project-execution" && age >= steer_max_age_s() => {
                 tracing::warn!(
@@ -23601,11 +23687,14 @@ async fn steering_debug(State(state): State<AppState>) -> Response {
 /// caller can win this UPDATE for a given row -- a losing caller means
 /// someone else is already delivering it (or already has), which is
 /// contention, not a delivery refusal.
-async fn claim_steering_row(store: &crate::db::SharedStore, id: &str) -> bool {
+pub(super) async fn claim_steering_row(store: &crate::db::SharedStore, id: &str) -> bool {
     use rusqlite::OptionalExtension;
     let id = id.to_string();
     store
         .write_async(move |conn| {
+            if super::delivery::ledger::queue_owned(conn, &id)? || super::delivery::ledger::queue_blocked(conn, &id)? {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
             let session: Option<String> = conn.query_row("SELECT session FROM steering_queue WHERE id=?1", [&id], |r|r.get(0)).optional()?;
             if let Some(session) = session {
                 if let Some(reason)=super::projects::steering_delivery_hold(conn,&session,&id).map_err(crate::project_execution::store::sql_error)? {
@@ -23692,8 +23781,21 @@ async fn send_claimed_steering(
     if !guard.is_empty() && !(guard == "project-steering" && sender.is_empty()) && !is_owner_configured_guard(&guard) {
         mode.origin = SendOrigin::Automation;
     }
+    mode.native_peer = super::delivery::ledger::candidate(&state.store, id);
     let mut queue_id = None;
     let result = send_text_inner_bound(state, session, text, mode, Some(id), &mut queue_id).await;
+    // Native receipts, not ok=true, own both drain completion paths. Even
+    // WrittenUnconfirmed keeps the row and its claim; only reconciliation
+    // may finalize an evidence-backed admission.
+    match super::delivery::ledger::queue_disposition(&state.store, id) {
+        super::delivery::ledger::QueueDisposition::Native(state) => {
+            tracing::info!(session, delivery_id=id, state=state.as_str(), measured=true, n_considered=1,
+                verdict="native_queue_retained", "native evidence owns completion; no legacy drain finalization");
+            return None;
+        },
+        super::delivery::ledger::QueueDisposition::Unmeasured => return None,
+        super::delivery::ledger::QueueDisposition::Terminal => {}
+    }
     if !result.0 {
         unclaim_steering_row(&state.store, id).await;
     }
@@ -23798,7 +23900,7 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
         .and_then(|conn| {
             conn.prepare(&format!(
                 "SELECT id, text, {STEER_DUE_AT_SQL}, COALESCE(deliver_at,0) \
-                 FROM steering_queue WHERE session=?1 AND delivering_since IS NULL \
+                 FROM steering_queue WHERE session=?1 AND delivering_since IS NULL AND NOT EXISTS (SELECT 1 FROM native_delivery_pending_queue p WHERE p.session=steering_queue.session AND p.queued_at<=steering_queue.queued_at) \
                  AND COALESCE(deliver_at,0) <= ?2 ORDER BY queued_at ASC",
             ))
             .and_then(|mut st| {
@@ -24087,10 +24189,11 @@ fn reconcile_orphaned_steering_claims_with(
     conn: &rusqlite::Connection,
     landing: impl Fn(&str, &str, f64) -> OrphanLanding,
 ) -> rusqlite::Result<usize> {
+    super::delivery::ledger::recover(conn)?;
     let orphans: Vec<OrphanedSteeringClaim> = conn
         .prepare(
             "SELECT id, session, text, queued_at, guard, sender FROM steering_queue \
-             WHERE delivering_since IS NOT NULL",
+             WHERE delivering_since IS NOT NULL AND NOT EXISTS (SELECT 1 FROM native_delivery_attempts n WHERE n.queue_id=steering_queue.id)",
         )?
         .query_map([], |r| {
             Ok(OrphanedSteeringClaim {
@@ -26917,6 +27020,9 @@ pub(crate) async fn steer_mutate(
     headers: &HeaderMap,
     body: &Value,
 ) -> Response {
+    if *method == Method::POST && body.get("action").and_then(Value::as_str) == Some("abandon") {
+        return super::delivery::ledger::abandon_action(state, name, headers, body).await;
+    }
     if *method == Method::DELETE {
         let msg_id = body_str(body, "id");
         let sent = body.get("sent").map(py_truthy).unwrap_or(false);
@@ -26930,12 +27036,16 @@ pub(crate) async fn steer_mutate(
         // should not have to unpack anything.
         let n_cleared = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
         let n_spared = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let native_retained = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let native_retained_w = native_retained.clone();
         let (n_cleared_w, n_spared_w) = (n_cleared.clone(), n_spared.clone());
         let reply = state
             .store
             .write_async(move |conn| {
                 let (n_cleared, n_spared) = (&n_cleared_w, &n_spared_w);
                 ensure_fleet_tables(conn)?;
+                let pending:i64=conn.query_row("SELECT count(*) FROM native_delivery_pending_queue WHERE session=?1 AND (?2='' OR id=?2)",rusqlite::params![session,id2],|r|r.get(0))?;
+                native_retained_w.store(pending,std::sync::atomic::Ordering::SeqCst);
                 let mut sent_row: Option<(String, f64)> = None;
                 // AMUX-3562: this path reads the row itself rather than calling
                 // steer_row_source, because it already has a SELECT here and a
@@ -26960,9 +27070,10 @@ pub(crate) async fn steer_mutate(
                         )
                         .ok();
                     sent_src = steer_row_source(conn, &id2);
-                    removed = conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])? as i64;
+                    removed = conn.execute("DELETE FROM steering_queue WHERE id=? AND NOT EXISTS (SELECT 1 FROM native_delivery_pending_queue p WHERE p.id=steering_queue.id)", [&id2])? as i64;
+                    if removed==0 {sent_row=None;}
                 } else if include_system {
-                    removed = conn.execute("DELETE FROM steering_queue WHERE session=?", [&session])? as i64;
+                    removed = conn.execute("DELETE FROM steering_queue WHERE session=? AND NOT EXISTS (SELECT 1 FROM native_delivery_pending_queue p WHERE p.id=steering_queue.id)", [&session])? as i64;
                 } else {
                     // Clear-all spares SYSTEM rows (board pushes, schedules —
                     // mirror of steer_guard_is_system): a human clearing their
@@ -26977,7 +27088,7 @@ pub(crate) async fn steer_mutate(
                     )?;
                     removed = conn.execute(
                         "DELETE FROM steering_queue WHERE session=? \
-                         AND (COALESCE(guard,'')='' OR guard IN ('selector-answer','project-steering'))",
+                         AND NOT EXISTS (SELECT 1 FROM native_delivery_pending_queue p WHERE p.id=steering_queue.id) AND (COALESCE(guard,'')='' OR guard IN ('selector-answer','project-steering'))",
                         [&session],
                     )? as i64;
                 }
@@ -27020,7 +27131,9 @@ pub(crate) async fn steer_mutate(
                 // clear-all on a lane holding nothing but system rows is a
                 // legitimate no-op, and without the second number it is
                 // indistinguishable from a broken route.
-                j200(json!({"ok": true, "cleared": cleared, "spared_system": spared}))
+                j200(json!({"ok": true, "cleared": cleared, "spared_system": spared,
+                    "native_retained":native_retained.load(std::sync::atomic::Ordering::SeqCst),
+                    "native_note":if native_retained.load(std::sync::atomic::Ordering::SeqCst)>0 {Some("Native delivery remains pending; clearing Amux cannot cancel it in Claude.")}else{None}}))
             }
             Err(e) => jresp(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -27156,6 +27269,11 @@ pub(crate) async fn steer_mutate(
                 );
             }
         };
+        let native_peer = (super::delivery::enabled() && !sender.is_empty() && sender != name
+            && !picker_answer && !is_slash_command(&text) && !at_picker_text(&text)
+            && ["attachments","file_attachments","images","keys"].iter().all(|k|body.get(*k).is_none()))
+            .then(||super::delivery::VerifiedPeer{sender:sender.clone(),
+                message_id:if dedup_id.is_empty(){format!("queue:{msg_id}")}else{dedup_id.clone()},body_stamped:false});
         send_dedup_accept(state, name, &dedup_id, &msg_id).await;
         let deliver_at = steer_deliver_at_from(body, now_f64()).unwrap_or(0.0);
         if deliver_at > 0.0 {
@@ -27174,7 +27292,7 @@ pub(crate) async fn steer_mutate(
                 })
                 .await;
         }
-        if body.get("record_history").map(py_truthy).unwrap_or(false) {
+        if body.get("record_history").map(py_truthy).unwrap_or(false) || native_peer.is_some() {
             let email = headers
                 .get("x-amux-user-email")
                 .and_then(|v| v.to_str().ok())
@@ -27197,10 +27315,12 @@ pub(crate) async fn steer_mutate(
                 DeliveryMeta::queued(now_i64() * 1000),
             )
             .await;
+            if let Some(peer)=native_peer.as_ref() {note_history_msg_id(state,row_id,&peer.message_id).await;}
             link_queued_message(state, name, row_id, &msg_id).await;
             // Autotask/labelling: Python's model-call feature — gap named in
             // the module doc.
         }
+        if let Some(peer)=native_peer.as_ref() {super::delivery::ledger::mark_candidate(&state.store,&msg_id,peer).await;}
         // AN IDLE LANE IS A BOUNDARY NOW, not at the next timer pass. Off the
         // request path: the response still says "queued", and the delivery
         // records itself exactly as an idle-hook drain does.
@@ -28754,7 +28874,10 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             json!({"ok":false,"code":"project_next_turn_only","error":"Project owner notes use automatic next-turn delivery during an authorized working claim. Send now is unsupported; existing queued input is unchanged. Cancel the queued note to remove it.","submitted":false}),
         );
     }
-    let msg_id: String = body_str(body, "msg_id").trim().chars().take(64).collect();
+    let mut msg_id: String = body_str(body, "msg_id").trim().chars().take(64).collect();
+    if msg_id.is_empty() && super::delivery::enabled() && !send_origin.is_empty() {
+        msg_id = super::delivery::uuid();
+    }
     if let Some(response) = send_dedup_gate(state, name, &msg_id).await {
         return response;
     }
@@ -28858,6 +28981,12 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             }),
         );
     }
+    let native_peer = (super::delivery::enabled()
+        && member_actor.is_none() && !origin.is_empty() && origin != name
+        && hdr_worker(headers).trim() == origin && !is_slash_command(&orig_text)
+        && !record_history && !at_picker_text(&orig_text)
+        && ["attachments", "file_attachments", "images", "keys"].iter().all(|k| body.get(*k).is_none()))
+        .then(|| super::delivery::VerifiedPeer { sender: origin.clone(), message_id: msg_id.clone(), body_stamped: true });
     // A REPEAT ASK IS SAID OUT LOUD (F8(e), AMUX-5241). Ethan sent
     // mixpeek-ops-server the same request on 09-25 and 09-26 because the first
     // result was not findable, and the lane got the second copy as new work.
@@ -28933,6 +29062,13 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                     .await;
                     link_queued_message(state, name, row_id, &result.id).await;
                 }
+                if let Some(peer) = native_peer.as_ref() {
+                    // Project steering stores the original prose. Its verified
+                    // peer stamp is added inside the native envelope at delivery.
+                    let mut peer = peer.clone();
+                    peer.body_stamped = false;
+                    super::delivery::ledger::mark_candidate(&state.store, &result.id, &peer).await;
+                }
                 send_dedup_accept(state, name, &msg_id, &result.id).await;
                 tracing::info!(
                     session = name,
@@ -29000,6 +29136,22 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             json!({"ok":true,"id":format!("MSG-{id}"),"message":"accepted into board lifecycle","submitted":null,"submission":"queued","root":result.get("root"),"task_ids":result.get("task_ids"),"planning":result.get("state")}),
         );
     }
+    // Persist the existing Messages lineage before native I/O. The legacy
+    // recorder's reserved verdict suppresses a fabricated delivery timestamp.
+    // Even a crash after the write leaves a visible row linked by request ID.
+    let native_history_id = if native_peer.is_some() {
+        let id = cmd_hist_record_with_id(state, name, &orig_text, "session", &origin, skip_board,
+            DeliveryMeta { delivery: Some(Delivery::Direct), submit_verdict: Some("reserved"),
+                repeat_of, ..DeliveryMeta::default() }).await;
+        if id == 0 {
+            send_dedup_forget(state,name,&msg_id).await;
+            tracing::warn!(session=name,measured=false,n_considered=1,verdict="native_history_intent_failed",
+                "no delivery was attempted; the request identity is released for retry");
+            return jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"ok":false,"error":"native Messages intent could not be persisted; no send attempted"}));
+        }
+        note_history_msg_id(state, id, &msg_id).await;
+        Some(id)
+    } else { None };
     let mut queue_id = None;
     let (ok, msg) = if let Some(h) = hold.as_ref() {
         // EMPTY guard, the sender recorded: this is a verified peer's own
@@ -29035,11 +29187,23 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             }
         }
     } else {
-        let (result, parked_id) =
-            send_text_with_queue_id(state, name, &text, defer_busy, send_origin).await;
-        queue_id = parked_id;
-        result
+        let mut mode = SendMode::deferring(defer_busy, send_origin);
+        mode.native_peer = native_peer.clone();
+        send_text_inner(state, name, &text, mode, &mut queue_id).await
     };
+    if let (Some(peer), Some(id)) = (native_peer.as_ref(), queue_id.as_deref()) {
+        super::delivery::ledger::mark_candidate(&state.store, id, peer).await;
+    }
+    if let Some(id) = native_history_id {
+        let send=super::delivery::ledger::HistorySendOutcome{row_id:id,ok,message:msg.clone(),queue_id:queue_id.clone()};
+        if let Err(error)=state.store.write_async(move |conn| {
+            super::delivery::ledger::record_history_outcome(conn,&send)?;
+            Ok(crate::db::WriteOutcome { applied:true, events:vec![] })
+        }).await {
+            tracing::warn!(message_id=id,%error,measured=false,n_considered=1,verdict="native_history_outcome_unmeasured",
+                "the existing receipt lineage remains durable; reconciliation owns its evidence");
+        }
+    }
     let no_effect = ok && msg == "no suggestion found";
     if no_effect {
         // A NO-OP IS NOT A SEND (ATE-75). Before this branch, the generic `ok`
@@ -29096,8 +29260,8 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             emit_event(
                 state,
                 name,
-                "message.sent",
-                Some(json!({"chars": text.chars().count(), "preview": chars_truncate(&text, 120), "human": record_history})),
+                if super::delivery::ReceiptState::from_result(&msg).is_some() { "message.native_delivery" } else { "message.sent" },
+                Some(json!({"chars": text.chars().count(), "preview": chars_truncate(&text, 120), "human": record_history, "native_state":super::delivery::ReceiptState::from_result(&msg)})),
                 if msg_id.is_empty() { None } else { Some(format!("send:{msg_id}")) },
                 "api-send",
             )
@@ -29135,7 +29299,13 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             client_meta: None,
             repeat_of,
         };
-        if record_history {
+        if let Some(row_id) = native_history_id {
+            // Already recorded before I/O; native reconciliation and the
+            // existing capture gate advance this exact row, never a new card.
+            if submission_verdict(ok, &msg).0 == Some(true) && !skip_board {
+                capture_recorded_message(state, row_id).await;
+            }
+        } else if record_history {
             let email = headers
                 .get("x-amux-user-email")
                 .and_then(|v| v.to_str().ok())
@@ -29215,7 +29385,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
         // the response reports (ethos rule 1). On the failure branch it returns
         // Some only for "not submitted", which means the text IS in the lane's
         // composer; every refusal maps to None.
-        if let Some(verdict) = submit_verdict_of(&msg) {
+        if let Some(verdict) = submit_verdict_of(&msg).filter(|_| native_history_id.is_none()) {
             // LOUD, for the same reason ghost-rescue is: keystroke delivery
             // failing is a defect, and until now it left the process without a
             // trace anywhere durable.
@@ -29271,6 +29441,11 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
     };
     let send_id = send_response_id(name, &msg_id);
     let mut resp = json!({"ok": ok, "message": msg, "id": send_id});
+    if let Ok(conn) = state.store.read() {
+        if let Ok(Some(receipt)) = super::delivery::ledger::receipt(&conn, name, &msg_id, queue_id.as_deref()) {
+            resp["delivery_receipt"] = receipt;
+        }
+    }
     if let (true, Some(h)) = (ok, hold.as_ref()) {
         // AMUX-5237: the fields a sender (and `amux send`) reads to know the
         // message is parked and the work is still theirs.
@@ -29341,6 +29516,9 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
 }
 
 fn message_acceptance_confirmed(ok: bool, message: &str) -> bool {
+    if super::delivery::ReceiptState::from_result(message).is_some() {
+        return ok; // the durable attempt is accepted into Amux, not delivered
+    }
     let (submitted, submission) = submission_verdict(ok, message);
     ok && (submitted == Some(true) || submission == "deferred")
 }
@@ -39480,10 +39658,12 @@ mod tests {
         // test it was written to satisfy went red on main and stayed red.
         // Counted again here rather than adjusted by hand: both new sites pass
         // the computed `skip_board`, which is the property below.
+        // 11 -> 12 for send_post's native_history_id reservation before native
+        // I/O (PR #67); it also passes the computed `skip_board`.
         assert_eq!(
             sites.len(),
-            11,
-            "the scan must see all 11 production call sites. A LOWER number means the detector \
+            12,
+            "the scan must see all 12 production call sites. A LOWER number means the detector \
              stopped matching rather than that the call sites went away, which is exactly how \
              the first two versions of this test passed a broken tree: one scanned a window \
              that excluded the send handlers, the other missed the multi-line spelling and left \
