@@ -25,3 +25,9 @@ test('board row later handed over reads as delivered', () => {
 test('direct row is unchanged', () => {
   assert.equal(label({ delivery: 'direct' }), 'direct');
 });
+
+test('approval request explains display and next-input requirements', () => {
+  assert.equal(label({ delivery: 'approval_request' }), 'approval request');
+  assert.match(chip({ delivery: 'approval_request' }), /Open owner Messages to display this question; only the very next owner input/);
+  for (const delivery of ['__proto__', 'constructor']) assert.equal(label({delivery}), 'direct?');
+});

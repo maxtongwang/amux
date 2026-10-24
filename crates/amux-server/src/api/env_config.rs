@@ -156,6 +156,13 @@ struct WorkerSpec {
     prompt: String,
 }
 
+/// The settings an env-spec worker create writes besides name and groups,
+/// for the delegation table (design review B3).
+fn env_spec_settings(w: &WorkerSpec) -> Vec<String> {
+    [("dir", &w.dir), ("desc", &w.desc), ("model", &w.model), ("provider", &w.provider), ("prompt", &w.prompt)]
+        .iter().filter(|(_, v)| !v.is_empty()).map(|(k, _)| format!("create:{k}")).collect()
+}
+
 /// An env apply creates workers with groups and had no caller check, so a
 /// worker could mint group members (fix/worker-membership-create). Each worker
 /// the spec CREATES goes through the shared create rule (only leads, only
@@ -181,17 +188,35 @@ fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Optio
         return refuse("env_apply_schedule_other_worker",
             format!("worker '{origin}' may schedule only itself, not '{}'", s.worker.trim()));
     }
-    // CARDS land on a worker's board and are dispatched to it: a worker may seed
-    // only its own board, as `amux board add` allows (ai-config #159).
-    if let Some(c) = spec.cards.iter().find(|c| !origin.is_empty() && c.worker.trim() != origin) {
-        return refuse("env_apply_card_other_worker",
-            format!("worker '{origin}' may add cards only to its own board, not '{}'", c.worker.trim()));
-    }
-    // GROUPS set a team's department and goal, which every member's context
-    // reads: the owner's configuration (ai-config #159).
-    if !origin.is_empty() && !spec.groups.is_empty() {
-        return refuse("env_apply_groups_owner_only",
-            format!("worker '{origin}' may not configure groups through an env apply; that is the owner's"));
+    // CARDS land on a worker's board and are dispatched to it, and GROUPS set a
+    // team's department and goal, which every member's context reads. Both
+    // are rows of the delegation table (ai-config #159/#160; dev-lead's #18
+    // ruling): cards on the caller's own board only, groups the owner's for
+    // every worker. MESSAGES go through #19's gated, stamped send inside the
+    // apply. Columns and global stay the owner's (review B3).
+    if !origin.is_empty() {
+        use crate::api::delegation::{refusal_value, Action, Target};
+        let forbid = |body: Value| Some((StatusCode::FORBIDDEN, Json(body)).into_response());
+        for board in spec.cards.iter().map(|c| c.worker.trim().to_string()) {
+            if let Some(body) = refusal_value(headers, &Target::Worker(board), &Action::SeedCards) {
+                return forbid(body);
+            }
+        }
+        if let Some(g) = spec.groups.first() {
+            let group = crate::api::session_verbs::norm_label(&g.name);
+            if let Some(body) = refusal_value(headers, &Target::Group(group), &Action::EnvApplyGroups) {
+                return forbid(body);
+            }
+        }
+        for (section, present) in [("columns", !spec.columns.is_empty()), ("global", spec.global.is_some())] {
+            if !present {
+                continue;
+            }
+            let action = Action::SetConfig { keys: vec![format!("env-apply:{section}")] };
+            if let Some(body) = refusal_value(headers, &Target::Settings(vec![section.to_string()]), &action) {
+                return forbid(body);
+            }
+        }
     }
     let sessions = crate::config::amux_home().join("sessions");
     for w in &spec.workers {
@@ -210,7 +235,7 @@ fn worker_apply_refusal(headers: &HeaderMap, spec: &EnvSpec, dry: bool) -> Optio
             }
         } else if let Some(r) = crate::api::session_verbs::worker_create_refusal(
             headers,
-            &crate::api::session_verbs::CreateRequest { name: None, tags: &w.groups, owner_only: None },
+            &crate::api::session_verbs::CreateRequest { name: Some(&name), tags: &w.groups, owner_only: None, settings: env_spec_settings(w) },
         ) {
             return Some(r);
         } else if !origin.is_empty() && !w.prompt.trim().is_empty()
@@ -273,6 +298,42 @@ async fn apply(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    // Plan the delegated creates up front (decided by worker_apply_refusal),
+    // log each only once the apply wrote it.
+    let dry = q.dry_run != 0;
+    let sessions = crate::config::amux_home().join("sessions");
+    let planned: Vec<(String, crate::api::delegation::Grant, Vec<String>)> = if dry {
+        vec![]
+    } else {
+        let raw = String::from_utf8_lossy(&body);
+        let spec: Option<EnvSpec> = serde_json::from_str(&raw).ok().or_else(|| serde_yaml::from_str(&raw).ok());
+        spec.map(|spec| spec.workers.iter().filter_map(|w| {
+            let name = sanitize(&w.name);
+            if name.is_empty() || sessions.join(format!("{name}.env")).exists() {
+                return None;
+            }
+            let groups = crate::api::session_verbs::tags_of(Some(&json!(w.groups))).ok()?;
+            let action = crate::api::delegation::Action::CreateWorker { tags: groups.clone(), settings: env_spec_settings(w), owner_only: None };
+            crate::api::delegation::grant_if_allowed(&headers, &crate::api::delegation::Target::NewWorker, &action).map(|g| (name, g, groups))
+        }).collect()).unwrap_or_default()
+    };
+    let resp = apply_inner(State(state.clone()), Query(q), headers, body).await;
+    if resp.status().is_success() {
+        for (name, g, groups) in planned {
+            if sessions.join(format!("{name}.env")).exists() {
+                g.commit(&state, Value::Null, json!({"name": name, "tags": groups, "via": "env/apply"}));
+            }
+        }
+    }
+    resp
+}
+
+async fn apply_inner(
+    State(state): State<AppState>,
+    Query(q): Query<ApplyQ>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     let dry = q.dry_run != 0;
     let ct = headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -280,7 +341,7 @@ async fn apply(
         .unwrap_or("");
     let raw = String::from_utf8_lossy(&body);
     // JSON is a subset of YAML for serde_yaml, but honor an explicit JSON type.
-    let spec: EnvSpec = if ct.contains("json") {
+    let mut spec: EnvSpec = if ct.contains("json") {
         match serde_json::from_str(&raw) {
             Ok(s) => s,
             Err(e) => return bad(format!("invalid JSON: {e}")),
@@ -292,6 +353,12 @@ async fn apply(
         }
     };
 
+    for worker in &mut spec.workers {
+        worker.groups = match crate::api::session_verbs::tags_of(Some(&json!(worker.groups))) {
+            Ok(groups) => groups,
+            Err(e) => return bad(e),
+        };
+    }
     if let Some(refusal) = worker_apply_refusal(&headers, &spec, dry) {
         return refusal;
     }
@@ -1009,7 +1076,7 @@ fn render_worker_env(w: &WorkerSpec) -> Result<String, String> {
     if !w.dir.is_empty() {
         pairs.push(("CC_DIR", w.dir.clone()));
     }
-    let groups: Vec<String> = w.groups.iter().map(|g| crate::api::session_verbs::norm_label(g)).filter(|g| !g.is_empty()).collect();
+    let groups = crate::api::session_verbs::tags_of(Some(&json!(w.groups)))?;
     if !groups.is_empty() {
         pairs.push(("CC_TAGS", groups.join(",")));
     }
@@ -1080,6 +1147,13 @@ fn write_env_atomic(path: &std::path::Path, body: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::api::sessions_legacy::worker_model_env;
+
+    #[test]
+    fn delegation_env_import_tags_use_canonical_array_grammar() {
+        let spec = WorkerSpec { name:"test-canonical".into(), groups:vec![" OPS ".into(),"dev,DEV".into()], ..Default::default() };
+        let rendered = render_worker_env(&spec).unwrap();
+        assert!(rendered.lines().any(|line| line == "CC_TAGS=\"dev,ops\""),"{rendered}");
+    }
 
     #[test]
     fn round8_env_apply_update_preserves_tokens_across_all_writers() {

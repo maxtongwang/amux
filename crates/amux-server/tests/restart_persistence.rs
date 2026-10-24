@@ -269,6 +269,13 @@ impl Rig {
         self.send_as(None, reqwest::Method::POST, path, body).await
     }
 
+    /// The owner's write of a privileged scope (connectors): a worker may not
+    /// widen its own connectors (ai-config #160), and these suites test
+    /// persistence, not authorization.
+    async fn send_owner(&self, method: reqwest::Method, path: &str, body: Value) -> (u16, Value) {
+        self.send_as(None, method, path, body).await
+    }
+
     async fn send_as(&self, worker: Option<&str>, method: reqwest::Method, path: &str, body: Value) -> (u16, Value) {
         let mut req = self
             .client
@@ -1297,7 +1304,7 @@ async fn declared_oauth_connector_lifecycle_survives_sigkill() {
     assert_eq!(accounts["accounts"][0]["families"]["fixture-oauth"], "ok");
 
     // Scope values are written through the production API, not a guessed file.
-    let response=rig.send(reqwest::Method::PUT,"/api/scope",json!({"level":"worker","name":"rr0150-suite","capability":"connectors","value":{"fixture-oauth":{"enabled":true,"account":"beth"}}})).await;
+    let response=rig.send_owner(reqwest::Method::PUT,"/api/scope",json!({"level":"worker","name":"rr0150-suite","capability":"connectors","value":{"fixture-oauth":{"enabled":true,"account":"beth"}}})).await;
     assert_eq!(response.0, 200, "{}", response.1);
     let (status, minted) = rig
         .post("/api/connectors/fixture-oauth/token", json!({}))
@@ -1439,7 +1446,7 @@ async fn connector_scope_patches_survive_concurrency_and_sigkill() {
     let scoped = "rr0150-suite";
     let value = json!({"slack":{"enabled":true,"account":"beth","mcp":"fixture-mcp"},"fixture-oauth":{"enabled":true,"account":"beth"}});
     assert_eq!(
-        rig.send(
+        rig.send_owner(
             reqwest::Method::PUT,
             "/api/scope",
             json!({"level":"worker","name":scoped,"capability":"connectors","value":value})
@@ -1448,6 +1455,14 @@ async fn connector_scope_patches_survive_concurrency_and_sigkill() {
         .0,
         200
     );
+    // The same privileged write from the worker itself is refused: a worker
+    // may not widen its own connectors (ai-config #160, dev-lead #18).
+    let (code, refused) = rig.send(
+        reqwest::Method::PUT,
+        "/api/scope",
+        json!({"level":"worker","name":scoped,"capability":"connectors","value":{"slack":{"enabled":true}}}),
+    ).await;
+    assert_eq!((code, refused["code"].as_str()), (403, Some("owner_only_key")), "{refused}");
     let writes=(0..24).map(|i| {
         let client=rig.client.clone();let url=rig.url("/api/scope");
         async move {
@@ -1456,7 +1471,7 @@ async fn connector_scope_patches_survive_concurrency_and_sigkill() {
         }
     });
     futures::future::join_all(writes).await;
-    assert_eq!(rig.send(reqwest::Method::PUT,"/api/scope",json!({"level":"worker","name":scoped,"capability":"connectors","value":{"connectors":{"slack":{"enabled":false}},"merge":true}})).await.0,200);
+    assert_eq!(rig.send_owner(reqwest::Method::PUT,"/api/scope",json!({"level":"worker","name":scoped,"capability":"connectors","value":{"connectors":{"slack":{"enabled":false}},"merge":true}})).await.0,200);
     rig.restart().await;
     let (_, scope) = rig
         .get(&format!("/api/scope?level=worker&name={scoped}"))
@@ -1479,7 +1494,7 @@ async fn connector_scope_patches_survive_concurrency_and_sigkill() {
     assert_eq!(cfg["fixture-oauth"]["account"], "beth");
     let bad = json!({"level":"worker","name":scoped,"capability":"connectors","value":{"connectors":{"slack":{"enabled":true}},"merge":"yes"}});
     assert_eq!(
-        rig.send(reqwest::Method::PUT, "/api/scope", bad).await.0,
+        rig.send_owner(reqwest::Method::PUT, "/api/scope", bad).await.0,
         400
     );
     // Storage corruption is retained; a partial toggle must not erase it.
@@ -1489,7 +1504,7 @@ async fn connector_scope_patches_survive_concurrency_and_sigkill() {
     );
     let patch = json!({"level":"worker","name":scoped,"capability":"connectors","value":{"connectors":{"slack":{"enabled":true}},"merge":true}});
     assert_eq!(
-        rig.send(reqwest::Method::PUT, "/api/scope", patch).await.0,
+        rig.send_owner(reqwest::Method::PUT, "/api/scope", patch).await.0,
         500
     );
     rig.restart().await;

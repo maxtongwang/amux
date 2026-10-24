@@ -19,6 +19,49 @@ observer = module('observer', 'native-status.py')
 installer = module('installer', 'install-native-status-hooks.py')
 
 class NativeStatus(unittest.TestCase):
+    def test_stop_transcript_fallback_uses_only_complete_latest_assistant_text(self):
+        for provider, records in [
+            ('claude', [{'type':'assistant', 'message':{'role':'assistant', 'content':[
+                {'type':'thinking', 'thinking':'private reasoning'},
+                {'type':'text', 'text':'Exact question? Request REQ1'}]}}]),
+            ('codex', [{'type':'response_item', 'payload':{'type':'message', 'role':'assistant',
+                'content':[{'type':'output_text', 'text':'Exact question? Request REQ1'}]}}]),
+        ]:
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp); transcript=root/'transcript.jsonl'
+                transcript.write_text('\n'.join(map(json.dumps,records))+'\n')
+                data={'hook_event_name':'Stop', 'transcript_path':str(transcript)}
+                self.assertTrue(observer.observe(data,root,'mrpopo','abc',provider,100.0))
+                value=json.loads(next((root/'status-events/mrpopo/abc').glob('0*.json')).read_text())
+                self.assertEqual(value['assistant_message'],'Exact question? Request REQ1')
+                self.assertNotIn('private reasoning',json.dumps(value))
+                if provider == 'claude':
+                    with transcript.open('a') as out:
+                        out.write(json.dumps({'type':'assistant','message':{'role':'assistant',
+                                  'content':[{'type':'tool_use','name':'example'}]}})+'\n')
+                    self.assertIsNone(observer.assistant_message(data,provider))
+                with transcript.open('a') as out:
+                    out.write(json.dumps({'type':'user','message':{'role':'user','content':'new input'}})
+                              if provider=='claude' else json.dumps({'type':'event_msg','payload':{'type':'user_message','message':'new input'}}))
+                self.assertIsNone(observer.assistant_message(data,provider))
+                transcript.write_text('{"partial":')
+                self.assertIsNone(observer.assistant_message(data,provider))
+
+    def test_stop_carries_exact_assistant_message_only_for_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            text = 'Exact question?\nRequest REQ1 ' + 'x' * 25000
+            for worker, event, extra in [('mrpopo', 'Stop', {}), ('other', 'Stop', {}),
+                                         ('mrpopo', 'PostToolUse', {}),
+                                         ('mrpopo', 'Stop', {'agent_id': 'child'})]:
+                observer.observe(dict(hook_event_name=event, last_assistant_message=text, **extra),
+                                 root, worker, 'abc', 'claude', 100.0)
+            values = [json.loads(p.read_text()) for p in sorted((root/'status-events/mrpopo/abc').glob('0*.json'))]
+            self.assertEqual(values[0]['assistant_message'], text)
+            self.assertNotIn('assistant_message', values[1])
+            other = json.loads(next((root/'status-events/other/abc').glob('0*.json')).read_text())
+            self.assertNotIn('assistant_message', other)
+
     def test_provider_edges(self):
         expected = {'SessionStart':'idle', 'UserPromptSubmit':'active',
             'PreToolUse':'active', 'PermissionRequest':'blocked',
@@ -59,7 +102,22 @@ class NativeStatus(unittest.TestCase):
             observer.observe({'hook_event_name':'PostToolUse','prompt':'private prompt'},root,'worker','abc','claude',2.0)
             values=[json.loads(p.read_text()) for p in sorted((root/'status-events/worker/abc').glob('0*.json'))]
             self.assertEqual(len(values[0]['prompt']),20000)
+            self.assertTrue(values[0]['prompt_truncated'])
             self.assertNotIn('prompt',values[1])
+
+    def test_owner_submit_preserves_session_proof_and_reports_truncation(self):
+        for session in ['terminal-session', 'remote-control-session']:
+            with self.subTest(session=session), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for prompt in ['no', 'yes' + ' ' * 20000 + 'do not proceed']:
+                    self.assertTrue(observer.observe({'hook_event_name':'UserPromptSubmit',
+                        'session_id':session, 'prompt':prompt}, root, 'mrpopo', 'abc', 'claude', 1.0))
+                values=[json.loads(p.read_text()) for p in sorted((root/'status-events/mrpopo/abc').glob('0*.json'))]
+                self.assertEqual(len(values),2)
+                self.assertEqual(values[0]['prompt'],'no')
+                self.assertFalse(values[0]['prompt_truncated'])
+                self.assertTrue(values[1]['prompt_truncated'])
+                self.assertTrue(all(v['session_id']==session and v['run_id']=='abc' for v in values))
 
     def test_question_notification_preserves_waiting_but_real_permission_blocks(self):
         with tempfile.TemporaryDirectory() as tmp:

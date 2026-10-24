@@ -621,8 +621,27 @@ async fn get_config() -> Response {
     .into_response()
 }
 
-async fn patch_config(body: Option<Json<Value>>) -> Response {
+async fn patch_config(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
     let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    // ai-config #175 / #160: the owner's alert channels (phone, email) are
+    // owner-only, or mrpopo through a grant Max approves.
+    let grant = match crate::api::delegation::authorize(&state, &headers, &crate::api::delegation::Target::Fleet,
+        &crate::api::delegation::Action::SetConfig { keys: vec!["settings:alerts".into()] }, Some(&body)) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    let resp = patch_config_inner(body.clone()).await;
+    if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(&state, Value::Null, body);
+    }
+    resp
+}
+
+async fn patch_config_inner(body: Value) -> Response {
     let home = amux_home();
     // Python: each key applied only when PRESENT in the body (`"phone" in body`).
     if let Some(v) = body.get("phone") {

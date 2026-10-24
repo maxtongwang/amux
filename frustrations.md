@@ -6173,3 +6173,102 @@ FIX: Withhold completion while scans or entries fail, persist pending paths, and
   retry at startup or once per minute on identity operations. Successful entries
   leave the pending list; WARN identity_migration_pending reports counts and
   identity_migration_attempt records each bounded pass.
+
+
+## Citation approval could override an owner's reversal
+AREA: delegation
+SEVERITY: breaks
+STATUS: fixed
+DATE: 2026-10-23
+SESSION: pr18-r4
+CARD: maxtongwang/ai-config#160
+SYMPTOM: One cited ask/reply pair could mint repeated grants, including after
+  the owner restored removed membership. Mutable target names and incidental
+  setting mentions also let the request diverge from the cited ask.
+COST: PR #18 round-3 B1 and N1-N5; regression tests await the parent's Cargo
+  run because safe-cargo exits 75 on the sandbox-denied reclaim lock.
+FIX: Reserve one pair with its spent timestamp and exact request in the grant
+  transaction; compare delegated env writes under the writer's locks; bind
+  worker asks/grants to CC_INCARNATION; require directed tag requests and
+  canonical tag serialization. Refusals log delegation_refused with distinct
+  codes, delegation_grant_refused or delegation_state_changed. Array inputs
+  emit tags_array_normalized. SQLite uniqueness mutation failed as expected
+  and reverted; Rust behavioral verification is pending. Handler side effects
+  still span SQLite/files and are not one atomic resource transaction.
+  B1 ruling (a) follow-up: failed atomic env writes keep the pair spent and
+  persist failed status. WARN delegation_grant_failed names the grant; API
+  failure_reason, amux grant list [--json], and the existing dashboard audit
+  rows instruct a fresh owner ask. Failure-injection tests and exact mutations
+  are supplied for the parent's runtime verification.
+
+  Opus delta review of edc942b2 follow-up: all citation actions now use one
+  target/value/direction matcher, including negation refusal; passing mentions
+  cannot fund YOLO on another worker. Restored the original 0126 and moved all
+  later schema additions to 0127 so an already-stamped DB upgrades. Env CAS
+  compares touched keys plus identity and merges unrelated writes. Ask binding
+  reads existing incarnations on demand without fleet scans or env writes.
+  The populated-old-0126 SQLite probe passed, its reply-index mutation failed
+  and reverted; the parent still owns Cargo and Rust regression verification.
+
+## Typed yes bound to another approval
+AREA: delegation
+SEVERITY: breaks
+STATUS: fixed
+DATE: 2026-10-23
+SESSION: pr18-r4
+CARD: maxtongwang/ai-config#160
+SYMPTOM: PR #18 review B1 let one actor spend Max's yes under another actor's
+  question; B2 treated a contrast clause as approval of the excluded change.
+COST: Another review round; free-text matching could not establish approval identity.
+FIX: Max 2026-10-23: approval identity resolution. Supersedes the free-text
+  matcher portion of "Citation approval could override an owner's reversal".
+  Explicit request IDs bind existing actor, target and reply incarnations,
+  exact structured operands and the generated Messages question. A reply
+  resolves only one question in its own unanswered session window; ambiguous
+  and absent candidates fund nothing. Distinct request refusal codes and
+  delegation_request_resolution verdicts survive in the API, CLI and existing
+  dashboard list. 0129 adds the request bindings and resolution receipts;
+  0124-0128 remain unchanged. Rust regressions/mutations await the parent;
+  local CLI/dashboard and SQLite uniqueness/SIGKILL boundary probes pass.
+
+
+## Approval draft reused its parent receipt
+AREA: delegation
+SEVERITY: breaks
+STATUS: fixed
+DATE: 2026-10-23
+SESSION: pr18-r4
+CARD: maxtongwang/ai-config#160
+SYMPTOM: Three parent lib tests and explicit request creation returned 409
+  Interaction could not be recorded before deriving an approval request.
+COST: Parent test round blocked; integration fixtures also retained removed
+  citation helpers and an undefined cited_at timestamp.
+FIX: The internal config draft no longer inherits the POST interaction ID or
+  command kind. It retains actor/auth identity and gets its own durable receipt;
+  real method/path/actor conflicts remain refused. delegation_request_draft logs
+  the parent ID and draft method/path, alongside interaction_accept_failed for
+  actual collisions. The regression checks separate receipts and a genuine 409;
+  integration fixtures use request IDs and forbidden request creation. Parent
+  owns Rust execution; non-cargo syntax, registry and seven Node checks pass.
+
+
+## Owner hook fixture silently ignored submitted replies
+AREA: delegation
+SEVERITY: breaks
+STATUS: fixed
+DATE: 2026-10-23
+SESSION: pr18-r4
+CARD: maxtongwang/ai-config#160
+SYMPTOM: Parent integration tests got HTTP 200 after pane yes/approve but no
+  request resolution. The helper omitted native state=active; the real handler
+  answered applied=false, with native_status_refused reason=invalid_state.
+COST: Two failing integration cases and a misleading missing-wiring diagnosis.
+FIX: Use the complete provider hook payload and require an applied receipt.
+  Assert the committed resolution before GET recovery can conceal an unhooked
+  recorder. The class sweep also preserves verified owner proof for Chat,
+  steering, project sends and forwarded owner input through the same recorder;
+  peer/member exclusion and direct Remote application proof stay enforced.
+  Existing delegation_request_resolution and delegation_request_refused verdicts
+  now announce these replies; the fixture fails at the rejected receipt itself.
+  Native-hook tests (6), SQLite schema/SIGKILL probes and Rust parsing pass.
+  Parent owns Rust regressions and the recorder-unhook mutation; no Cargo ran.

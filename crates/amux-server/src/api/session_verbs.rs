@@ -516,6 +516,12 @@ pub(crate) fn unique_tmp_path(path: &Path) -> std::path::PathBuf {
     ))
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    // Test-only, scoped to one async request; production has no failure switch.
+    pub(crate) static TEST_ENV_RENAME_FAILURE: std::path::PathBuf;
+}
+
 /// Cross-process companion to env_write_lock. The Bash registrar uses the
 /// same flock, so its env replacement cannot race the server's first mint.
 pub(crate) fn incarnation_file_lock(path: &Path) -> std::io::Result<Option<std::fs::File>> {
@@ -551,6 +557,15 @@ fn worker_incarnation_for_write(path: &Path) -> std::io::Result<Option<String>> 
 
 fn worker_text_with_incarnation(path: &Path, text: &str) -> std::io::Result<String> {
     let Some(id) = worker_incarnation_for_write(path)? else { return Ok(text.to_string()); };
+    let mut identities = text.lines().filter_map(EnvFile::parse_line)
+        .filter(|(key, _)| key == super::rename_identity::INCARNATION_KEY);
+    // Raw undo must keep the original bytes, including identity position and
+    // quoting. Only a single assignment of the current identity is safe to keep.
+    if identities.next().is_some_and(|(_, value)| value == id) && identities.next().is_none() {
+        return Ok(text.to_string());
+    }
+    tracing::info!(path = %path.display(), verdict = "env_incarnation_text_repaired", measured = true, n_considered = 1,
+        "env replacement needed its missing, different or duplicate identity replaced with the worker's current incarnation");
     let mut text: String = text.split_inclusive('\n').filter(|line| {
         EnvFile::parse_line(line).is_none_or(|(key, _)| key != super::rename_identity::INCARNATION_KEY)
     }).collect();
@@ -735,11 +750,15 @@ impl EnvFile {
     pub(crate) fn write(&self, path: &Path) -> std::io::Result<()> {
         let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _file = incarnation_file_lock(path)?;
-        let mut latest = if self.dirty.is_empty() {
-            self.clone()
+        let mut latest = Self::load(path);
+        let keys: Vec<&str> = if self.dirty.is_empty() {
+            // A whole snapshot also removes keys absent from that snapshot.
+            self.pairs.iter().chain(latest.pairs.iter()).map(|(key, _)| key.as_str()).collect()
         } else {
-            Self::load(path)
+            self.dirty.iter().map(|(key, _)| key.as_str()).collect()
         };
+        super::delegation_grants::compare_env(path, &keys)?;
+        if self.dirty.is_empty() { latest = self.clone(); }
         for (key, value) in &self.dirty {
             match value {
                 Some(value) => latest.set(key, value),
@@ -749,7 +768,9 @@ impl EnvFile {
         if let Some(id) = worker_incarnation_for_write(path)? {
             latest.set(super::rename_identity::INCARNATION_KEY, &id);
         }
-        latest.write_unlocked(path)
+        latest.write_unlocked(path)?;
+        super::delegation_grants::env_written(path);
+        Ok(())
     }
 
     /// Why `key=value` cannot be written to an env file, or None.
@@ -804,12 +825,27 @@ impl EnvFile {
             f.write_all(out.as_bytes())?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        Self::commit_tmp(&tmp, path)
+    }
+
+    /// Every env writer commits by same-directory rename, after writing/syncing
+    /// the complete temp file. A failed commit leaves the destination intact.
+    fn commit_tmp(tmp: &Path, path: &Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        if TEST_ENV_RENAME_FAILURE.try_with(|blocked| blocked == path).unwrap_or(false) {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected env rename failure"));
+        }
+        std::fs::rename(tmp, path)
     }
 
     pub(crate) fn replace_text(path: &Path, text: &str) -> std::io::Result<()> {
         let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _file = incarnation_file_lock(path)?;
+        // A raw replacement touches every existing and supplied key.
+        let current = Self::load(path);
+        let replacement = Self::from_text(text);
+        let keys: Vec<&str> = current.pairs.iter().chain(replacement.pairs.iter()).map(|(key, _)| key.as_str()).collect();
+        super::delegation_grants::compare_env(path, &keys)?;
         let text = worker_text_with_incarnation(path, text)?;
         use std::io::Write as _;
         if let Some(dir) = path.parent() {
@@ -826,7 +862,9 @@ impl EnvFile {
             f.write_all(text.as_bytes())?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        Self::commit_tmp(&tmp, path)?;
+        super::delegation_grants::env_written(path);
+        Ok(())
     }
 
     /// A value as it must appear in a file bash sources and both env parsers
@@ -866,6 +904,8 @@ impl EnvFile {
         }
         let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _file = incarnation_file_lock(path)?;
+        let keys: Vec<&str> = updates.iter().map(|(key, _)| key.as_str()).collect();
+        super::delegation_grants::compare_env(path, &keys)?;
         // Read with the worker-file parser: it un-escapes the double-quoted
         // values Self::write produces, which crate::config::parse_env_file
         // does not, so a round trip here cannot grow backslashes.
@@ -901,7 +941,9 @@ impl EnvFile {
             file.write_all(text.as_bytes())?;
             file.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        Self::commit_tmp(&tmp, path)?;
+        super::delegation_grants::env_written(path);
+        Ok(())
     }
 }
 
@@ -6797,6 +6839,8 @@ pub(crate) fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Resu
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN msg_id TEXT", []);
     // Same migration: set when a row's delivery was inferred from its TEXT.
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN reconciled_at INTEGER", []);
+    // Migration 0124 carries the same ADDCOL for migrated DBs (ai-config#160).
+    let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN process_origin TEXT", []);
     // Dead-lettered vs delivered must be distinguishable in history
     // (AMUX-3110; migration 0024 carries the same ADDCOL for migrated DBs,
     // this covers a DB bootstrapped through this legacy path).
@@ -7091,6 +7135,12 @@ pub(crate) struct DeliveryMeta<'a> {
     /// The earlier owner message this one repeats (F8(e), migration 0088).
     /// None for everything that is not a detected repeat.
     pub repeat_of: Option<i64>,
+    /// The process-attribution verdict of the request that sent an OWNER
+    /// message (`outside`, `remote` or `remote-forwarded`, from
+    /// `process_identity`), migration 0124. `max_ref` accepts an owner send as
+    /// the owner's own words only with one of those. None on every other row:
+    /// peer, member, schedule, pane, and every row written before 0124.
+    pub process_origin: Option<&'a str>,
 }
 
 impl DeliveryMeta<'_> {
@@ -7101,6 +7151,7 @@ impl DeliveryMeta<'_> {
             submit_verdict: Some("accepted"),
             client_meta: None,
             repeat_of: None,
+            process_origin: None,
         }
     }
     /// A send handed straight to a live lane, with nothing to verify.
@@ -7135,6 +7186,7 @@ impl DeliveryMeta<'_> {
             submit_verdict: None,
             client_meta: None,
             repeat_of: None,
+            process_origin: None,
         }
     }
 }
@@ -7676,6 +7728,34 @@ fn prior_delivered(
     .ok()
 }
 
+/// Only server-attributed owner requests may carry proof into the recorder.
+pub(crate) fn owner_input_process_origin(headers: &HeaderMap) -> Option<&str> {
+    if super::org::is_verified_local_member(headers) || !hdr_worker(headers).trim().is_empty() {
+        return None;
+    }
+    headers.get(super::process_identity::PROCESS_ORIGIN_HEADER).and_then(|v| v.to_str().ok())
+}
+
+pub(crate) fn close_discarded_owner_input(state: &AppState, name: &str, headers: &HeaderMap, reason: &str) -> Option<Response> {
+    super::delegation_requests::discarded_send(state,name,headers,reason).err().map(|error|
+        super::delegation_requests::refusal("request_input_boundary_failed",&error))
+}
+
+// Default CLI relays are peer deliveries even through an outside process.
+// Match the deferred-send branch; explicit owner history/immediate controls
+// retain their conservative owner boundary on every outcome.
+fn close_discarded_send_input(state: &AppState, name: &str, headers: &HeaderMap, body: &Value, reason: &str) -> Option<Response> {
+    let relay = !body.get("record_history").map(py_truthy).unwrap_or(false)
+        && !body.get("deliver_now").map(py_truthy).unwrap_or(false)
+        && !body_str(body,"source_session").trim().is_empty();
+    if relay {
+        tracing::info!(session=name, reason, verdict="delegation_peer_relay_preserved", measured=true, n_considered=1,
+            "peer relay does not consume the owner's reply window");
+        return None;
+    }
+    close_discarded_owner_input(state,name,headers,reason)
+}
+
 pub(crate) async fn cmd_hist_record_full(
     state: &AppState,
     session: &str,
@@ -7701,7 +7781,7 @@ pub(crate) async fn cmd_hist_record_full(
 /// message ... test against each active worker"): the title is a display label
 /// written to amux's own meta from text amux already holds, and nothing reaches
 /// the worker.
-fn spawn_task_title(session: &str, text: &str) {
+pub(crate) fn spawn_task_title(session: &str, text: &str) {
     if amux_core::board::is_conversational_ack(text) || text.trim().chars().count() < 12 {
         return;
     }
@@ -7859,6 +7939,11 @@ pub(crate) async fn cmd_hist_record_with_id(
     let submit_verdict = meta.submit_verdict.map(|v| v.to_string());
     let queued_at_ms = meta.queued_at_ms;
     let repeat_of = meta.repeat_of;
+    // Forwarded owner input can correlate; it still cannot prove direct Remote approval.
+    let process_origin = meta
+        .process_origin
+        .filter(|v| matches!(*v, "outside" | "remote" | "remote-forwarded"))
+        .map(str::to_string);
     // Bounded, and only if it parses as a JSON OBJECT. This lands in a column
     // the Messages tab renders and the Ask panel feeds to a model, so a client
     // must not be able to write a megabyte of arbitrary text into it, nor a
@@ -7874,7 +7959,7 @@ pub(crate) async fn cmd_hist_record_with_id(
             .filter(Value::is_object)
             .map(|v| v.to_string())
     });
-    let now_ms = now_i64() * 1000;
+    let now_ms = (now_f64() * 1000.0) as i64;
 
     // DUPLICATE-DELIVERY DETECTOR (Ethan's standing rule, 2026-08-11: fix the
     // bug AND make the next one surface in the logs).
@@ -7988,6 +8073,7 @@ pub(crate) async fn cmd_hist_record_with_id(
                 && amux_core::board::reads_as_qualifier(&text)
                 && !amux_core::board::is_conversational_ack(&text)))
         && !amux_core::board::is_informational_query(&text);
+    let delegation_session_incarnation = super::rename_identity::incarnation(&crate::config::amux_home(), &session);
     let msg_row_id_w = msg_row_id.clone();
     let cap_session = session.clone();
     let truth_session = cap_session.clone();
@@ -8006,12 +8092,12 @@ pub(crate) async fn cmd_hist_record_with_id(
                 dup_prior_ts_w.store(pts, std::sync::atomic::Ordering::SeqCst);
             }
             conn.execute(
-                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, repeat_of) \
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, repeat_of, process_origin, delegation_session_incarnation, delegation_message_type) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rusqlite::params![
                     text, ctype, session, now_ms, origin,
                     delivery, queued_at_ms, delivered_at_ms, submit_verdict, capture_pending,
-                    client_meta, repeat_of
+                    client_meta, repeat_of, process_origin, delegation_session_incarnation, ctype
                 ],
             )?;
             let row_id = conn.last_insert_rowid();
@@ -8023,6 +8109,8 @@ pub(crate) async fn cmd_hist_record_with_id(
             msg_row_id_w.store(row_id, std::sync::atomic::Ordering::SeqCst);
             conn.execute(
                 "DELETE FROM cmd_history WHERE session=?1 AND project_group IS NULL AND capture_pending=0 AND ts<?3 \
+                 AND NOT EXISTS (SELECT 1 FROM _amux_delegation_grants dg WHERE dg.shown_row=cmd_history.id OR dg.evidence_row=cmd_history.id OR (dg.reply_session=cmd_history.session AND dg.status='pending' AND cmd_history.id>=dg.shown_row)) \
+                 AND NOT EXISTS (SELECT 1 FROM _amux_delegation_resolutions dr WHERE dr.reply_row=cmd_history.id) \
                  AND NOT EXISTS (SELECT 1 FROM issues i WHERE i.id=cmd_history.card_id AND i.deleted IS NULL AND i.archived=0 AND i.status NOT IN ('done','verified','discarded','quarantined','cancelled')) AND id NOT IN \
                  (SELECT id FROM cmd_history WHERE session=?1 ORDER BY ts DESC LIMIT ?2)",
                 rusqlite::params![session, CMD_HIST_KEEP, now_ms-3_600_000],
@@ -8154,7 +8242,13 @@ pub(crate) async fn cmd_hist_record_with_id(
             .await;
         }
     }
-    msg_row_id.load(std::sync::atomic::Ordering::SeqCst)
+    let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
+    if row_id > 0 {
+        // Single post-recording resolution point for pane, send, Chat and steering.
+        // on_row reserves replies idempotently in the Store writer transaction.
+        Box::pin(super::delegation_grants::on_row(state, row_id)).await;
+    }
+    row_id
 }
 
 async fn link_queued_message(state: &AppState, session: &str, row_id: i64, queue_id: &str) {
@@ -8956,8 +9050,9 @@ fn steer_row_source(conn: &rusqlite::Connection, id: &str) -> (Option<String>, O
 ///
 /// Membership is by producer, not by heuristic, so adding a content-bearing
 /// producer is a deliberate edit here rather than something that has to be
-/// noticed later.
-const NON_COALESCING_GUARDS: &[&str] = &["board-progress"];
+/// noticed later. The delegated-change feed is one: each notice names a
+/// different change, so a second one must not overwrite the first.
+const NON_COALESCING_GUARDS: &[&str] = &["board-progress", super::delegation_log::FEED_GUARD];
 
 /// Whether `guard` names a content-bearing producer (see
 /// [`NON_COALESCING_GUARDS`]). Guards stay non-empty for these, so the isolation
@@ -18674,6 +18769,7 @@ async fn wake_session(state: &AppState, name: &str) -> (bool, String) {
             axum::extract::State(state.clone()),
             None,
             axum::extract::Path(name.to_string()),
+            axum::http::HeaderMap::new(),
         )
         .await;
         let ok = resp.status().is_success();
@@ -25315,14 +25411,8 @@ async fn dispatch(
     if let Some(worker) = super::chat_worker::companion_parent(&name) {
         let worker = worker.to_string();
         let receipt = qs_get(&qs, "msg_id");
-        let caller = headers
-            .get("x-amux-session")
-            .or_else(|| headers.get("x-amux-worker"))
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
         return super::chat_worker::companion_route(
-            &state, &worker, method == Method::POST, &action, receipt, &body, &caller,
+            &state, &worker, method == Method::POST, &action, receipt, &body, &headers,
         )
         .await;
     }
@@ -26917,6 +27007,14 @@ pub(crate) async fn steer_mutate(
     headers: &HeaderMap,
     body: &Value,
 ) -> Response {
+    let response=steer_mutate_inner(state,name,method,headers,body).await;
+    if *method == Method::POST && !response.status().is_success() {
+        return close_discarded_owner_input(state,name,headers,"steer_refused").unwrap_or(response);
+    }
+    response
+}
+
+async fn steer_mutate_inner(state: &AppState, name: &str, method: &Method, headers: &HeaderMap, body: &Value) -> Response {
     if *method == Method::DELETE {
         let msg_id = body_str(body, "id");
         let sent = body.get("sent").map(py_truthy).unwrap_or(false);
@@ -27105,7 +27203,10 @@ pub(crate) async fn steer_mutate(
             format!("steer:{client_id}")
         };
         if let Some(response) = send_dedup_gate(state, name, &dedup_id).await {
-            return response;
+            return close_discarded_owner_input(state,name,headers,"steer_deduplicated").unwrap_or(response);
+        }
+        if !body.get("record_history").map(py_truthy).unwrap_or(false) {
+            if let Some(error)=close_discarded_owner_input(state,name,headers,"steer_history_disabled") { return error; }
         }
         // IS THIS A PICKER ANSWER? Decide NOW, while the picker is still on
         // screen — intent is only knowable at the moment it existed (AMUX-2823).
@@ -27194,7 +27295,10 @@ pub(crate) async fn steer_mutate(
                 history_type,
                 history_origin,
                 skip_board,
-                DeliveryMeta::queued(now_i64() * 1000),
+                DeliveryMeta {
+                    process_origin: owner_input_process_origin(headers),
+                    ..DeliveryMeta::queued(now_i64() * 1000)
+                },
             )
             .await;
             link_queued_message(state, name, row_id, &msg_id).await;
@@ -27295,13 +27399,51 @@ async fn post_dispatch(
 ) -> Response {
     // The verbs that rewrite who a worker is (its name, its instructions, its
     // memory) follow the peer-config rule; the rename alias and PATCH config
-    // must not differ, lead team renames included.
-    if action == "rename" {
-        let to = rename_verb_target(body);
-        if let Some(refusal) = peer_config_refusal_unless_lead_rename(headers, name, action, Some(to)) { return refusal; }
-    } else if matches!(action, "instructions" | "memory") {
-        if let Some(refusal) = peer_config_refusal(headers, name, action) { return refusal; }
+    // must not differ.
+    // Through the delegation table (ai-config #160); `stop` joined these: a
+    // worker stops itself, a lead its team, anyone else is refused.
+    // git-push is not here: git_push_verb asks the table itself (GitPush), so
+    // the sessions and workers routes cannot differ.
+    if matches!(action, "rename" | "instructions" | "memory" | "stop" | "start" | "reset" | "clear" | "git" | "worktree" | "archive" | "keys") {
+        use super::delegation::{authorize, reserved_name_refusal, Action, Target};
+        let act = match action {
+            "rename" => {
+                let to = rename_verb_target(body).to_string();
+                if let Some(r) = reserved_name_refusal(headers, &to) { return r; }
+                Action::RenameWorker { to }
+            }
+            "stop" => Action::StopWorker,
+            // keys: self only (a pane writer); never a lead power.
+            "instructions" | "memory" | "keys" => Action::SetConfig { keys: vec![action.to_string()] },
+            other => Action::Lifecycle { verb: other.to_string() },
+        };
+        let grant = match authorize(state, headers, &Target::Worker(name.to_string()), &act, Some(body)) {
+            Ok(g) => g,
+            Err(r) => return r,
+        };
+        if let Some(g) = grant {
+            let resp = post_dispatch_inner(state, name, action, headers, body).await;
+            if resp.status().is_success() {
+                let after = match &act {
+                    Action::RenameWorker { to } => json!({"name": to}),
+                    Action::StopWorker => json!({"stopping": true}),
+                    _ => json!({"updated": action}),
+                };
+                g.commit(state, json!({"name": name}), after);
+            }
+            return resp;
+        }
     }
+    post_dispatch_inner(state, name, action, headers, body).await
+}
+
+async fn post_dispatch_inner(
+    state: &AppState,
+    name: &str,
+    action: &str,
+    headers: &HeaderMap,
+    body: &Value,
+) -> Response {
     match action {
         "transcripts" => match backup_session_jsonl(name, "manual") {
             Some(path) => j200(json!({"ok": true, "path": path})),
@@ -27473,8 +27615,11 @@ async fn post_dispatch(
         "clear" => clear_verb(name).await,
         "duplicate" => duplicate_verb(state, name, headers, body),
         "clone" => {
-            if let Some(refusal) = copy_refusal(name, headers) { return refusal; }
-            clone_post(state, name, body).await
+            let new_name = body_str(body, "new_name");
+            if let Some(refusal) = copy_refusal(name, headers, Some(new_name.trim())) { return refusal; }
+            let resp = clone_post(state, name, body).await;
+            if resp.status().is_success() { log_copy(state, headers, name, new_name.trim(), "clone"); }
+            resp
         }
         "archive" => {
             if !session_destructive_allowed(state, headers) {
@@ -28053,6 +28198,13 @@ async fn get_cross_group_config() -> Response {
 /// cross-group channel, which is the escalation the scope policy exists to stop.
 /// A request carrying no worker origin is the dashboard.
 async fn put_cross_group_config(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    // Routing is a delegation row (ai-config #160): mrpopo through a grant only.
+    // This legacy endpoint can only CLEAR the override and has no AppState to
+    // store a grant, so every worker gets the table's refusal here; the
+    // header check below stays for verified members.
+    if let Some(refusal) = super::delegation::refusal_value(&headers, &super::delegation::Target::Fleet, &super::delegation::Action::SetRouting) {
+        return jresp(StatusCode::FORBIDDEN, refusal);
+    }
     if ["x-amux-session", "x-amux-worker"].iter().any(|h| {
         headers
             .get(*h)
@@ -28671,6 +28823,14 @@ async fn send_post_detached(
 }
 
 pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
+    let response=send_post_inner(state,name,headers,body).await;
+    if !response.status().is_success() {
+        return close_discarded_send_input(state,name,headers,body,"send_refused").unwrap_or(response);
+    }
+    response
+}
+
+async fn send_post_inner(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
     if let Some(refusal) = probe_refusal(state, name, headers, &body_str(body, "text")).await {
         return refusal;
     }
@@ -28756,13 +28916,26 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
     }
     let msg_id: String = body_str(body, "msg_id").trim().chars().take(64).collect();
     if let Some(response) = send_dedup_gate(state, name, &msg_id).await {
-        return response;
+        return close_discarded_send_input(state,name,headers,body,"send_deduplicated").unwrap_or(response);
     }
     if text.trim().starts_with("/compact") {
         let n = name.to_string();
         crate::db::interactions::spawn_blocking(move || backup_session_jsonl(&n, "pre_compact"));
     }
-    let record_history = body.get("record_history").map(py_truthy).unwrap_or(false);
+    // The owner CLI sends text/msg_id to the worker-ID alias without a
+    // history flag. Derive the default from server process proof, never from
+    // the absence of a worker header alone. Explicit opt-out and peer relays
+    // retain their existing behavior.
+    let owner_history_default = owner_input_process_origin(headers).is_some()
+        && body_str(body, "source_session").trim().is_empty();
+    let record_history = body.get("record_history").map(py_truthy).unwrap_or(owner_history_default);
+    if !record_history {
+        if let Some(error)=close_discarded_send_input(state,name,headers,body,"send_history_disabled") { return error; }
+    }
+    if body.get("record_history").is_none() && owner_history_default {
+        tracing::info!(session = name, verdict = "owner_send_history_defaulted", measured = true,
+            n_considered = 1, "verified owner CLI/API input retained for reply resolution");
+    }
     // The context the sender composed in (AMUX-4693). Serialised back to a
     // string here rather than threaded as a `&Value` so the recorder's
     // validation has exactly one input shape to defend, and so a caller that
@@ -28786,6 +28959,11 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
         text = no_board_re().replace(&text, "").trim().to_string();
     }
     let orig_text = text.clone();
+    // Empty owner input is an Enter control, including successful/no-op sends.
+    // Its unknown composer contents cannot leave an old approval window open.
+    if orig_text.trim().is_empty() {
+        if let Some(error)=close_discarded_send_input(state,name,headers,body,"send_empty_control") { return error; }
+    }
     let mut origin = String::new();
     if defer_busy {
         origin = if member_actor.is_some() {
@@ -28921,17 +29099,23 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
         {
             Ok(result) => {
                 if result.disposition == StableEnqueueDisposition::New {
+                    let caller = hdr_worker(headers);
                     let row_id = cmd_hist_record_with_id(
                         state,
                         name,
                         &orig_text,
-                        "user",
-                        member_actor.as_deref().unwrap_or(""),
+                        if caller.is_empty() && origin.is_empty() { "user" } else { "session" },
+                        member_actor.as_deref().unwrap_or(if caller.is_empty() { &origin } else { &caller }),
                         true,
-                        DeliveryMeta::queued(now_i64() * 1000),
+                        DeliveryMeta {
+                            process_origin: owner_input_process_origin(headers),
+                            ..DeliveryMeta::queued(now_i64() * 1000)
+                        },
                     )
                     .await;
                     link_queued_message(state, name, row_id, &result.id).await;
+                } else if let Some(error)=close_discarded_send_input(state,name,headers,body,"project_send_deduplicated") {
+                    return error;
                 }
                 send_dedup_accept(state, name, &msg_id, &result.id).await;
                 tracing::info!(
@@ -29134,6 +29318,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             // invent a sender context for a machine.
             client_meta: None,
             repeat_of,
+            process_origin: None,
         };
         if record_history {
             let email = headers
@@ -29141,12 +29326,25 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             let author = member_actor.as_deref().unwrap_or(email);
+            // The process verdict, recorded only for the OWNER's own send: no
+            // member actor and no worker identity (a worker pane's request
+            // carries its worker header after attribution, whatever it sent).
+            let process_origin = owner_input_process_origin(headers).filter(|_| message_acceptance_confirmed(ok,&msg));
+            tracing::info!(session = %name, process_origin = process_origin.unwrap_or(""),
+                forwarded = process_origin == Some(super::process_identity::REMOTE_FORWARDED),
+                verdict = "owner_send_process_origin", measured = true, n_considered = 1,
+                "an owner send and its process origin (only a non-local Remote one approves a pending grant)");
             let meta = DeliveryMeta {
                 client_meta: client_meta_raw.as_deref(),
+                process_origin,
                 ..meta
             };
+            // Explicit history does not turn a peer into uncertain owner input.
+            let caller=hdr_worker(headers);
+            let history_type=if caller.is_empty() { "user" } else { "session" };
+            let history_origin=if caller.is_empty() { author } else { &caller };
             let row_id =
-                cmd_hist_record_with_id(state, name, &orig_text, "user", author, skip_board, meta)
+                cmd_hist_record_with_id(state, name, &orig_text, history_type, history_origin, skip_board, meta)
                     .await;
             note_history_msg_id(state, row_id, &msg_id).await;
             if let Some(id) = queue_id.as_deref() {
@@ -29231,6 +29429,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                 submit_verdict: Some(verdict),
                 client_meta: None,
                 repeat_of,
+                process_origin: None,
             };
             if record_history {
                 let email = headers
@@ -30241,11 +30440,23 @@ pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Valu
 /// `/api/workers/{id}/git/...` surface (AF-291).
 pub(crate) async fn git_push_verb(state: &AppState, name: &str, headers: &HeaderMap) -> Response {
     // Delivers a server-written push instruction into the pane as owner input,
-    // so it follows the peer-config rule (the owner, the worker itself or its
-    // own Chat tab); a peer asks through `send`, which stamps and gates.
-    if let Some(refusal) = peer_config_refusal(headers, name, "git-push") {
-        return refusal;
+    // so the delegation table's GitPush row decides it: the owner, the worker
+    // itself or its own Chat tab (#19); into another worker it is owner-only,
+    // leads and mrpopo included. A peer asks through `send`, which stamps and
+    // gates. Both routes (sessions and workers) reach the table only here.
+    use super::delegation::{authorize, Action, Target};
+    let grant = match authorize(state, headers, &Target::Worker(name.to_string()), &Action::GitPush, None) {
+        Ok(g) => g,
+        Err(refusal) => return refusal,
+    };
+    let resp = git_push_deliver(state, name).await;
+    if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+        g.commit(state, json!({"name": name}), json!({"updated": "git-push"}));
     }
+    resp
+}
+
+async fn git_push_deliver(state: &AppState, name: &str) -> Response {
     if !is_running(name).await {
         return jresp(
             StatusCode::BAD_REQUEST,
@@ -30804,7 +31015,7 @@ pub(crate) async fn peek_verb(state: &AppState, name: &str, qs: &[(String, Strin
 pub(crate) fn duplicate_verb(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
     // A copy inherits the source's groups (env file and store row), so it is a
     // create with those groups: only a lead, and only inside its own team.
-    if let Some(refusal) = copy_refusal(name, headers) { return refusal; }
+    if let Some(refusal) = copy_refusal(name, headers, Some(body_str(body, "new_name").trim())) { return refusal; }
     let new_name = body_str(body, "new_name").trim().to_string();
     if new_name.is_empty() {
         return jresp(
@@ -30841,6 +31052,7 @@ pub(crate) fn duplicate_verb(state: &AppState, name: &str, headers: &HeaderMap, 
             );
         }
     };
+    log_copy(state, headers, name, &new_name, "duplicate");
     j200(json!({
         "ok": true,
         "message": format!("duplicated as {new_name}"),
@@ -32167,7 +32379,12 @@ pub(crate) async fn report_post(
         );
     }
     if body["native_status"].as_bool() == Some(true) {
-        return super::native_status::post(state, name, body).await;
+        let mut observation = body.clone();
+        if origin != name && observation.as_object_mut().and_then(|m|m.remove("assistant_message")).is_some() {
+            tracing::warn!(session=name, verdict="delegation_pane_report_not_self", measured=true,
+                n_considered=1, "outside report cannot attest an owner assistant turn");
+        }
+        return super::native_status::post(state, name, &observation).await;
     }
     let report_provider = body_str(body, "provider");
     let configured_provider = provider_of(&parse_env(name));
@@ -32564,14 +32781,31 @@ pub(crate) async fn report_post(
 // ---------------------------------------------------------------------------
 
 async fn patch_dispatch(state: &AppState, name: &str, action: &str, body: &Value, headers: &HeaderMap) -> Response {
-    let rename_to = if action == "config" { config_rename_only(body) } else { None };
-    if let Some(refusal) = peer_config_refusal_unless_lead_rename(headers, name, action, rename_to) { return refusal; }
-    if let Some(refusal) = membership_patch_refusal(headers, names_messaging_authority(body)) { return refusal; }
+    // Both verbs go through the delegation table (ai-config #160).
     match action {
-        "commit-guard" => commit_guard_patch_verb(name, body),
-        "config" => config_patch(state, name, body).await,
+        "commit-guard" => {
+            let target = super::delegation::Target::Worker(name.to_string());
+            let act = super::delegation::Action::SetConfig { keys: vec!["commit-guard".into()] };
+            let grant = match super::delegation::authorize(state, headers, &target, &act, Some(body)) {
+                Ok(g) => g,
+                Err(r) => return r,
+            };
+            let resp = commit_guard_patch_verb(name, body);
+            if let Some(g) = grant.filter(|_| resp.status().is_success()) {
+                g.commit(state, Value::Null, body.clone());
+            }
+            resp
+        }
+        "config" => super::delegation::guarded_config_patch(state, headers, name, body).await,
         _ => not_found(),
     }
+}
+
+/// Every key a config PATCH reads, for the delegation sweep test: the
+/// operations table, `create`, and the modifiers handled inside a branch.
+#[cfg(test)]
+pub(crate) fn config_patch_fields_for_delegation() -> Vec<&'static str> {
+    config_patch_operations_keys()
 }
 
 /// The provider/model/effort/yolo restart choreography shared by four config
@@ -33826,34 +34060,8 @@ async fn apply_live_config_change(
     }
 }
 
-/// THE membership rule: a worker-originated request may not set or change a
-/// worker's messaging authority. Every path that writes group membership calls
-/// this one predicate, so the rule and its error code have one definition.
-///
-/// Messaging authority is group membership (`CC_TAGS`, `_amux_workers.group`)
-/// plus the two settings that act as membership of every group: the chat
-/// worker type, which speaks for the owner (`chat_speaks_for_owner`), and a
-/// group's open-inbound switch. `membership_named` is the caller's statement
-/// that the request would set one of those.
-///
-/// This governs EXISTING workers: no worker may change any worker's groups,
-/// its own included. Creating a worker is [`worker_create_refusal`]'s rule.
-/// Owners, the dashboard and verified human members are unaffected.
-pub(crate) fn membership_patch_refusal(headers: &HeaderMap, membership_named: bool) -> Option<Response> {
-    membership_refusal_body(headers, membership_named).map(|body| jresp(StatusCode::FORBIDDEN, body))
-}
 
-/// [`membership_patch_refusal`]'s decision and 403 body, for a handler whose
-/// return type is not a `Response`.
-pub(crate) fn membership_refusal_body(headers: &HeaderMap, membership_named: bool) -> Option<Value> {
-    let origin = worker_origin(headers);
-    if !membership_named || origin.is_empty() { return None; }
-    tracing::warn!(verdict="worker_group_membership_refused", measured=true, n_considered=1,
-        worker = %origin,
-        "worker cannot widen messaging authority by editing group membership");
-    Some(json!({"ok":false,"code":"worker_group_membership_refused",
-        "error":"Group membership changes require direct owner input."}))
-}
+
 
 /// The worker this request speaks for, from the one verified identity
 /// (`worker_identity::verified_worker`): empty for the owner/dashboard and
@@ -33865,102 +34073,10 @@ pub(crate) fn worker_origin(headers: &HeaderMap) -> String {
     }
 }
 
-/// CONFIGURING ANOTHER WORKER IS THE OWNER'S (review round 3, N2/N3). A worker
-/// may change typed settings on itself only: renaming a peer left the renamed
-/// lane with no stored token (trusted without one), and editing a peer's env,
-/// instructions or memory rewrites what that peer is. The rule is owner-only
-/// except for one lead rename ([`peer_config_refusal_unless_lead_rename`]).
-/// A worker's own Chat tab (`w@chat`) counts as `w`. Owners and verified
-/// members are unaffected.
-pub(crate) fn peer_config_refusal(headers: &HeaderMap, target: &str, what: &str) -> Option<Response> {
-    peer_config_refusal_body(headers, target, what).map(|body| jresp(StatusCode::FORBIDDEN, body))
-}
-
-/// [`peer_config_refusal`]'s decision and 403 body, for a handler whose return
-/// type is not a `Response`.
-pub(crate) fn peer_config_refusal_body(headers: &HeaderMap, target: &str, what: &str) -> Option<Value> {
-    let origin = worker_origin(headers);
-    if origin.is_empty() || origin == target || super::chat_worker::companion_parent(&origin) == Some(target) {
-        return None;
-    }
-    tracing::warn!(origin = %origin, target, what, verdict = "peer_config_owner_only", measured = true,
-        n_considered = 1, "a worker tried to configure another worker");
-    Some(json!({"ok": false, "code": "peer_config_owner_only",
-        "error": format!("'{origin}' may not change {what} of '{target}'; configuring another worker is the owner's")}))
-}
-
-/// Max's owner agent (`agents/owner.md` in ai-config). No lead renames it, and
-/// no lead renames a worker to it.
-pub(crate) const OWNER_AGENT: &str = "mrpopo";
-
-/// THE one exception to [`peer_config_refusal`] (ai-config #203; Max,
-/// 2026-10-17: "Worker name dynamic change with task is still not in right?"),
-/// for every path that renames a session: a verified lead may RENAME a worker
-/// in its own team. `rename_to` is `Some(new name)` only when the request
-/// renames the target and changes nothing else; any other request takes the
-/// owner-only rule unchanged. amux #3 keeps the renamed worker's incarnation,
-/// token and old-name alias, and `rename_session` journals the rename.
-pub(crate) fn peer_config_refusal_unless_lead_rename(
-    headers: &HeaderMap,
-    target: &str,
-    what: &str,
-    rename_to: Option<&str>,
-) -> Option<Response> {
-    if let Some(to) = rename_to {
-        let origin = worker_origin(headers);
-        if origin != target {
-            if let Some(team) = lead_team_rename(&origin, target, to) {
-                // A "-lead" name grants nothing (lead status comes from
-                // groups) but would mislead peers (ai-config #205 N2).
-                if is_lead_suffixed(to) {
-                    tracing::warn!(origin = %origin, target, to, verdict = "lead_rename_reserved_suffix",
-                        measured = true, n_considered = 1, "a lead tried to give a team worker a '-lead' name");
-                    return Some(jresp(StatusCode::FORBIDDEN, json!({"ok": false, "code": "lead_rename_reserved_suffix",
-                        "error": format!("a lead may not give '{target}' a name ending in '-lead' ('{to}'); only the owner may")})));
-                }
-                // Authorization only: the rename runs after this, and
-                // rename_session logs its outcome (ai-config #205 N6).
-                tracing::info!(origin = %origin, target, to, ?team, verdict = "lead_team_rename_authorized",
-                    measured = true, n_considered = 1, "a lead was authorized to rename a worker in its own team");
-                return None;
-            }
-        }
-    }
-    peer_config_refusal(headers, target, what)
-}
-
-/// Whether verified worker `origin` may rename `target` to `to` as its lead:
-/// `origin` is in `leads`, `target` is not, they share a group other than
-/// `leads`, and neither `target` nor the new name is the owner agent. The
-/// shared groups, or `None`. `origin` is [`worker_origin`]'s verified identity
-/// (an unverified claim names no lane, so it has no groups).
-pub(crate) fn lead_team_rename(origin: &str, target: &str, to: &str) -> Option<std::collections::BTreeSet<String>> {
-    let owner_agent = |n: &str| n.trim().eq_ignore_ascii_case(OWNER_AGENT);
-    if owner_agent(origin) || owner_agent(target) || owner_agent(&sanitize_session_name(to)) {
-        return None;
-    }
-    let (caller, theirs) = (lane_groups(origin), lane_groups(target));
-    if !caller.contains(LEADS_GROUP) || theirs.contains(LEADS_GROUP) {
-        return None;
-    }
-    let shared: std::collections::BTreeSet<String> =
-        caller.intersection(&theirs).filter(|g| *g != LEADS_GROUP).cloned().collect();
-    (!shared.is_empty()).then_some(shared)
-}
-
-/// Whether `to` (sanitized) ends in `-lead`: a lead-looking name.
+/// Whether `to` (sanitized) ends in `-lead`: a lead-looking name
+/// (ai-config #205 N2; a lead may not give one, see `delegation::decide_lead`).
 pub(crate) fn is_lead_suffixed(to: &str) -> bool {
     sanitize_session_name(to).to_ascii_lowercase().ends_with("-lead")
-}
-
-/// The new name a config PATCH body asks for when renaming is ALL it does:
-/// an object whose only key is a string `rename`. Anything else is `None`.
-pub(crate) fn config_rename_only(body: &Value) -> Option<&str> {
-    let obj = body.as_object()?;
-    if obj.len() != 1 {
-        return None;
-    }
-    obj.get("rename")?.as_str()
 }
 
 /// The new name `POST .../rename` reads: `name`, else `rename`; empty if neither.
@@ -33985,6 +34101,9 @@ pub(crate) struct CreateRequest<'a> {
     /// Something only the owner may grant at create: the chat worker type
     /// (it speaks for the owner) or a store `group` id.
     pub owner_only: Option<&'static str>,
+    /// Every other setting the create writes, classified by the delegation
+    /// table (`create:<field>`, `row:<field>`, `env:<KEY>`; design review B3).
+    pub settings: Vec<String>,
 }
 
 /// THE create rule, for every path that makes a worker: session create, store
@@ -34024,28 +34143,28 @@ pub(crate) fn worker_create_refusal_body(headers: &HeaderMap, req: &CreateReques
     let adds_no_group = req.owner_only.is_none()
         && req.tags.iter().map(|t| norm_label(t)).filter(|t| !t.is_empty()).all(|t| caller.contains(&t));
     if req.name == Some(origin.as_str()) && adds_no_group && env_path(&origin).exists() {
+        // Self-registration writes nothing new about groups, but its settings
+        // (a row's environment, permissions) still go through the table as
+        // settings on itself (review B4): no early return before them.
+        if !req.settings.is_empty() {
+            let keys: Vec<String> = req.settings.iter().map(|k| k.strip_prefix("create:").map(str::to_string).unwrap_or_else(|| k.clone())).collect();
+            if let Some(body) = super::delegation::refusal_value(headers, &super::delegation::Target::Worker(origin.clone()),
+                &super::delegation::Action::SetConfig { keys }) {
+                return Some(body);
+            }
+        }
         tracing::info!(worker = %origin, verdict = "worker_self_registration", measured = true, n_considered = 1,
             "a worker registered its own existing session; not a worker creation");
         return None;
     }
-    if !caller.contains(LEADS_GROUP) {
-        tracing::warn!(worker = %origin, verdict = "worker_create_requires_lead", measured = true, n_considered = 1,
-            "a worker outside the leads group tried to create a worker");
-        return Some(json!({"ok": false, "code": "worker_create_requires_lead",
-            "error": format!("Only leads can create workers; '{origin}' is not in the '{LEADS_GROUP}' group.")}));
+    // The create rule is a delegation-table row (ai-config #160): only a lead
+    // (CC_ORCHESTRATOR=1 and `leads`), only with its own team tag.
+    if let Some(name) = req.name.filter(|n| super::delegation::reserved_name(n)) {
+        return Some(super::delegation::refusal_body("reserved_name",
+            &format!("'{name}' is a reserved identity; only the owner may give a worker that name")));
     }
-    let team: std::collections::BTreeSet<String> = caller.iter().filter(|g| *g != LEADS_GROUP).cloned().collect();
-    let outside: Vec<String> = req.tags.iter().map(|t| norm_label(t)).filter(|t| !t.is_empty() && !team.contains(t)).collect();
-    if outside.is_empty() && req.owner_only.is_none() { return None; }
-    tracing::warn!(worker = %origin, ?outside, owner_only = req.owner_only.unwrap_or(""), ?team,
-        verdict = "worker_create_tags_outside_team", measured = true, n_considered = 1,
-        "a lead tried to create a worker outside its own team");
-    let what = match req.owner_only {
-        Some(o) => format!("{o} is the owner's to grant"),
-        None => format!("tags {outside:?} are outside the lead's team {team:?} ('{LEADS_GROUP}' is the owner's to grant)"),
-    };
-    Some(json!({"ok": false, "code": "worker_create_tags_outside_team",
-        "error": format!("A lead may create workers only inside its own team: {what}."), "team": team}))
+    super::delegation::refusal_value(headers, &super::delegation::Target::NewWorker,
+        &super::delegation::Action::CreateWorker { tags: req.tags.to_vec(), settings: req.settings.clone(), owner_only: req.owner_only })
 }
 
 /// The groups a create request names, from a `tags` array or a comma string,
@@ -34053,17 +34172,21 @@ pub(crate) fn worker_create_refusal_body(headers: &HeaderMap, req: &CreateReques
 /// Anything else (a number, an object, a non-string array item) is an error:
 /// a check that read it as "no tags" while a writer stored it was review N1.
 pub(crate) fn tags_of(v: Option<&Value>) -> Result<Vec<String>, String> {
-    let keep = |s: &str| Some(norm_label(s)).filter(|t| !t.is_empty());
-    match v {
-        None | Some(Value::Null) => Ok(vec![]),
-        Some(Value::String(s)) => Ok(s.split(',').filter_map(keep).collect()),
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|x| x.as_str().ok_or_else(|| format!("tags must be strings; got {x}")))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|v| v.into_iter().filter_map(keep).collect()),
-        Some(other) => Err(format!("tags must be an array of strings or a comma-separated string; got {other}")),
+    let strings: Vec<&str> = match v {
+        None | Some(Value::Null) => vec![],
+        Some(Value::String(s)) => vec![s],
+        Some(Value::Array(items)) => items.iter().map(|x| x.as_str().ok_or_else(|| format!("tags must be strings; got {x}")))
+            .collect::<Result<_, _>>()?,
+        Some(other) => return Err(format!("tags must be an array of strings or a comma-separated string; got {other}")),
+    };
+    // Array elements and comma strings use ONE grammar at every write surface.
+    let tags: std::collections::BTreeSet<String> = strings.into_iter().flat_map(|s| s.split(','))
+        .map(norm_label).filter(|s| !s.is_empty()).collect();
+    if matches!(v, Some(Value::Array(_))) {
+        tracing::info!(verdict = "tags_array_normalized", measured = true, n_considered = tags.len(),
+            "array tags normalized to canonical comma-separated membership");
     }
+    Ok(tags.into_iter().collect())
 }
 
 /// THE normalizer for every tag and worker-type comparison (review B4): the
@@ -34086,18 +34209,23 @@ pub(crate) fn requests_chat_type(body: &Value) -> bool {
     body.get("worker_type").and_then(Value::as_str).is_some_and(is_chat_type)
 }
 
-/// Whether a config-style body names messaging authority: a `tags` edit of any
-/// shape (clearing counts, as before) or a switch to the chat worker type.
-pub(crate) fn names_messaging_authority(body: &Value) -> bool {
-    body.get("tags").is_some() || requests_chat_type(body)
-}
 
 /// The create rule for a copy of `source` (duplicate/clone): the copy carries
 /// the source's groups and worker type, so it is a create with those.
-fn copy_refusal(source: &str, headers: &HeaderMap) -> Option<Response> {
+/// Log a delegated copy (duplicate/clone) after it succeeded.
+fn log_copy(state: &AppState, headers: &HeaderMap, source: &str, new_name: &str, verb: &str) {
+    let tags: Vec<String> = lane_groups(source).into_iter().collect();
+    let action = super::delegation::Action::CreateWorker { tags: tags.clone(), settings: super::delegation::copy_settings(source), owner_only: None };
+    if let Some(g) = super::delegation::grant_if_allowed(headers, &super::delegation::Target::NewWorker, &action) {
+        g.commit(state, json!({"source": source}), json!({"verb": verb, "name": new_name, "tags": tags}));
+    }
+}
+
+fn copy_refusal(source: &str, headers: &HeaderMap, new_name: Option<&str>) -> Option<Response> {
     let tags: Vec<String> = lane_groups(source).into_iter().collect();
     let chat = crate::api::worker_exec::worker_type_of(source).as_str() == "chat";
-    worker_create_refusal(headers, &CreateRequest { name: None, tags: &tags, owner_only: chat.then_some("the chat worker type") })
+    worker_create_refusal(headers, &CreateRequest { name: new_name.filter(|n| !n.is_empty()), tags: &tags, owner_only: chat.then_some("the chat worker type"),
+        settings: super::delegation::copy_settings(source) })
 }
 
 /// The first string in a config body (top-level values and string arrays) the
@@ -34161,26 +34289,34 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
 /// Every key a config PATCH reads, flattened from [`config_patch_operations`]'s
 /// table plus `create` (sent with `branch`).
 fn config_patch_operations_keys() -> Vec<&'static str> {
-    let mut v: Vec<&'static str> = CONFIG_PATCH_OPS.iter().flat_map(|k| k.iter().copied()).collect();
-    v.push("create");
-    v
+    CONFIG_PATCH_OPS.iter().flat_map(|k| k.iter().copied()).collect()
 }
 
+/// EVERY key [`config_patch_with_liveness`] reads, grouped by the branch that
+/// reads it (review B1: `toggle_auto_continue` and the six board-automation
+/// fields were missing, so a body pairing one of them with `tags` passed the
+/// guard and the earlier branch applied it). `config_patch_ops_cover_every_key_the_handler_reads`
+/// scans the handler's source, so a new `body.get` without a row fails.
 const CONFIG_PATCH_OPS: &[&[&str]] = &[
     &["worktree_verify"], &["worktree_base"], &["rename"], &["worker_type"],
-    &["provider"], &["model", "effort"], &["dir"], &["task_summary"], &["desc"],
-    &["toggle_pin"], &["isolated"], &["toggle_yolo"], &["external_email_allowed"],
-    &["send_allow", "spans_groups"], &["worktree_profile"], &["branch"], &["tags"],
+    &["provider"], &["model", "effort", "force"], &["dir"], &["task_summary"], &["desc"],
+    &["toggle_pin"], &["isolated"], &["toggle_yolo", "toggle_auto_continue"],
+    &["auto_drain_backlog"], &["board_auto_pickup"], &["board_auto_continue"], &["board_standing_orders"],
+    &["board_decompose"], &["board_force_adherence"], &["external_email_allowed"],
+    &["send_allow", "spans_groups"], &["worktree_profile"], &["branch", "create"], &["tags"],
     &["mcp"], &["new_conversation", "restart"],
 ];
 
 /// The settings a config PATCH body names. Keys handled together by one
-/// branch count as one setting: model with effort, send_allow with
-/// spans_groups, new_conversation with restart.
+/// branch count as one setting: model with effort and force, toggle_yolo with
+/// toggle_auto_continue, send_allow with spans_groups, branch with create,
+/// new_conversation with restart. Each setting is named by the keys the body
+/// sent, so a model+effort body is not reported as naming `force`.
 fn config_patch_operations(body: &Value) -> Vec<String> {
     CONFIG_PATCH_OPS.iter()
-        .filter(|keys| keys.iter().any(|k| body.get(*k).is_some()))
-        .map(|keys| keys.join("+"))
+        .map(|keys| keys.iter().copied().filter(|k| body.get(*k).is_some()).collect::<Vec<_>>())
+        .filter(|sent| !sent.is_empty())
+        .map(|sent| sent.join("+"))
         .collect()
 }
 
@@ -35141,39 +35277,10 @@ async fn config_patch_with_liveness(
     // rule being that destroying data must be requested, never inferred from a
     // type the handler failed to understand.
     if let Some(tv) = body.get("tags") {
-        let joined = match tv {
-            Value::Array(items) => {
-                let mut bad = None;
-                let parts: Vec<String> = items
-                    .iter()
-                    .filter_map(|x| match x.as_str() {
-                        Some(s) => Some(s.trim().to_string()),
-                        None => {
-                            bad = Some(x.clone());
-                            None
-                        }
-                    })
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if let Some(b) = bad {
-                    return jresp(
-                        StatusCode::BAD_REQUEST,
-                        json!({"error": format!("tags must be strings; got {b}"), "wrote": false}),
-                    );
-                }
-                parts.join(",")
-            }
-            Value::String(s) => s.trim().to_string(),
-            Value::Null => String::new(),
-            other => {
-                return jresp(
-                    StatusCode::BAD_REQUEST,
-                    json!({
-                        "error": format!("tags must be an array of strings, a comma-separated string, or null; got {other}"),
-                        "wrote": false,
-                    }),
-                );
-            }
+        let joined = match tags_of(Some(tv)) {
+            Ok(tags) => tags.join(","),
+            Err(error) => return jresp(StatusCode::BAD_REQUEST,
+                json!({"ok": false, "code": "tags_invalid", "error": error, "wrote": false})),
         };
         cfg.set("CC_TAGS", &joined);
         if let Err(e) = cfg.write(&f) {
@@ -37393,9 +37500,143 @@ mod tests {
             let body: Value = serde_json::from_slice(&axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap();
             assert_eq!(body["code"], json!("peer_config_owner_only"), "{target}: {body}");
         }
+        // The rule is the delegation table's GitPush row (#18 removed
+        // peer_config_refusal): the same decision the verb asks for.
+        use crate::api::delegation::{refusal_value, Action, Target};
         for allowed in [axum::http::HeaderMap::new(), worker_headers("caller"), worker_headers("caller@chat")] {
-            assert!(peer_config_refusal(&allowed, "caller", "git-push").is_none(), "{allowed:?}");
+            assert!(refusal_value(&allowed, &Target::Worker("caller".into()), &Action::GitPush).is_none(), "{allowed:?}");
         }
+    }
+
+    // ---- the composed #18 + #19 table (dev-lead's round-2 ruling) ------------
+    // Route-level cells, one test each, named table_<actor>_<column>; the
+    // pure decide() cells are in delegation::tests under the same names.
+
+    /// `lanes` plus a verified lead of `alpha` and mrpopo (in `leads` only).
+    fn table_lanes(dir: &std::path::Path) {
+        lanes(dir);
+        let sessions = dir.join("sessions");
+        std::fs::write(sessions.join("review-lead.env"), "CC_TAGS=leads,alpha\nCC_ORCHESTRATOR=1\n").unwrap();
+        std::fs::write(sessions.join("mrpopo.env"), "CC_TAGS=leads\n").unwrap();
+    }
+
+    /// A worker claim with the identity proof the rule-10 layer stamps.
+    fn proven(name: &str) -> axum::http::HeaderMap {
+        let mut h = worker_headers(name);
+        h.insert(crate::api::worker_identity::PROOF_HEADER, name.parse().unwrap());
+        h
+    }
+
+    async fn code_of(r: Response) -> (StatusCode, Value) {
+        let st = r.status();
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        (st, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    /// A refused git-push: the verb answers 403 with the table's code before
+    /// anything reaches the pane.
+    async fn git_push_cell(caller: axum::http::HeaderMap, target: &str) -> (StatusCode, Value) {
+        let (state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        table_lanes(dir.path());
+        code_of(git_push_verb(&state, target, &caller).await).await
+    }
+
+    /// An allowed git-push, read from the decision the verb asks for (the
+    /// verb itself would go on to tmux, which unit tests never touch).
+    fn git_push_allowed(caller: &axum::http::HeaderMap, target: &str) -> bool {
+        let (_state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        table_lanes(dir.path());
+        use crate::api::delegation::{refusal_value, Action, Target};
+        refusal_value(caller, &Target::Worker(target.into()), &Action::GitPush).is_none()
+    }
+
+    #[tokio::test]
+    async fn table_owner_git_push_other() {
+        assert!(git_push_allowed(&axum::http::HeaderMap::new(), "teammate"));
+    }
+
+    #[tokio::test]
+    async fn table_self_git_push_self() {
+        assert!(git_push_allowed(&proven("teammate"), "teammate"));
+    }
+
+    #[tokio::test]
+    async fn table_self_git_push_own_chat_tab() {
+        assert!(git_push_allowed(&worker_headers("teammate@chat"), "teammate"), "its own Chat tab is the worker");
+    }
+
+    #[tokio::test]
+    async fn table_lead_git_push_self() {
+        assert!(git_push_allowed(&proven("review-lead"), "review-lead"));
+    }
+
+    #[tokio::test]
+    async fn table_lead_git_push_other() {
+        let (st, v) = git_push_cell(proven("review-lead"), "teammate").await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("peer_config_owner_only")), "no lead row: {v}");
+    }
+
+    #[tokio::test]
+    async fn table_mrpopo_git_push_other() {
+        let (st, v) = git_push_cell(proven("mrpopo"), "teammate").await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("peer_config_owner_only")), "no mrpopo row: {v}");
+    }
+
+    #[tokio::test]
+    async fn table_mrpopo_git_push_self() {
+        assert!(git_push_allowed(&proven("mrpopo"), "mrpopo"), "mrpopo's own pane");
+    }
+
+    #[tokio::test]
+    async fn table_worker_git_push_other() {
+        let (st, v) = git_push_cell(proven("caller"), "teammate").await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("peer_config_owner_only")), "{v}");
+    }
+
+    /// The send/kickoff column: a `/start` prompt to another worker takes
+    /// send's gate (#19) for every worker class alike; no class widens it.
+    async fn kickoff_cell(caller: axum::http::HeaderMap, target: &str) -> Result<String, (StatusCode, Value)> {
+        let (_state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        table_lanes(dir.path());
+        match start_prompt_for(&caller, target, "do this".into()) {
+            Ok(text) => Ok(text),
+            Err(r) => Err(code_of(*r).await),
+        }
+    }
+
+    #[tokio::test]
+    async fn table_owner_send_kickoff() {
+        assert_eq!(kickoff_cell(axum::http::HeaderMap::new(), "outsider").await.unwrap(), "do this", "owner input, unstamped");
+    }
+
+    #[tokio::test]
+    async fn table_self_send_kickoff() {
+        assert_eq!(kickoff_cell(proven("teammate"), "teammate").await.unwrap(), "do this", "its own input, unstamped");
+    }
+
+    #[tokio::test]
+    async fn table_lead_send_kickoff() {
+        let text = kickoff_cell(proven("review-lead"), "teammate").await.unwrap();
+        assert!(text.starts_with("[amux-origin: review-lead "), "inside its team: stamped: {text}");
+        let (st, v) = kickoff_cell(proven("review-lead"), "outsider").await.unwrap_err();
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "outside its groups: {v}");
+    }
+
+    #[tokio::test]
+    async fn table_mrpopo_send_kickoff() {
+        let (st, v) = kickoff_cell(proven("mrpopo"), "teammate").await.unwrap_err();
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "mrpopo has no send row: {v}");
+    }
+
+    #[tokio::test]
+    async fn table_worker_send_kickoff() {
+        let text = kickoff_cell(proven("caller"), "teammate").await.unwrap();
+        assert!(text.starts_with("[amux-origin: caller "), "{text}");
+        let (st, v) = kickoff_cell(proven("caller"), "outsider").await.unwrap_err();
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_group_boundary")), "{v}");
     }
 
     /// A queued `/start` prompt from another worker keeps that worker as its
@@ -39878,6 +40119,7 @@ mod tests {
                 submit_verdict: Some("stuck"),
                 client_meta: None,
                 repeat_of: None,
+                process_origin: None,
             },
         )
         .await;
@@ -39933,6 +40175,7 @@ mod tests {
                 submit_verdict: Some("stuck"),
                 client_meta: None,
                 repeat_of: None,
+                process_origin: None,
             },
         )
         .await;
@@ -40068,6 +40311,7 @@ mod tests {
                 submit_verdict: Some("retried"),
                 client_meta: None,
                 repeat_of: None,
+                process_origin: None,
             },
         )
         .await;
@@ -41364,6 +41608,7 @@ mod tests {
                     submit_verdict: Some("confirmed"),
                     client_meta: None,
                     repeat_of: None,
+                    process_origin: None,
                 },
             )
             .await;
@@ -41488,6 +41733,7 @@ mod tests {
                 submit_verdict: Some("confirmed"),
                 client_meta: None,
                 repeat_of: None,
+                process_origin: None,
             },
         )
         .await;
@@ -41516,6 +41762,7 @@ mod tests {
                 submit_verdict: Some("confirmed"),
                 client_meta: None,
                 repeat_of: None,
+                process_origin: None,
             },
         )
         .await;
@@ -46255,7 +46502,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         )
         .await;
         assert_eq!(st, StatusCode::OK);
-        assert_eq!(parse_env("probe").get("CC_TAGS"), Some("x, y"));
+        assert_eq!(parse_env("probe").get("CC_TAGS"), Some("x,y"));
         let (st, _) = call(
             &app,
             "PATCH",
@@ -54348,6 +54595,37 @@ mod merge_plain_quoting_tests {
     use super::EnvFile;
 
     #[test]
+    fn delegation_raw_replacement_preserves_matching_identity_bytes_and_rejects_identity_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let f = sessions.join("worker.env");
+        let before = "# original\r\nCC_DIR=/tmp\r\nCC_INCARNATION='original-worker'\r\nCC_DESC=fixture";
+        std::fs::write(&f, before).unwrap();
+        EnvFile::replace_text(&f, before).unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), before.as_bytes(), "raw replacement must retain order, quoting, CRLF and no final newline");
+        for replacement in [
+            "CC_DESC=changed\n",
+            "CC_INCARNATION=other-worker\nCC_DESC=changed\n",
+            "CC_INCARNATION=original-worker\nCC_INCARNATION=other-worker\n",
+            "CC_INCARNATION=original-worker\nCC_INCARNATION=original-worker\n",
+        ] {
+            EnvFile::replace_text(&f, replacement).unwrap();
+            let cfg = EnvFile::load(&f);
+            assert_eq!(cfg.get("CC_INCARNATION"), Some("original-worker"), "{replacement}");
+            let text = std::fs::read_to_string(&f).unwrap();
+            assert_eq!(text.lines().filter(|line| line.starts_with("CC_INCARNATION=")).count(), 1, "{text}");
+        }
+        // Both other writer paths must preserve the same identity too.
+        EnvFile::merge_plain(&f, &[("CC_INCARNATION".into(), Some("other-worker".into()))]).unwrap();
+        assert_eq!(EnvFile::load(&f).get("CC_INCARNATION"), Some("original-worker"));
+        let mut cfg = EnvFile::load(&f);
+        cfg.set("CC_INCARNATION", "other-worker");
+        cfg.write(&f).unwrap();
+        assert_eq!(EnvFile::load(&f).get("CC_INCARNATION"), Some("original-worker"));
+    }
+
+    #[test]
     fn a_scope_merge_keeps_a_worker_file_sourceable_and_round_trips_values() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("w.env");
@@ -54383,7 +54661,10 @@ mod config_patch_operation_tests {
         assert_eq!(super::config_patch_operations(&json!({"model": "m", "effort": "high"})), vec!["model+effort"]);
         assert_eq!(super::config_patch_operations(&json!({"new_conversation": true, "restart": true})).len(), 1);
         assert_eq!(super::config_patch_operations(&json!({"send_allow": "x", "spans_groups": true})).len(), 1);
-        assert_eq!(super::config_patch_operations(&json!({"branch": "b", "create": true})), vec!["branch"]);
+        assert_eq!(super::config_patch_operations(&json!({"model": "m", "effort": "high", "force": true})), vec!["model+effort+force"]);
+        assert_eq!(super::config_patch_operations(&json!({"model": "m"})), vec!["model"]);
+        assert_eq!(super::config_patch_operations(&json!({"branch": "b", "create": true})), vec!["branch+create"]);
+        assert_eq!(super::config_patch_operations(&json!({"toggle_yolo": true, "toggle_auto_continue": true})).len(), 1);
         assert!(super::config_patch_operations(&json!({})).is_empty());
     }
 }

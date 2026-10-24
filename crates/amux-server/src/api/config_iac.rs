@@ -170,6 +170,8 @@ pub async fn apply(
     // through the shared membership rule.
     let actor = super::groups::hdr_worker(&headers);
     let home = super::groups::amux_home();
+    // Grants decided here, logged after the apply wrote them (review H3).
+    let mut planned: Vec<(String, super::delegation::Grant)> = Vec::new();
     for w in doc.get("workers").and_then(Value::as_array).into_iter().flatten() {
         let Some(name) = w.get("name").and_then(Value::as_str) else { continue };
         // The name becomes a path under sessions/, and the tags are parsed by
@@ -187,30 +189,68 @@ pub async fn apply(
                 return (StatusCode::BAD_REQUEST, Json(json!({"code": "env_value_invalid", "error": format!("worker '{name}': {why}")})));
             }
         }
+        // Every declared field goes through the delegation table (ai-config
+        // #160, design review): `flags` can carry the permission-bypass flag
+        // and `creator` is attribution, so neither is a worker's to write.
         let refusal = if home.join("sessions").join(format!("{name}.env")).exists() {
-            super::session_verbs::peer_config_refusal_body(&headers, name, "the worker declaration")
-                .or_else(|| super::session_verbs::membership_refusal_body(&headers, w.get("tags").is_some()))
+            let target = super::delegation::Target::Worker(name.to_string());
+            let keys: Vec<String> = [("dir", "dir"), ("flags", "env:CC_FLAGS"), ("creator", "create:creator")]
+                .iter().filter(|(k, _)| w.get(*k).is_some()).map(|(_, n)| n.to_string()).collect();
+            let tags_ref = w.get("tags").and_then(|_| super::delegation::refusal_value(&headers, &target,
+                &super::delegation::Action::SetTags { from: super::session_verbs::lane_groups(name).into_iter().collect(), to: tags.clone() }));
+            let tag_action = super::delegation::Action::SetTags { from: super::session_verbs::lane_groups(name).into_iter().collect(), to: tags.clone() };
+            let cfg_action = super::delegation::Action::SetConfig { keys: keys.clone() };
+            let refused = tags_ref.or_else(|| (!keys.is_empty()).then(|| super::delegation::refusal_value(&headers, &target, &cfg_action)).flatten());
+            if refused.is_none() {
+                if w.get("tags").is_some() {
+                    planned.extend(super::delegation::grant_if_allowed(&headers, &target, &tag_action).map(|g| (name.to_string(), g)));
+                }
+                if !keys.is_empty() {
+                    planned.extend(super::delegation::grant_if_allowed(&headers, &target, &cfg_action).map(|g| (name.to_string(), g)));
+                }
+            }
+            refused
         } else {
+            let settings: Vec<String> = ["dir", "flags", "creator"].iter().filter(|k| w.get(**k).is_some()).map(|k| format!("create:{k}")).collect();
+            let action = super::delegation::Action::CreateWorker { tags: tags.clone(), settings, owner_only: None };
+            planned.extend(super::delegation::grant_if_allowed(&headers, &super::delegation::Target::NewWorker, &action).map(|g| (name.to_string(), g)));
             super::session_verbs::worker_create_refusal_body(
                 &headers,
-                &super::session_verbs::CreateRequest { name: None, tags: &tags, owner_only: None },
+                &super::session_verbs::CreateRequest { name: Some(name), tags: &tags, owner_only: None,
+                    settings: ["dir", "flags", "creator"].iter().filter(|k| w.get(**k).is_some()).map(|k| format!("create:{k}")).collect() },
             )
         };
         if let Some(body) = refusal {
             return (StatusCode::FORBIDDEN, Json(body));
         }
     }
-    if !actor.is_empty() && std::env::var("AMUX_SCOPE_WRITE_AGENTS").ok().as_deref() != Some("1") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": format!(
-                    "session '{actor}' may not apply instance config — global and group \
-                     layers belong to the human (same policy as /api/scope). Set \
-                     AMUX_SCOPE_WRITE_AGENTS=1 to allow it."
-                ),
-            })),
-        );
+    // Instance-level sections (skins, columns, anything but worker
+    // declarations) are an instance apply: owner, or mrpopo with a specific
+    // grant Max approves (ai-config #160). AMUX_SCOPE_WRITE_AGENTS no longer opens it.
+    let instance = doc.as_object().is_some_and(|o| o.keys().any(|k| !matches!(k.as_str(), "workers" | "why" | "version")));
+    let mut grant = None;
+    if !actor.is_empty() && instance {
+        // The grant names the settings applied (the target): a column id or
+        // title, or a skin key (review H1).
+        let mut names: Vec<String> = Vec::new();
+        for c in doc.get("columns").and_then(Value::as_array).into_iter().flatten() {
+            for k in ["id", "title", "name", "gate"] {
+                if let Some(v) = c.get(k).and_then(Value::as_str) { names.push(v.to_string()); }
+            }
+        }
+        if let Some(skins) = doc.get("skins").and_then(Value::as_object) {
+            names.extend(skins.keys().cloned());
+        }
+        match super::delegation::authorize(&state, &headers, &super::delegation::Target::Settings(names),
+            &super::delegation::Action::SetConfig { keys: vec!["instance:apply".into()] }, Some(&doc)) {
+            Ok(g) => grant = g,
+            Err(r) => {
+                let status = r.status();
+                let body = axum::body::to_bytes(r.into_body(), 64 * 1024).await.ok()
+                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok()).unwrap_or(Value::Null);
+                return (status, Json(body));
+            }
+        }
     }
 
     let mut changed: Vec<String> = Vec::new();
@@ -381,6 +421,20 @@ pub async fn apply(
         }
     }
 
+    // Delegated changes are logged (ai-config #160): the instance apply's
+    // grant, and each worker declaration a worker applied.
+    // A 207 with errors is not a clean change: the instance apply is logged
+    // only when every item applied (worker declarations log per changed item).
+    if let Some(g) = grant.as_ref().filter(|_| errors.is_empty()) {
+        g.commit(&state, Value::Null, json!({"changed": changed}));
+    }
+    for (name, g) in planned {
+        if changed.iter().any(|c| c == &format!("worker:{name}")) {
+            let decl = doc.get("workers").and_then(Value::as_array).into_iter().flatten()
+                .find(|w| w.get("name").and_then(Value::as_str) == Some(name.as_str())).cloned().unwrap_or(Value::Null);
+            g.commit(&state, Value::Null, decl);
+        }
+    }
     let status = if errors.is_empty() {
         StatusCode::OK
     } else {

@@ -1934,6 +1934,46 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET"],
     },
     RouteEntry {
+        path: "/api/delegation/log",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/delegation/requests",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/delegation/requests/{code}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/delegation/questions/render",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/delegation/questions/{ask}/display",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/delegation/grants",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/delegation/grants/{code}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/delegation/grants/{code}/deny",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/delegation/grants/{code}/undo",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/delegation/whoami",
+        methods: &["GET"],
+    },
+    RouteEntry {
         path: "/api/vault/secrets/{id}",
         methods: &["PUT", "PATCH", "DELETE"],
     },

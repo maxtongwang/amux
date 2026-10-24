@@ -32,7 +32,7 @@ pub(crate) const GATE_KEY: &str = "AMUX_PANE_PROMPT_HISTORY";
 /// How long an amux delivery can explain a later UserPromptSubmit. A queued
 /// message is noted when it is typed, not when it was queued, so this only has
 /// to cover typing-to-hook latency plus a slow turn boundary.
-const DELIVERY_WINDOW_S: f64 = 900.0;
+pub(crate) const DELIVERY_WINDOW_S: f64 = 900.0;
 /// Per-lane ring size. A lane receives a few deliveries a minute at most; 32
 /// covers the window with room to spare and bounds memory.
 const RING_PER_LANE: usize = 32;
@@ -50,6 +50,13 @@ type Ring = Mutex<HashMap<String, VecDeque<(f64, String)>>>;
 fn ring() -> &'static Ring {
     static RING: OnceLock<Ring> = OnceLock::new();
     RING.get_or_init(Default::default)
+}
+
+/// Each hermetic route fixture owns a new home but uses the reserved owner
+/// session name; keep its process-local delivery cache in the same scope.
+#[cfg(test)]
+pub(crate) fn reset_test_deliveries(session: &str) {
+    ring().lock().unwrap().remove(session);
 }
 
 /// Collapse whitespace so a paste that gained a trailing space (the
@@ -80,7 +87,7 @@ pub(crate) fn note_delivery(session: &str, text: &str) {
     }
 }
 
-fn recent_deliveries(session: &str) -> Vec<String> {
+pub(crate) fn recent_deliveries(session: &str) -> Vec<String> {
     let now = crate::config::now_f64();
     ring()
         .lock()
