@@ -1020,7 +1020,7 @@ fn degraded(cause: &str, reason: String) -> Value {
     json!({ "available": false, "cause": cause, "reason": reason })
 }
 
-/// GET /api/usage/attribution — WHAT SPENT THE PLAN, in dollars, by why the
+/// GET /api/usage/attribution — list-price equivalent, not billed, by why the
 /// turn happened (AMUX-3544).
 ///
 /// # The complaint this answers
@@ -1033,7 +1033,7 @@ fn degraded(cause: &str, reason: String) -> Value {
 /// impossible from the data we keep IS the bug.
 ///
 /// Both halves already existed and nothing joined them. `token_ledger` has the
-/// real cost per turn (from the Claude Code transcripts, priced per model) but
+/// token counters per turn (repriced with the configured list-price table) but
 /// knows only WHICH SESSION spent it. `cmd_history` knows WHY each turn
 /// happened — a human typed it, a schedule fired, a peer lane sent a message —
 /// but nothing about cost. Attribution is the correlated lookup between them:
@@ -1074,73 +1074,8 @@ async fn get_attribution(
         let conn = store.read()?;
         let cutoff: i64 = chrono::Utc::now().timestamp() - hours * 3600;
 
-        // The control, not decoration: an unbounded match and a correct match
-        // look identical from the rows alone.
-        let total_rows: i64 =
-            conn.query_row("SELECT COUNT(*) FROM token_ledger", [], |r| r.get(0))?;
-        let in_window: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM token_ledger WHERE ts > ?1",
-            [cutoff],
-            |r| r.get(0),
-        )?;
-
-        let mut stmt = conn.prepare(
-            &format!(
-                "WITH lg AS (SELECT ts, session, cost_usd, input, output FROM token_ledger WHERE ts > ?1), {PROMPT_SOURCE_SRC} \
-                 SELECT {PROMPT_SOURCE_TRIG} AS trig, SUM(cost_usd), COUNT(*), SUM(input), SUM(output) \
-                 FROM src GROUP BY 1 ORDER BY 2 DESC"
-            ),
-        )?;
-        let rows = stmt.query_map([cutoff], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, f64>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)?,
-            ))
-        })?;
-
-        let mut sources = Vec::new();
-        let (mut total_usd, mut bg_usd) = (0.0f64, 0.0f64);
-        for row in rows {
-            let (trig, usd, turns, inp, outp) = row?;
-            total_usd += usd;
-            let human = trig == "user";
-            if !human {
-                bg_usd += usd;
-            }
-            sources.push(json!({
-                "source": if trig.is_empty() { "unattributed" } else { trig.as_str() },
-                "label": trigger_label(&trig),
-                "is_background": !human,
-                "cost_usd": (usd * 100.0).round() / 100.0,
-                "turns": turns,
-                "input_tokens": inp,
-                "output_tokens": outp,
-            }));
-        }
-
-        // "A schedule fired" is actionable only when it names WHICH schedule,
-        // and "a peer messaged" only when it names the lane. One schedule
-        // accounted for 134 turns in 24h here and was invisible without this.
-        let mut top = stmt_top(&conn, cutoff)?;
-        top.truncate(10);
-
-        Ok(json!({
-            "window_hours": hours,
-            "total_cost_usd": (total_usd * 100.0).round() / 100.0,
-            "background_cost_usd": (bg_usd * 100.0).round() / 100.0,
-            "background_pct": if total_usd > 0.0 {
-                (bg_usd / total_usd * 1000.0).round() / 10.0
-            } else { 0.0 },
-            "by_source": sources,
-            "top_origins": top,
-            // Proof the window filtered. Equal counts mean the cutoff matched
-            // everything and the numbers below are the whole table, not a window.
-            "rows_considered": in_window,
-            "rows_excluded_by_window": total_rows - in_window,
-        }))
+        let table = crate::runtime_jobs::token_ledger::prices(&crate::config::amux_home());
+        summarize_attribution(&conn, cutoff, hours, &table)
     })
     .await;
 
@@ -1157,6 +1092,112 @@ async fn get_attribution(
         )
             .into_response(),
     }
+}
+
+/// Explicit pricing keeps prompt attribution independent of stale stored dollars.
+fn summarize_attribution(
+    conn: &rusqlite::Connection,
+    cutoff: i64,
+    hours: i64,
+    table: &[(String, [f64; 4])],
+) -> anyhow::Result<Value> {
+    // The control, not decoration: an unbounded match and a correct match
+    // look identical from the rows alone.
+    let total_rows: i64 = conn.query_row("SELECT COUNT(*) FROM token_ledger", [], |r| r.get(0))?;
+    let in_window: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM token_ledger WHERE ts > ?1",
+        [cutoff],
+        |r| r.get(0),
+    )?;
+
+    let mut stmt = conn.prepare(
+        &format!(
+            "WITH lg AS (SELECT * FROM token_ledger WHERE ts > ?1), {PROMPT_SOURCE_SRC} \
+             SELECT {PROMPT_SOURCE_TRIG}, model, SUM(input), SUM(cache_read), SUM(cache_write), SUM(output), COUNT(*) \
+             FROM src GROUP BY 1,2"
+        ),
+    )?;
+    let rows = stmt.query_map([cutoff], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            [r.get::<_, i64>(2)?, r.get(3)?, r.get(4)?, r.get(5)?],
+            r.get::<_, i64>(6)?,
+        ))
+    })?;
+    let mut grouped = std::collections::BTreeMap::<String, (f64, i64, [i64; 4])>::new();
+    let mut unpriced_turns = 0;
+    for row in rows {
+        let (trig, model, tokens, turns) = row?;
+        let entry = grouped.entry(trig).or_default();
+        entry.0 += crate::runtime_jobs::token_ledger::turn_cost_usd(table, &model, tokens);
+        entry.1 += turns;
+        for (total, count) in entry.2.iter_mut().zip(tokens) {
+            *total += count;
+        }
+        if !crate::runtime_jobs::token_ledger::model_is_priced(table, &model) {
+            unpriced_turns += turns;
+        }
+    }
+
+    let mut sources = Vec::new();
+    let (mut total_usd, mut bg_usd) = (0.0f64, 0.0f64);
+    for (trig, (usd, turns, tokens)) in grouped {
+        total_usd += usd;
+        let human = trig == "user";
+        if !human {
+            bg_usd += usd;
+        }
+        sources.push(json!({
+            "source": if trig.is_empty() { "unattributed" } else { trig.as_str() },
+            "label": trigger_label(&trig),
+            "is_background": !human,
+            "cost_usd": (usd * 100.0).round() / 100.0,
+            "turns": turns,
+            "input_tokens": tokens[0],
+            "output_tokens": tokens[3],
+        }));
+    }
+
+    sources.sort_by(|a, b| {
+        b["cost_usd"]
+            .as_f64()
+            .unwrap()
+            .total_cmp(&a["cost_usd"].as_f64().unwrap())
+    });
+
+    // "A schedule fired" is actionable only when it names WHICH schedule,
+    // and "a peer messaged" only when it names the lane. One schedule
+    // accounted for 134 turns in 24h here and was invisible without this.
+    let top = stmt_top(conn, cutoff, table)?;
+
+    tracing::info!(
+        verdict = "usage_list_price_repriced",
+        surface = "attribution",
+        measured = true,
+        n_considered = in_window,
+        unpriced_turns,
+        cost_basis = super::observability::COST_BASIS,
+        "priced token counters with the configured list-price table"
+    );
+    Ok(json!({
+        "window_hours": hours,
+        "cost_basis": super::observability::price_basis(table),
+        "unpriced_turns": unpriced_turns,
+        "billing_measured": false,
+        "billed_usd": Value::Null,
+        "total_cost_usd": (total_usd * 100.0).round() / 100.0,
+        "background_cost_usd": (bg_usd * 100.0).round() / 100.0,
+        "background_pct": if total_usd > 0.0 {
+            (bg_usd / total_usd * 1000.0).round() / 10.0
+        } else { 0.0 },
+        "by_source": sources,
+        "top_origins": top,
+        // Proof the window filtered. Equal counts mean the cutoff matched
+        // everything and the numbers below are the whole table, not a window.
+        "rows_considered": in_window,
+        "rows_excluded_by_window": total_rows - in_window,
+    }))
 }
 
 // AMUX-4584: GET /api/usage/report.md — the token-usage dashboard as markdown.
@@ -1521,26 +1562,40 @@ fn trigger_label(t: &str) -> &'static str {
 }
 
 /// The named offenders inside the background bucket.
-fn stmt_top(conn: &rusqlite::Connection, cutoff: i64) -> anyhow::Result<Vec<Value>> {
-    let mut stmt = conn.prepare(
-        &format!(
-            "WITH lg AS (SELECT ts, session, cost_usd FROM token_ledger WHERE ts > ?1), {PROMPT_SOURCE_SRC} \
-             SELECT {PROMPT_SOURCE_TRIG}, {PROMPT_SOURCE_ORIGIN}, src.session, SUM(cost_usd), COUNT(*) \
-             FROM src GROUP BY 1,2,3 ORDER BY 4 DESC LIMIT 10"
-        ),
-    )?;
+fn stmt_top(
+    conn: &rusqlite::Connection,
+    cutoff: i64,
+    table: &[(String, [f64; 4])],
+) -> anyhow::Result<Vec<Value>> {
+    let mut stmt = conn.prepare(&format!(
+        "WITH lg AS (SELECT * FROM token_ledger WHERE ts > ?1), {PROMPT_SOURCE_SRC} \
+         SELECT {PROMPT_SOURCE_TRIG}, {PROMPT_SOURCE_ORIGIN}, src.session, model, \
+         SUM(input), SUM(cache_read), SUM(cache_write), SUM(output), COUNT(*) \
+         FROM src GROUP BY 1,2,3,4"
+    ))?;
     let rows = stmt.query_map([cutoff], |r| {
         Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, f64>(3)?,
-            r.get::<_, i64>(4)?,
+            (
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ),
+            r.get::<_, String>(3)?,
+            [r.get::<_, i64>(4)?, r.get(5)?, r.get(6)?, r.get(7)?],
+            r.get::<_, i64>(8)?,
         ))
     })?;
-    let mut out = Vec::new();
+    let mut grouped = std::collections::BTreeMap::<(String, String, String), (f64, i64)>::new();
     for row in rows {
-        let (trig, origin, session, usd, turns) = row?;
+        let (key, model, tokens, turns) = row?;
+        let entry = grouped.entry(key).or_default();
+        entry.0 += crate::runtime_jobs::token_ledger::turn_cost_usd(table, &model, tokens);
+        entry.1 += turns;
+    }
+    let mut ranked: Vec<_> = grouped.into_iter().collect();
+    ranked.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+    let mut out = Vec::new();
+    for ((trig, origin, session), (usd, turns)) in ranked.into_iter().take(10) {
         out.push(json!({
             "source": if trig.is_empty() { "unattributed" } else { trig.as_str() },
             "label": trigger_label(&trig),
@@ -1617,6 +1672,84 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
+    #[test]
+    fn attribution_reprices_sources_and_origins_from_configured_counters() {
+        let conn = crate::db::migrate::test_memdb();
+        let now = 1_789_400_000;
+        let table = vec![
+            ("fixture-a".into(), [1.0, 2.0, 3.0, 4.0]),
+            ("fixture-b".into(), [2.0, 4.0, 6.0, 8.0]),
+            ("fixture-free".into(), [0.0; 4]),
+        ];
+        for (session, kind, origin) in [("human", "user", ""), ("background", "session", "peer")] {
+            conn.execute(
+                "INSERT INTO cmd_history(text,type,session,ts,origin) VALUES('p',?1,?2,?3,?4)",
+                rusqlite::params![kind, session, (now - 100) * 1000, origin],
+            )
+            .unwrap();
+        }
+        for (session, model, at, stored) in [
+            ("human", "fixture-a", now - 60, 900.0),
+            ("background", "fixture-b", now - 50, 1.0),
+            ("background", "fixture-a", now - 40, 1.0),
+            ("background", "fixture-free", now - 30, 500.0),
+            ("background", "unknown-vendor", now - 20, 500.0),
+            ("human", "fixture-a", now - 3600, 999.0),
+        ] {
+            conn.execute(
+                "INSERT INTO token_ledger(ts,session,conversation,model,input,cache_read,cache_write,output,cost_usd,task) VALUES(?1,?2,'c',?3,1000000,1000000,1000000,1000000,?4,'')",
+                rusqlite::params![at, session, model, stored],
+            ).unwrap();
+        }
+        let value = summarize_attribution(&conn, now - 3600, 1, &table).unwrap();
+        assert_eq!(value["total_cost_usd"], json!(40.0));
+        assert_eq!(value["background_cost_usd"], json!(30.0));
+        assert_eq!(value["background_pct"], json!(75.0));
+        assert_eq!(value["by_source"][0]["source"], "session");
+        assert_eq!(value["by_source"][0]["cost_usd"], json!(30.0));
+        assert_eq!(value["by_source"][0]["input_tokens"], json!(4_000_000));
+        assert_eq!(value["by_source"][1]["cost_usd"], json!(10.0));
+        assert_eq!(value["top_origins"][0]["origin"], "peer");
+        assert_eq!(value["top_origins"][0]["cost_usd"], json!(30.0));
+        assert_eq!(value["top_origins"][0]["turns"], json!(4));
+        assert_eq!(value["top_origins"][1]["cost_usd"], json!(10.0));
+        assert_eq!(value["rows_considered"], json!(5));
+        assert_eq!(value["rows_excluded_by_window"], json!(1));
+        assert_eq!(value["unpriced_turns"], json!(1));
+        assert_eq!(
+            value["cost_basis"],
+            super::super::observability::price_basis(&table)
+        );
+        assert_eq!(value["billing_measured"], false);
+        assert!(value["billed_usd"].is_null());
+        let empty = summarize_attribution(&conn, now, 1, &table).unwrap();
+        assert_eq!(empty["total_cost_usd"], json!(0.0));
+        assert_eq!(empty["background_pct"], json!(0.0));
+        assert_eq!(empty["by_source"], json!([]));
+        assert_eq!(empty["top_origins"], json!([]));
+        assert_eq!(empty["cost_basis"], value["cost_basis"]);
+        let missing_schema = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(summarize_attribution(&missing_schema, now, 1, &table).is_err());
+    }
+
+    #[test]
+    fn top_origins_rank_configured_equivalents_before_limiting() {
+        let conn = crate::db::migrate::test_memdb();
+        let table = vec![("fixture".into(), [1.0, 0.0, 0.0, 0.0])];
+        for i in 1..=12 {
+            conn.execute(
+                "INSERT INTO token_ledger(ts,session,conversation,model,input,cache_read,cache_write,output,cost_usd,task) VALUES(100,?1,'c','fixture',?2,0,0,0,?3,'')",
+                rusqlite::params![format!("lane-{i}"), i * 1_000_000, 13 - i],
+            ).unwrap();
+        }
+        let value = summarize_attribution(&conn, 0, 1, &table).unwrap();
+        let top = value["top_origins"].as_array().unwrap();
+        assert_eq!(top.len(), 10);
+        assert_eq!(top[0]["session"], "lane-12");
+        assert_eq!(top[0]["cost_usd"], json!(12.0));
+        assert_eq!(top[9]["session"], "lane-3");
+    }
+
     #[tokio::test]
     async fn undelivered_or_refused_prompts_do_not_claim_later_token_usage() {
         let dir = tempfile::tempdir().unwrap();
@@ -1627,9 +1760,9 @@ mod tests {
             conn.execute("INSERT INTO cmd_history(text,type,session,ts,delivery) VALUES('queued peer','session','lane',?1,'queued')",[(now-80)*1000])?;
             conn.execute("INSERT INTO cmd_history(text,type,session,ts,delivery) VALUES('refused peer','session','lane',?1,'refused')",[(now-60)*1000])?;
             conn.execute("INSERT INTO steering_history(id,session,text,queued_at,delivered_at,outcome,guard,sender) VALUES('denied','lane','refused',?1,?1,'refused:worker_group_boundary','board-progress','outside')",[now-50])?;
-            conn.execute("INSERT INTO token_ledger(ts,session,conversation,model,input,cache_read,cache_write,output,cost_usd,task) VALUES(?1,'lane','c','opus',1,0,0,1,1.0,'')",[now-40])?;
+            conn.execute("INSERT INTO token_ledger(ts,session,conversation,model,input,cache_read,cache_write,output,cost_usd,task) VALUES(?1,'lane','c','opus',100000,0,0,0,1.0,'')",[now-40])?;
             conn.execute("INSERT INTO steering_history(id,session,text,queued_at,delivered_at,outcome,guard,sender) VALUES('accepted','lane','actual callback',?1,?1,'sent (queued while generating)','task-callback:C','peer')",[now-30])?;
-            conn.execute("INSERT INTO token_ledger(ts,session,conversation,model,input,cache_read,cache_write,output,cost_usd,task) VALUES(?1,'lane','c','opus',1,0,0,1,2.0,'')",[now-20])?;
+            conn.execute("INSERT INTO token_ledger(ts,session,conversation,model,input,cache_read,cache_write,output,cost_usd,task) VALUES(?1,'lane','c','opus',200000,0,0,0,2.0,'')",[now-20])?;
             Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
         }).unwrap();
         let app = axum::Router::new()
@@ -1668,7 +1801,7 @@ mod tests {
             .map(|r| {
                 (
                     r["source"].as_str().unwrap(),
-                    r["cost_usd"].as_f64().unwrap(),
+                    r["input_tokens"].as_f64().unwrap() / 100_000.0,
                 )
             })
             .collect();
@@ -1753,7 +1886,7 @@ mod tests {
                     conn.execute(
                         "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, \
                          cache_write, output, cost_usd, task) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                        rusqlite::params![at, "lane", "c", "opus", 10, 0, 0, 5, cost, ""],
+                        rusqlite::params![at, "lane", "c", "opus", (cost * 100_000.0) as i64, 0, 0, 0, cost, ""],
                     )?;
                 }
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
@@ -1790,7 +1923,7 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
 
-        // 1. The money is in the right buckets, and the labels are for a human.
+        // 1. Token shares are in the right buckets, and the labels are for a human.
         let by: std::collections::HashMap<String, f64> = v["by_source"]
             .as_array()
             .unwrap()
@@ -1798,7 +1931,7 @@ mod tests {
             .map(|r| {
                 (
                     r["source"].as_str().unwrap().to_string(),
-                    r["cost_usd"].as_f64().unwrap(),
+                    r["input_tokens"].as_f64().unwrap() / 100_000.0,
                 )
             })
             .collect();
@@ -1850,9 +1983,26 @@ mod tests {
         );
 
         // 2. Background share is the headline the complaint was about.
-        assert_eq!(v["total_cost_usd"], json!(33.0));
-        assert_eq!(v["background_cost_usd"], json!(32.0));
-        assert_eq!(v["background_pct"], json!(97.0));
+        let table = crate::runtime_jobs::token_ledger::prices(&crate::config::amux_home());
+        let equivalent = |shares: i64| {
+            crate::runtime_jobs::token_ledger::turn_cost_usd(
+                &table,
+                "opus",
+                [shares * 100_000, 0, 0, 0],
+            )
+        };
+        assert_eq!(
+            v["total_cost_usd"],
+            json!((equivalent(33) * 100.0).round() / 100.0)
+        );
+        assert_eq!(
+            v["background_cost_usd"],
+            json!((equivalent(32) * 100.0).round() / 100.0)
+        );
+        assert_eq!(
+            v["background_pct"],
+            json!(if equivalent(33) > 0.0 { 97.0 } else { 0.0 })
+        );
 
         // 3. THE CONTROL. The 30-day-old row must be OUTSIDE a 1-hour window.
         //    If this is 0 the join matched everything and every number above is
@@ -1954,7 +2104,7 @@ mod tests {
                 conn.execute(
                     "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, \
                      cache_write, output, cost_usd, task) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    rusqlite::params![now - 60, "lane", "c", "opus", 10, 0, 0, 5, 4.0, ""],
+                    rusqlite::params![now - 60, "lane", "c", "opus", 400_000, 0, 0, 0, 4.0, ""],
                 )?;
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
@@ -1996,7 +2146,7 @@ mod tests {
             .map(|r| {
                 (
                     r["source"].as_str().unwrap_or("").to_string(),
-                    r["cost_usd"].as_f64().unwrap_or(0.0),
+                    r["input_tokens"].as_f64().unwrap() / 100_000.0,
                 )
             })
             .collect();
@@ -2016,7 +2166,7 @@ mod tests {
             "and 4.0 HERE is the same bug seen through c_ts: with the peer's row dropped, the \
              steering delivery at now-90 becomes the newest thing this lane received: {v}"
         );
-        assert_eq!(v["background_pct"], json!(100.0), "{v}");
+        assert_eq!(v["background_cost_usd"], v["total_cost_usd"], "{v}");
     }
 
     /// A fixture probe that counts how many times it was called.

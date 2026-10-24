@@ -1,6 +1,8 @@
 # Usage attribution and equivalents
 
-The Cost tab and `GET /api/usage/report.md` show **list-price equivalent on Max
+The Cost tab, `GET /api/usage/report.md`, Settings usage by trigger
+(`GET /api/usage/attribution?hours=24`), and Messages weekly trends
+(`GET /api/review/week?days=7`) show **list-price equivalent on Max
 subscriptions, not billed**. All breakdowns use the same configured rates and
 counters as the headline. Unpriced responses contribute tokens but no equivalent
 dollars; the priced subtotal has `cost_status: "partial"`. Empty models count as
@@ -96,6 +98,16 @@ its absence has `measured: false`, not a claim that compaction never happened.
 The Cost tab exposes the same scopes as expandable work/worker/conversation rows,
 then UTC days and individual responses. No worker identity and no work reference
 are separate facts; unattributed work does not measure idleness.
+
+The trigger and weekly endpoints also return the shared `cost_basis`,
+`unpriced_turns`, `billing_measured: false` and `billed_usd: null`, including
+empty windows. They group all four token counters by model and reprice with
+`turn_cost_usd`; stored `cost_usd` is not their price source. Trigger origins
+are merged across models and ranked by the configured equivalent before the
+top-ten limit. The trigger window retains its existing strict cutoff (`ts >
+now - hours * 3600`); weekly trends retain `ts >= now - days * 86400`.
+The `usage_list_price_repriced` log verdict identifies the serving surface,
+rows considered, unpriced turns and price label.
 
 ## Accounting and verification
 

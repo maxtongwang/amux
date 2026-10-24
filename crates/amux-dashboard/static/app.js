@@ -47514,7 +47514,7 @@ async function loadSpendAttribution() {
     const d = await r.json();
     if (!d || d.error || !Array.isArray(d.by_source)) { box.innerHTML = ''; return; }
     if (!d.by_source.length) {
-      box.innerHTML = '<div style="font-size:0.74rem;color:var(--dim);">No spend recorded in the last 24h.</div>';
+      box.innerHTML = '<div style="font-size:0.74rem;color:var(--dim);">No token usage recorded in the last 24h.</div>';
       return;
     }
     const usd = n => '$' + (n >= 100 ? Math.round(n).toLocaleString() : n.toFixed(2));
@@ -47549,14 +47549,14 @@ async function loadSpendAttribution() {
     const wasOpen = !!box.querySelector('details.settings-fold[open]');
     box.innerHTML =
         '<details class="settings-fold"' + (wasOpen ? ' open' : '') + '><summary style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">'
-      +   '<span style="font-size:0.8rem;color:var(--fg);">What spent it (24h)</span>'
-      +   '<span style="font-size:0.74rem;color:var(--dim);">' + usd(d.total_cost_usd || 0) + '</span>'
+      +   '<span style="font-size:0.8rem;color:var(--fg);">Usage by trigger (24h)</span>'
+      +   '<span style="font-size:0.74rem;color:var(--dim);text-align:right;">' + usd(d.total_cost_usd || 0) + ' · ' + esc(d.cost_basis?.label || 'list-price equivalent, not billed') + '</span>'
       + '</summary>'
       + '<div style="height:6px;border-radius:4px;background:var(--border);overflow:hidden;margin-bottom:6px;">'
       +   '<div style="height:100%;width:' + bgPct + '%;background:' + col + ';"></div>'
       + '</div>'
       + '<div style="font-size:0.74rem;color:' + col + ';margin-bottom:6px;">'
-      +   bgPct + '% of spend was background work, not you'
+      +   bgPct + '% of list-price equivalent was background work'
       + '</div>'
       + rows
       + (top ? '<div style="font-size:0.72rem;color:var(--dim);margin:8px 0 2px;">Biggest background sources</div>' + top : '')
@@ -49715,7 +49715,7 @@ function _trendsRender() {
     + stat((t.cards_created||0).toLocaleString(), 'cards')
     + stat((t.cards_verified||0)+' / '+(t.cards_done||0), 'verified / done')
     + stat((t.tokens||0)>=1e6 ? (t.tokens/1e6).toFixed(1)+'M' : (t.tokens||0).toLocaleString(), 'tokens')
-    + stat('$'+Math.round(t.cost_usd||0).toLocaleString(), 'spend');
+    + stat('$'+Math.round(t.cost_usd||0).toLocaleString(), esc(_trendsWeek?.cost_basis?.label || 'list-price equivalent, not billed'));
   // Cluster your directives into themes.
   const themed = _TREND_THEMES.map(th => ({ ...th, msgs: [], sessions: new Set(), cards: new Set() }));
   const other = { key:'other', label:'Other', msgs:[], sessions:new Set(), cards:new Set() };

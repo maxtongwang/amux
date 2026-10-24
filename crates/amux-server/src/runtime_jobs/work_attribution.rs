@@ -768,6 +768,31 @@ mod tests {
         }
     }
     #[test]
+    fn unknown_worker_snapshot_records_no_worker_identity() {
+        let c = fixture();
+        capture(&c, "ghost", &event(100), false).unwrap();
+        capture(&c, "ghost", &event(110), true).unwrap();
+        let reasons: Vec<(String, String)> = c
+            .prepare("SELECT worker_id,attribution FROM usage_work_snapshots ORDER BY effective_at")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| {
+                let (id, raw): (String, String) = r.unwrap();
+                let v: Value = serde_json::from_str(&raw).unwrap();
+                (id, v["reason"].as_str().unwrap_or_default().to_string())
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                (String::new(), "no_worker_identity".to_string()),
+                (String::new(), "isolated".to_string()),
+            ],
+            "a turn with no durable worker identity must say so, and isolation must win"
+        );
+    }
+    #[test]
     fn snapshot_ownership_cannot_be_adopted_by_another_worker() {
         let c = fixture();
         capture(&c, "renamed", &event(100), false).unwrap();

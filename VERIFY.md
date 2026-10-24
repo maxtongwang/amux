@@ -251,6 +251,8 @@ CARGO_TARGET_DIR=$HOME/.amux/rust-build-target scripts/safe-cargo.sh test -p amu
 CARGO_TARGET_DIR=$HOME/.amux/rust-build-target scripts/safe-cargo.sh test -p amux-server --lib work_attribution
 CARGO_TARGET_DIR=$HOME/.amux/rust-build-target scripts/safe-cargo.sh test -p amux-server --lib observability
 CARGO_TARGET_DIR=$HOME/.amux/rust-build-target scripts/safe-cargo.sh test -p amux-server --lib usage_report_tests
+CARGO_TARGET_DIR=$HOME/.amux/rust-build-target scripts/safe-cargo.sh test -p amux-server --lib api::usage::tests
+CARGO_TARGET_DIR=$HOME/.amux/rust-build-target scripts/safe-cargo.sh test -p amux-server --lib api::review::tests
 ```
 
 Pass: JavaScript syntax exits 0, Node reports zero failures, and each Rust command

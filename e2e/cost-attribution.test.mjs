@@ -82,3 +82,57 @@ test('an unmeasured or malformed evidence response is an error, not an empty rea
     assert.equal(node.dataset.loaded,undefined);assert.equal(node.dataset.loading,undefined);
   }
 });
+
+function surfaceFunction(signature, nextMarker) {
+  const first = source.indexOf(signature);
+  const last = source.indexOf(nextMarker, first);
+  assert(first >= 0 && last > first, `missing renderer ${signature}`);
+  return source.slice(first, last);
+}
+const basisLabel = 'list-price equivalent on Max subscriptions, not billed';
+test('trigger widget labels totals, source rows and origin rows with the API cost basis', async () => {
+  const box = { innerHTML: '', querySelector: () => null };
+  const payload = {
+    cost_basis: { label: basisLabel }, total_cost_usd: 40, background_pct: 75,
+    by_source: [{ source: 'session', label: 'a peer lane messaged', is_background: true, cost_usd: 30, turns: 4 }],
+    top_origins: [{ session: 'background', origin: 'peer', is_background: true, cost_usd: 30 }],
+  };
+  const surface = vm.createContext({
+    API: '', esc, document: { getElementById: () => box },
+    fetch: async () => ({ json: async () => payload }),
+  });
+  vm.runInContext(surfaceFunction('async function loadSpendAttribution()', '// AMUX-5270:'), surface);
+  await surface.loadSpendAttribution();
+  assert.match(box.innerHTML, /\$40\.00/);
+  assert.match(box.innerHTML, /\$30\.00/);
+  assert.match(box.innerHTML, /list-price equivalent on Max subscriptions, not billed/);
+  assert.match(box.innerHTML.split('</summary>')[0], /list-price equivalent on Max subscriptions, not billed/);
+  assert.match(box.innerHTML, /75% of list-price equivalent was background work/);
+  assert.doesNotMatch(box.innerHTML, /of spend/);
+  payload.cost_basis.label = '<b>configured basis</b>';
+  await surface.loadSpendAttribution();
+  assert.match(box.innerHTML, /&lt;b&gt;configured basis&lt;\/b&gt;/);
+  delete payload.cost_basis;
+  await surface.loadSpendAttribution();
+  assert.match(box.innerHTML, /list-price equivalent, not billed/);
+});
+test('weekly trends dollar stat uses the API basis with a not-billed fallback', () => {
+  const totals = { innerHTML: '' };
+  const surface = vm.createContext({
+    esc, _cmdHistory: [], boardItems: [], _TREND_THEMES: [],
+    _trendsLoadSummary: () => {},
+    _trendsWeek: { totals: { cost_usd: 30 }, cost_basis: { label: basisLabel } },
+    document: { getElementById: id => id === 'trends-totals' ? totals : null },
+  });
+  vm.runInContext(surfaceFunction('function _trendsRender()', 'function _trendsLoadSummary('), surface);
+  surface._trendsRender();
+  assert.match(totals.innerHTML, /\$30/);
+  assert.match(totals.innerHTML, /list-price equivalent on Max subscriptions, not billed/);
+  assert.doesNotMatch(totals.innerHTML, />spend</);
+  surface._trendsWeek.cost_basis.label = '<b>configured basis</b>';
+  surface._trendsRender();
+  assert.match(totals.innerHTML, /&lt;b&gt;configured basis&lt;\/b&gt;/);
+  delete surface._trendsWeek.cost_basis;
+  surface._trendsRender();
+  assert.match(totals.innerHTML, /list-price equivalent, not billed/);
+});
