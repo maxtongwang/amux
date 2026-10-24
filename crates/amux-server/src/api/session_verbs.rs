@@ -3607,6 +3607,13 @@ pub const SESSION_SCOPED_FIELDS: &[(&str, RenameDisposition)] = &[
     ),
     // -- history written under the old name: keeps it, on purpose --
     (
+        "native_delivery_attempts.endpoint_session",
+        RenameDisposition::KeepForAudit(
+            "the receiver's Claude conversation ID binds exact receipt evidence; \
+             it is not an amux worker name and must survive a worker rename unchanged",
+        ),
+    ),
+    (
         "session_events",
         RenameDisposition::KeepForAudit(
             "the rename journal entry links the old and new name, so the audit \
@@ -39651,10 +39658,12 @@ mod tests {
         // test it was written to satisfy went red on main and stayed red.
         // Counted again here rather than adjusted by hand: both new sites pass
         // the computed `skip_board`, which is the property below.
+        // 11 -> 12 for send_post's native_history_id reservation before native
+        // I/O (PR #67); it also passes the computed `skip_board`.
         assert_eq!(
             sites.len(),
-            11,
-            "the scan must see all 11 production call sites. A LOWER number means the detector \
+            12,
+            "the scan must see all 12 production call sites. A LOWER number means the detector \
              stopped matching rather than that the call sites went away, which is exactly how \
              the first two versions of this test passed a broken tree: one scanned a window \
              that excluded the send handlers, the other missed the multi-line spelling and left \
