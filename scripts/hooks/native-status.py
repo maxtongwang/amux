@@ -15,6 +15,56 @@ import sys
 import time
 import urllib.request
 
+# A complete record must fit the tail; never acknowledge a truncated message.
+ASSISTANT_TAIL_BYTES = 1_048_576
+OWNER_WORKER = 'mrpopo'
+
+
+def assistant_message(data, provider):
+    direct = data.get('last_assistant_message')
+    if isinstance(direct, str):
+        return direct
+    path = data.get('transcript_path')
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        with Path(path).open('rb') as source:
+            size = source.seek(0, 2)
+            source.seek(max(0, size - ASSISTANT_TAIL_BYTES))
+            if size > ASSISTANT_TAIL_BYTES:
+                source.readline()  # Drop the partial boundary record.
+            lines = source.read().splitlines()
+        for line in reversed(lines):
+            record = json.loads(line)
+            if provider == 'codex':
+                if record.get('type') == 'event_msg':
+                    payload = record.get('payload', {})
+                    if payload.get('type') == 'agent_message':
+                        return payload.get('message')
+                    if payload.get('type') == 'user_message':
+                        return None
+                if record.get('type') != 'response_item':
+                    continue
+                message = record.get('payload', {})
+            else:
+                message = record.get('message', {})
+            role = message.get('role', record.get('type'))
+            if role == 'user':
+                return None
+            if role != 'assistant':
+                continue
+            content = message.get('content', [])
+            if isinstance(content, str):
+                return content
+            texts = [block['text'] for block in content
+                     if block.get('type') in ('text', 'output_text') and isinstance(block.get('text'), str)]
+            if texts:
+                return '\n'.join(texts)
+            return None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    return None
+
 
 def state_for(data):
     event = data.get('hook_event_name')
@@ -95,6 +145,12 @@ def observe(data, root, worker, run, provider, occurred_at):
         # server strips it before storing the status report (F8(c)).
         if data.get('hook_event_name') == 'UserPromptSubmit' and isinstance(data.get('prompt'), str):
             payload['prompt'] = data['prompt'][:20000]
+        # Only the owner's own completed turn can acknowledge pane display.
+        # Carry verbatim text in the durable spool, never in fleet status.
+        if worker == OWNER_WORKER and not agent and data.get('hook_event_name') == 'Stop':
+            message = assistant_message(data, provider)
+            if isinstance(message, str) and message:
+                payload['assistant_message'] = message
         # startup / resume / clear / compact: the server drops queued
         # auto-approvals on an owner /clear.
         if data.get('hook_event_name') == 'SessionStart' and isinstance(data.get('source'), str):

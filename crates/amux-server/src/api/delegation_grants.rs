@@ -426,8 +426,8 @@ struct NewGrant<'a> {
     target_incarnation: Option<String>,
 }
 
-/// Persist a question, not a display claim. Only the owner Messages render
-/// receipt may populate shown_row. Identity is read, never minted.
+/// Persist a question, not a display claim. Owner Messages or the native owner
+/// assistant turn supplies the receipt. Identity is read, never minted.
 #[allow(clippy::result_large_err)]
 fn insert(state: &AppState, g: &NewGrant, c: &Captured) -> Result<(String, String), Response> {
     let actor_id = super::delegation_requests::incarnation(g.actor)
@@ -491,9 +491,9 @@ pub(crate) fn request_explicit(state: &AppState, actor: &str, class: &str, targe
         why: super::delegation::request_why(body), reply_session, change, target_incarnation: target_id }, &c) {
         Ok(x) => x, Err(r) => return r,
     };
-    tracing::info!(request_id = %code, actor, reply_session, verdict = "delegation_request_created", measured = true, n_considered = 1, "approval question awaits an owner Messages render receipt");
+    tracing::info!(request_id = %code, actor, reply_session, verdict = "delegation_request_created", measured = true, n_considered = 1, "approval question awaits an owner Messages or native assistant render receipt");
     (StatusCode::ACCEPTED, Json(json!({"ok":true,"pending":true,"request_id":code,"grant_code":code,"sentence":text,
-        "reply_session":reply_session,"how":"Open owner Messages to display the question, then reply yes as the very next owner input; apply with request_id"}))).into_response()
+        "reply_session":reply_session,"question":load(state, &code).and_then(|g|g.ask_text),"how":"Display the exact question in owner Messages or mrpopo's own assistant turn with its request ID, then reply yes as the very next owner input; apply with request_id"}))).into_response()
 }
 
 /// Cite-mode applications spend the request's resolved reply; no new grant
@@ -536,8 +536,8 @@ fn validate_request_identity(state: &AppState, g: &GrantRow, actor: &str) -> Res
     }
     if g.shown_row.is_none() { return Err(("request_not_shown", "request was never shown in a reply session".into())); }
     let conn = state.store.read().map_err(|_|("request_read_failed", "request message ledger unavailable".into()))?;
-    let shown: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM cmd_history WHERE id=?1 AND session=?2 AND origin=?3 AND type='session' AND text=?4 AND delegation_session_incarnation=?5 AND delivery='approval_display' AND repeat_of=?6 AND delivered_at=ts)",
-        rusqlite::params![g.shown_row,g.reply_session,g.actor,g.ask_text,g.reply_incarnation,g.ask_row],|r|r.get(0))
+    let shown: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM cmd_history WHERE id=?1 AND session=?2 AND delegation_session_incarnation=?5 AND repeat_of=?6 AND delivered_at=ts AND ((origin=?3 AND type='session' AND text=?4 AND delivery='approval_display') OR (origin=session AND type='assistant' AND delivery='approval_pane_display' AND instr(text,?4)>0 AND instr(text,?7)>0)))",
+        rusqlite::params![g.shown_row,g.reply_session,g.actor,g.ask_text,g.reply_incarnation,g.ask_row,g.code],|r|r.get(0))
         .map_err(|_|("request_read_failed", "request message ledger unavailable".into()))?;
     if !shown { return Err(("request_not_shown", "the recorded question is absent from the reply session".into())); }
     drop(conn);

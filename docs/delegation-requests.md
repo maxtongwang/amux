@@ -1,6 +1,6 @@
 # Delegation approval requests
 
-Max 2026-10-23; Sonnet review of 04c2138d B1/B2, refs maxtongwang/ai-config#160.
+Max 2026-10-23; dev-lead ruling (b), 2026-10-24; refs maxtongwang/ai-config#160.
 
 ## Create, display, apply
 
@@ -40,9 +40,34 @@ The question remains `ask_row`. Repeated acknowledgments are idempotent and
 cannot move the display or reopen its window. Pre-fix rows that merely used
 the question as `shown_row` are ineligible; create a new request.
 
-Only the scoped Messages tab has this render hook. CLI output, native panes,
-Chat, the global history views and push/phone notifications cannot display
-approvals. A claimed unsupported surface returns
+The owner pane has a second receipt path. `scripts/hooks/native-status.py`
+forwards the owner's `Stop.last_assistant_message` verbatim, falling back to the
+latest complete assistant text in the hook's transcript (Claude or Codex).
+It never uses reasoning, tool output, partial records or text before a newer
+user message. Only the configured owner worker carries assistant text.
+`POST /api/sessions/{owner}/report` → `native_status::apply` →
+`delegation_requests::native_assistant_turn` records the assistant message in
+`cmd_history`, after native run/sequence/provider validation. Only a self-report
+may carry pane evidence; outside reports strip it, and server-owned Chat status
+never enters the pane recorder. The server-written
+launch record must carry the same stable incarnation as the current owner and
+request; old launch records without that identity cannot supply a pane receipt.
+
+The entire stored `ask_text` must occur verbatim in that single assistant message,
+and the request ID must occur as an exact token, delimited by whitespace or ASCII
+punctuation. There is no normalization, fuzzy matching, substring ID match or
+cross-message concatenation. Exactly one pending, unrefused, unexpired,
+request without a prior pane receipt may match. A first pane receipt may
+supersede a Messages receipt; both evidence rows remain in history. A match marks that **assistant row**
+`delivery='approval_pane_display'`, `repeat_of=ask_row`, `delivered_at=ts`, and
+binds `shown_row` to its order position. The receipt, native acceptance and
+assistant row commit in one transaction. A replay adopts the committed receipt;
+a later assistant turn, even repeating the question, cannot reopen it.
+Assistant text is stripped from fleet status and lifecycle event projections.
+
+The scoped Messages tab retains its existing `approval_display` path. CLI output,
+Chat, other panes/sessions, global history views and push/phone notifications
+cannot supply a receipt. A claimed unsupported surface returns
 `request_display_surface_unsupported`; a browser without IntersectionObserver
 shows that code and records nothing. Reading request/history APIs never arms a
 request. No terminal prompt or board card is injected.
@@ -54,8 +79,9 @@ method/path/body. It spends the reply once in the existing grant transaction.
 
 | API | Input or result |
 | --- | --- |
-| `POST /api/delegation/requests` | `{method,path,body}` → HTTP 202, `request_id`, `grant_code`, `reply_session`, `sentence`, `how` |
+| `POST /api/delegation/requests` | `{method,path,body}` → HTTP 202, `request_id`, `grant_code`, `reply_session`, `sentence`, exact `question`, `how` |
 | `POST /api/delegation/questions/{ask_row}/display` | Owner renderer only: `{surface:"owner-messages",text,after_row}` → `{ok,ask_row,surface}` or a structured refusal |
+| `POST /api/sessions/{owner}/report` | Native observer only: accepted `Stop` with verbatim `assistant_message`, run/sequence/time/provider identity → `{ok,applied}`; no public display claim for pane |
 | `POST /api/delegation/questions/render` | Owner renderer: `{surface:"owner-messages"}` → `{ok,after_row}`; closes previous window before DOM insertion |
 | `GET /api/delegation/requests` | `{requests,grants,resolutions,mode,measured,n_considered}` |
 | `GET /api/delegation/requests/{id}` | `{request,measured,n_considered}` |
@@ -92,14 +118,17 @@ Server-owned chat output, including the owner companion, records an
 `approval_output` boundary before publishing provider output or the finished
 reply. Applied native lifecycle events other than `UserPromptSubmit` also close
 windows conservatively in their transaction. These markers store no provider
-text and emit `delegation_request_output_boundary`. Native pane display itself
-is unsupported: no lifecycle event is claimed as a render acknowledgment.
+text and emit `delegation_request_output_boundary`. A native Stop may then record
+a new exact assistant-turn receipt; lifecycle state alone never acknowledges
+display. Every subsequent assistant turn or owner row closes the window by
+cmd_history order.
 
 ## Owner input routes
 
 Recorded replies converge on `cmd_hist_record_with_id` →
 `delegation_grants::on_row` → `delegation_requests::resolve_observed`.
-Each requires a prior owner Messages display; none can manufacture it.
+Each requires a prior owner Messages or native assistant-turn receipt; none can
+manufacture one from an input row.
 
 | Entry point | Evidence |
 | --- | --- |
@@ -121,7 +150,8 @@ alone cannot apply it. `amux grant CODE` is not a reply selector.
 ## Storage and recovery
 
 No migration is added: existing `ask_row`, `shown_row`, `repeat_of`, `ts` and
-`delivered_at` represent distinct question/display rows. Migration numbering
+`delivered_at` represent question/display evidence. A pane display uses the
+assistant row itself, rather than inserting a separate display row. Migration numbering
 remains dense through 0129; 0130 is unused here. Incarnation and original message
 type columns remain from 0129. Existing unique indexes protect shown/resolution
 rows, and 0127/0128 reserve spent replies, including failed and undone grants.
@@ -155,7 +185,8 @@ claim; `delegation_request_displayed` records receipt ID/time/surface. WARN
 
 ## Verification
 
-Run `python3 -B scripts/test-delegation-reply-window.py` and
+Run `python3 -B scripts/test-native-status.py` for exact Stop payloads and
+transcript extraction. Run `python3 -B scripts/test-delegation-reply-window.py` and
 `python3 -B scripts/test-delegation-request-schema.py` for actual SQLite queries,
 constraints and SIGKILL rollback/receipt adoption. Rust route tests live in
 `api/delegation_reply_tests.rs`; run them and all delegation, max_ref and migration
