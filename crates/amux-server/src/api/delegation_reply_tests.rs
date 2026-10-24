@@ -563,6 +563,39 @@ async fn p4_dashboard_pre_echo_no_closes_window() {
 }
 
 #[tokio::test]
+async fn owner_text_match_alone_cannot_demote_verified_owner_input() {
+    let f=Fixture::new(); let id=f.ask().await;
+    // Unlike P4's short "no", this body also matches INSIDE a stamped delivery.
+    // No native submission fires: peer delivery alone leaves the window open.
+    let text="no, wait for my review";
+    accepted(f.send(OWNER_AGENT,PEER,text,"owner-text-peer").await);
+    f.peer_recorded(text,"session");
+    assert_eq!(f.request_resolution(&id),(None,None));
+    // Delayed steer records verified owner input without another pane delivery.
+    accepted(f.owner_reply(text).await);
+    let row_id=f.state.store.read().unwrap().query_row(
+        "SELECT MAX(id) FROM cmd_history WHERE session=?1 AND COALESCE(delegation_message_type,type)='user'",
+        [OWNER_AGENT],|r|r.get::<_,i64>(0)).unwrap();
+    let row=max_ref::one(&f.state,row_id).unwrap().unwrap();
+    assert_eq!(row.text,text);
+    assert_eq!(row.source,Some(max_ref::HumanSource::OwnerSend),"process proof admits this row");
+    assert!(!row.input_boundary,"no uncertain/native boundary decides this case");
+    let delivered=crate::api::pane_prompts::recent_deliveries(&row.session);
+    assert_eq!(crate::api::pane_prompts::classify(&row.text,&delivered),
+        crate::api::pane_prompts::PaneVerdict::SkipAmuxDelivered,
+        "the old text guard must match even though the peer delivery is stamped");
+    assert_eq!(crate::api::pane_prompts::classify(&row.text,&[]),
+        crate::api::pane_prompts::PaneVerdict::Record,"owner text has no injection stamp");
+    assert_eq!(max_ref::typed_by_max(&row),Some(max_ref::HumanSource::OwnerSend),
+        "OWNER-TEXT alone: delivery similarity cannot demote verified owner input");
+    f.resolution(OWNER_AGENT,"request_reply_not_affirmative",None);
+    assert_eq!(f.request_resolution(&id),(None,Some("request_reply_not_affirmative".into())));
+    accepted(f.owner_reply("yes").await);
+    f.resolution(OWNER_AGENT,"request_no_candidate",None);
+    assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn p5_native_pane_pre_echo_no_closes_window() {
     let f=Fixture::new(); let id=f.ask().await;
     accepted(f.call(Some(PEER),None,&format!("/api/sessions/{OWNER_AGENT}/send"),
