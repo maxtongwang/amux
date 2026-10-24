@@ -16,8 +16,9 @@ signal a peer build or a worker.
 | Simultaneous wrapper invocations | 2 | `AMUX_CARGO_MAX_CONCURRENT` |
 | Compiler jobs per invocation | 2 | `CARGO_BUILD_JOBS` or explicit Cargo `-j` |
 | Test threads per test executable | 2 | `RUST_TEST_THREADS` or explicit libtest argument |
-| Incremental compilation | off | `CARGO_INCREMENTAL` |
-| Dev/test DWARF | off | `CARGO_PROFILE_DEV_DEBUG`, `CARGO_PROFILE_TEST_DEBUG` |
+| Incremental compilation | on (fork, `scripts/fork-build-speed.sh`) | `CARGO_INCREMENTAL` |
+| Dev/test debug info | `line-tables-only` (fork) | `CARGO_PROFILE_DEV_DEBUG`, `CARGO_PROFILE_TEST_DEBUG` |
+| Compiler cache | `sccache` when on `PATH` and incremental is off (fork) | `RUSTC_WRAPPER`, `AMUX_CARGO_NO_SCCACHE=1` |
 | Aggregate RSS of owned process group | 12 GiB | `AMUX_CARGO_MAX_RSS_MB` |
 | Elapsed Cargo execution | 1 hour | `AMUX_CARGO_MAX_SECONDS` |
 | Combined selected target directories | 40 GiB | `AMUX_CARGO_MAX_TARGET_GB` |
