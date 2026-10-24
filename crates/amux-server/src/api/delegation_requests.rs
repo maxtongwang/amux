@@ -1,12 +1,10 @@
 // Explicit approval identity and correlation — Max 2026-10-23, refs maxtongwang/ai-config#160.
-//! Request IDs are pending grant codes, not inferred questions. The server shows
-//! the exact structured change in the owner session's Messages and retains its
-//! row ID and stable incarnation. Asker-selected reply sessions are retired.
-//! Each human reply closes a question window. One unanswered request shown in
-//! that session/incarnation since the previous human reply can resolve; two
-//! are ambiguous, zero is no candidate. Older windows never receive a later yes.
+//! Only a rendered owner Messages question opens a reply window. The very next
+//! owner input may answer the latest display; any intervening owner input or
+//! owner-session output closes it. cmd_history order is the authority; the
+//! resolutions table records outcomes only.
 use super::{delegation::{Action, Target, OWNER_AGENT}, max_ref, AppState};
-use axum::{body::Body, extract::State, http::{HeaderMap, Request, StatusCode}, response::{IntoResponse, Response}, Json};
+use axum::{body::Body, extract::{Path, State}, http::{HeaderMap, Request, StatusCode}, response::{IntoResponse, Response}, Json};
 use serde_json::{json, Value};
 
 /// Maximum ledger rows inspected per reconciliation; a full scan refuses.
@@ -93,6 +91,105 @@ pub(crate) fn refusal(code: &str, note: &str) -> Response {
     (StatusCode::FORBIDDEN, Json(super::delegation::refusal_body(code, note))).into_response()
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DisplayReceipt {
+    surface: String,
+    text: String,
+    after_row: i64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RenderStart { surface: String }
+
+/// Close the previous window before a new question can reach the DOM. Without
+/// this barrier a delayed render ACK could let a yes fund the previous display.
+pub(crate) async fn prepare_display(State(state): State<AppState>, headers: HeaderMap, Json(input): Json<RenderStart>) -> Response {
+    if let Some(r) = display_refusal(&headers, &input.surface) { return r; }
+    let after = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let saved = after.clone();
+    let result = state.store.write(move |conn| {
+        conn.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts) VALUES(?1,'Preparing owner Messages display','assistant',?1,'approval_render_pending',?2)", rusqlite::params![OWNER_AGENT,(crate::config::now_f64()*1000.0) as i64])?;
+        saved.store(conn.last_insert_rowid(),std::sync::atomic::Ordering::SeqCst);
+        Ok(crate::db::WriteOutcome { applied:true, events:vec![] })
+    });
+    match result {
+        Ok(_) => {
+            let after_row=after.load(std::sync::atomic::Ordering::SeqCst);
+            tracing::info!(after_row, verdict="delegation_request_render_pending", measured=true, n_considered=1, "closed the old window before displaying owner Messages");
+            Json(json!({"ok":true,"after_row":after_row})).into_response()
+        },
+        Err(e) => refusal("request_display_prepare_failed", &e.to_string()),
+    }
+}
+
+fn display_refusal(headers: &HeaderMap, surface: &str) -> Option<Response> {
+    if surface != "owner-messages" {
+        return Some(refusal("request_display_surface_unsupported", "this surface has no approval render hook; open owner Messages"));
+    }
+    if !super::session_verbs::owner_input_process_origin(headers)
+        .is_some_and(|p| matches!(p, "outside" | "remote" | "remote-forwarded")) {
+        return Some(refusal("request_display_not_owner", "only the owner UI can record a rendered question"));
+    }
+    None
+}
+
+/// Called by the owner Messages renderer only after its expanded question is
+/// visible. Reads, creation, terminal delivery and notification dispatch never
+/// count as display. Repeat receipts cannot reopen a closed window.
+pub(crate) async fn display(State(state): State<AppState>, Path(ask): Path<i64>, headers: HeaderMap, Json(input): Json<DisplayReceipt>) -> Response {
+    if let Some(r) = display_refusal(&headers, &input.surface) { return r; }
+    let Some(identity) = incarnation(OWNER_AGENT) else {
+        return refusal("request_reply_identity_changed", "owner incarnation unavailable");
+    };
+    let at = (crate::config::now_f64() * 1000.0) as i64;
+    let result = state.store.write(move |conn| {
+        let mut st = conn.prepare("SELECT g.code,g.actor,g.shown_row FROM _amux_delegation_grants g JOIN cmd_history q ON q.id=g.ask_row WHERE g.ask_row=?1 AND g.reply_session=?2 AND g.reply_incarnation=?3 AND g.ask_text=?4 AND q.text=g.ask_text AND q.session=g.reply_session AND q.delivery='approval_request' AND q.delegation_session_incarnation=g.reply_incarnation AND (g.shown_row IS NULL OR EXISTS(SELECT 1 FROM cmd_history d WHERE d.id=g.shown_row AND d.delivery='approval_display' AND d.repeat_of=g.ask_row)) AND g.status='pending' AND g.resolution_code IS NULL AND g.expires_at>?5 AND g.ask_row<=?6 AND EXISTS(SELECT 1 FROM cmd_history p WHERE p.id=?6 AND p.session=g.reply_session AND p.delivery='approval_render_pending') AND NOT EXISTS(SELECT 1 FROM cmd_history h WHERE h.session=g.reply_session AND h.id>?6 AND COALESCE(h.delivery,'')<>'approval_display')")?;
+        let request = st.query_row(rusqlite::params![ask, OWNER_AGENT, identity, input.text, at as f64 / 1000.0, input.after_row], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<i64>>(2)?)));
+        drop(st);
+        let (code, actor, shown) = match request {
+            Ok(r) => r,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
+            Err(e) => return Err(e),
+        };
+        if shown.is_none() {
+            conn.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery,delegation_session_incarnation,repeat_of,delivered_at) VALUES(?1,'session',?2,?3,?4,'approval_display',?5,?6,?3)", rusqlite::params![input.text, OWNER_AGENT, at, actor, identity, ask])?;
+            let displayed = conn.last_insert_rowid();
+            conn.execute("UPDATE _amux_delegation_grants SET shown_row=?2,resolution_note='displayed in owner Messages; awaiting the very next owner input' WHERE code=?1", rusqlite::params![code,displayed])?;
+            tracing::info!(request_id = code, ask_row = ask, shown_row = displayed, displayed_at_ms = at, surface = "owner-messages", verdict = "delegation_request_displayed", measured = true, n_considered = 1, "owner renderer recorded question display");
+        }
+        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+    });
+    match result {
+        Ok(o) if o.applied => Json(json!({"ok":true,"ask_row":ask,"surface":"owner-messages"})).into_response(),
+        Ok(_) => refusal("request_display_ineligible", "question is missing, changed, refused, expired or outside the current owner incarnation"),
+        Err(e) => refusal("request_display_failed", &e.to_string()),
+    }
+}
+
+/// Record an output boundary before server-owned output reaches the owner.
+/// One boundary per open display suffices; never store provider output/secrets.
+pub(crate) fn output_boundary(conn: &rusqlite::Connection, session: &str) -> rusqlite::Result<()> {
+    if session != OWNER_AGENT { return Ok(()); }
+    let at = (crate::config::now_f64() * 1000.0) as i64;
+    let n = conn.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts) SELECT ?1,'Owner-session output closed the approval reply window','assistant',?1,'approval_output',?2 WHERE EXISTS(SELECT 1 FROM _amux_delegation_grants g WHERE g.reply_session=?1 AND g.status='pending' AND g.resolution_code IS NULL AND g.shown_row IS NOT NULL AND NOT EXISTS(SELECT 1 FROM cmd_history h WHERE h.session=?1 AND h.id>g.shown_row AND h.delivery='approval_output'))", rusqlite::params![session,at])?;
+    if n > 0 {
+        tracing::info!(session, verdict = "delegation_request_output_boundary", measured = true, n_considered = n, "owner-session output closed the approval window");
+    }
+    Ok(())
+}
+
+pub(crate) fn observe_output(state: &AppState, session: &str) -> Result<(), String> {
+    let session = super::chat_worker::companion_parent(session).unwrap_or(session);
+    if session != OWNER_AGENT { return Ok(()); }
+    let session = session.to_string();
+    state.store.write(move |conn| {
+        output_boundary(conn, &session)?;
+        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+    }).map(|_| ()).map_err(|e| e.to_string())
+}
+
 /// Replay the durable ledger in row order, so a missed hook/restart does not
 /// change matching. Bounded reads fail closed; no truncated scan grants consent.
 pub(crate) fn resolve_session(state: &AppState, session: &str) -> Result<(), String> {
@@ -108,7 +205,7 @@ pub(crate) fn resolve_session(state: &AppState, session: &str) -> Result<(), Str
 }
 
 /// Resolving and recording candidates uses the serialized writer transaction.
-/// No actor filter: every explicit question in the reply session participates.
+/// No actor filter: only the latest owner event can identify a displayed request.
 fn resolve_reply(state: &AppState, row: &max_ref::Row) -> Result<(), String> {
     let (reply, session, identity, text, ts) = (row.id, row.session.clone(), row.incarnation.clone(), row.text.clone(), row.ts);
     let affirmative = max_ref::reply_is_affirmative(&text);
@@ -119,12 +216,12 @@ fn resolve_reply(state: &AppState, row: &max_ref::Row) -> Result<(), String> {
         if conn.query_row("SELECT EXISTS(SELECT 1 FROM _amux_delegation_resolutions WHERE reply_row=?1)", [reply], |r| r.get::<_, bool>(0))? {
             return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
         }
-        // A processed owner reply permanently closes its window, whatever
-        // later peer deliveries or message projections do to cmd_history.
-        let previous: i64 = conn.query_row("SELECT COALESCE(MAX(reply_row),0) FROM _amux_delegation_resolutions WHERE session=?1 AND reply_row<?2", rusqlite::params![session, reply], |r| r.get(0))?;
+        // Read the ledger, not processed outcomes: missed hooks cannot leave a
+        // window open. Peer deliveries are not owner input or owner output.
+        let latest: i64 = conn.query_row("SELECT COALESCE(MAX(id),0) FROM cmd_history WHERE session=?1 AND id<?2 AND (delivery='approval_display' OR (COALESCE(delegation_message_type,type) IN ('user','chat') AND ((origin='pane' AND delivery='pane') OR (origin<>'pane' AND delivery IN ('direct','queued') AND process_origin IN ('outside','remote','remote-forwarded')))) OR type='assistant' OR (type='session' AND origin=session AND delivery<>'approval_request'))", rusqlite::params![session, reply], |r| r.get(0))?;
         let candidates: Vec<(String, String, i64)> = {
-            let mut st = conn.prepare("SELECT code,reply_incarnation,(SELECT ts FROM cmd_history WHERE id=shown_row) FROM _amux_delegation_grants WHERE reply_session=?1 AND shown_row>?2 AND shown_row<?3 AND status='pending' AND resolution_row IS NULL AND resolution_code IS NULL ORDER BY shown_row DESC")?;
-            let rows = st.query_map(rusqlite::params![if owner_reply { session.as_str() } else { "" }, previous, reply], |r| Ok((r.get(0)?,r.get(1)?,r.get::<_, Option<i64>>(2)?.unwrap_or(i64::MAX))))?;
+            let mut st = conn.prepare("SELECT code,reply_incarnation,(SELECT ts FROM cmd_history WHERE id=shown_row) FROM _amux_delegation_grants WHERE reply_session=?1 AND shown_row=?2 AND shown_row<?3 AND status='pending' AND resolution_row IS NULL AND resolution_code IS NULL ORDER BY shown_row DESC")?;
+            let rows = st.query_map(rusqlite::params![if owner_reply { session.as_str() } else { "" }, latest, reply], |r| Ok((r.get(0)?,r.get(1)?,r.get::<_, Option<i64>>(2)?.unwrap_or(i64::MAX))))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
         let (code, note) = if !owner_reply {
@@ -132,9 +229,7 @@ fn resolve_reply(state: &AppState, row: &max_ref::Row) -> Result<(), String> {
         } else if !affirmative {
             ("request_reply_not_affirmative", "reply is not an explicit affirmative; request remains pending")
         } else if candidates.is_empty() {
-            ("request_no_candidate", "no unanswered request was shown in this reply session since Max's previous reply")
-        } else if candidates.len() != 1 {
-            ("request_ambiguous", "multiple unanswered requests were shown since Max's previous reply; none is approved, ask separately")
+            ("request_no_candidate", "no eligible latest display immediately precedes this owner input")
         } else if identity.as_deref() != Some(candidates[0].1.as_str()) || identity != incarnation(&session) {
             ("request_reply_identity_changed", "reply session incarnation differs from the one shown the request")
         } else if ts < candidates[0].2 as f64 / 1000.0 || ts - candidates[0].2 as f64 / 1000.0 > max_ref::ASK_REPLY_WINDOW_S || ts > at || at - ts > max_ref::MAX_REF_MAX_AGE_S {
@@ -144,19 +239,18 @@ fn resolve_reply(state: &AppState, row: &max_ref::Row) -> Result<(), String> {
         };
         let request = (code == "request_resolved").then(|| candidates[0].0.clone());
         conn.execute("INSERT INTO _amux_delegation_resolutions(reply_row,request_id,session,code,note,created_at) VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![reply,request,session,code,note,at])?;
-        for (id, _, _) in candidates.iter().filter(|(id, _, _)| request.as_ref().is_none_or(|selected| selected == id)) {
+        for (id, _, _) in &candidates {
             conn.execute("UPDATE _amux_delegation_grants SET resolution_row=CASE WHEN ?2='request_resolved' THEN ?3 ELSE NULL END,resolution_code=?2,resolution_note=?4 WHERE code=?1 AND resolution_row IS NULL", rusqlite::params![id,code,reply,note])?;
         }
         if affirmative && code != "request_resolved" {
             tracing::warn!(reply_row = reply, session, code, note, verdict = "delegation_request_refused", measured = true, n_considered = candidates.len(), "owner reply funded no request");
         }
-        tracing::info!(reply_row = reply, previous_reply_row = previous, session, request_id = ?request, code, note, verdict = "delegation_request_resolution", measured = true, n_considered = candidates.len(), "owner reply correlation recorded");
+        tracing::info!(reply_row = reply, latest_owner_event_row = latest, session, request_id = ?request, code, note, verdict = "delegation_request_resolution", measured = true, n_considered = candidates.len(), "owner reply correlation recorded");
         Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
     }).map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// Hook path also records a no-candidate reply when no request exists. The
-/// stored owner resolution, never a reclassified message, closes the window.
+/// Hook path records outcomes; window boundaries come directly from history.
 pub(crate) fn resolve_observed(state: &AppState, id: i64) -> Result<(), String> {
     let row = max_ref::one(state, id).map_err(|e| e.code().to_string())?.ok_or("request_reply_missing")?;
     if max_ref::typed_by_max(state, &row).is_none() {

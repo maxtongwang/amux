@@ -26,8 +26,8 @@ test('direct row is unchanged', () => {
   assert.equal(label({ delivery: 'direct' }), 'direct');
 });
 
-test('approval request is shown in Messages without claiming a pane delivery', () => {
+test('approval request explains display and next-input requirements', () => {
   assert.equal(label({ delivery: 'approval_request' }), 'approval request');
-  assert.match(chip({ delivery: 'approval_request' }), /Shown in this session’s Messages/);
+  assert.match(chip({ delivery: 'approval_request' }), /Open owner Messages to display this question; only the very next owner input/);
   for (const delivery of ['__proto__', 'constructor']) assert.equal(label({delivery}), 'direct?');
 });

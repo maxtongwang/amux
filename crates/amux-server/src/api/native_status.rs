@@ -1,3 +1,4 @@
+// Native provider observations — durable lifecycle and conservative approval output barriers.
 //! Ordered, passive Codex/Claude lifecycle observations. The local spool survives
 //! network/server outages; every accepted edge shares the existing report/SSE
 //! projection. Observation never sends a prompt or creates a board item.
@@ -222,6 +223,11 @@ fn apply(
             applied: false,
             events: vec![],
         });
+    }
+    // Providers render outside amux. A non-input lifecycle edge conservatively
+    // closes any displayed approval before later input can resolve it.
+    if event["event"] != "UserPromptSubmit" {
+        super::delegation_requests::output_boundary(conn, name)?;
     }
     let prev = reports[name].clone();
     let mut report = event.clone();
