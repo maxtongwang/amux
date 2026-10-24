@@ -16,13 +16,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT
 
 
-def function(path, name):
+def function(path, name, indent=""):
     text = path.read_text()
-    matches = list(re.finditer(r"^(?:pub\(crate\) )?(?:async )?fn " + name + r"\([^\n]*", text, re.M))
+    matches = list(re.finditer(r"^" + re.escape(indent) + r"(?:pub\(crate\) )?(?:async )?fn " + name + r"\([^\n]*", text, re.M))
     if len(matches) != 1:
         raise AssertionError((name, len(matches)))
     start = matches[0].start()
-    end = text.index("\n}", start) + 2
+    end = text.index("\n" + indent + "}", start) + len(indent) + 2
     return text[start:end]
 
 
@@ -35,6 +35,34 @@ def shell_function(name):
 
 
 class OwnerOrigin(unittest.TestCase):
+    def test_held_relay_refusals_keep_policy_and_identity_statuses(self):
+        path = SOURCE / 'crates/amux-server/src/api/session_verbs.rs'
+        source = path.read_text()
+        constants = []
+        for name in ['ISOLATED_REFUSAL_PREFIX', 'HERDR_NOT_ADDRESSABLE', 'BG_VIEW_REFUSAL_PREFIX', 'OWNER_INPUT_REFUSALS']:
+            matches = re.findall(r'^(?:pub\(crate\) )?const ' + name + r': .*?;\n', source, re.M | re.S)
+            self.assertEqual(len(matches), 1, name)
+            constants.extend(matches)
+        # Compile the shipped classifier and its Rust regression test; only
+        # HTTP's numeric StatusCode wrapper is replaced, with no Cargo build.
+        code = '''#[derive(Debug,PartialEq,Eq,Clone,Copy)] pub(crate) struct StatusCode(u16);
+impl StatusCode {
+    const BAD_REQUEST: Self=Self(400);
+    const FORBIDDEN: Self=Self(403);
+    const NOT_FOUND: Self=Self(404);
+    const CONFLICT: Self=Self(409);
+    const INTERNAL_SERVER_ERROR: Self=Self(500);
+    const NOT_IMPLEMENTED: Self=Self(501);
+}
+''' + '\n'.join(constants) + '\n' + function(path, 'owner_input_refusal') + '\n' + function(path, 'send_failure_status')
+        # ROOT supplies the new assertion even when SOURCE selects the old code.
+        code += '\n#[test]\n' + function(ROOT / 'crates/amux-server/src/api/session_verbs.rs', 'held_relay_refusals_keep_policy_and_identity_statuses', indent='    ')
+        with tempfile.TemporaryDirectory(prefix='held-relay-status-') as tmp:
+            src, binary = Path(tmp)/'check.rs', Path(tmp)/'check'
+            src.write_text(code)
+            subprocess.run(['rustc','--edition','2021','--test',str(src),'-o',str(binary)],check=True)
+            subprocess.run([str(binary)],check=True)
+
     def test_peer_stamp_and_dispatch_ignore_history_and_immediate_flags(self):
         path = SOURCE / 'crates/amux-server/src/api/session_verbs.rs'
         source = path.read_text()

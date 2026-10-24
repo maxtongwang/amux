@@ -71,11 +71,11 @@ pub(crate) fn transport_text(state: &AppState, session: &str, text: &str, owner_
     }
     let identity=incarnation(session).ok_or("owner input transport incarnation missing")?;
     let token=super::rename_identity::new_incarnation().map_err(|e|e.to_string())?;
-    let (lane,nonce)=(session.to_string(),token.clone());
+    let (lane,nonce,payload)=(session.to_string(),token.clone(),text.to_string());
     state.store.write(move |conn| {
         super::session_verbs::ensure_fleet_tables(conn)?;
-        conn.execute("INSERT INTO cmd_history(session,msg_id,text,type,origin,delivery,ts,delegation_session_incarnation,delegation_message_type) VALUES(?1,?2,'Programmatic pane input: not an approval','session','amux','approval_transport',?3,?4,'session')",
-            rusqlite::params![lane,nonce,(crate::config::now_f64()*1000.0) as i64,identity])?;
+        conn.execute("INSERT INTO cmd_history(session,msg_id,text,type,origin,delivery,ts,delegation_session_incarnation,delegation_message_type) VALUES(?1,?2,?5,'session','amux','approval_transport',?3,?4,'session')",
+            rusqlite::params![lane,nonce,(crate::config::now_f64()*1000.0) as i64,identity,payload])?;
         Ok(crate::db::WriteOutcome { applied:true, events:vec![] })
     }).map_err(|e|e.to_string())?;
     tracing::info!(session, verdict="owner_pane_transport_non_owner", measured=true, n_considered=1,
@@ -105,8 +105,12 @@ pub(crate) fn discarded_native_input(state: &AppState, session: &str, event: &Va
             None=>false,
         }
     };
-    if known { return discarded_input(state,session,"native_transport_replayed"); }
-    discarded_input(state,session,reason)
+    if known {
+        tracing::info!(session, reason="native_transport_replayed", verdict="owner_pane_transport_observed", measured=true, n_considered=1,
+            "replayed programmatic submission retains non-owner transport classification");
+        return discarded_input(state,session,"native_transport_replayed",true);
+    }
+    discarded_input(state,session,reason,false)
 }
 
 /// Structured operands, including the effective direction of toggles. Metadata
@@ -303,17 +307,18 @@ pub(crate) fn discarded_send(state: &AppState, session: &str, headers: &HeaderMa
     let session = super::chat_worker::companion_parent(session).unwrap_or(session);
     if session != OWNER_AGENT || super::session_verbs::session_is_isolated(session)
         || super::session_verbs::owner_input_process_origin(headers).is_none() { return Ok(()); }
-    discarded_input(state,session,reason)
+    discarded_input(state,session,reason,false)
 }
 
-pub(crate) fn discarded_input(state: &AppState, session: &str, reason: &str) -> Result<(), String> {
+fn discarded_input(state: &AppState, session: &str, reason: &str, non_owner: bool) -> Result<(), String> {
     if session != OWNER_AGENT || super::session_verbs::session_is_isolated(session) { return Ok(()); }
     let owner=session;
     let (session,reason)=(session.to_string(),reason.to_string());
     state.store.write(move |conn| {
         let open:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM _amux_delegation_grants WHERE reply_session=?1 AND shown_row IS NOT NULL AND status='pending' AND resolution_row IS NULL AND resolution_code IS NULL)",[&session],|r|r.get(0))?;
         if !open { return Ok(crate::db::WriteOutcome { applied:false, events:vec![] }); }
-        input_boundary(conn,&session,&reason)?;
+        if non_owner { non_owner_submission(conn,&session,&reason)?; }
+        else { input_boundary(conn,&session,&reason)?; }
         Ok(crate::db::WriteOutcome { applied:true, events:vec![input_event(conn.last_insert_rowid())] })
     }).map_err(|e| e.to_string())?;
     // The refused/empty owner route must publish its closure before returning;

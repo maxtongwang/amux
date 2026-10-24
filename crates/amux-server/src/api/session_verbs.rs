@@ -11466,6 +11466,14 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
             ),
         );
     }
+    // Held-relay eligibility is a policy/state refusal; neither case permits
+    // falling back to peer keystrokes into the owner pane.
+    if m.starts_with("held_relay_owner_managed_only") {
+        return (StatusCode::FORBIDDEN, Some("server held-relay submission requires a managed owner pane; use native delivery (#67) or let the server re-arm eligible held relays (#66)"));
+    }
+    if m.starts_with("held_relay_identity_missing") {
+        return (StatusCode::CONFLICT, Some("restore the worker's current incarnation before server held-relay recovery (#66); use native delivery (#67) while identity is unavailable"));
+    }
     // --- 409: amux's own paste of this exact message is already in the
     //     composer and will be submitted at the next idle boundary. Nothing is
     //     lost and nothing needs retrying; 500 would send someone debugging.
@@ -29931,9 +29939,15 @@ fn owner_pane_write_allowed(name: &str) -> bool {
 #[allow(dead_code)] // Wired by #66 after rebase; covered with the real report route.
 pub(crate) async fn submit_held_relay_non_owner(state: &AppState, name: &str) -> (bool, String) {
     if !super::delegation_requests::is_owner_session(name) || session_is_isolated(name) {
+        tracing::warn!(session=name, verdict="held_relay_owner_managed_only", measured=true, n_considered=1,
+            alternative=super::delegation_requests::OWNER_KEYS_ALTERNATIVE,
+            "held relay submission requires a managed owner pane");
         return (false,"held_relay_owner_managed_only".into());
     }
     let Some(identity)=super::delegation_requests::incarnation(name) else {
+        tracing::warn!(session=name, verdict="held_relay_identity_missing", measured=true, n_considered=1,
+            alternative=super::delegation_requests::OWNER_KEYS_ALTERNATIVE,
+            "held relay retained until the current worker incarnation is restored");
         return (false,"held_relay_identity_missing".into());
     };
     let boundary=state.store.write(|conn| {
@@ -53546,6 +53560,19 @@ mod steer_coalescing_tests {
 #[cfg(test)]
 mod refusal_status_tests {
     use super::*;
+
+    #[test]
+    fn held_relay_refusals_keep_policy_and_identity_statuses() {
+        for (msg,expected) in [("held_relay_owner_managed_only",StatusCode::FORBIDDEN),("held_relay_identity_missing",StatusCode::CONFLICT)] {
+            for message in [msg.to_string(),format!("auto-wake failed: {msg}")] {
+                let (code,hint)=send_failure_status(&message);
+                assert_eq!(code,expected,"{message}");
+                let hint=hint.expect("held relay refusals need a next step");
+                assert!(hint.contains("#66") && hint.contains("#67"),"{hint}");
+            }
+        }
+        assert_eq!(send_failure_status("held_relay_boundary_failed: database unavailable").0,StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     /// THE incident, pinned: 15 of the 19 errors in the 6h window on
     /// 2026-08-10 were this one refusal shipping as HTTP 500 — `amux`

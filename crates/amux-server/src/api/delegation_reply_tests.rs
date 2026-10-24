@@ -1527,6 +1527,8 @@ async fn transport_echo_spool_recovery_closes_the_question_across_replay() {
         crate::api::native_status::replay(&f.state);
         assert!(!path.exists(),"receipt ACK only after replay completes");
         assert_eq!(f.request_resolution(&request),(None,Some("request_reply_not_owner_input".into())));
+        let row=f.resolution(OWNER_AGENT,"request_reply_not_owner_input",None);
+        assert_eq!(f.state.store.read().unwrap().query_row("SELECT origin FROM cmd_history WHERE id=?1",[row],|r|r.get::<_,String>(0)).unwrap(),"amux","replayed receipt must stay known non-owner input");
         accepted(f.owner_reply("yes").await);
         f.resolution(OWNER_AGENT,"request_no_candidate",None);
         assert_eq!(f.apply(&request).await.0,StatusCode::FORBIDDEN);
@@ -1694,7 +1696,14 @@ async fn failed_peer_send_with_history_is_non_owner_and_leaves_question_open() {
     std::fs::write(&path,original.clone()+"CC_TEST_FAKE_SEND_OK=0\nCC_TEST_FAKE_SEND_RESULT=not running\n").unwrap();
     let (st,_)=f.send(OWNER_AGENT,PEER,"yes","failed-peer").await;
     assert!(!st.is_success());
-    f.peer_recorded("yes","session");
+    // The pane refused the attempt: no direct-delivery row is claimed. Its
+    // pre-dispatch receipt must retain the real prepared text for audit.
+    let (row,text,ty,origin,delivery,process): (i64,String,String,String,String,Option<String>) = f.state.store.read().unwrap().query_row(
+        "SELECT id,text,delegation_message_type,origin,delivery,process_origin FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1",
+        [OWNER_AGENT],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap();
+    assert_eq!(text,session_verbs::origin_stamped(LEAD,OWNER_AGENT,"yes").unwrap());
+    assert_eq!((ty,origin,delivery,process),("session".into(),"amux".into(),"approval_transport".into(),None));
+    assert_eq!(max_ref::one(&f.state,row).unwrap().unwrap().source,None);
     assert_eq!(f.request_resolution(&id),(None,None));
     std::fs::write(path,original).unwrap();
     accepted(f.owner_reply("yes").await);

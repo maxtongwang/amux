@@ -137,9 +137,14 @@ a typed approval. A preceding display receipt remains mandatory.
 Every programmatic text delivery into the managed owner pane records an
 incarnation-bound `approval_transport` receipt before transport. The pane
 receives `[amux-input-receipt:<nonce>]` followed by the delivered text. The
-native observer's exact receipt identifies a non-owner submission: it closes
+receipt retains that prepared text verbatim, including the worker origin stamp,
+even if delivery fails; it records a transport attempt, not direct delivery.
+The native observer's exact receipt identifies a non-owner submission: it closes
 the window and never funds a question, including on direct/spool replay, after
 a restart, and with an incomplete body. Delivery alone leaves the window open.
+Duplicate or rejected known receipts retain their non-owner transport origin.
+Their recognition logs `native_transport_replayed` even when no open question
+needs another boundary.
 Worker sends carry the origin stamp and Automation transport regardless of
 `record_history` or `deliver_now`, including self-sends and active Chat relays
 into the owner pane. Empty/whitespace/stripped peer sends are refused before
@@ -235,6 +240,9 @@ window before sending exactly Enter with an incarnation-bound write scope.
 A failed boundary write prevents Enter; the later native hook remains
 non-owner input. This seam grants no peer key permission and does not expose
 an HTTP action. It cannot bypass #66's held-relay eligibility/recovery checks.
+Ineligible panes return `held_relay_owner_managed_only` (403); missing current
+incarnations return `held_relay_identity_missing` (409). Both log WARN and name
+native delivery (#67) or server recovery (#66); neither permits peer keys.
 
 Sweep regressions are in `api/delegation_reply_tests.rs`. No-Cargo checks:
 `python3 -B scripts/test-owner-input-origin.py` executes the shipped CLI functions

@@ -124,7 +124,10 @@ class ReplyWindowStorage(unittest.TestCase):
         known = schema.source_sql(REQUESTS, "SELECT EXISTS(SELECT 1 FROM cmd_history WHERE session=?1 AND msg_id=?2 AND delivery='approval_transport'")
         self.request()
         token = "a" * 32
-        row = self.conn.execute(query, ["desk", token, 2000, "inc-desk"]).lastrowid
+        payload = '[amux-origin: peer]\n\nyes\n"quoted audit text"'
+        row = self.conn.execute(query, {"1":"desk", "2":token, "3":2000, "4":"inc-desk", "5":payload}).lastrowid
+        self.assertEqual(self.conn.execute("SELECT text,origin,delivery FROM cmd_history WHERE id=?", [row]).fetchone(),
+                         (payload, "amux", "approval_transport"))
         self.assertEqual(self.conn.execute(known, ["desk",token,"inc-desk"]).fetchone(), (1,))
         for args in [["desk",token,"old-inc"], ["other",token,"inc-desk"], ["desk","b"*32,"inc-desk"]]:
             self.assertEqual(self.conn.execute(known,args).fetchone(), (0,))
@@ -146,7 +149,7 @@ class ReplyWindowStorage(unittest.TestCase):
                 conn.execute("ALTER TABLE cmd_history ADD COLUMN msg_id TEXT")
             query = schema.source_sql(REQUESTS, "INSERT INTO cmd_history(session,msg_id,text,type,origin,delivery,ts,delegation_session_incarnation,delegation_message_type)")
             known = schema.source_sql(REQUESTS, "SELECT EXISTS(SELECT 1 FROM cmd_history WHERE session=?1 AND msg_id=?2 AND delivery='approval_transport'")
-            args = ["desk", "a"*32, 2000, "inc-desk"]
+            args = ["desk", "a"*32, 2000, "inc-desk", "yes"]
             schema.crash_probe(database,query,args,False)
             with sqlite3.connect(database) as conn:
                 self.assertEqual(conn.execute(known,["desk",args[1],"inc-desk"]).fetchone(),(0,))
@@ -154,6 +157,8 @@ class ReplyWindowStorage(unittest.TestCase):
             with sqlite3.connect(database) as conn:
                 for _ in range(2):
                     self.assertEqual(conn.execute(known,["desk",args[1],"inc-desk"]).fetchone(),(1,))
+                self.assertEqual(conn.execute("SELECT text,origin,delivery FROM cmd_history").fetchall(),
+                                 [("yes", "amux", "approval_transport")])
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM cmd_history WHERE type='user' OR process_origin IS NOT NULL").fetchone(),(0,))
 
 
