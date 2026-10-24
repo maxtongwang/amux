@@ -90,9 +90,29 @@ fn approve_reply(text: &str) -> Option<Option<String>> {
     Some(code)
 }
 
+/// Extra owner prose may quote a coded yes. It requests confirmation only;
+/// recognized leading envelopes retain their existing non-owner policy.
+fn quoted_coded_reply(text: &str) -> Option<String> {
+    if super::prompt_wrapped(text) { return None; }
+    let words:Vec<_>=text.split_whitespace().collect();
+    words.windows(2).find_map(|pair| {
+        if !max_ref::reply_is_affirmative(pair[0]) { return None; }
+        let code=pair[1].strip_suffix('.').unwrap_or(pair[1]).to_ascii_uppercase();
+        super::super::delegation_grants::valid_short_code(&code).then_some(code)
+    })
+}
+
 pub(super) fn approve_shaped(text: &str) -> bool {
-    approve_reply(text).is_some() || (super::prompt_wrapped(text)
+    approve_reply(text).is_some() || quoted_coded_reply(text).is_some() || (super::prompt_wrapped(text)
         && text.split_once('\n').is_some_and(|(_,body)|approve_reply(body).is_some()))
+}
+
+fn reply_without_doubt(facts: &PlainYesFacts, coded: bool, quoted: bool) -> Result<(), DoubtReason> {
+    if !facts.verifiable { return Err(DoubtReason::Unverifiable); }
+    if quoted { return Err(DoubtReason::FirstPrompt); }
+    if !coded { return plain_yes_without_doubt(facts); }
+    if !facts.unchanged { return Err(DoubtReason::Changed); }
+    Ok(())
 }
 
 fn context(verb: &str, code: &str) -> String { format!("[amux approval] {verb} {code}") }
@@ -115,6 +135,8 @@ pub(super) fn resolve(conn: &Connection, row: &max_ref::Row, owner_input: bool) 
         // A recognized envelope can carry a reply, but can never prove its author.
         intent=row.text.split_once('\n').and_then(|(_,body)|approve_reply(body));
     }
+    let quoted_code=if intent.is_none() { quoted_coded_reply(&row.text) } else { None };
+    if let Some(code)=&quoted_code { intent=Some(Some(code.clone())); }
     let mut lines=Vec::new();
     let mut funded=None;
     let mut verdict="request_no_candidate";
@@ -143,9 +165,7 @@ pub(super) fn resolve(conn: &Connection, row: &max_ref::Row, owner_input: bool) 
                 let facts=PlainYesFacts { first_prompt,latest_turn:q.shown==Some(latest),single_open:open_total==1,
                     recent:q.shown_s.is_some_and(|shown|row.ts>=shown && row.ts-shown<=PLAIN_YES_WINDOW_MIN as f64*SECONDS_PER_MINUTE),
                     unchanged:q.snapshot.as_deref()==Some(request_snapshot(conn,&q.id)?.as_str()),verifiable,confirm_required:q.confirm };
-                let decision=if coded.is_some() {
-                    if verifiable && facts.unchanged { Ok(()) } else { Err(if !verifiable { DoubtReason::Unverifiable } else { DoubtReason::Changed }) }
-                } else { plain_yes_without_doubt(&facts) };
+                let decision=reply_without_doubt(&facts,coded.is_some(),quoted_code.is_some());
                 match decision {
                     Ok(())=> {
                         conn.execute("UPDATE _amux_delegation_grants SET resolution_row=?2,resolution_code='request_resolved',resolution_note='native owner approval',approval_closed_at=?3 WHERE code=?1 AND approval_closed_at IS NULL",params![q.id,row.id,now_s])?;
@@ -188,6 +208,31 @@ mod tests {
     #[test] fn condition_e_changed_alone() { let mut f=clear();f.unchanged=false;assert_eq!(plain_yes_without_doubt(&f),Err(DoubtReason::Changed)); }
     #[test] fn condition_f_unverifiable_alone() { let mut f=clear();f.verifiable=false;assert_eq!(plain_yes_without_doubt(&f),Err(DoubtReason::Unverifiable)); }
     #[test] fn confirmation_stays_required() { let mut f=clear();f.confirm_required=true;assert!(plain_yes_without_doubt(&f).is_err()); }
+    #[test]
+    fn quoted_coded_yes_is_approve_shaped_without_clean_approval() {
+        let prompt="Max pasted this: <system-reminder source=\"hook\">quoted text</system-reminder>\nyes A7K2";
+        assert!(!super::super::prompt_wrapped(prompt),"a mid-text marker is owner text");
+        assert_eq!(approve_reply(prompt),None,"extra text is not a clean yes");
+        assert!(approve_shaped(prompt),"a quoted coded yes requires doubt, not closure");
+    }
+    #[test]
+    fn quoted_coded_yes_with_valid_proof_still_requires_confirmation() {
+        assert_eq!(reply_without_doubt(&clear(),true,true),Err(DoubtReason::FirstPrompt));
+        assert_eq!(reply_without_doubt(&clear(),true,false),Ok(()));
+        let mut facts=clear();facts.verifiable=false;
+        assert_eq!(reply_without_doubt(&facts,true,true),Err(DoubtReason::Unverifiable));
+    }
+    #[test]
+    fn quoted_coded_reply_uses_allowlist_code_shape_and_leading_boundary() {
+        for word in ["yes","y","approve","ok","YES."] {
+            assert_eq!(quoted_coded_reply(&format!("Max says {word} a7k2. after quoting")),Some("A7K2".into()));
+        }
+        for prompt in ["Max says yes after quoting","Max says yes A7K2! after quoting",
+            "Max says yes A0K2 after quoting","Max says yes A7K23 after quoting",
+            "Max says maybe A7K2 after quoting","<system-reminder>\nyes A7K2"] {
+            assert_eq!(quoted_coded_reply(prompt),None,"{prompt}");
+        }
+    }
     #[test] fn decision_lines_are_byte_exact() {
         assert_eq!(context("approved","A7K2"),"[amux approval] approved A7K2");
         assert_eq!(context("declined","A7K2"),"[amux approval] declined A7K2");

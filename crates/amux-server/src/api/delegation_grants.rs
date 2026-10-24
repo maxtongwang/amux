@@ -396,6 +396,11 @@ fn now() -> f64 {
     crate::config::now_f64()
 }
 
+/// Shared code shape for recognizing an ambiguous coded reply in owner text.
+pub(super) fn valid_short_code(code: &str) -> bool {
+    code.len() == CODE_LEN && code.bytes().all(|b| ALPHABET.contains(&b))
+}
+
 fn new_code() -> Option<String> {
     use std::io::Read;
     let mut b = [0u8; CODE_LEN];

@@ -1809,12 +1809,42 @@ async fn v31_exact_envelope_prefixes_only_and_midtext_remains_owner_text() {
         "your claude.ai usage limit has reset","goal check-in:","base directory for this skill:","press up to edit queued messages",
         "[request interrupted by user","this session is being continued from a previous conversation"] {
         assert!(prompt_wrapped(marker),"{marker}");
-        assert!(!prompt_wrapped(&format!("Max pasted a quote: {marker}")),"midtext: {marker}");
+        for prefix in ["", " \t\n", " \n<pasted_content id=\"quote\"> \t"] {
+            assert!(prompt_wrapped(&format!("{prefix}{}",marker.to_ascii_uppercase())),"leading: {prefix}{marker}");
+            let prompt=format!("{prefix}Max pasted a quote: {marker}");
+            assert!(!prompt_wrapped(&prompt),"midtext: {prompt}");
+            let f=Fixture::new();let id=f.ask().await;
+            let (_,v)=f.owner_reply(&prompt).await;
+            assert_eq!(v["approval_context"],format!("[amux approval] declined {}",f.short(&id)));
+            let row=f.resolution(OWNER_AGENT,"request_reply_not_affirmative",None);
+            let recorded:(String,bool)=f.state.store.read().unwrap().query_row(
+                "SELECT origin,approval_wrapped FROM cmd_history WHERE id=?1",[row],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(recorded,("pane".into(),false),"mid-text marker must retain owner provenance");
+            assert!(!f.open(&id));
+        }
         let f=Fixture::new();let id=f.ask().await;
         let (_,v)=f.owner_reply(&format!("{marker}\nnot approval")).await;
         assert_eq!(v["approval_context"],format!("[amux approval] declined {}",f.short(&id)));
         assert!(!f.open(&id));
     }
+}
+
+#[tokio::test]
+async fn quoted_coded_yes_after_midtext_system_reminder_is_owner_doubt() {
+    let (logs,_guard,_peer)=capture_reply_logs();
+    let f=Fixture::new();let id=f.ask().await;let code=f.short(&id);
+    let prompt=format!("Max pasted this: <system-reminder source=\"hook\">quoted text</system-reminder>\nyes {code}");
+    assert!(!prompt_wrapped(&prompt));
+    f.expect_confirm(&id,&prompt,"text-between").await;
+    let row=f.resolution(OWNER_AGENT,"request_confirm_needed",None);
+    let recorded:(String,bool)=f.state.store.read().unwrap().query_row(
+        "SELECT origin,approval_wrapped FROM cmd_history WHERE id=?1",[row],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(recorded,("pane".into(),false),"quoted snippet does not demote Max's prompt");
+    let logs=String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("delegation_request_resolution") && logs.contains("request_confirm_needed") && logs.contains("text-between"),"doubt must be observable: {logs}");
+    accepted(f.hook(OWNER_AGENT,f.stop(&confirm_block(&code,&f.question(&id)))).await);
+    accepted(f.owner_reply(&format!("yes {code}")).await);
+    f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
 }
 
 #[tokio::test]
@@ -1896,10 +1926,14 @@ async fn v31_queued_nonapprove_before_stop_closes_without_funding() {
 #[tokio::test]
 async fn v31_rejected_submit_order_is_doubt_not_closure() {
     for sequence in [Value::Null,json!(0)] {
-        let f=Fixture::new();let id=f.ask().await;let mut prompt=f.report("yes");prompt["sequence"]=sequence;
-        let (_,v)=f.hook_with_applied(OWNER_AGENT,prompt,false).await;
-        assert_eq!(v["approval_context"],format!("[amux approval] confirm needed {} (reason: unverifiable)",f.short(&id)));
-        assert!(f.open(&id));assert_eq!(f.request_resolution(&id).0,None);
+        for quoted in [false,true] {
+            let f=Fixture::new();let id=f.ask().await;
+            let text=if quoted { format!("Max pasted <system-reminder>quoted</system-reminder>\nyes {}",f.short(&id)) } else { "yes".into() };
+            let mut prompt=f.report(&text);prompt["sequence"]=sequence.clone();
+            let (_,v)=f.hook_with_applied(OWNER_AGENT,prompt,false).await;
+            assert_eq!(v["approval_context"],format!("[amux approval] confirm needed {} (reason: unverifiable)",f.short(&id)));
+            assert!(f.open(&id));assert_eq!(f.request_resolution(&id).0,None);
+        }
     }
 }
 

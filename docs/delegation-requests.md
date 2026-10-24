@@ -40,6 +40,7 @@ boundary. All approval `*_at` timestamps are Unix seconds; history `ts` is ms.
 | `yes`, `y`, `approve`, `ok` (trimmed, case-insensitive, optional final period) | Approves only through `plain_yes_without_doubt` |
 | Approve word plus code, e.g. `yes A7K2` | Approves that open request once a verified block/confirmation turn has ended; intervening text does not invalidate that receipt |
 | Plain yes with doubt | Stays open, funds nothing, requires coded confirmation |
+| Owner prose containing an approve word plus a code, including after a pasted snippet | Doubt (`text-between`): stays open and requires a clean coded confirmation; never approves |
 | Another plain yes after confirmation | Confirmation again; never funds |
 | Wrong, unknown or closed code | No open approval; never falls back to plain yes |
 | Non-approve text or empty Enter immediately following a display | Declines/closes, never funds |
@@ -108,7 +109,10 @@ A prompt CONTAINING `[amux approval]` anywhere is reserved text: typed, pasted,
 wrapped and truncated variants neither fund nor close nor consume the window.
 The hook detects this before truncation; the server records an ignored decision.
 Ordinary pasted quotes containing other envelope markers mid-text remain owner
-text. They are not approve words, so immediately following a display they decline.
+text. With an approve word plus a code, such as `yes A7K2` after a pasted
+`<system-reminder ...>` snippet in Max's own prose, they require confirmation:
+they neither approve nor close. Other non-approve text immediately following
+a display declines.
 
 ## Unanswered confirmation reminder
 
