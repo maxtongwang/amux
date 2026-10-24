@@ -1,5 +1,5 @@
 //! Approval request identity/correlation regressions — Max 2026-10-23, refs maxtongwang/ai-config#160.
-//! Real router, explicit requests and durable Messages rows. No text is parsed
+//! Real router, explicit requests and native Stop/UserPromptSubmit reports. No text is parsed
 //! into a request. Historical free-text matcher tests were retired with it.
 mod delegation_support;
 use delegation_support::*;
@@ -17,18 +17,9 @@ async fn apply(e: &Env, actor: &str, id: &str, worker: &str, body: Value) -> (ax
     e.call(Who::Worker(actor),"PATCH",&cfg(worker),Some(with_request(body,json!(id)))).await
 }
 
-// A native hook authenticates the provider session, not the composer author.
-// Exercise the owner's actual attributed queued-input route for grant tests.
+// Only the live native owner session funds approval. HTTP sends are close-only.
 async fn owner_reply(e: &Env, text: &str) -> (axum::http::StatusCode,Value) {
-    use tower::ServiceExt;
-    use axum::{body::Body,http::{Request,header}};
-    let mut req=Request::builder().method("POST").uri(format!("/api/sessions/{MAX_PANE}/steer"))
-        .header(header::CONTENT_TYPE,"application/json")
-        .body(Body::from(json!({"text":text,"record_history":true,"no_board":true,"delay_s":3600}).to_string())).unwrap();
-    req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([192,0,2,1],42105))));
-    let res=e.app.clone().oneshot(req).await.unwrap(); let status=res.status();
-    let bytes=axum::body::to_bytes(res.into_body(),usize::MAX).await.unwrap();
-    (status,serde_json::from_slice(&bytes).unwrap())
+    e.type_in_pane(MAX_PANE, text).await
 }
 
 // Read the recorder's result directly: GET request/list reconciles missed
@@ -62,7 +53,9 @@ async fn explicit_request_is_shown_with_stable_identities_and_structured_change(
     let conn=e.store.read().unwrap();
     let (session,text):(String,String)=conn.query_row("SELECT session,text FROM cmd_history WHERE id=?1",[g["shown_row"].as_i64().unwrap()],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
     assert_eq!(session,MAX_PANE);
-    assert!(text.contains(&id) && text.contains("SetTags") && text.contains(DEV_B));
+    assert_eq!(text, e.approval_block(&id));
+    assert!(text.starts_with(&format!("Approval needed — {}\n", e.short_code(&id))));
+    assert!(!text.contains(&id), "the display uses a short code, never the full request ID");
 }
 
 #[tokio::test]
@@ -81,20 +74,18 @@ async fn approval_yes_is_bound_to_the_shown_session_and_requesting_actor() {
 }
 
 #[tokio::test]
-async fn newer_unanswered_request_gets_yes_and_older_window_never_does() {
+async fn native_decline_closes_old_request_before_coded_new_approval() {
     let e=setup().await;
     let old=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
-    let wait=e.seed_owner_send(MAX_PANE,"wait",now_s(),Some("outside"));
-    e.store.write(move|c| {
-        c.execute("UPDATE cmd_history SET type='steering',delegation_message_type='user' WHERE id=?1",[wait])?;
-        Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
-    }).unwrap();
+    owner_reply(&e,"wait").await;
+    recorded_resolution(&e,"request_reply_not_affirmative");
     let new=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"toggle_yolo":true})).await;
-    e.seed_owner_send(MAX_PANE,"yes",now_s(),Some("outside"));
+    owner_reply(&e,&format!("yes {}",e.short_code(&new))).await;
+    recorded_resolution(&e,"request_resolved");
     let (st,v)=apply(&e,DEV_LEAD,&old,DEV_B,json!({"tags":""})).await;
-    assert_code(st,&v,"request_reply_not_affirmative","old unanswered question cannot catch a later yes");
+    assert_code(st,&v,"request_reply_not_affirmative","a native decline permanently closes the old question");
     let (st,v)=apply(&e,MRPOPO,&new,DEV_A,json!({"toggle_yolo":true})).await;
-    assert_allowed(st,&v,"newer question gets this window's yes");
+    assert_allowed(st,&v,"the code approves only the new question");
     assert_eq!(e.grant_status(&old),"pending");
 }
 
@@ -124,13 +115,11 @@ async fn peer_echo_no_never_reopens_refused_request_p1() {
 }
 
 #[tokio::test]
-async fn peer_rows_preserve_windows_but_uncertain_user_shapes_close_them() {
-    // Actual peer rows retain session provenance, including project projection.
-    // Legacy user/chat rows without owner proof are uncertain input boundaries.
+async fn peer_rows_preserve_requests_but_uncertain_input_closes_them() {
+    // Peer session rows preserve provenance. Uncertain user/chat shapes are
+    // close-only boundaries; neither is a substitute for the native hook.
     for (ty,projected) in [("session",false),("chat",false),("user",false),("session",true)] {
         let e=setup().await;
-        owner_reply(&e,"wait").await;
-        recorded_resolution(&e,"request_reply_not_affirmative");
         let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
         let peer=e.seed_row(MAX_PANE,"no",ty,DEV_LEAD,Some("direct"),now_s());
         if projected {
@@ -139,38 +128,36 @@ async fn peer_rows_preserve_windows_but_uncertain_user_shapes_close_them() {
                 Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
             }).unwrap();
         }
-        owner_reply(&e,"yes").await;
-        recorded_resolution(&e,if ty == "session" { "request_resolved" } else { "request_no_candidate" });
+        // Reconcile the legacy boundary before later live input. Native
+        // production reports already adjudicate their input atomically.
+        view(&e,&id).await;
+        owner_reply(&e,&format!("yes {}",e.short_code(&id))).await;
+        recorded_resolution(&e,if ty == "session" { "request_resolved" } else { "request_no_open_code" });
         let (st,v)=apply(&e,DEV_LEAD,&id,DEV_B,json!({"tags":""})).await;
         if ty == "session" {
-            assert_allowed(st,&v,"peer input cannot close the owner's pending window");
+            assert_allowed(st,&v,"peer input cannot close the pending native question");
         } else {
-            assert_code(st,&v,"request_reply_not_owner_input","uncertain input consumes the window without funding");
+            assert_code(st,&v,"request_reply_not_owner_input","uncertain input closes without funding");
         }
         let conn=e.store.read().unwrap();
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM _amux_delegation_resolutions WHERE reply_row=?1",
-            [peer],|r|r.get::<_,i64>(0)).unwrap(),i64::from(ty != "session"),"only uncertain input records a nonfunding boundary resolution");
+            [peer],|r|r.get::<_,i64>(0)).unwrap(),i64::from(ty != "session"));
     }
 }
 
 #[tokio::test]
-async fn refused_request_is_never_a_later_candidate_without_a_prior_boundary() {
-    // Isolate the refusal guard: no prior owner resolution exists to protect
-    // these pending rows. Any stored code must exclude the request by itself.
-    for code in ["request_reply_not_affirmative","request_ambiguous","request_reply_identity_changed","request_reply_outside_window"] {
-        let e=setup().await;
-        let before=e.config_snapshot();
-        let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
-        let (request,refusal)=(id.clone(),code.to_string());
-        e.store.write(move|c| {
-            c.execute("UPDATE _amux_delegation_grants SET resolution_code=?2,resolution_note='stored refusal' WHERE code=?1",
-                rusqlite::params![request,refusal])?;
-            Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
-        }).unwrap();
-        owner_reply(&e,"yes").await;
+async fn declined_request_never_reopens_for_later_plain_or_coded_yes() {
+    // v3.1 confirmation is open; a decline is durably closed. The old
+    // resolution_code-only exclusion is superseded by approval_closed_at.
+    let e=setup().await;
+    let before=e.config_snapshot();
+    let id=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
+    owner_reply(&e,"no").await;
+    recorded_resolution(&e,"request_reply_not_affirmative");
+    for text in ["yes".to_string(),format!("yes {}",e.short_code(&id))] {
+        owner_reply(&e,&text).await;
         let (st,v)=apply(&e,DEV_LEAD,&id,DEV_B,json!({"tags":""})).await;
-        assert_code(st,&v,code,"a refused pending row cannot become a candidate again");
-        recorded_resolution(&e,"request_no_candidate");
+        assert_code(st,&v,"request_reply_not_affirmative","closed request cannot become a candidate again");
         assert_eq!(before,e.config_snapshot());
     }
 }
@@ -208,15 +195,25 @@ async fn negated_free_text_never_creates_or_funds_a_request() {
 }
 
 #[tokio::test]
-async fn two_displayed_requests_fund_only_the_latest() {
+async fn two_displayed_requests_require_confirmation_and_code_selects_one() {
+    // v3.1: multiple open requests require confirmation; plain yes cannot
+    // silently choose the most recent display. A short code selects one.
     let e=setup().await;
     let a=e.request(DEV_LEAD,"PATCH",&cfg(DEV_B),json!({"tags":""})).await;
     let b=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"toggle_yolo":true})).await;
-    e.seed_owner_send(MAX_PANE,"yes",now_s(),Some("outside"));
-    let (st,v)=apply(&e,DEV_LEAD,&a,DEV_B,json!({"tags":""})).await;
-    assert_code(st,&v,"request_unresolved","older display cannot catch the latest display's reply");
+    let (_,reply)=owner_reply(&e,"yes").await;
+    assert!(reply["approval_context"].as_str().unwrap().contains("reason: several-open"),"{reply}");
+    recorded_resolution(&e,"request_confirm_needed");
+    for (actor,id,worker,body) in [(DEV_LEAD,&a,DEV_B,json!({"tags":""})),(MRPOPO,&b,DEV_A,json!({"toggle_yolo":true}))] {
+        let (st,v)=apply(&e,actor,id,worker,body).await;
+        assert_code(st,&v,"request_unresolved","plain yes must fund neither open request");
+        assert_eq!(view(&e,id).await["resolution_code"],"request_confirm_needed");
+    }
+    owner_reply(&e,&format!("yes {}",e.short_code(&b))).await;
+    recorded_resolution(&e,"request_resolved");
     let (st,v)=apply(&e,MRPOPO,&b,DEV_A,json!({"toggle_yolo":true})).await;
-    assert_allowed(st,&v,"only the latest display gets the immediately following yes");
+    assert_allowed(st,&v,"the explicit code selects only its request");
+    assert_eq!(view(&e,&a).await["open"],true);
     assert_eq!(e.grant_status(&a),"pending");
 }
 
@@ -313,15 +310,15 @@ async fn nonaffirmative_replies_and_unshown_requests_never_fund() {
     for text in ["no","wait","yes?","yes, don't proceed","yes but not yet"] {
         let e=setup().await;
         let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"})).await;
-        e.seed_owner_send(MAX_PANE,text,now_s(),Some("outside"));
+        owner_reply(&e,text).await;
         let (st,v)=apply(&e,MRPOPO,&id,DEV_A,json!({"worktree_verify":"one"})).await;
         assert_code(st,&v,"request_reply_not_affirmative",text);
     }
     let e=setup().await;
-    let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"})).await;
-    let i=id.clone();
-    e.store.write(move|c| {c.execute("UPDATE _amux_delegation_grants SET shown_row=NULL WHERE code=?1",[i])?;Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})}).unwrap();
-    e.seed_owner_send(MAX_PANE,"yes",now_s(),Some("outside"));
+    let (st,v)=e.request_result(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"})).await;
+    assert_eq!(st, axum::http::StatusCode::ACCEPTED, "{v}");
+    let id=v["request_id"].as_str().unwrap().to_string();
+    owner_reply(&e,"yes").await;
     let (st,v)=apply(&e,MRPOPO,&id,DEV_A,json!({"worktree_verify":"one"})).await;
     assert_code(st,&v,"request_not_shown","no shown message means no authority");
 }
@@ -350,7 +347,7 @@ async fn shown_message_must_still_exist_in_the_bound_reply_session() {
         c.execute("DELETE FROM cmd_history WHERE id=(SELECT shown_row FROM _amux_delegation_grants WHERE code=?1)",[i])?;
         Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
     }).unwrap();
-    e.seed_owner_send(MAX_PANE,"yes",now_s(),Some("outside"));
+    owner_reply(&e,"yes").await;
     let (st,v)=apply(&e,MRPOPO,&id,DEV_A,json!({"worktree_verify":"one"})).await;
     assert_code(st,&v,"request_not_shown","a dangling shown-row reference is not a visible question");
     assert_eq!(e.grant_status(&id),"pending");
@@ -426,12 +423,12 @@ async fn project_steering_projection_preserves_owner_but_never_peer_authorship()
     assert_eq!(view(&e,&id).await["resolution_row"],row);
     {
         let conn=e.store.read().unwrap();
-        assert_eq!(conn.query_row("SELECT delegation_message_type FROM cmd_history WHERE id=?1",[row],|r|r.get::<_,String>(0)).unwrap(),"user");
+        assert_eq!(conn.query_row("SELECT delivery FROM cmd_history WHERE id=?1",[row],|r|r.get::<_,String>(0)).unwrap(),"approval_native_prompt");
     }
     // Project execution's existing type projection must not rewrite the
     // recorder's original authorship fact or erase an eligible prior reply.
     e.store.write(move|c| {
-        c.execute("UPDATE cmd_history SET type='steering' WHERE id=?1",[row])?;
+        c.execute("UPDATE cmd_history SET type='steering',delegation_message_type='user' WHERE id=?1",[row])?;
         Ok(amux_server::db::WriteOutcome{applied:true,events:vec![]})
     }).unwrap();
     let (st,v)=apply(&e,MRPOPO,&id,DEV_A,json!({"worktree_verify":"one"})).await;
@@ -445,7 +442,7 @@ async fn project_steering_projection_preserves_owner_but_never_peer_authorship()
     }).unwrap();
     let (st,v)=apply(&e,MRPOPO,&next,DEV_B,json!({"worktree_verify":"two"})).await;
     assert_code(st,&v,"request_unresolved","peer steering is still not owner input");
-    let (st,v)=owner_reply(&e,"go ahead").await;
+    let (st,v)=owner_reply(&e,&format!("ok {}",e.short_code(&next))).await;
     assert_allowed(st,&v,"record the actual owner control");
     recorded_resolution(&e,"request_resolved");
     let (st,v)=apply(&e,MRPOPO,&next,DEV_B,json!({"worktree_verify":"two"})).await;

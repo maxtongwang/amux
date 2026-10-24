@@ -167,23 +167,36 @@ fn bounded_output(cmd: &mut Command) -> Result<String, String> {
 }
 
 pub(super) fn snapshot() -> Snapshot {
+    snapshot_with_probe(|| {
+        #[cfg(target_os = "macos")]
+        {
+            bounded_output(Command::new("/usr/bin/top").args([
+                "-l",
+                "1",
+                "-o",
+                "mem",
+                "-n",
+                "5",
+                "-stats",
+                "pid,mem,cmprs,command",
+            ]))
+            .and_then(|raw| parse_top(&raw))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            rss_snapshot()
+        }
+    })
+}
+
+/// Acquisition is injectable; measurement/error semantics and metric naming
+/// are shared with production even when the host forbids process inspection.
+fn snapshot_with_probe(probe: impl FnOnce() -> Result<Vec<Consumer>, String>) -> Snapshot {
     #[cfg(target_os = "macos")]
-    let (metric, result) = (
-        "macos_top_mem_includes_compressed",
-        bounded_output(Command::new("/usr/bin/top").args([
-            "-l",
-            "1",
-            "-o",
-            "mem",
-            "-n",
-            "5",
-            "-stats",
-            "pid,mem,cmprs,command",
-        ]))
-        .and_then(|raw| parse_top(&raw)),
-    );
+    let metric = "macos_top_mem_includes_compressed";
     #[cfg(not(target_os = "macos"))]
-    let (metric, result) = ("rss_only", rss_snapshot());
+    let metric = "rss_only";
+    let result = probe();
     match result {
         Ok(consumers) => Snapshot {
             measured: true,
@@ -192,13 +205,17 @@ pub(super) fn snapshot() -> Snapshot {
             why_unmeasured: None,
             consumers,
         },
-        Err(error) => Snapshot {
-            measured: false,
-            n_considered: 0,
-            metric,
-            why_unmeasured: Some(error),
-            consumers: Vec::new(),
-        },
+        Err(error) => {
+            tracing::warn!(verdict="memory_consumer_probe_unmeasured", measured=false, n_considered=0,
+                metric, reason=%error, "memory consumer probe unavailable; no consumers measured");
+            Snapshot {
+                measured: false,
+                n_considered: 0,
+                metric,
+                why_unmeasured: Some(error),
+                consumers: Vec::new(),
+            }
+        }
     }
 }
 
@@ -323,38 +340,12 @@ mod tests {
         }
     }
 
-    /// The ONE host condition that excuses an unmeasured snapshot.
-    ///
-    /// Two cfg'd definitions rather than one function with cfg'd blocks, so
-    /// each platform's body is the whole function and the Linux build cannot
-    /// trip over a macOS-only constant.
-    #[cfg(target_os = "macos")]
-    fn tolerable_unmeasured_reason() -> Option<String> {
-        Some(probe_timeout_reason())
-    }
-
-    /// `None`: `ps` here takes no timeout, so nothing legitimate produces an
-    /// unmeasured snapshot and that arm stays a hard failure.
-    #[cfg(not(target_os = "macos"))]
-    fn tolerable_unmeasured_reason() -> Option<String> {
-        None
-    }
-
-    /// AMUX-4787. This asserted `measured == true`, which on a busy box is an
-    /// assertion about the HOST, in the one module whose whole purpose is to
-    /// publish whether the measurement ran. `top -l 1` was timed at 28-36s
-    /// against its own 5s deadline on this machine at load 38, so the test
-    /// reddened for load and read as a regression in whatever was being
-    /// changed at the time.
-    ///
-    /// THE RELAXATION IS NARROW ON PURPOSE. The unmeasured arm is admitted
-    /// only for the producer's own timeout string; a malformed parse, a
-    /// non-zero exit and a spawn failure all land in the same arm and all
-    /// still fail. Without that, "tolerate unmeasured" would turn this into a
-    /// test that passes when the parser is broken.
+    /// Drive the production probe boundary with deterministic process output.
+    /// Live host permissions and load cannot stand in for parser correctness.
     #[test]
     fn native_memory_snapshot_is_measured_and_names_its_metric() {
-        let result = snapshot();
+        let result =
+            snapshot_with_probe(|| parse_top("PID MEM CMPRS COMMAND\n42 2G 1G fixture-process\n"));
         // UNCONDITIONAL: the metric names which probe ran, which is a property
         // of this code and never of the host, so no load excuses it.
         #[cfg(target_os = "macos")]
@@ -365,22 +356,10 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         assert_eq!(result.metric, "rss_only", "{result:?}");
 
-        if !result.measured {
-            let why = result.why_unmeasured.clone().unwrap_or_default();
-            assert_eq!(
-                Some(why.clone()),
-                tolerable_unmeasured_reason(),
-                "an unmeasured snapshot is excusable ONLY when the probe ran out of time: {result:?}"
-            );
-            // Still not a free pass: an unmeasured snapshot must carry no data.
-            // The pair (measured=false, consumers non-empty) is the shape this
-            // module exists to make impossible.
-            assert_eq!(result.n_considered, 0, "{result:?}");
-            assert!(result.consumers.is_empty(), "{result:?}");
-            eprintln!("host probe timed out, so the measured assertions below did not run: {why}");
-            return;
-        }
-
+        assert!(
+            result.measured,
+            "fixture must exercise the measured branch: {result:?}"
+        );
         assert!(result.n_considered > 0, "{result:?}");
         assert_eq!(result.n_considered, result.consumers.len(), "{result:?}");
         assert!(result.consumers.iter().any(|r| r.bytes > 0), "{result:?}");
@@ -396,5 +375,18 @@ mod tests {
                 .all(|r| r.compressed_bytes.is_some()),
             "{result:?}"
         );
+    }
+    #[test]
+    fn denied_and_malformed_memory_probes_remain_explicitly_unmeasured() {
+        let denied = "Operation not permitted (os error 1)".to_string();
+        let malformed =
+            parse_top("PID MEM CMPRS COMMAND\n42 broken 0B fixture-process\n").unwrap_err();
+        for error in [denied, malformed] {
+            let result = snapshot_with_probe(|| Err(error.clone()));
+            assert!(!result.measured, "{result:?}");
+            assert_eq!(result.n_considered, 0, "{result:?}");
+            assert!(result.consumers.is_empty(), "{result:?}");
+            assert_eq!(result.why_unmeasured.as_deref(), Some(error.as_str()));
+        }
     }
 }

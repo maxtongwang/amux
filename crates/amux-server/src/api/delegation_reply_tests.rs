@@ -217,7 +217,9 @@ impl Fixture {
                 "incarnation":incarnation(session)}).to_string()).unwrap();
         }
         let mut report=report; report["approval_live"]=json!(true);
-        let result=self.call(None,Some(session),&format!("/api/sessions/{session}/report"),report).await;
+        let managed=crate::db::queries::get_worker(&self.state.store.read().unwrap(),session).unwrap().is_some();
+        let path=format!("/api/{}/{session}/report",if managed { "workers" } else { "sessions" });
+        let result=self.call(None,Some(session),&path,report).await;
         assert!(result.0.is_success(),"hook HTTP failure: {result:?}");
         assert_eq!(result.1["applied"],applied,"hook must reach the expected observation outcome: {result:?}");
         result
@@ -853,7 +855,7 @@ async fn peer_paste_and_chat_relay_echoes_are_recorded_non_owner() {
         }
         assert!(f.transported().contains(&format!("[amux-origin: {sender} —")),"self and active Chat relays also need a worker stamp");
         assert_eq!(crate::api::worker_exec::fake_pane::typed(OWNER_AGENT).last().unwrap().1,"amux");
-        f.echo_closes_without_funding(&id).await;
+        f.echo_never_funds(&id,"request_reply_not_owner_input").await;
     }
 }
 
@@ -865,7 +867,7 @@ async fn peer_steer_delivery_echo_is_recorded_non_owner() {
     assert!(crate::api::session_verbs::steer_deliver_for_session(&f.state,OWNER_AGENT).await,"real idle consumer must deliver the peer queue row");
     assert_eq!(f.request_resolution(&id),(None,None));
     assert!(f.transported().contains(&format!("[amux-origin: {LEAD} —")),"steer queue must carry its sender's stamp");
-    f.echo_closes_without_funding(&id).await;
+    f.echo_never_funds(&id,"request_reply_not_owner_input").await;
 }
 
 #[tokio::test]
@@ -890,7 +892,7 @@ async fn schedule_and_goal_configuration_are_not_max_typing_now() {
                 assert_eq!(typed.last().unwrap(), &("yes".into(),"owner"),"configured exception preserves owner transport and bytes");
                 accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
                 assert_eq!(f.request_resolution(&id),(None,None),"status-only observer cannot close or fund an isolated approval");
-            } else { f.echo_closes_without_funding(&id).await; }
+            } else { f.echo_never_funds(&id,"request_confirm_needed").await; }
         }
     }
 }
@@ -1009,7 +1011,7 @@ async fn project_peer_send_preserves_non_owner_provenance() {
     // The real idle-hook delivery consumer, including project claim admission.
     assert!(crate::api::session_verbs::steer_deliver_for_session(&f.state,OWNER_AGENT).await);
     assert!(f.transported().contains(&format!("[amux-origin: {LEAD} —")),"project queue must carry its sender's stamp");
-    f.echo_closes_without_funding(&id).await;
+    f.echo_never_funds(&id,"request_reply_not_owner_input").await;
 }
 
 #[tokio::test]
@@ -1051,7 +1053,7 @@ async fn schedule_run_route_echo_is_non_owner() {
         assert!(crate::api::session_verbs::steer_deliver_for_session(&f.state,OWNER_AGENT).await);
     }
     assert_eq!(f.request_resolution(&id),(None,None));
-    f.echo_closes_without_funding(&id).await;
+    f.echo_never_funds(&id,"request_confirm_needed").await;
 }
 
 #[tokio::test]
@@ -1075,7 +1077,7 @@ async fn server_owned_text_producers_are_not_owner_typing() {
         let f=Fixture::new(); let id=f.ask().await;
         let (ok,message)=send_text(&f.state,OWNER_AGENT,"yes",false,origin).await;
         assert!(ok,"{message}");
-        f.echo_closes_without_funding(&id).await;
+        f.echo_never_funds(&id,"request_confirm_needed").await;
     }
 }
 
@@ -1136,7 +1138,7 @@ async fn server_shell_schedule_send_is_not_current_owner_input() {
     assert_eq!(f.request_resolution(&id),(None,None));
     let (st,v)=f.call(Some(AUTOMATION),None,&format!("/api/workers/{OWNER_AGENT}/keys"),json!({"keys":"Enter"})).await;
     assert_eq!(st,StatusCode::FORBIDDEN,"{v}"); assert_eq!(v["code"],"owner_session_keys_refused");
-    f.echo_closes_without_funding(&id).await;
+    f.echo_never_funds(&id,"request_confirm_needed").await;
 }
 
 #[tokio::test]
@@ -1152,7 +1154,7 @@ async fn reparented_schedule_cli_marker_keeps_outside_send_non_owner() {
     assert!(response.status().is_success());
     f.peer_recorded("yes","session");
     assert_eq!(f.request_resolution(&id),(None,None));
-    f.echo_closes_without_funding(&id).await;
+    f.echo_never_funds(&id,"request_confirm_needed").await;
 }
 
 #[tokio::test]
@@ -1291,16 +1293,21 @@ impl Fixture {
         text
     }
 
-    async fn echo_closes_without_funding(&self, id: &str) {
+    async fn echo_never_funds(&self, id: &str, expected: &str) {
         let text=self.transported();
         self.type_in_pane(&text,"non-owner-delivery").await;
-        assert_eq!(self.request_resolution(id),(None,Some("request_reply_not_owner_input".into())),"submitted delivery closes without funding");
-        let row=self.resolution(OWNER_AGENT,"request_reply_not_owner_input",None);
+        let row=self.resolution(OWNER_AGENT,expected,None);
         let boundary=max_ref::one(&self.state,row).unwrap().unwrap();
         assert_eq!(boundary.source,None);
-        assert_eq!(self.state.store.read().unwrap().query_row("SELECT origin FROM cmd_history WHERE id=?1",[row],|r|r.get::<_,String>(0)).unwrap(),"amux","known receipt must retain explicit non-owner origin");
-        accepted(self.owner_reply("yes").await);
-        self.resolution(OWNER_AGENT,"request_no_candidate",None);
+        assert!(boundary.wrapped,"transport receipt is non-owner input");
+        assert_eq!(self.state.store.read().unwrap().query_row("SELECT origin FROM cmd_history WHERE id=?1",[row],|r|r.get::<_,String>(0)).unwrap(),"amux");
+        assert_eq!(self.request_resolution(id).0,None,"wrapped transport can never fund");
+        if expected=="request_confirm_needed" {
+            assert!(self.open(id),"v3.1 wrapped approve-shaped input confirms and stays open");
+            assert_eq!(self.request_resolution(id).1.as_deref(),Some(expected));
+        }
+        // For non-approve text, intervening output may have ended the displayed
+        // turn. Its audit remains non-owner regardless of which turn can close.
         assert_eq!(self.apply(id).await.0,StatusCode::FORBIDDEN);
     }
 }
@@ -1620,7 +1627,8 @@ async fn session_durable_messages_route_closes_and_delivery_is_wrapped() {
     assert!(prompt_wrapped(&body));
     let next=f.ask().await;
     f.type_in_pane(&body,"owner-native-session").await;
-    f.resolution(OWNER_AGENT,"request_reply_not_owner_input",None);
+    f.resolution(OWNER_AGENT,"request_confirm_needed",None);
+    assert!(f.open(&next),"v3.1 wrapped yes requests confirmation without funding");
     assert_eq!(f.apply(&next).await.0,StatusCode::FORBIDDEN);
     let (st,_)=f.call(Some(PEER),None,"/api/messages",json!({"to":worker,"body":"yes"})).await;
     assert_eq!(st,StatusCode::FORBIDDEN);
@@ -1660,8 +1668,11 @@ async fn v31_no_doubt_plain_yes_funds_and_line_is_exact() {
 #[tokio::test]
 async fn v31_a_intervening_prompt_confirms_stays_open() {
     let f=Fixture::new(); let id=f.ask().await;
-    // Insert an unprocessed prompt, independently of the assistant-turn guard.
-    f.write(|c| { c.execute("INSERT INTO cmd_history(session,text,type,delivery,ts) VALUES(?1,'intervening','user','pane',1)",[OWNER_AGENT])?;Ok(()) });
+    // An adjudicated wrong-code native prompt preserves the request while
+    // becoming intervening text. Production never leaves live input unresolved.
+    let unknown=if f.short(&id)=="A7K2" { "B7K2" } else { "A7K2" };
+    accepted(f.owner_reply(&format!("yes {unknown}")).await);
+    f.resolution(OWNER_AGENT,"request_no_open_code",None);
     f.expect_confirm(&id,"yes","text-between").await;
 }
 #[tokio::test]

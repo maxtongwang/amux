@@ -143,16 +143,25 @@ mod tests {
         let child = std::process::Command::new("true").spawn().expect("spawn true");
         let pid = child.id() as i32;
         drop(child);
-        let me = std::process::id() as i32;
-        let mut zombie = false;
-        for _ in 0..50 {
-            let out = std::process::Command::new("ps").args(["-A", "-o", "pid=,ppid=,stat="]).output().unwrap();
-            if zombie_children(&String::from_utf8_lossy(&out.stdout), me).contains(&pid) { zombie = true; break; }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        // Process enumeration is a host privilege on macOS. The production
+        // waitpid boundary can prove a real dropped child was reaped without
+        // ps; the parser and two-tick selection have independent assertions.
+        const REAP_ATTEMPTS: usize = 50;
+        const REAP_RETRY_DELAY: Duration = Duration::from_millis(50);
+        let observed = [pid].into_iter().collect();
+        assert!(due(&BTreeSet::new(), &observed).is_empty());
+        let candidates = due(&observed, &observed);
+        assert_eq!(candidates, vec![pid]);
+        let mut reaped = false;
+        for _ in 0..REAP_ATTEMPTS {
+            if reap(&candidates) == (1, 0) { reaped = true; break; }
+            tokio::time::sleep(REAP_RETRY_DELAY).await;
         }
-        assert!(zombie, "the dropped child should be a zombie of this process");
-        assert_eq!(reap(&due(&[pid].into_iter().collect(), &[pid].into_iter().collect())), (1, 0));
-        let out = std::process::Command::new("ps").args(["-A", "-o", "pid=,ppid=,stat="]).output().unwrap();
-        assert!(!zombie_children(&String::from_utf8_lossy(&out.stdout), me).contains(&pid), "reaped");
+        assert!(reaped, "production waitpid must reap the real dropped child");
+        assert_eq!(reap(&candidates), (0, 1), "a second reap must not claim success");
+        let mut status = 0;
+        // SAFETY: this is the test's own child PID; WNOHANG never waits.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD), "child has actually been reaped");
     }
 }

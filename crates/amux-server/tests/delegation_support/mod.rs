@@ -48,11 +48,6 @@ pub const OPS_A: &str = "review-ops-a";
 /// The delegated-change log (spec, piece c).
 pub const LOG_REL: &str = "audit/delegated-changes.jsonl";
 
-/// The column piece (b) records #7's attribution verdict in, on the message
-/// row of an owner dashboard/CLI send. NOT FIXED BY THE SPEC: (b) owns it, and
-/// this is the one place to change if it lands under another name.
-pub const ATTRIBUTION_COLUMN: &str = "process_origin";
-
 /// Who a request speaks for.
 #[derive(Clone, Copy, Debug)]
 pub enum Who<'a> {
@@ -193,24 +188,22 @@ impl Env {
     }
 
     pub async fn display_request(&self, id: &str) {
-        let (ask,text):(i64,String)=self.store.read().unwrap().query_row(
-            "SELECT ask_row,ask_text FROM _amux_delegation_grants WHERE code=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-        // A non-loopback ConnectInfo exercises the production Remote proof
-        // without OS process discovery, live sockets or a cfg(test) API.
-        let mut prepare=Request::builder().method("POST").uri("/api/delegation/questions/render")
-            .header(header::CONTENT_TYPE,"application/json")
-            .body(Body::from(json!({"surface":"owner-messages"}).to_string())).unwrap();
-        prepare.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([192,0,2,1],42105))));
-        let res=self.app.clone().oneshot(prepare).await.unwrap(); assert!(res.status().is_success());
-        let bytes=axum::body::to_bytes(res.into_body(),usize::MAX).await.unwrap();
-        let after_row=serde_json::from_slice::<Value>(&bytes).unwrap()["after_row"].as_i64().unwrap();
-        let mut req=Request::builder().method("POST").uri(format!("/api/delegation/questions/{ask}/display"))
-            .header(header::CONTENT_TYPE,"application/json")
-            .body(Body::from(json!({"surface":"owner-messages","text":text,"after_row":after_row}).to_string())).unwrap();
-        req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([192,0,2,1],42105))));
-        let res=self.app.clone().oneshot(req).await.unwrap();
-        let st=res.status(); let bytes=axum::body::to_bytes(res.into_body(),usize::MAX).await.unwrap();
-        assert!(st.is_success(),"display receipt: {}",String::from_utf8_lossy(&bytes));
+        let block = self.approval_block(id);
+        self.native_report(MAX_PANE, "Stop", &block).await;
+        let shown: Option<i64> = self.store.read().unwrap().query_row(
+            "SELECT shown_row FROM _amux_delegation_grants WHERE code=?1", [id], |r| r.get(0)).unwrap();
+        assert!(shown.is_some(), "exact completed native block must bind shown_row");
+    }
+
+    pub fn short_code(&self, id: &str) -> String {
+        self.store.read().unwrap().query_row(
+            "SELECT short_code FROM _amux_delegation_grants WHERE code=?1", [id], |r| r.get(0)).unwrap()
+    }
+
+    pub fn approval_block(&self, id: &str) -> String {
+        let question: String = self.store.read().unwrap().query_row(
+            "SELECT ask_text FROM _amux_delegation_grants WHERE code=?1", [id], |r| r.get(0)).unwrap();
+        format!("Approval needed — {}\n{question}\nReply \"yes\" to approve. Anything else declines.", self.short_code(id))
     }
 
     /// Exercise request creation without assuming that the change is delegable.
@@ -221,7 +214,13 @@ impl Env {
 
     pub async fn approved_request(&self, actor: &str, method: &str, path: &str, body: Value) -> Value {
         let id=self.request(actor,method,path,body).await;
-        self.seed_owner_send(MAX_PANE,"yes",now_s(),Some("outside"));
+        let short = self.short_code(&id);
+        let (_,reply)=self.type_in_pane(MAX_PANE, &format!("yes {short}")).await;
+        assert_eq!(reply["approval_context"],format!("[amux approval] approved {short}"));
+        let resolved: bool = self.store.read().unwrap().query_row(
+            "SELECT resolution_row IS NOT NULL AND resolution_code='request_resolved' FROM _amux_delegation_grants WHERE code=?1",
+            [&id], |r| r.get(0)).unwrap();
+        assert!(resolved,"native report must commit approval before any recovery read or apply");
         json!(id)
     }
 
@@ -355,36 +354,6 @@ impl Env {
         id.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// A prompt typed into `session`'s pane, in exactly the shape
-    /// api/pane_prompts.rs::record writes it: type 'user', origin 'pane',
-    /// delivery 'pane'. A Claude remote-control prompt typed on the owner's
-    /// phone is a real UserPromptSubmit with no stamp and lands identically.
-    pub fn seed_pane_prompt(&self, session: &str, text: &str, ts_s: f64) -> i64 {
-        self.seed_row(session, text, "user", "pane", Some("pane"), ts_s)
-    }
-
-    /// An owner send (dashboard / phone / CLI) to `session` with #7's
-    /// attribution verdict recorded on the row (`None` = no verdict recorded).
-    /// Panics with a pointer at piece (b) when the column does not exist.
-    pub fn seed_owner_send(&self, session: &str, text: &str, ts_s: f64, verdict: Option<&str>) -> i64 {
-        let id = self.seed_row(session, text, "user", "", Some("direct"), ts_s);
-        if let Some(v) = verdict {
-            let v = v.to_string();
-            self.store
-                .write(move |conn| {
-                    conn.execute(
-                        &format!("UPDATE cmd_history SET {ATTRIBUTION_COLUMN}=?1 WHERE id=?2"),
-                        rusqlite::params![v, id],
-                    )?;
-                    Ok(WriteOutcome { applied: true, events: vec![] })
-                })
-                .unwrap_or_else(|e| {
-                    panic!("piece (b) records #7's attribution verdict in cmd_history.{ATTRIBUTION_COLUMN}; not present: {e}")
-                });
-        }
-        id
-    }
-
     /// Every row's (session, origin, type, text) since `after_id`.
     pub fn rows_after(&self, after_id: i64) -> Vec<(String, String, String, String)> {
         let conn = self.store.read().unwrap();
@@ -397,14 +366,10 @@ impl Env {
             .collect()
     }
 
-    /// A person typing `text` into `lane`'s pane, through the real path: the
-    /// provider's UserPromptSubmit hook posting to the lane's own /report.
-    pub async fn type_in_pane(&self, lane: &str, text: &str) -> (StatusCode, Value) {
+    /// Native lifecycle payloads go through the real report route, with the
+    /// provider session and launch incarnation used by production approval.
+    pub async fn native_report(&self, lane: &str, event: &str, text: &str) -> (StatusCode, Value) {
         let now = now_s();
-        let env = self.env_path(lane);
-        if !env.exists() {
-            std::fs::write(&env, "CC_DIR=\"/tmp\"\n").unwrap();
-        }
         let dir = self.home().join("status-events").join(lane);
         std::fs::create_dir_all(&dir).unwrap();
         let run = format!("review-run-{lane}");
@@ -413,12 +378,23 @@ impl Env {
                 "incarnation":format!("inc-{lane}")}).to_string()).unwrap();
         }
         let seq = PANE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let report = json!({"native_status": true, "event": "UserPromptSubmit", "state": "active", "run_id": run, "provider": "claude",
-            "sequence": seq, "event_ts": now, "turn_id": format!("t{seq}"), "prompt": text,"prompt_truncated":false});
+        let mut report = json!({"native_status": true, "approval_live": true, "event": event,
+            "state": if event == "Stop" { "idle" } else { "active" }, "run_id": run, "provider": "claude",
+            "sequence": seq, "event_ts": now, "session_id": format!("native-{lane}"), "turn_id": ""});
+        if event == "Stop" {
+            report["assistant_message"] = json!(text);
+        } else {
+            report["prompt"] = json!(text);
+            report["prompt_truncated"] = json!(false);
+        }
         let reply = self.call(Who::Worker(lane), "POST", &format!("/api/sessions/{lane}/report"), Some(report)).await;
         assert!(reply.0.is_success() && reply.1["applied"] == true,
             "native hook report must be applied before it can record owner input: {reply:?}");
         reply
+    }
+
+    pub async fn type_in_pane(&self, lane: &str, text: &str) -> (StatusCode, Value) {
+        self.native_report(lane, "UserPromptSubmit", text).await
     }
 
     /// A stored grant's status, or "" when there is no such grant.

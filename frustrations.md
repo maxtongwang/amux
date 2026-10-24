@@ -6292,3 +6292,26 @@ FIX: Only the next unwrapped native prompt after an exact native assistant block
   and owner_tmux_input_refused. Same-uid processes outside the hook remain a
   documented residual; only OS separation closes that boundary. Rust route
   verification is parent-owned; this builder runs no Cargo.
+
+
+## Session approval tests used retired receipts
+AREA: delegation
+SEVERITY: breaks
+STATUS: fixed
+DATE: 2026-10-24
+SESSION: pr18-r2
+CARD: maxtongwang/ai-config#160
+SYMPTOM: The parent's first full test run compiled the session-based stack but
+  fixtures still tried to approve through Messages receipts or payloads without
+  live native proof. A real native doubt decision also lost its request-scoped
+  log subscriber when the atomic write moved onto the blocking pool.
+COST: 41 non-excluded failures obscured the new approval contract.
+FIX: Shared fixtures use exact native Stop blocks and live session/incarnation
+  payloads; native writes carry their tracing dispatch so
+  delegation_request_resolution remains observable. The existing refusal gate
+  now classifies owner_native_delivery_held as 409, and timestamp invariants
+  declare all five approval clocks. The reply parser validates the four-character
+  code before interpreting a second word, so yes please declines and valid
+  unknown codes never fall back. Host probe fixtures verify measured and
+  unmeasured outcomes independently; memory_consumer_probe_unmeasured announces
+  denied acquisition. Parent owns Rust execution; no Cargo ran in this repair.
