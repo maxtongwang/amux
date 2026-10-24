@@ -7939,7 +7939,7 @@ pub(crate) async fn cmd_hist_record_with_id(
             .filter(Value::is_object)
             .map(|v| v.to_string())
     });
-    let now_ms = now_i64() * 1000;
+    let now_ms = (now_f64() * 1000.0) as i64;
 
     // DUPLICATE-DELIVERY DETECTOR (Ethan's standing rule, 2026-08-11: fix the
     // bug AND make the next one surface in the logs).
@@ -28883,7 +28883,17 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
         let n = name.to_string();
         crate::db::interactions::spawn_blocking(move || backup_session_jsonl(&n, "pre_compact"));
     }
-    let record_history = body.get("record_history").map(py_truthy).unwrap_or(false);
+    // The owner CLI sends text/msg_id to the worker-ID alias without a
+    // history flag. Derive the default from server process proof, never from
+    // the absence of a worker header alone. Explicit opt-out and peer relays
+    // retain their existing behavior.
+    let owner_history_default = owner_input_process_origin(headers).is_some()
+        && body_str(body, "source_session").trim().is_empty();
+    let record_history = body.get("record_history").map(py_truthy).unwrap_or(owner_history_default);
+    if body.get("record_history").is_none() && owner_history_default {
+        tracing::info!(session = name, verdict = "owner_send_history_defaulted", measured = true,
+            n_considered = 1, "verified owner CLI/API input retained for reply resolution");
+    }
     // The context the sender composed in (AMUX-4693). Serialised back to a
     // string here rather than threaded as a `&Value` so the recorder's
     // validation has exactly one input shape to defend, and so a caller that

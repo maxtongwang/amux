@@ -79,7 +79,7 @@ def main():
     message = source_sql(grants, "INSERT INTO cmd_history(text,type,session,ts,origin,delivery,delegation_session_incarnation)")
     request = source_sql(grants, "INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,why,created_at,expires_at,status,mode,target_incarnation,actor_incarnation")
     resolution = source_sql(requests, "INSERT INTO _amux_delegation_resolutions(")
-    candidates = source_sql(requests, "SELECT code,reply_incarnation,created_at FROM _amux_delegation_grants")
+    candidates = source_sql(requests, "SELECT code,reply_incarnation,(SELECT ts FROM cmd_history WHERE id=shown_row) FROM _amux_delegation_grants")
     claim = source_sql(grants, "UPDATE _amux_delegation_grants SET status='applying', decided_by=")
     with tempfile.TemporaryDirectory(prefix="amux-request-schema-") as tmp:
         database = Path(tmp) / "requests.db"

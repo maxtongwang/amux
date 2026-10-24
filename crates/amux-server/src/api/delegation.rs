@@ -56,7 +56,9 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
 /// The verified worker name that acts on Max's behalf.
-pub(crate) const MRPOPO: &str = "mrpopo";
+pub(crate) const OWNER_AGENT: &str = "mrpopo";
+// Historical role name; one authoritative owner-session lookup key.
+pub(crate) use self::OWNER_AGENT as MRPOPO;
 use super::session_verbs::LEADS_GROUP;
 
 /// HANDS-ONLY: owner only, never delegable, not even through a grant (dev-lead,

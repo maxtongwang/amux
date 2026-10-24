@@ -19,7 +19,7 @@ class ReplyWindowStorage(unittest.TestCase):
         self.addCleanup(self.conn.close)
         schema.migrate(self.conn)
         self.candidates = schema.source_sql(
-            REQUESTS, "SELECT code,reply_incarnation,created_at FROM _amux_delegation_grants")
+            REQUESTS, "SELECT code,reply_incarnation,(SELECT ts FROM cmd_history WHERE id=shown_row) FROM _amux_delegation_grants")
 
     def previous(self, session, reply):
         query = schema.source_sql(REQUESTS, "SELECT COALESCE(MAX(reply_row),0)")
@@ -85,7 +85,7 @@ class ReplyWindowStorage(unittest.TestCase):
                 # pending row when only the refusal is removed.
                 self.conn.execute("UPDATE _amux_delegation_grants SET resolution_code=NULL")
                 self.assertEqual(self.conn.execute(
-                    self.candidates, ["desk", 0, yes]).fetchall(), [("refused", "inc-desk", 1)])
+                    self.candidates, ["desk", 0, yes]).fetchall(), [("refused", "inc-desk", 1000)])
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 // Explicit requests and grants for widening changes — Max 2026-10-23: approval identity resolution; refs maxtongwang/ai-config#160.
 //! POST /api/delegation/requests derives a pending request through the real
 //! authorization table, stores the exact structured change, stable actor/target
-//! and reply-session identities, and shows a generated question in Messages.
+//! and owner-session incarnations, and shows a generated question in the owner
+//! session's Messages. Asker-selected reply sessions and free-text funding are
+//! superseded (Max 2026-10-23 20:08).
 //! Its grant code is the request ID. Free text never creates requests.
 //! Typed affirmative correlation lives in delegation_requests; passkey approval
 //! still requires a direct Remote owner. Every application cites request_id and
@@ -507,10 +509,10 @@ pub(crate) fn begin_requested(state: &AppState, id: &str, actor: &str, change: &
     let reply = g.resolution_row.ok_or((resolution_refusal(g.resolution_code.as_deref()), g.resolution_note.clone().unwrap_or_default()))?;
     let row = super::max_ref::one(state, reply).map_err(|e| (e.code(), "owner reply unavailable".into()))?
         .ok_or(("request_reply_missing", "owner reply unavailable".into()))?;
-    let source = super::max_ref::typed_by_max(state, &row).ok_or(("max_ref_not_human_typed", "reply is not owner input".into()))?;
-    if !super::max_ref::cite_source_allowed(actor, &row.session, source, row.remote) {
-        return Err(("max_ref_own_lane", "own-lane reply needs direct Remote owner proof".into()));
+    if row.session != super::delegation::OWNER_AGENT || row.incarnation != g.reply_incarnation {
+        return Err(("request_reply_identity_changed", "reply is outside the stored owner incarnation".into()));
     }
+    super::max_ref::typed_by_max(state, &row).ok_or(("max_ref_not_human_typed", "reply is not owner input".into()))?;
     claim_pending(state, &g.code, &format!("owner:reply:{reply}"), Some(reply))?;
     if !arm(state, &g.code) { return Err(("grant_unavailable", "request could not be armed; reply remains spent".into())); }
     Ok(g.code)
@@ -523,11 +525,15 @@ fn resolution_refusal(code: Option<&str>) -> &'static str {
         Some("request_reply_not_affirmative") => "request_reply_not_affirmative",
         Some("request_reply_identity_changed") => "request_reply_identity_changed",
         Some("request_reply_outside_window") => "request_reply_outside_window",
+        Some("request_reply_not_owner_session") => "request_reply_not_owner_session",
         _ => "request_unresolved",
     }
 }
 
 fn validate_request_identity(state: &AppState, g: &GrantRow, actor: &str) -> Result<(), (&'static str, String)> {
+    if g.reply_session.as_deref() != Some(super::delegation::OWNER_AGENT) {
+        return Err(("request_reply_not_owner_session", "superseded asker-selected reply session; ask again in the owner session".into()));
+    }
     if g.shown_row.is_none() { return Err(("request_not_shown", "request was never shown in a reply session".into())); }
     let conn = state.store.read().map_err(|_|("request_read_failed", "request message ledger unavailable".into()))?;
     let shown: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM cmd_history WHERE id=?1 AND session=?2 AND origin=?3 AND type='session' AND text=?4 AND delegation_session_incarnation=?5)",
@@ -1439,7 +1445,7 @@ mod tests {
     /// whoami reports each verdict, forwarded included.
     async fn explicit_request(app: &Router, body: Value) -> String {
         let (st,v,_) = call(app,"POST","/api/delegation/requests",Some("mrpopo"),json!({
-            "reply_session":"test-desk","method":"PATCH","path":"/api/sessions/test-dev-a/config","body":body}),None).await;
+            "method":"PATCH","path":"/api/sessions/test-dev-a/config","body":body}),None).await;
         assert_eq!(st,StatusCode::ACCEPTED,"{v}");
         v["request_id"].as_str().unwrap().to_string()
     }
@@ -1458,7 +1464,7 @@ mod tests {
             .header("x-amux-session", "mrpopo")
             .header("x-amux-interaction-id", parent_id)
             .header("x-amux-command-kind", "environment.post")
-            .body(Body::from(json!({"reply_session":"test-desk", "method":"PATCH", "path":path,
+            .body(Body::from(json!({ "method":"PATCH", "path":path,
                 "body":{"worktree_verify":"one"}}).to_string())).unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
         let status = res.status();
@@ -1527,7 +1533,7 @@ mod tests {
                 process_origin:Some(proof),
                 ..if queued { DeliveryMeta::queued((now()*1000.0) as i64) } else { DeliveryMeta::direct() }
             };
-            let row=cmd_hist_record_with_id(&state,"test-desk","yes",ctype,"",true,meta).await;
+            let row=cmd_hist_record_with_id(&state,"mrpopo","yes",ctype,"",true,meta).await;
             // No GET or explicit resolver call before this assertion.
             assert_eq!(load(&state,&id).unwrap().resolution_row,Some(row),"{ctype}/{queued}/{proof}");
             on_row(&state,row).await;
@@ -1537,30 +1543,30 @@ mod tests {
         }
         let id=explicit_request(&app,json!({"worktree_verify":"two"})).await;
         for (ctype,proof) in [("session",Some("remote")),("chat",None),("user",Some("worker"))] {
-            let row=cmd_hist_record_with_id(&state,"test-desk","approve",ctype,"peer",true,
+            let row=cmd_hist_record_with_id(&state,"mrpopo","approve",ctype,"peer",true,
                 DeliveryMeta { process_origin:proof, ..DeliveryMeta::direct() }).await;
             assert!(load(&state,&id).unwrap().resolution_row.is_none(),"{ctype}/{proof:?} cannot supply owner provenance");
             assert_eq!(state.store.read().unwrap().query_row(
                 "SELECT COUNT(*) FROM _amux_delegation_resolutions WHERE reply_row=?1",[row],|r|r.get::<_,i64>(0)).unwrap(),0);
         }
         // A Chat-tab wait closes the old window for a subsequent pane/send yes.
-        cmd_hist_record_with_id(&state,"test-desk","wait","chat","",true,
+        cmd_hist_record_with_id(&state,"mrpopo","wait","chat","",true,
             DeliveryMeta { process_origin:Some("outside"), ..DeliveryMeta::direct() }).await;
         let next=explicit_request(&app,json!({"worktree_verify":"three"})).await;
-        let row=cmd_hist_record_with_id(&state,"test-desk","yes","user","",true,
+        let row=cmd_hist_record_with_id(&state,"mrpopo","yes","user","",true,
             DeliveryMeta { process_origin:Some("outside"), ..DeliveryMeta::direct() }).await;
         assert_eq!(load(&state,&next).unwrap().resolution_row,Some(row));
         assert_eq!(load(&state,&id).unwrap().resolution_code.as_deref(),Some("request_reply_not_affirmative"));
     }
 
     async fn record_reply(state: &AppState, text: &str, source: &str) -> i64 {
-        let session="test-desk".to_string();
+        let session="mrpopo".to_string();
         let text=text.to_string();
         let source=source.to_string();
         let id=Arc::new(std::sync::atomic::AtomicI64::new(0));
         let out=id.clone();
         state.store.write(move|c| {
-            c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,process_origin,ts,delegation_session_incarnation) VALUES(?1,?2,'user',?3,?4,?5,?6,'inc-test-desk')",
+            c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,process_origin,ts,delegation_session_incarnation) VALUES(?1,?2,'user',?3,?4,?5,?6,'inc-mrpopo')",
                 rusqlite::params![session,text,if source=="pane" {"pane"} else {""},if source=="pane" {"pane"} else {"direct"},source,(now()*1000.0) as i64])?;
             out.store(c.last_insert_rowid(),std::sync::atomic::Ordering::SeqCst);
             Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
