@@ -1701,7 +1701,7 @@ async fn failed_peer_send_with_history_is_non_owner_and_leaves_question_open() {
     let (row,text,ty,origin,delivery,process): (i64,String,String,String,String,Option<String>) = f.state.store.read().unwrap().query_row(
         "SELECT id,text,delegation_message_type,origin,delivery,process_origin FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1",
         [OWNER_AGENT],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap();
-    assert_eq!(text,session_verbs::origin_stamped(LEAD,OWNER_AGENT,"yes").unwrap());
+    assert_eq!(text,crate::api::session_verbs::origin_stamped(LEAD,OWNER_AGENT,"yes").unwrap());
     assert_eq!((ty,origin,delivery,process),("session".into(),"amux".into(),"approval_transport".into(),None));
     assert_eq!(max_ref::one(&f.state,row).unwrap().unwrap().source,None);
     assert_eq!(f.request_resolution(&id),(None,None));
