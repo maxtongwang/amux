@@ -367,9 +367,14 @@ pub(crate) async fn post(state: &AppState, name: &str, body: &Value) -> Response
     let body = body.clone();
     let prompt = submitted_prompt(&body);
     let (worker, event) = (name.clone(), body.clone());
+    // Atomic approval decisions run on the blocking pool; retain the native
+    // request's subscriber so their audit verdicts reach the same log sink.
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let outcome = state
         .store
-        .write_async(move |conn| apply(conn, &name, &body, &generation(&name)))
+        .write_async(move |conn| tracing::dispatcher::with_default(&dispatch, || {
+            apply(conn, &name, &body, &generation(&name))
+        }))
         .await;
     match outcome {
         Ok(out) => {

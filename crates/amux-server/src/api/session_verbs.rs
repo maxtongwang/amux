@@ -11474,6 +11474,9 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
     if m.starts_with("held_relay_identity_missing") {
         return (StatusCode::CONFLICT, Some("restore the worker's current incarnation before server held-relay recovery (#66); use native delivery (#67) while identity is unavailable"));
     }
+    if m.starts_with("owner_native_delivery_held:") {
+        return (StatusCode::CONFLICT, Some("native owner delivery (#67) is unavailable; retain the input or queue it for native delivery, then inspect its delivery receipt"));
+    }
     // --- 409: amux's own paste of this exact message is already in the
     //     composer and will be submitted at the next idle boundary. Nothing is
     //     lost and nothing needs retrying; 500 would send someone debugging.
@@ -53568,6 +53571,17 @@ mod refusal_status_tests {
                 let hint=hint.expect("held relay refusals need a next step");
                 assert!(hint.contains("#66") && hint.contains("#67"),"{hint}");
             }
+        }
+    }
+
+    #[test]
+    fn owner_native_delivery_hold_is_a_conflict_with_a_next_step() {
+        let message = "owner_native_delivery_held: native delivery unavailable; retain or queue input (#67)";
+        for refusal in [message.to_string(), format!("auto-wake failed: {message}")] {
+            let (status, hint) = send_failure_status(&refusal);
+            assert_eq!(status, StatusCode::CONFLICT);
+            let hint = hint.expect("a held native delivery needs a next step");
+            assert!(hint.contains("queue") && hint.contains("#67") && hint.contains("receipt"), "{hint}");
         }
     }
 
