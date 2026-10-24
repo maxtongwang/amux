@@ -33,8 +33,8 @@ pub(crate) const MODE_KEY: &str = "AMUX_DELEGATION_APPROVAL";
 pub(crate) const GRANT_HEADER: &str = "x-amux-grant";
 /// Response header naming the grant a cited change applied as.
 pub(crate) const GRANT_CODE_HEADER: &str = "x-amux-grant-code";
-/// Unambiguous code alphabet (no 0/O, 1/I/L, U).
-const ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTVWXYZ";
+/// v3 short-code alphabet (no 0/O or 1/I/L).
+const ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const CODE_LEN: usize = 4;
 /// Bound random-code collision retries; existing request IDs are never replaced.
 const CODE_MINT_ATTEMPTS: usize = 10;
@@ -436,7 +436,8 @@ fn insert(state: &AppState, g: &NewGrant, c: &Captured) -> Result<(String, Strin
         .ok_or_else(|| forbid("request_reply_identity_missing", "reply session needs an existing stable identity".into()))?;
     let created = now();
     for _ in 0..CODE_MINT_ATTEMPTS {
-        let Some(code) = new_code() else { break };
+        let Some(nonce) = super::rename_identity::new_incarnation().ok() else { break };
+        let code = format!("dlg_{nonce}");
         let text = sentence(&code, g.actor, g.action, g.target, c);
         // The whole structured change is visible, without truncating operands.
         let question = format!("Approval request {code} from {}: {} {} {}. Reply yes to approve this exact change.", g.actor, c.method, c.path, g.change);
@@ -446,11 +447,13 @@ fn insert(state: &AppState, g: &NewGrant, c: &Captured) -> Result<(String, Strin
             if conn.query_row("SELECT EXISTS(SELECT 1 FROM _amux_delegation_grants WHERE code=?1)", [&id], |r| r.get::<_, bool>(0))? {
                 return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
             }
+            let short = super::delegation_requests::allocate_short_code(conn, created, new_code)?;
             conn.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery,delegation_session_incarnation) VALUES(?1,'session',?2,?3,?4,'approval_request',?5)",
                 rusqlite::params![question,reply_session,(created*1000.0) as i64,actor,reply_id])?;
             let ask = conn.last_insert_rowid();
             conn.execute("INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,why,created_at,expires_at,status,mode,target_incarnation,actor_incarnation,reply_session,reply_incarnation,shown_row,change_spec,ask_row,ask_text,resolution_note) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'pending',?13,?14,?15,?16,?17,NULL,?19,?18,?20,'awaiting exact native owner assistant turn')",
                 rusqlite::params![id,actor,class,action,target,method,path,body,sentence,why,created,created+GRANT_TTL_S,mode_str(mode()),target_id,actor_id,reply_session,reply_id,ask,change,question])?;
+            conn.execute("UPDATE _amux_delegation_grants SET short_code=?2 WHERE code=?1", rusqlite::params![id,short])?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![crate::db::PendingEvent {
                 entity_type: amux_core::revision::EntityType::Message, entity_id: format!("MSG-{ask}"),
                 mutation: amux_core::revision::MutationKind::Created, payload: None,
@@ -493,7 +496,7 @@ pub(crate) fn request_explicit(state: &AppState, actor: &str, class: &str, targe
     };
     tracing::info!(request_id = %code, actor, reply_session, verdict = "delegation_request_created", measured = true, n_considered = 1, "approval question awaits the exact native owner assistant block");
     (StatusCode::ACCEPTED, Json(json!({"ok":true,"pending":true,"request_id":code,"grant_code":code,"sentence":text,
-        "reply_session":reply_session,"question":load(state, &code).and_then(|g|g.ask_text),"approval_block":super::delegation_requests::render_request(state, &code),"how":"Output approval_block verbatim as your entire next assistant reply. Only the very next native prompt in that same session decides. Apply with request_id"}))).into_response()
+        "short_code":load(state,&code).and_then(|g|g.short_code),"reply_session":reply_session,"question":load(state, &code).and_then(|g|g.ask_text),"approval_block":super::delegation_requests::render_request(state, &code),"how":"Output approval_block verbatim as your entire next assistant reply. Reply yes normally; use yes plus short_code when asked to confirm. Apply with request_id"}))).into_response()
 }
 
 /// Cite-mode applications spend the request's resolved reply; no new grant
@@ -539,12 +542,12 @@ fn validate_request_identity(state: &AppState, g: &GrantRow, actor: &str) -> Res
     }
     if g.shown_row.is_none() { return Err(("request_not_shown", "request was never shown in a reply session".into())); }
     let conn = state.store.read().map_err(|_|("request_read_failed", "request message ledger unavailable".into()))?;
-    let block = match g.ask_text.as_deref() {
-        Some(question) => super::delegation_requests::approval_block(&g.code,question),
+    let block = match super::delegation_requests::render_request(state, &g.code) {
+        Some(block) => block,
         None => return Err(("request_not_shown", "request has no question".into())),
     };
-    let shown: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM cmd_history WHERE id=?1 AND session=?2 AND delegation_session_incarnation=?3 AND repeat_of=?4 AND delivered_at=ts AND origin=session AND type='assistant' AND delivery='approval_pane_display' AND text=?5 AND approval_native_session IS NOT NULL)",
-        rusqlite::params![g.shown_row,g.reply_session,g.reply_incarnation,g.ask_row,block],|r|r.get(0))
+    let shown: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM cmd_history WHERE id=?1 AND session=?2 AND delegation_session_incarnation=?3 AND repeat_of=?4 AND delivered_at=ts AND origin=session AND type='assistant' AND delivery='approval_pane_display' AND (text=?5 OR text=?6) AND approval_native_session IS NOT NULL)",
+        rusqlite::params![g.shown_row,g.reply_session,g.reply_incarnation,g.ask_row,block,g.short_code.as_deref().zip(g.ask_text.as_deref()).map(|(code,question)|super::delegation_requests::confirm_block(code,question))],|r|r.get(0))
         .map_err(|_|("request_read_failed", "request message ledger unavailable".into()))?;
     if !shown { return Err(("request_not_shown", "the recorded question is absent from the reply session".into())); }
     drop(conn);
@@ -599,21 +602,24 @@ pub(crate) struct GrantRow {
     pub resolution_code: Option<String>,
     pub resolution_note: Option<String>,
     pub created_at: f64,
+    pub short_code: Option<String>,
+    pub approval_closed_at: Option<f64>,
+    pub confirm_required: bool,
 }
 
-const COLS: &str = "code, actor, class, action, target, method, path, body, sentence, status, expires_at, evidence_row, cited_excerpt, changes, ask_row, ask_text, reply_text, target_incarnation, cite_spent_at, actor_incarnation, reply_session, reply_incarnation, shown_row, change_spec, resolution_row, resolution_code, resolution_note, created_at";
+const COLS: &str = "code, actor, class, action, target, method, path, body, sentence, status, expires_at, evidence_row, cited_excerpt, changes, ask_row, ask_text, reply_text, target_incarnation, cite_spent_at, actor_incarnation, reply_session, reply_incarnation, shown_row, change_spec, resolution_row, resolution_code, resolution_note, created_at, short_code, approval_closed_at, confirm_required";
 
 fn map_row(r: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
     Ok(GrantRow {
         code: r.get(0)?, actor: r.get(1)?, class: r.get(2)?, action: r.get(3)?, target: r.get(4)?, method: r.get(5)?,
         path: r.get(6)?, body: r.get(7)?, sentence: r.get(8)?, status: r.get(9)?, expires_at: r.get(10)?, evidence_row: r.get(11)?,
-        cited_excerpt: r.get(12)?, changes: r.get(13)?, ask_row: r.get(14)?, ask_text: r.get(15)?, reply_text: r.get(16)?, target_incarnation: r.get(17)?, cite_spent_at: r.get(18)?, actor_incarnation: r.get(19)?, reply_session: r.get(20)?, reply_incarnation: r.get(21)?, shown_row: r.get(22)?, change_spec: r.get(23)?, resolution_row: r.get(24)?, resolution_code: r.get(25)?, resolution_note: r.get(26)?, created_at:r.get(27)?,
+        cited_excerpt: r.get(12)?, changes: r.get(13)?, ask_row: r.get(14)?, ask_text: r.get(15)?, reply_text: r.get(16)?, target_incarnation: r.get(17)?, cite_spent_at: r.get(18)?, actor_incarnation: r.get(19)?, reply_session: r.get(20)?, reply_incarnation: r.get(21)?, shown_row: r.get(22)?, change_spec: r.get(23)?, resolution_row: r.get(24)?, resolution_code: r.get(25)?, resolution_note: r.get(26)?, created_at:r.get(27)?, short_code:r.get(28)?, approval_closed_at:r.get(29)?, confirm_required:r.get(30)?,
     })
 }
 
 pub(crate) fn load(state: &AppState, code: &str) -> Option<GrantRow> {
     let conn = state.store.read().ok()?;
-    conn.query_row(&format!("SELECT {COLS} FROM _amux_delegation_grants WHERE code=?1"), [code.to_ascii_uppercase()], map_row).ok()
+    conn.query_row(&format!("SELECT {COLS} FROM _amux_delegation_grants WHERE code=?1 COLLATE NOCASE"), [code], map_row).ok()
 }
 
 fn set_status(state: &AppState, code: &str, from: &str, to: &str, by: &str, evidence: Option<i64>) -> bool {
@@ -872,7 +878,7 @@ async fn approve(State(state): State<AppState>, uri: Uri, headers: HeaderMap, Pa
         return r;
     }
     match apply(&state, &code, "owner:approve", None).await {
-        Ok(out) => Json(json!({"ok": true, "grant_code": code.to_ascii_uppercase(), "applied": true, "response": out})).into_response(),
+        Ok(out) => Json(json!({"ok": true, "grant_code": code, "applied": true, "response": out})).into_response(),
         Err((c, why)) => (StatusCode::CONFLICT, Json(super::delegation::refusal_body(c, &why))).into_response(),
     }
 }
@@ -1080,7 +1086,10 @@ fn request_view(g: &GrantRow) -> Value {
             "target_incarnation": g.target_incarnation, "cite_spent_at": g.cite_spent_at,
             "request_id": g.code, "created_at":g.created_at, "actor_incarnation":g.actor_incarnation, "reply_session":g.reply_session, "reply_incarnation":g.reply_incarnation,
             "shown_row":g.shown_row, "change":g.change_spec.as_deref().and_then(|s|serde_json::from_str::<Value>(s).ok()),
-            "approval_block":g.ask_text.as_deref().map(|question| super::delegation_requests::approval_block(&g.code,question)),
+            "short_code":g.short_code,"open":status=="pending" && g.approval_closed_at.is_none() && g.resolution_row.is_none(),
+            "approval_closed_at":g.approval_closed_at,"confirm_required":g.confirm_required,
+            "confirm_block":g.ask_text.as_deref().zip(g.short_code.as_deref()).filter(|_|g.confirm_required).map(|(question,code)|super::delegation_requests::confirm_block(code,question)),
+            "approval_block":g.ask_text.as_deref().zip(g.short_code.as_deref()).map(|(question,code)| super::delegation_requests::approval_block(code,question)),
             "resolution_row":g.resolution_row,"resolution_code":g.resolution_code,"resolution_note":g.resolution_note,
             "cited_excerpt": g.cited_excerpt, "ask_row": g.ask_row, "ask_text": g.ask_text, "reply_text": g.reply_text, "body": serde_json::from_str::<Value>(&g.body).unwrap_or(Value::Null)})
 }
@@ -1129,8 +1138,8 @@ fn list_rows(state: &AppState) -> Result<Vec<GrantRow>, String> {
 
 fn resolution_views(state: &AppState) -> Result<Vec<Value>, String> {
     let conn = state.store.read().map_err(|e|e.to_string())?;
-    let mut st = conn.prepare("SELECT reply_row,request_id,session,code,note FROM _amux_delegation_resolutions ORDER BY reply_row DESC LIMIT ?1").map_err(|e|e.to_string())?;
-    let rows = st.query_map([LIST_LIMIT_ROWS], |r| Ok(json!({"reply_row":r.get::<_,i64>(0)?,"request_id":r.get::<_,Option<String>>(1)?,"session":r.get::<_,String>(2)?,"code":r.get::<_,String>(3)?,"note":r.get::<_,String>(4)?}))).map_err(|e|e.to_string())?;
+    let mut st = conn.prepare("SELECT reply_row,request_id,session,code,note,approval_context FROM _amux_delegation_resolutions ORDER BY reply_row DESC LIMIT ?1").map_err(|e|e.to_string())?;
+    let rows = st.query_map([LIST_LIMIT_ROWS], |r| Ok(json!({"reply_row":r.get::<_,i64>(0)?,"request_id":r.get::<_,Option<String>>(1)?,"session":r.get::<_,String>(2)?,"code":r.get::<_,String>(3)?,"note":r.get::<_,String>(4)?,"approval_context":r.get::<_,Option<String>>(5)?}))).map_err(|e|e.to_string())?;
     rows.collect::<rusqlite::Result<_>>().map_err(|e|e.to_string())
 }
 
@@ -1392,7 +1401,8 @@ mod tests {
     fn a_code_uses_only_the_unambiguous_alphabet() {
         for _ in 0..50 {
             let c = new_code().unwrap();
-            assert_eq!(c.len(), CODE_LEN);
+            assert_eq!(c.len(), 4);
+            assert_eq!(ALPHABET,b"23456789ABCDEFGHJKMNPQRSTUVWXYZ");
             assert!(c.bytes().all(|b| ALPHABET.contains(&b)), "{c}");
         }
     }

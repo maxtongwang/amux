@@ -86,8 +86,7 @@ def main():
     requests = ROOT / "crates/amux-server/src/api/delegation_requests.rs"
     message = source_sql(grants, "INSERT INTO cmd_history(text,type,session,ts,origin,delivery,delegation_session_incarnation)")
     request = source_sql(grants, "INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,why,created_at,expires_at,status,mode,target_incarnation,actor_incarnation")
-    resolution = source_sql(requests, "INSERT INTO _amux_delegation_resolutions(")
-    candidates = source_sql(requests, "SELECT code,reply_incarnation,(SELECT ts FROM cmd_history WHERE id=shown_row),")
+    resolution = source_sql(requests.with_name("delegation_approval.rs"), "INSERT INTO _amux_delegation_resolutions(")
     claim = source_sql(grants, "UPDATE _amux_delegation_grants SET status='applying', decided_by=")
     with tempfile.TemporaryDirectory(prefix="amux-request-schema-") as tmp:
         database = Path(tmp) / "requests.db"
@@ -102,13 +101,12 @@ def main():
             shown = conn.execute(message, question).lastrowid
             row = ["REQ1", "actor", "mrpopo", "set_config:send_allow", "worker", "PATCH", "/api/sessions/worker/config", '{"send_allow":"one"}', "exact change", None, 1, 86401, "cite", "inc-worker", "inc-actor", "desk", "inc-desk", shown, '{"body":{"send_allow":"one"}}', question[0]]
             conn.execute(request, row)
-            assert conn.execute(candidates, ["desk", 0, shown+1]).fetchall() == []
-            display = source_sql(requests, "INSERT INTO cmd_history(session,text,type,origin,delivery,ts,delegation_session_incarnation,approval_native_session)")
+            display = source_sql(requests, "INSERT INTO cmd_history(session,text,type,origin,delivery,ts,delegation_session_incarnation,approval_native_session,approval_run,approval_sequence)")
             conn.commit()
-        display_args = ["desk", "Approval needed — REQ1\n" + question[0] + '\nReply "yes" to approve. Anything else declines.', 1500, "inc-desk", "native-desk"]
+        display_args = ["desk", "Approval needed — REQ1\n" + question[0] + '\nReply "yes" to approve. Anything else declines.', 1500, "inc-desk", "native-desk", "run", 1]
         receipt = source_sql(requests, "UPDATE cmd_history SET delivery='approval_pane_display',repeat_of=")
-        binding = source_sql(requests, "UPDATE _amux_delegation_grants SET resolution_code=NULL,resolution_note=")
-        followup = [[receipt, [None, shown], 0], [binding, ["REQ1", None], 1]]
+        binding = source_sql(requests, "UPDATE _amux_delegation_grants SET resolution_note=")
+        followup = [[receipt, [None, shown], 0], [binding, ["REQ1", None, "snapshot"], 1]]
         crash_probe(database, display, display_args, False, followup)
         with sqlite3.connect(database) as conn:
             assert conn.execute("SELECT COUNT(*) FROM cmd_history WHERE delivery IN ('native_assistant','approval_pane_display')").fetchone()[0] == 0
@@ -117,19 +115,16 @@ def main():
         with sqlite3.connect(database) as conn:
             displayed = conn.execute("SELECT shown_row FROM _amux_delegation_grants WHERE code='REQ1'").fetchone()[0]
             assert conn.execute("SELECT repeat_of,ts,delivered_at,approval_native_session FROM cmd_history WHERE id=?", [displayed]).fetchone() == (shown,1500,1500,"native-desk")
-            assert conn.execute(candidates, ["desk", displayed, displayed+1]).fetchone() == ("REQ1","inc-desk",1500,"native-desk")
-            assert conn.execute(candidates, ["elsewhere", 0, shown+1]).fetchall() == []
-            assert conn.execute(candidates, ["desk", shown, shown+1]).fetchall() == []
             duplicate = row.copy()
             duplicate[0] = "REQ2"
             conn.execute(request, duplicate)
             expect_constraint(conn, "UPDATE _amux_delegation_grants SET shown_row=? WHERE code='REQ2'", [displayed])  # One render receipt, one request.
             conn.execute("DELETE FROM _amux_delegation_grants WHERE code='REQ2'")
-            prompt = source_sql(requests, "INSERT INTO cmd_history(session,text,type,origin,delivery,ts,delegation_session_incarnation,approval_native_session,approval_wrapped)")
-            reply = conn.execute(prompt, ["desk","yes","approval_native_prompt",2000,"inc-desk","native-desk",False,"pane"]).lastrowid
+            prompt = source_sql(requests, "INSERT INTO cmd_history(session,text,type,origin,delivery,ts,delegation_session_incarnation,approval_native_session,approval_wrapped,approval_run,approval_sequence)")
+            reply = conn.execute(prompt, ["desk","yes","approval_native_prompt",2000,"inc-desk","native-desk",False,"pane","run",2]).lastrowid
             assert conn.execute("SELECT text,approval_native_session,approval_wrapped FROM cmd_history WHERE id=?",[reply]).fetchone() == ("yes","native-desk",0)
             conn.commit()
-        result = [reply, "REQ1", "desk", "request_resolved", "exactly one", 2]
+        result = [reply, "REQ1", "desk", "request_resolved", "exactly one", 2, "[amux approval] approved A7K2"]
         crash_probe(database, resolution, result, False)
         with sqlite3.connect(database) as conn:
             assert conn.execute("SELECT COUNT(*) FROM _amux_delegation_resolutions").fetchone()[0] == 0
@@ -137,8 +132,8 @@ def main():
         with sqlite3.connect(database) as conn:
             assert conn.execute("SELECT request_id FROM _amux_delegation_resolutions WHERE reply_row=?", [reply]).fetchone() == ("REQ1",)
             expect_constraint(conn, resolution, result)
-            expect_constraint(conn, resolution, [reply, "REQ2", "desk", "request_resolved", "duplicate reply", 3])
-            expect_constraint(conn, resolution, [reply+1, "REQ1", "desk", "request_resolved", "duplicate", 3])
+            expect_constraint(conn, resolution, [reply, "REQ2", "desk", "request_resolved", "duplicate reply", 3, None])
+            expect_constraint(conn, resolution, [reply+1, "REQ1", "desk", "request_resolved", "duplicate", 3, None])
             conn.execute("UPDATE _amux_delegation_grants SET resolution_row=? WHERE code='REQ1'", [reply])
             conn.execute(claim, ["actor", 2, reply, "REQ1"])
             assert conn.execute("SELECT status,evidence_row,cite_spent_at FROM _amux_delegation_grants WHERE code='REQ1'").fetchone() == ("applying", reply, 2)

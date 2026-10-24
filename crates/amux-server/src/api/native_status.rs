@@ -247,6 +247,7 @@ fn apply(
     } else {
         super::delegation_requests::native_owner_input(conn, name, event, launch)?
     };
+    if let Some(row)=native_input { super::delegation_requests::resolve_native(conn,row)?; }
     if event["event"] == "Stop" && event["subagent"] != true
         && event["worker_type"] != amux_core::worker_type::WorkerTypeId::CHAT {
         super::delegation_requests::native_assistant_turn(conn, name, event, launch)?;
@@ -372,6 +373,31 @@ pub(crate) async fn post(state: &AppState, name: &str, body: &Value) -> Response
         .await;
     match outcome {
         Ok(out) => {
+            // A lost ACK can repeat an already committed prompt. Adopt its
+            // decision by exact run/sequence/body, never by latest-row inference.
+            if !out.applied && event["event"] == "UserPromptSubmit"
+                && event["approval_live"] == true && generation(&worker)["run_id"] == event["run_id"] {
+                use rusqlite::OptionalExtension;
+                let retained=(|| -> Result<Option<String>,String> {
+                    let conn=state.store.read().map_err(|e|e.to_string())?;
+                    conn.query_row("SELECT r.approval_context FROM cmd_history h JOIN _amux_delegation_resolutions r ON r.reply_row=h.id WHERE h.session=?1 AND h.approval_run=?2 AND h.approval_sequence=?3 AND h.text=?4 AND h.approval_native_session IS ?5 AND h.delegation_session_incarnation=?6",
+                        rusqlite::params![worker,event["run_id"].as_str(),event["sequence"].as_i64(),event["prompt"].as_str(),event["session_id"].as_str().filter(|s|!s.is_empty()),super::delegation_requests::incarnation(&worker)],|r|r.get::<_,Option<String>>(0))
+                        .optional().map(Option::flatten).map_err(|e|e.to_string())
+                })();
+                if let Ok(Some(context))=retained {
+                    if !super::delegation_requests::prompt_wrapped(event["prompt"].as_str().unwrap_or("")) || context=="[amux approval] ignored reserved marker in prompt" {
+                        tracing::info!(session=worker,verdict="approval_context_receipt_adopted",measured=true,n_considered=1,"returning the exact committed hook decision after lost ACK");
+                        return Json(json!({"ok":true,"applied":false,"approval_context":context})).into_response();
+                    }
+                }
+            }
+            if !out.applied && event["event"] == "UserPromptSubmit" && super::delegation_requests::is_owner_session(&worker) {
+                match super::delegation_requests::ambiguous_native_input(state,&worker,&event) {
+                    Ok(Some(context))=>return Json(json!({"ok":true,"applied":false,"approval_context":context})).into_response(),
+                    Ok(None)=>{},
+                    Err(error)=>return (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"error":error}))).into_response(),
+                }
+            }
             title_native_input(state,&out);
             // Only an APPLIED edge: a duplicate or replayed observation of the
             // same submit must not write the prompt twice.
@@ -402,7 +428,19 @@ pub(crate) async fn post(state: &AppState, name: &str, body: &Value) -> Response
                     return (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"error":error}))).into_response();
                 }
             }
-            Json(json!({"ok":true,"applied":out.applied})).into_response()
+            let mut approval_lines=Vec::new();
+            if out.applied && event["event"] == "UserPromptSubmit" {
+                for edge in &out.events {
+                    if edge.entity_type != amux_core::revision::EntityType::Message { continue; }
+                    if let Some(id)=edge.entity_id.strip_prefix("MSG-").and_then(|v|v.parse::<i64>().ok()) {
+                        match super::delegation_requests::approval_context(state,id) {
+                            Ok(Some(line))=>approval_lines.push(line), Ok(None)=>{},
+                            Err(error)=>return (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"error":error}))).into_response(),
+                        }
+                    }
+                }
+            }
+            Json(json!({"ok":true,"applied":out.applied,"approval_context":approval_lines.join("\n")})).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -465,9 +503,10 @@ fn replay_run(state: &AppState, name: &str, dir: &Path) {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(body) = serde_json::from_str::<Value>(&raw) else {
+        let Ok(mut body) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
+        body["approval_live"]=json!(false); // Offline replay is never a live approval hook.
         let worker = name.to_owned();
         let prompt = submitted_prompt(&body);
         let submitted=body["event"] == "UserPromptSubmit";

@@ -11468,8 +11468,8 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
     }
     // Held-relay eligibility is a policy/state refusal; neither case permits
     // falling back to peer keystrokes into the owner pane.
-    if m.starts_with("held_relay_owner_managed_only") {
-        return (StatusCode::FORBIDDEN, Some("server held-relay submission requires a managed owner pane; use native delivery (#67) or let the server re-arm eligible held relays (#66)"));
+    if m.starts_with("held_relay_owner_skipped") || m.starts_with("held_relay_isolated_skipped") {
+        return (StatusCode::FORBIDDEN, Some("#66 skips owner and isolated sessions; use native delivery (#67) for owner messages"));
     }
     if m.starts_with("held_relay_identity_missing") {
         return (StatusCode::CONFLICT, Some("restore the worker's current incarnation before server held-relay recovery (#66); use native delivery (#67) while identity is unavailable"));
@@ -29938,35 +29938,28 @@ fn owner_pane_write_allowed(name: &str) -> bool {
     allowed
 }
 
-/// #66 integration seam: the server submits a relay it has already verified as
-/// held in this pane. Not an HTTP verb or owner proof; no arbitrary keys/text.
-/// Close durably BEFORE Enter, so hook loss or a restart cannot fund the draft.
-#[allow(dead_code)] // Wired by #66 after rebase; covered with the real report route.
-pub(crate) async fn submit_held_relay_non_owner(state: &AppState, name: &str) -> (bool, String) {
-    if !super::delegation_requests::is_owner_session(name) || session_is_isolated(name) {
-        tracing::warn!(session=name, verdict="held_relay_owner_managed_only", measured=true, n_considered=1,
-            alternative=super::delegation_requests::OWNER_KEYS_ALTERNATIVE,
-            "held relay submission requires a managed owner pane");
-        return (false,"held_relay_owner_managed_only".into());
+/// #66 submits verified held relays only outside the owner session. Owner
+/// delivery is native-only (#67); no recovery/re-arm may paste or press Enter.
+#[allow(dead_code)] // Wired by #66 after rebase; real execution fixture coverage.
+pub(crate) async fn submit_held_relay_non_owner(_state: &AppState, name: &str) -> (bool, String) {
+    if super::delegation_requests::is_owner_session(name) {
+        tracing::info!(session=name,verdict="held_relay_owner_skipped",reason="owner_session_native_delivery_only",measured=true,n_considered=1,
+            "held relay submission skips owner session; nothing is pasted there");
+        return (false,"held_relay_owner_skipped: owner_session_native_delivery_only".into());
     }
-    let Some(identity)=super::delegation_requests::incarnation(name) else {
-        tracing::warn!(session=name, verdict="held_relay_identity_missing", measured=true, n_considered=1,
-            alternative=super::delegation_requests::OWNER_KEYS_ALTERNATIVE,
-            "held relay retained until the current worker incarnation is restored");
+    if session_is_isolated(name) {
+        tracing::info!(session=name,verdict="held_relay_isolated_skipped",reason="isolated_transport_only",measured=true,n_considered=1,
+            "held relay recovery does not steer an isolated worker");
+        return (false,"held_relay_isolated_skipped".into());
+    }
+    if super::delegation_requests::incarnation(name).is_none() {
+        tracing::warn!(session=name,verdict="held_relay_identity_missing",measured=true,n_considered=1,
+            "held relay retained until current worker identity is available");
         return (false,"held_relay_identity_missing".into());
-    };
-    let boundary=state.store.write(|conn| {
-        super::delegation_requests::non_owner_submission(conn,super::delegation::OWNER_AGENT,"held_relay_server_submit")?;
-        Ok(crate::db::WriteOutcome { applied:true, events:vec![super::delegation_requests::input_event(conn.last_insert_rowid())] })
-    }).map_err(|e|e.to_string()).and_then(|_|super::delegation_requests::resolve_session(state,super::delegation::OWNER_AGENT));
-    if let Err(error)=boundary {
-        tracing::warn!(session=name, %error, verdict="held_relay_boundary_failed", measured=true, n_considered=1,
-            "held relay not submitted because its non-owner boundary could not commit");
-        return (false,format!("held_relay_boundary_failed: {error}"));
     }
-    let result=OWNER_PANE_WRITE.scope(identity,send_keys_op(name,"Enter")).await;
-    tracing::info!(session=name, submitted=result.0, verdict="held_relay_server_submit_non_owner", measured=true, n_considered=1,
-        "server held-relay Enter is non-owner input; no approval is funded");
+    let result=send_keys_op(name,"Enter").await;
+    tracing::info!(session=name,submitted=result.0,verdict="held_relay_server_submit_non_owner",measured=true,n_considered=1,
+        "server submitted non-owner held relay");
     result
 }
 
@@ -53568,7 +53561,7 @@ mod refusal_status_tests {
 
     #[test]
     fn held_relay_refusals_keep_policy_and_identity_statuses() {
-        for (msg,expected) in [("held_relay_owner_managed_only",StatusCode::FORBIDDEN),("held_relay_identity_missing",StatusCode::CONFLICT)] {
+        for (msg,expected) in [("held_relay_owner_skipped",StatusCode::FORBIDDEN),("held_relay_isolated_skipped",StatusCode::FORBIDDEN),("held_relay_identity_missing",StatusCode::CONFLICT)] {
             for message in [msg.to_string(),format!("auto-wake failed: {msg}")] {
                 let (code,hint)=send_failure_status(&message);
                 assert_eq!(code,expected,"{message}");
@@ -53576,7 +53569,6 @@ mod refusal_status_tests {
                 assert!(hint.contains("#66") && hint.contains("#67"),"{hint}");
             }
         }
-        assert_eq!(send_failure_status("held_relay_boundary_failed: database unavailable").0,StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// THE incident, pinned: 15 of the 19 errors in the 6h window on

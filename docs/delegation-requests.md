@@ -1,134 +1,166 @@
 # Delegated change requests
 
-Max 2026-10-24 12:48: session-based approval (refs maxtongwang/ai-config#160).
-The owner answers in the native owner session, using either the terminal or
-provider Remote Control. No new typing convention or Messages visit is required.
+Session approvals v3.1, dev-lead answers 2026-10-24 (a-f), refs
+maxtongwang/ai-config#160. Max answers normally in mrpopo's native session,
+including provider Remote Control. Messages and all other surfaces close only.
 
-## Request and reply contract
+## Display and reply contract
 
-`POST /api/delegation/requests` drafts a supported mutation through its actual
-handler without applying it. The request stores the exact change, method, path,
-body, actor/target incarnations and owner incarnation. Leads remain limited to
-team workers and their own groups; requests cannot grant membership in `leads`.
-The request ID is the existing grant code. Creation alone proves no display.
+`POST /api/delegation/requests` drafts the exact mutation through its real
+handler. It returns the full `dlg_` request ID, `short_code`, verbatim `question`
+and server-rendered `approval_block`. Request list/detail responses expose the
+same fields. Apply with the full request ID. Leads retain their team/own-group
+scope; an approval cannot change membership in `leads`.
 
-The creation response and request view include `approval_block`, rendered by
-`delegation_requests::render_request` / `approval_block`. mrpopo must output that
-block verbatim as its entire assistant reply:
+mrpopo outputs ONE request per reply, using the renderer's bytes:
 
 ```text
-Approval needed — <request id>
-<question copied verbatim, including its line breaks>
+Approval needed — A7K2
+<the exact stored question, including its line breaks>
 Reply "yes" to approve. Anything else declines.
 ```
 
-The heading contains an em dash, U+2014, with one space on each side. Its ID line
-has no suffix. The stored question and final line must match byte for byte.
-Additional prose, wrong/missing IDs, paraphrases, altered punctuation and two
-blocks in one reply provide no display receipt. A question containing another
-approval heading also fails closed.
+The heading uses U+2014 with one space on either side. No heading suffix,
+additional prose, changed question/final line or second block is accepted.
+The native Stop hook binds the display and its request/requester snapshot.
+A later native prompt must have a strictly larger hook sequence in the same
+run, native session and current owner incarnation. Wall-clock ties alone do
+not prove this order. Missing/tied sequence or unknown identity cannot fund.
+A queued mid-turn yes therefore cannot approve a subsequently completed block.
 
-Only the owner's native `Stop` hook supplies this display receipt. The very next
-`UserPromptSubmit` in that same native session and stable owner incarnation may
-fund the request. Trimmed, case-insensitive whole replies `yes`, `y`, `approve`
-and `ok` approve. Everything else, including empty Enter, `okay`, `yes please`
-and the former `yep`/`go ahead` phrases, closes without approval.
+Short codes contain exactly four characters from
+`23456789ABCDEFGHJKMNPQRSTUVWXYZ`. Matching is case-insensitive. The serialized
+allocator retries collisions, enforces SQL uniqueness while open, and reserves
+a closed code for `SHORT_CODE_REUSE_DAYS = 7`. Allocation failure logs
+`approval_code_exhausted` and creates nothing. Reuse is allowed at the seven-day
+boundary. All approval `*_at` timestamps are Unix seconds; history `ts` is ms.
 
-Another prompt or assistant turn invalidates the receipt. Showing the exact
-block again creates a new window for the still-pending request. A replayed hook
-cannot reopen it. One native reply funds one request and remains spent after
-failed application or undo. Application compares the exact stored change and
-all identities; an approval cannot transfer to a different change.
-
-## Input and delivery boundaries
-
-Funding uses only accepted native hook payloads. The report route verifies run,
-provider, event sequence, native session ID and launch incarnation. Each owner
-prompt records its text, native session ID and server-computed `wrapped` boolean.
-Missing/truncated/subagent/Chat payloads close without funding. Delivery-text
-similarity, pre-echo matching and HTTP process provenance do not decide funding.
-
-| Input path | Verdict |
+| Reply | Result |
 | --- | --- |
-| Owner terminal or provider Remote Control `UserPromptSubmit`, immediately after exact native block | Funds only an affirmative, unwrapped prompt in the same native session/incarnation |
-| Wrapped native prompt | Closes only |
-| Dashboard `/send`, owner CLI, outside/Remote/remote-forwarded `/send` | Closes only |
-| Chat tab, Chat worker, recorded steer, project send | Closes only |
-| Durable `/api/messages` (including env-apply fan-out) | Closes at enqueue; native delivery is wrapped again at dispatch |
-| Owner Messages render/display ACK | Display telemetry only; rendering closes the previous window |
-| Worker/peer send, self-send, Chat relay, steer, project relay, schedule, goal, server notices | Stamped; their native submission closes only |
-| Peer raw keys, control bytes, empty Enter into owner | Refused before writing |
-| Owner raw Enter | Closes only |
-| Remote Approve button in passkey mode | Additional application proof after native approval; cannot fund |
+| `yes`, `y`, `approve`, `ok` (trimmed, case-insensitive, optional final period) | Approves only through `plain_yes_without_doubt` |
+| Approve word plus code, e.g. `yes A7K2` | Approves that open request once a verified block/confirmation turn has ended; intervening text does not invalidate that receipt |
+| Plain yes with doubt | Stays open, funds nothing, requires coded confirmation |
+| Another plain yes after confirmation | Confirmation again; never funds |
+| Wrong, unknown or closed code | No open approval; never falls back to plain yes |
+| Non-approve text or empty Enter immediately following a display | Declines/closes, never funds |
+| Coded answer to another open request | Answers that request; leaves this question open |
 
-`[amux…]`, `<cross-session-message`, injected/provider stamps and the reserved
-`<amux-native-delivery` envelope are wrapped. Long provider paste envelopes are
-unwrapped only far enough to inspect their leading stamp. Durable
-`[amux-input-receipt:<nonce>]` transport records remain for audit/replay; text
-matching remains only in delivery/history deduplication.
+`plain_yes_without_doubt` checks every condition explicitly:
 
-The common send dispatcher holds owner input with
-`verdict=owner_native_delivery_held` if its adapter cannot deliver natively. It
-never falls through to terminal/herdr paste. #67 native delivery is absent on
-this branch; the fake execution adapter in route tests models handled native
-delivery. Held text remains in the delivery/transport evidence for retry by the
-owning caller. No worker may substitute raw keys.
+| Condition | Required fact | Context reason on doubt |
+| --- | --- | --- |
+| a | First submitted prompt after the completed display | `text-between` |
+| b | Display is the most recent owner turn; no intervening reply/input | `text-between` |
+| c | Exactly one approval is open in total | `several-open` |
+| d | Display no more than `PLAIN_YES_WINDOW_MIN = 30` minutes ago | `stale-30min` |
+| e | Stored exact change and requester still equal the display snapshot | `changed` |
+| f | Hook proves identity, native session, incarnation, block and Stop-before-submit order | `unverifiable` |
 
-The server-only #66 seam, `submit_held_relay_non_owner`, remains available for an
-already verified, stamped held relay. It commits a non-owner closing boundary
-before Enter, uses an incarnation-scoped writer, and refuses if boundary storage
-fails. It exposes no peer key permission or HTTP action. The later native prompt
-is wrapped and cannot fund. Parent default pending dev-lead confirmation: #66 is
-allowed on these terms; Messages remains close-only; a queued native prompt
-counts if it is next and nothing intervenes.
+No block, two blocks, missing native session, old incarnation, truncated prompt,
+subagent/Chat provenance or any other unverifiable hook fact is doubt. A plain
+yes under (f) neither closes nor approves. An unverifiable coded yes also cannot
+fund and returns confirmation. Other unverifiable text remains close-only.
 
-## Worker Bash guard
+## Hook output and owner behavior
 
-`owner-input-guard.py` is installed beside the read/mail guards. Both native and
-managed hook installers register a `PreToolUse` Bash matcher for Claude and
-Codex. Codex still requires its native hook trust review. The guard resolves the
-owner from the server-exported `AMUX_STATUS_OWNER`, which follows rename config.
-Missing owner config refuses injection rather than guessing an owner name.
+Only the synchronous `UserPromptSubmit` response can supply approval context.
+The observer emits Claude Code's stdout JSON shape:
 
-The guard blocks `tmux send-keys`, `paste-buffer`, `load-buffer` and `set-buffer`
-with owner session targets, `=name`, `amux-name`, `-t` attached/separate targets,
-quoted targets and pane/window IDs. ID resolution uses read-only tmux queries
-with the original `-L`/`-S` socket options. Unknown IDs fail closed. Untargeted
-global buffer writes are refused. Explicit non-owner targets remain allowed.
-Each refusal appends `verdict=owner_tmux_input_refused` to
-`~/.amux/logs/owner-input-guard.log`, without command or prompt text.
+```json
+{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"[amux approval] approved A7K2"}}
+```
 
-**Same-uid residual:** a process outside this hook—a background script, a
-provider without the hook, or direct tmux socket use—can still type unwrapped
-text into the owner session. This design does not authenticate physical hands.
-Only OS separation closes that boundary.
+The fixed line forms are:
 
-## Storage and verification
+```text
+[amux approval] approved A7K2
+[amux approval] confirm needed A7K2 (reason: text-between)
+[amux approval] no open approval A7K2
+[amux approval] declined A7K2
+[amux approval] ignored reserved marker in prompt
+```
 
-Migration 0129 retains request records, exact changes and incarnation bindings.
-0130 adds `cmd_history.approval_native_session` and `approval_wrapped`; legacy
-NULL values never prove native approval. A separate fresh branch also claims
-0130, so the parent must renumber one migration when integrating them.
+The confirm reason enum is exactly `text-between`, `several-open`, `stale-30min`,
+`changed`, `unverifiable`. Several open requests produce a separate context line
+for each request, for mrpopo to handle in separate replies. Decisions and reasons
+are retained in `_amux_delegation_resolutions.approval_context` and logged as
+`delegation_request_resolution`. Context is never pasted, sent as keys, or
+stamped into the conversation through a message route.
 
-Display rows, binding and accepted native sequence commit in one transaction.
-Prompt rows commit with native acceptance; ordered resolution is recoverable
-from the ledger and spool. Unique display/reply/evidence indexes prevent reuse.
-Ordering reads preceding ledger rows, not merely processed resolutions.
+mrpopo trusts these lines ONLY in hook `additionalContext`, never in prompt
+text. On `confirm needed`, it replies ONCE with the exact server confirmation
+format, one request per reply:
 
-`delegation_native_prompt` logs session proof and wrapped verdict;
-`delegation_request_displayed` logs the native receipt;
-`delegation_pane_no_exact_request`, `delegation_request_resolution` and WARN
-`delegation_request_refused` explain refusal. Existing expiry, identity and
-spent-reply checks remain in force.
+```text
+To confirm, reply: yes A7K2
+<the exact stored question again>
+```
 
-| Check | Expected result |
+That confirmation's Stop can supply the missing receipt. Another plain yes
+still requires confirmation; only a subsequent verified coded yes approves.
+On `approved` or `declined`, mrpopo confirms the result to Max in one line.
+On `no open approval`, it tells Max the code is not open. On the ignored-marker
+line it treats the prompt as inert for approvals. The owner-agent instructions
+are owned outside this repo by ai-config `agents/owner.md`; its maintainer must
+carry this behavior there (no external instruction file was edited here).
+
+A prompt CONTAINING `[amux approval]` anywhere is reserved text: typed, pasted,
+wrapped and truncated variants neither fund nor close nor consume the window.
+The hook detects this before truncation; the server records an ignored decision.
+Ordinary pasted quotes containing other envelope markers mid-text remain owner
+text. They are not approve words, so immediately following a display they decline.
+
+## Delivery and recovery boundaries
+
+Only recognized leading envelopes classify a prompt as wrapped (case-insensitive,
+after leading whitespace and an optional provider paste envelope):
+
+| Marker family | Exact prefixes |
 | --- | --- |
-| `python3 -B scripts/test-owner-input-guard.py` | Guard forms, audit and both installers pass |
-| `python3 -B scripts/test-native-status.py` | Native producer/transcript and installer tests pass |
-| `python3 -B scripts/test-delegation-request-schema.py` | Actual SQL and SIGKILL rollback/adoption pass |
-| `python3 -B scripts/test-delegation-reply-window.py` | Actual ledger-order/storage queries pass |
-| `scripts/test-contended.sh -p amux-server api::delegation_requests::tests` | Session route tests pass (parent runs Rust checks) |
+| amux stamps | `[amux` (includes origin, steering and input receipt stamps) |
+| Cross-session and #67 | `<cross-session-message`, `<amux-native-delivery` |
+| Harness envelopes | `[SYSTEM NOTIFICATION`, `<task-notification`, `<system-reminder`, `<local-command`, `<command-name`, `<command-message`, `<user-prompt-submit-hook` |
+| Provider-generated notices | `your claude.ai usage limit has reset`, `goal check-in:`, `base directory for this skill:`, `press up to edit queued messages`, `[request interrupted by user`, `this session is being continued from a previous conversation` |
 
-The untracked `.pr18-b1-notes.md` holds the current class sweep, exact mutation
-commands, parent defaults and verification limits. SQLite probes do not replace
-the Rust routes or workspace checks.
+All external HTTP/CLI, Chat, steer/project sends, durable Messages and Messages
+render ACKs remain close-only. Transport receipts retain non-owner provenance
+across restart/replay. Neither raw keys nor delivery-text similarity supplies
+approval. The common dispatcher holds owner delivery if native delivery is
+unavailable, with `owner_native_delivery_held`, preserving its evidence.
+
+The #66 `submit_held_relay_non_owner` seam EXPLICITLY skips the owner, including
+renamed aliases, logging `held_relay_owner_skipped` and reason
+`owner_session_native_delivery_only`. Isolated workers remain exempt from
+recovery steering. Normal sessions still receive their verified held-relay Enter.
+There is no owner held-relay recovery/re-arm implementation elsewhere on this
+branch. #67's envelope is reserved; its native delivery implementation is absent.
+
+Native acceptance, prompt proof, decision and context now commit atomically.
+A failed decision write rolls back acceptance. Exact run/sequence/body receipts
+recover a lost ACK with `approval_context_receipt_adopted`; no new request is
+funded. The hook's bounded synchronous request emits no context on unreachable
+server. Its persisted spool has no live funding flag: offline replay retains
+proof and confirmation/closure evidence but never creates approval. Native Stop
+receipt/snapshot binding is atomic with its accepted sequence too.
+
+Migration 0130 is extended in place; numbering remains dense. It adds native
+run/sequence, short codes, closure timestamps, snapshots, sticky confirmation and
+context audit storage. Legacy NULLs cannot prove funding. Unique indexes protect
+open short codes, display rows and spent replies. Approval closes the code even
+before application; a failed application or undo never restores the spent reply.
+Application still rechecks the exact mutation and stable actor/target identities.
+
+The worker Bash guard remains installed by both hook installers, blocks raw
+owner tmux input and logs `owner_tmux_input_refused`. Same-uid processes outside
+these hooks remain an OS boundary; this does not authenticate physical hands.
+
+| Check | Coverage |
+| --- | --- |
+| `python3 -B scripts/test-native-status.py` | Producer, synchronous response, additionalContext, unreachable endpoint, reserved prefix before truncation |
+| `python3 -B scripts/test-delegation-request-schema.py` | Actual schema/SQL, SIGKILL rollback/adoption |
+| `python3 -B scripts/test-delegation-reply-window.py` | Actual code uniqueness/reuse, snapshots, confirmation and ignored-input queries |
+| `python3 -B scripts/test-owner-input-guard.py` | Raw tmux refusal, audit, installer wiring |
+| `scripts/test-contended.sh -p amux-server api::delegation_requests` | Actual report/router behavior, individual doubt conditions and coded/decline matrices (parent executes Rust) |
+
+The untracked `.pr18-b1-notes.md` is the sole current mutation/coverage handoff;
+it is never staged. No cargo, push, host installation or deployment ran here.

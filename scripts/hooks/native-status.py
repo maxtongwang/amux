@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Passive provider lifecycle observer. No stdout, prompt changes or policy decisions.
+"""Native lifecycle observer and private UserPromptSubmit approval context bridge.
 
 Persist before delivery; the server replays pending events after an outage. The
 launch identity is inherited, never looked up afresh by an old hook process.
@@ -18,6 +18,8 @@ import urllib.request
 # A complete record must fit the tail; never acknowledge a truncated message.
 ASSISTANT_TAIL_BYTES = 1_048_576
 MAX_PROMPT_CHARS = 20_000
+HOOK_DELIVERY_TIMEOUT_S = 2.0
+MAX_DELIVERY_EVENTS = 512
 
 
 def assistant_message(data, provider):
@@ -82,31 +84,56 @@ def state_for(data):
             'SessionEnd': 'idle', 'StopFailure': 'error'}.get(event)
 
 
-def deliver(root, worker, run):
+def deliver(root, worker, run, submit_sequence=None):
     folder = root / 'status-events' / worker / run
+    deadline = time.monotonic() + HOOK_DELIVERY_TIMEOUT_S
     with (folder / 'deliver.lock').open('a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if submit_sequence is None or time.monotonic() >= deadline:
+                    return None
+                time.sleep(0.01)
         token = (root / 'auth_token').read_text().strip()
         context = ssl.create_default_context(cafile=str(root / 'tls' / 'cert.pem'))
-        for path in sorted(folder.glob('*.json')):
+        approval_context = None
+        for path in sorted(folder.glob('*.json'))[:MAX_DELIVERY_EVENTS]:
             if path.name == 'counter.json':
                 continue
+            if time.monotonic() >= deadline:
+                break
             payload = json.loads(path.read_text())
+            # Leave owner submits for their synchronous hook. The server's
+            # bounded replay can adopt abandoned files without funding them.
+            if payload.get('event') == 'UserPromptSubmit' and worker == os.environ.get('AMUX_STATUS_OWNER') and submit_sequence is None:
+                break
+            # Only the current synchronous hook may fund; outage replay is close-only.
+            payload['approval_live'] = payload.get('sequence') == submit_sequence
             url = os.environ['AMUX_STATUS_URL'] + '/api/sessions/' + worker + '/report'
             req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={
                 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json',
                 'X-Amux-Session': worker,
                 # Contract rule 10 (AH-387): the lane's minted identity.
                 **({'X-Amux-Worker-Token': os.environ['AMUX_WORKER_TOKEN']} if os.environ.get('AMUX_WORKER_TOKEN') else {})})
-            with urllib.request.urlopen(req, context=context, timeout=2) as response:
+            with urllib.request.urlopen(req, context=context, timeout=max(0.01, deadline-time.monotonic())) as response:
                 ack = json.load(response)
             if ack.get('ok'):
+                if payload.get('sequence') == submit_sequence:
+                    approval_context = ack.get('approval_context')
                 path.unlink(missing_ok=True)
             else:
                 break
+        return approval_context
+
+
+def approval_output(context):
+    # Only server responses enter this channel. Prompt text is never a signal.
+    if isinstance(context, str) and context:
+        return {'hookSpecificOutput': {'hookEventName': 'UserPromptSubmit',
+                                       'additionalContext': context}}
+    return None
 
 
 def observe(data, root, worker, run, provider, occurred_at):
@@ -146,6 +173,8 @@ def observe(data, root, worker, run, provider, occurred_at):
         if data.get('hook_event_name') == 'UserPromptSubmit' and isinstance(data.get('prompt'), str):
             payload['prompt'] = data['prompt'][:MAX_PROMPT_CHARS]
             payload['prompt_truncated'] = len(data['prompt']) > MAX_PROMPT_CHARS
+            # Detect the reserved prefix before truncation, including pasted/peer text.
+            payload['approval_reserved_marker'] = '[amux approval]' in data['prompt']
         # Only the owner's own completed turn can acknowledge pane display.
         # Carry verbatim text in the durable spool, never in fleet status.
         if worker == os.environ.get('AMUX_STATUS_OWNER', '') and not agent and data.get('hook_event_name') == 'Stop':
@@ -166,7 +195,7 @@ def observe(data, root, worker, run, provider, occurred_at):
                 out.flush()
                 os.fsync(out.fileno())
             temp.replace(path)
-    return True
+    return seq
 
 
 def main():
@@ -183,14 +212,20 @@ def main():
     provider = sys.argv[1] if len(sys.argv) > 1 else ''
     if provider not in ('codex', 'claude'):
         return
-    if observe(json.load(sys.stdin), root, worker, run, provider, occurred_at):
+    data = json.load(sys.stdin)
+    sequence = observe(data, root, worker, run, provider, occurred_at)
+    if sequence and data.get('hook_event_name') == 'UserPromptSubmit' and worker == os.environ.get('AMUX_STATUS_OWNER'):
+        output = approval_output(deliver(root, worker, run, sequence))
+        if output is not None:
+            print(json.dumps(output))
+    elif sequence:
         subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--deliver'],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
 
 
 if __name__ == '__main__':
-    # Observation must never block or alter the provider's turn. Pending files
+    # Bounded network errors emit no context and never fund on replay. Pending files
     # remain available to the server even if immediate network delivery fails.
     try:
         main()

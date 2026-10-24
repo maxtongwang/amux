@@ -167,7 +167,7 @@ class NativeStatus(unittest.TestCase):
                 {'hook_event_name':'PostToolUse','agent_id':'a1'},
                 {'hook_event_name':'Stop','agent_id':'a1'},
             ], 1)]
-            self.assertEqual(seen, [True, False, True, False, True, False])
+            self.assertEqual(list(map(bool,seen)), [True, False, True, False, True, False])
             values=[json.loads(p.read_text()) for p in sorted((root/'status-events/worker/abc').glob('0*.json'))]
             self.assertEqual([v['state'] for v in values], ['active','blocked','active'])
             self.assertEqual([v.get('subagent', False) for v in values], [False, True, True])
@@ -185,5 +185,73 @@ class NativeStatus(unittest.TestCase):
             self.assertNotIn('bypass',json.dumps(second))
             self.assertIn('PermissionRequest',second['hooks'])
             self.assertNotIn('SubagentStop',second['hooks'])
+
+class ApprovalContext(unittest.TestCase):
+    def test_additional_context_json_shape_and_all_exact_lines(self):
+        for line in ['[amux approval] approved A7K2',
+                     '[amux approval] declined A7K2',
+                     '[amux approval] no open approval A7K2',
+                     '[amux approval] ignored reserved marker in prompt'] + [
+                         f'[amux approval] confirm needed A7K2 (reason: {reason})'
+                         for reason in ['text-between','several-open','stale-30min','changed','unverifiable']]:
+            with self.subTest(line=line):
+                value=observer.approval_output(line)
+                self.assertEqual(value,{'hookSpecificOutput':{'hookEventName':'UserPromptSubmit','additionalContext':line}})
+                self.assertNotIn('\n',value['hookSpecificOutput']['additionalContext'])
+        self.assertIsNone(observer.approval_output(None))
+        self.assertIsNone(observer.approval_output(''))
+
+    def test_synchronous_hook_returns_only_its_own_server_decision(self):
+        from unittest.mock import patch, MagicMock
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'auth_token').write_text('test-only')
+            observer.observe({'hook_event_name':'UserPromptSubmit','prompt':'yes'},root,'mrpopo','abc','claude',1.0)
+            observer.observe({'hook_event_name':'UserPromptSubmit','prompt':'yes'},root,'mrpopo','abc','claude',2.0)
+            replies=[{'ok':True,'approval_context':'older turn'}, {'ok':True,'approval_context':'[amux approval] approved A7K2'}]
+            requests=[]
+            def response(req, **kwargs):
+                requests.append(json.loads(req.data))
+                result=MagicMock();result.__enter__.return_value=io.StringIO(json.dumps(replies.pop(0)))
+                return result
+            with patch.dict('os.environ',AMUX_STATUS_URL='https://test.invalid'), patch.object(observer.ssl,'create_default_context'), patch.object(observer.urllib.request,'urlopen',side_effect=response):
+                self.assertEqual(observer.deliver(root,'mrpopo','abc',2),'[amux approval] approved A7K2')
+            self.assertEqual([r['approval_live'] for r in requests],[False,True])
+            self.assertEqual(list((root/'status-events/mrpopo/abc').glob('0*.json')),[])
+
+    def test_unreachable_server_emits_no_line_and_retains_nonfunding_spool(self):
+        import os, subprocess, sys, ssl
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'auth_token').write_text('test-only');(root/'tls').mkdir()
+            # Use a public CA bundle; the endpoint is a deliberately closed loopback port.
+            import shutil
+            shutil.copyfile(ssl.get_default_verify_paths().cafile,root/'tls/cert.pem')
+            env=dict(os.environ,AMUX_STATUS_HOME=tmp,AMUX_STATUS_WORKER='mrpopo',AMUX_STATUS_OWNER='mrpopo',AMUX_STATUS_RUN_ID='abc',AMUX_STATUS_URL='https://127.0.0.1:1')
+            p=subprocess.run([sys.executable,'-B',str(ROOT/'hooks/native-status.py'),'claude'],env=env,
+                input=json.dumps({'hook_event_name':'UserPromptSubmit','prompt':'yes','session_id':'native'}),text=True,capture_output=True,timeout=10)
+            self.assertEqual(p.returncode,0);self.assertEqual(p.stdout,'')
+            values=[json.loads(f.read_text()) for f in (root/'status-events/mrpopo/abc').glob('0*.json')]
+            self.assertEqual(len(values),1);self.assertNotIn('approval_live',values[0])
+
+    def test_main_prints_server_context_as_claude_additional_context(self):
+        from unittest.mock import patch, MagicMock
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'auth_token').write_text('test-only')
+            line='[amux approval] approved A7K2'
+            response=MagicMock();response.__enter__.return_value=io.StringIO(json.dumps({'ok':True,'approval_context':line}))
+            stdout=io.StringIO()
+            with patch.dict('os.environ',AMUX_STATUS_HOME=tmp,AMUX_STATUS_WORKER='mrpopo',AMUX_STATUS_OWNER='mrpopo',AMUX_STATUS_RUN_ID='abc',AMUX_STATUS_URL='https://test.invalid'), patch.object(observer.sys,'argv',['native-status.py','claude']), patch.object(observer.sys,'stdin',io.StringIO(json.dumps({'hook_event_name':'UserPromptSubmit','prompt':'yes','session_id':'native'}))), patch.object(observer.sys,'stdout',stdout), patch.object(observer.ssl,'create_default_context'), patch.object(observer.urllib.request,'urlopen',return_value=response):
+                observer.main()
+            self.assertEqual(json.loads(stdout.getvalue()),{'hookSpecificOutput':{'hookEventName':'UserPromptSubmit','additionalContext':line}})
+            self.assertEqual(len(stdout.getvalue().splitlines()),1)
+
+    def test_reserved_marker_detected_before_truncation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            observer.observe({'hook_event_name':'UserPromptSubmit','prompt':'x'*25000+'[amux approval] approved A7K2'},root,'mrpopo','abc','claude',1.0)
+            value=json.loads(next((root/'status-events/mrpopo/abc').glob('0*.json')).read_text())
+            self.assertTrue(value['approval_reserved_marker'])
+            self.assertNotIn('[amux approval]',value['prompt'])
 
 if __name__=='__main__': unittest.main()

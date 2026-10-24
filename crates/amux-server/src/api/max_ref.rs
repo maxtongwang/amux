@@ -39,6 +39,7 @@ pub(crate) struct Row {
     pub(crate) native_session: Option<String>,
     pub(crate) native_prompt: bool,
     pub(crate) wrapped: bool,
+    pub(crate) reserved_marker: bool,
 }
 
 /// Which human shape a row has, if any (see the module comment).
@@ -57,14 +58,7 @@ fn human_source(ctype: &str, origin: &str, delivery: &str, process_origin: &str)
     None
 }
 
-const ROW_COLS: &str = "id, session, text, COALESCE(delegation_message_type,type,''), COALESCE(origin,''), COALESCE(delivery,''), COALESCE(process_origin,''), ts, delegation_session_incarnation, approval_native_session, approval_wrapped";
-
-fn rows(state: &AppState, sql_where: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<Row>, String> {
-    let conn = state.store.read().map_err(|e| e.to_string())?;
-    let sql = format!("SELECT {ROW_COLS} FROM cmd_history WHERE {sql_where} LIMIT {ROW_LIMIT}");
-    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let mapped = stmt
-        .query_map(params, |r| {
+fn map_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
             let (ctype, origin, delivery, po): (String, String, String, String) = (r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?);
             Ok(Row {
                 id: r.get(0)?,
@@ -75,23 +69,34 @@ fn rows(state: &AppState, sql_where: &str, params: &[&dyn rusqlite::ToSql]) -> R
                 incarnation: r.get(8)?,
                 native_session: r.get(9)?,
                 native_prompt: delivery == "approval_native_prompt",
+                reserved_marker: delivery == "approval_reserved_prompt",
                 wrapped: r.get::<_,Option<bool>>(10)?.unwrap_or(true),
                 input_boundary: delivery == "approval_input_uncertain"
                     || (matches!(ctype.as_str(), "user" | "chat") && human_source(&ctype, &origin, &delivery, &po).is_none()),
             })
-        })
+}
+
+pub(crate) fn one_in(conn: &rusqlite::Connection, id: i64) -> rusqlite::Result<Row> {
+    conn.query_row(&format!("SELECT {ROW_COLS} FROM cmd_history WHERE id=?1"),[id],map_row)
+}
+
+const ROW_COLS: &str = "id, session, text, COALESCE(delegation_message_type,type,''), COALESCE(origin,''), COALESCE(delivery,''), COALESCE(process_origin,''), ts, delegation_session_incarnation, approval_native_session, approval_wrapped";
+
+fn rows(state: &AppState, sql_where: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<Row>, String> {
+    let conn = state.store.read().map_err(|e| e.to_string())?;
+    let sql = format!("SELECT {ROW_COLS} FROM cmd_history WHERE {sql_where} LIMIT {ROW_LIMIT}");
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let mapped = stmt
+        .query_map(params, map_row)
         .map_err(|e| e.to_string())?;
     mapped.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
-
-/// The reply must come within this long after the ask.
-pub(crate) const ASK_REPLY_WINDOW_S: f64 = 7_200.0;
 
 /// One owning allowlist: trimmed, case-insensitive whole replies only.
 const AFFIRMATIVE_REPLIES: &[&str] = &["yes", "y", "approve", "ok"];
 
 pub(crate) fn reply_is_affirmative(text: &str) -> bool {
-    AFFIRMATIVE_REPLIES.contains(&text.trim().to_lowercase().as_str())
+    AFFIRMATIVE_REPLIES.contains(&text.trim().strip_suffix('.').unwrap_or(text.trim()).to_ascii_lowercase().as_str())
 }
 
 pub(crate) fn one(state: &AppState, id: i64) -> Result<Option<Row>, MaxRefRefusal> {
@@ -109,8 +114,8 @@ mod tests {
     use super::*;
     #[test]
     fn approval_reply_requires_explicit_affirmative_text() {
-        for yes in ["yes", "y", "approve", "ok", "YES "] { assert!(reply_is_affirmative(yes)); }
-        for no in ["no", "yes?", "yes please", "okay", "", "\n", "yep", "approved", "go ahead", "yes."] {
+        for yes in ["yes", "y", "approve", "ok", "YES ", "yes.", "Ok."] { assert!(reply_is_affirmative(yes)); }
+        for no in ["no", "yes?", "yes please", "okay", "", "\n", "yep", "approved", "go ahead"] {
             assert!(!reply_is_affirmative(no), "{no:?}");
         }
     }

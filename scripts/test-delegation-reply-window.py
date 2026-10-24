@@ -1,167 +1,69 @@
 #!/usr/bin/env python3
-"""Run actual storage queries; AMUX_DELEGATION_SOURCE_ROOT selects a baseline.
-
-SQLite evidence only. The Rust route suite proves recorder/resolver wiring.
-"""
+"""Exercise v3.1's actual SQLite queries and constraints; Rust owns decisions."""
 import importlib.util
-import os
 from pathlib import Path
 import sqlite3
 import unittest
 
-ROOT = Path(__file__).resolve().parents[1]
-SOURCE = Path(os.environ.get("AMUX_DELEGATION_SOURCE_ROOT", ROOT))
-REQUESTS = SOURCE / "crates/amux-server/src/api/delegation_requests.rs"
-GRANTS = SOURCE / "crates/amux-server/src/api/delegation_grants.rs"
-spec = importlib.util.spec_from_file_location("request_schema", ROOT / "scripts/test-delegation-request-schema.py")
-schema = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(schema)
+ROOT=Path(__file__).resolve().parents[1]
+spec=importlib.util.spec_from_file_location('schema',ROOT/'scripts/test-delegation-request-schema.py')
+schema=importlib.util.module_from_spec(spec);spec.loader.exec_module(schema)
+API=ROOT/'crates/amux-server/src/api'
 
-
-class ReplyWindowStorage(unittest.TestCase):
+class ApprovalStorage(unittest.TestCase):
     def setUp(self):
-        self.conn = sqlite3.connect(":memory:")
-        self.addCleanup(self.conn.close)
+        self.conn=sqlite3.connect(':memory:');self.addCleanup(self.conn.close)
         schema.migrate(self.conn)
-        self.candidates = schema.source_sql(REQUESTS, "SELECT code,reply_incarnation,(SELECT ts FROM cmd_history WHERE id=shown_row),")
-        self.current = 'SELECT COALESCE(MAX(id),0)' in REQUESTS.read_text()
-        self.boundary = schema.source_sql(REQUESTS, "SELECT COALESCE(MAX(id),0)" if self.current else "SELECT COALESCE(MAX(reply_row),0)")
+        self.request=schema.source_sql(API/'delegation_grants.rs','INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,why,created_at,expires_at,status,mode,target_incarnation,actor_incarnation')
 
-    def message(self, text, ty="user", origin="pane", delivery="pane", session="desk", process=None):
-        return self.conn.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts,process_origin) VALUES(?,?,?,?,?,2000,?)", [session,text,ty,origin,delivery,process]).lastrowid
+    def add(self,id='dlg_one',code='A7K2'):
+        self.conn.execute(self.request,[id,'lead','lead','config','worker','PATCH','/config','{}','question',None,1,2_000_000,'cite','target-inc','lead-inc','mrpopo','owner-inc',None,'{}','Exact question?'])
+        self.conn.execute('UPDATE _amux_delegation_grants SET short_code=? WHERE code=?',[code,id])
 
-    def request(self, code="REQ1", displayed=True, refusal=None):
-        question = ["Approval request " + code, "desk", 1000, "actor", "inc-desk"]
-        ask = self.conn.execute(schema.source_sql(GRANTS, "INSERT INTO cmd_history(text,type,session,ts,origin,delivery,delegation_session_incarnation)"), question).lastrowid
-        args = [code,"actor","lead","set_config","worker","PATCH","/api/sessions/worker/config","{}","question",None,1,86401,"cite","inc-worker","inc-actor","desk","inc-desk",ask,"{}",question[0]]
-        self.conn.execute(schema.source_sql(GRANTS, "INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,why,created_at,expires_at,status,mode,target_incarnation,actor_incarnation"), args)
-        shown = ask
-        if displayed and self.current:
-            query = schema.source_sql(REQUESTS, "INSERT INTO cmd_history(session,text,type,origin,delivery,ts,delegation_session_incarnation,approval_native_session)")
-            shown = self.conn.execute(query, ["desk",question[0],1500,"inc-desk","native-desk"]).lastrowid
-            self.conn.execute(schema.source_sql(REQUESTS,"UPDATE cmd_history SET delivery='approval_pane_display',repeat_of="),[shown,ask])
-            self.conn.execute("UPDATE _amux_delegation_grants SET shown_row=? WHERE code=?", [shown,code])
-        self.conn.execute("UPDATE _amux_delegation_grants SET resolution_code=? WHERE code=?", [refusal,code])
-        return shown
+    def test_short_code_unique_only_while_open_case_insensitive(self):
+        self.add()
+        with self.assertRaises(sqlite3.IntegrityError): self.add('dlg_two','a7k2')
+        self.conn.execute("UPDATE _amux_delegation_grants SET approval_closed_at=1 WHERE code='dlg_one'")
+        self.conn.execute("UPDATE _amux_delegation_grants SET short_code='a7k2' WHERE code='dlg_two'")
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM _amux_delegation_grants').fetchone(),(2,))
 
-    def eligible(self, reply):
-        latest = self.conn.execute(self.boundary, ["desk", reply]).fetchone()[0]
-        return self.conn.execute(self.candidates, ["desk",latest,reply]).fetchall()
+    def test_code_reuse_query_seven_day_boundary_and_open_collision(self):
+        self.add()
+        query=schema.source_sql(API/'delegation_approval.rs','SELECT EXISTS(SELECT 1 FROM _amux_delegation_grants WHERE short_code=')
+        self.assertEqual(self.conn.execute(query,['a7k2',9999999]).fetchone(),(1,))
+        self.conn.execute('UPDATE _amux_delegation_grants SET approval_closed_at=100')
+        for seconds,expected in [(100+7*86400-1,1),(100+7*86400,0),(100+7*86400+1,0)]:
+            self.assertEqual(self.conn.execute(query,['A7K2',seconds-7*86400]).fetchone(),(expected,))
 
-    def test_probe_unrelated_yes_without_display_evidence_funds_hidden_request(self):
-        self.request(displayed=False)
-        self.assertEqual(self.eligible(self.message("yes")), [])
+    def test_status_closure_retains_code(self):
+        self.add();self.conn.execute("UPDATE _amux_delegation_grants SET status='expired'")
+        closed=self.conn.execute('SELECT approval_closed_at,short_code FROM _amux_delegation_grants').fetchone()
+        self.assertIsInstance(closed[0],float);self.assertEqual(closed[1],'A7K2')
 
-    def test_probe_unprocessed_intervening_owner_row_does_not_leave_window_open(self):
-        self.request()
-        self.message("what is the build status?")  # No resolution / on_row.
-        self.assertEqual(self.eligible(self.message("yes")), [])
+    def test_snapshot_contains_requester_and_exact_operands(self):
+        self.add()
+        query=schema.source_sql(API/'delegation_approval.rs','SELECT actor,actor_incarnation,change_spec,method,path,body,ask_text,target_incarnation,reply_incarnation FROM')
+        original=self.conn.execute(query,['dlg_one']).fetchone()
+        for field in ['actor','actor_incarnation','change_spec','method','path','body','ask_text','target_incarnation','reply_incarnation']:
+            with self.subTest(field=field):
+                self.conn.execute('SAVEPOINT edit')
+                self.conn.execute(f"UPDATE _amux_delegation_grants SET {field}='different'")
+                self.assertNotEqual(self.conn.execute(query,['dlg_one']).fetchone(),original)
+                self.conn.execute('ROLLBACK TO edit')
 
-    def test_immediate_yes_funds_latest_display_only(self):
-        self.request("OLD")
-        self.request("NEW")
-        self.assertEqual([r[0] for r in self.eligible(self.message("yes"))], ["NEW"])
+    def test_confirmation_stays_open_in_actual_candidate_query(self):
+        self.add();query=schema.source_sql(API/'delegation_approval.rs','SELECT g.code,g.short_code,g.shown_row,h.ts/1000.0')
+        self.conn.execute("UPDATE _amux_delegation_grants SET confirm_required=1,resolution_code='request_confirm_needed'")
+        self.assertEqual(len(self.conn.execute(query,[100,501]).fetchall()),1)
+        self.conn.execute('UPDATE _amux_delegation_grants SET approval_closed_at=100')
+        self.assertEqual(self.conn.execute(query,[100,501]).fetchall(),[])
 
-    def test_owner_output_closes_window(self):
-        for ty in ["assistant", "session"]:
-            with self.subTest(ty=ty):
-                self.request("OUTPUT" + ty)
-                self.message("another question", ty, "desk", "direct")
-                self.assertEqual(self.eligible(self.message("yes")), [])
+    def test_reserved_prompt_is_not_an_intervening_boundary(self):
+        query=schema.source_sql(API/'delegation_approval.rs','SELECT COALESCE(MAX(id),0)')
+        self.conn.execute("INSERT INTO cmd_history(session,text,type,delivery) VALUES('mrpopo','shown','assistant','approval_pane_display')")
+        shown=self.conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        self.conn.execute("INSERT INTO cmd_history(session,text,type,delivery) VALUES('mrpopo','long truncated prefix','user','approval_reserved_prompt')")
+        self.conn.execute("INSERT INTO cmd_history(session,text,type,delivery) VALUES('mrpopo','paste [amux approval] approved A7K2','user','approval_native_prompt')")
+        self.assertEqual(self.conn.execute(query,['mrpopo',999]).fetchone(),(shown,))
 
-    def test_unprocessed_owner_send_closes_window_for_every_route_shape(self):
-        for ty in ["user", "chat"]:
-            for delivery in ["direct", "queued"]:
-                for process in ["outside", "remote", "remote-forwarded"]:
-                    with self.subTest(ty=ty, delivery=delivery, process=process):
-                        self.request(ty+delivery+process)
-                        self.message("wait", ty, "", delivery, process=process)
-                        self.assertEqual(self.eligible(self.message("yes")), [])
-
-    def test_peer_notice_does_not_close_window(self):
-        self.request()
-        self.message("notice", "session", "lead", "direct", process="worker")
-        self.assertEqual([r[0] for r in self.eligible(self.message("yes"))], ["REQ1"])
-
-    def test_recorded_owner_worker_self_send_is_non_owner_input(self):
-        self.request()
-        row=self.message("yes","session","desk","direct")
-        self.conn.execute("UPDATE cmd_history SET delegation_message_type='session' WHERE id=?",[row])
-        self.assertEqual([r[0] for r in self.eligible(self.message("yes"))],["REQ1"])
-
-    def test_uncertain_or_discarded_owner_input_closes_window_without_resolution(self):
-        for delivery in ["approval_input_uncertain", "direct", "queued", "unknown"]:
-            with self.subTest(delivery=delivery):
-                self.request("UNCERTAIN" + delivery)
-                self.message("discarded", delivery=delivery, origin="", process=None)
-                self.assertEqual(self.eligible(self.message("yes")), [])
-
-    def test_refused_request_is_never_a_candidate_without_a_boundary(self):
-        for index, code in enumerate(["request_reply_not_affirmative", "request_ambiguous", "request_reply_identity_changed", "request_reply_outside_window", ""]):
-            with self.subTest(code=code):
-                shown = self.request("REF" + str(index), refusal=code)
-                reply = self.message("yes")
-                # Pass the display directly: isolate refusal from next-input guard.
-                self.assertEqual(self.conn.execute(self.candidates,["desk",shown,reply]).fetchall(), [])
-                self.conn.execute("UPDATE _amux_delegation_grants SET resolution_code=NULL WHERE shown_row=?", [shown])
-                self.assertEqual(len(self.conn.execute(self.candidates,["desk",shown,reply]).fetchall()), 1)
-
-    def test_future_display_row_cannot_hide_current_input_from_reconciliation(self):
-        query = schema.source_sql(REQUESTS, "SELECT id FROM cmd_history WHERE session=?1 AND id >= COALESCE")
-        for offset in [0, 1]:
-            with self.subTest(offset=offset):
-                self.conn.execute("DELETE FROM _amux_delegation_grants")
-                self.conn.execute("DELETE FROM cmd_history")
-                shown = self.request("FUTURE" + str(offset))
-                reply = self.message("yes")
-                self.conn.execute("UPDATE _amux_delegation_grants SET shown_row=? WHERE shown_row=?", [reply + offset, shown])
-                self.assertIn((reply,), self.conn.execute(query, ["desk", 501]).fetchall())
-                self.assertEqual(self.eligible(reply), [])
-
-    def test_transport_receipt_is_non_owner_and_incarnation_bound(self):
-        for col in ["msg_id TEXT", "submit_verdict TEXT"]:
-            self.conn.execute("ALTER TABLE cmd_history ADD COLUMN " + col)
-        query = schema.source_sql(REQUESTS, "INSERT INTO cmd_history(session,msg_id,text,type,origin,delivery,ts,delegation_session_incarnation,delegation_message_type)")
-        known = schema.source_sql(REQUESTS, "SELECT EXISTS(SELECT 1 FROM cmd_history WHERE session=?1 AND msg_id=?2 AND delivery='approval_transport'")
-        self.request()
-        token = "a" * 32
-        payload = '[amux-origin: peer]\n\nyes\n"quoted audit text"'
-        row = self.conn.execute(query, {"1":"desk", "2":token, "3":2000, "4":"inc-desk", "5":payload}).lastrowid
-        self.assertEqual(self.conn.execute("SELECT text,origin,delivery FROM cmd_history WHERE id=?", [row]).fetchone(),
-                         (payload, "amux", "approval_transport"))
-        self.assertEqual(self.conn.execute(known, ["desk",token,"inc-desk"]).fetchone(), (1,))
-        for args in [["desk",token,"old-inc"], ["other",token,"inc-desk"], ["desk","b"*32,"inc-desk"]]:
-            self.assertEqual(self.conn.execute(known,args).fetchone(), (0,))
-        self.assertEqual(self.conn.execute("SELECT delegation_message_type,process_origin FROM cmd_history WHERE id=?",[row]).fetchone(), ("session",None))
-        self.assertEqual([r[0] for r in self.eligible(self.message("yes"))], ["REQ1"])
-
-    def test_unverified_native_boundary_cannot_fund_or_leave_window_open(self):
-        query = schema.source_sql(REQUESTS, "INSERT INTO cmd_history(session,text,type,origin,delivery,ts) VALUES(?1,'Discarded or uncertain owner input'")
-        self.request()
-        self.conn.execute(query, ["desk",2000])
-        self.assertEqual(self.eligible(self.message("yes")), [])
-
-    def test_transport_receipt_survives_sigkill_without_owner_provenance(self):
-        import tempfile
-        with tempfile.TemporaryDirectory(prefix="owner-transport-crash-") as tmp:
-            database = Path(tmp) / "receipt.db"
-            with sqlite3.connect(database) as conn:
-                schema.migrate(conn)
-                conn.execute("ALTER TABLE cmd_history ADD COLUMN msg_id TEXT")
-            query = schema.source_sql(REQUESTS, "INSERT INTO cmd_history(session,msg_id,text,type,origin,delivery,ts,delegation_session_incarnation,delegation_message_type)")
-            known = schema.source_sql(REQUESTS, "SELECT EXISTS(SELECT 1 FROM cmd_history WHERE session=?1 AND msg_id=?2 AND delivery='approval_transport'")
-            args = ["desk", "a"*32, 2000, "inc-desk", "yes"]
-            schema.crash_probe(database,query,args,False)
-            with sqlite3.connect(database) as conn:
-                self.assertEqual(conn.execute(known,["desk",args[1],"inc-desk"]).fetchone(),(0,))
-            schema.crash_probe(database,query,args,True)
-            with sqlite3.connect(database) as conn:
-                for _ in range(2):
-                    self.assertEqual(conn.execute(known,["desk",args[1],"inc-desk"]).fetchone(),(1,))
-                self.assertEqual(conn.execute("SELECT text,origin,delivery FROM cmd_history").fetchall(),
-                                 [("yes", "amux", "approval_transport")])
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM cmd_history WHERE type='user' OR process_origin IS NOT NULL").fetchone(),(0,))
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+if __name__=='__main__': unittest.main(verbosity=2)
