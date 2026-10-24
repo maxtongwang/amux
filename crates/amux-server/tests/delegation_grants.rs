@@ -110,9 +110,9 @@ async fn peer_echo_no_never_reopens_refused_request_p1() {
 }
 
 #[tokio::test]
-async fn peer_messages_never_close_a_pending_request_window() {
-    // Peer input must not advance the boundary either, including a projected
-    // row with a misleading process verdict but retained peer provenance.
+async fn peer_rows_preserve_windows_but_uncertain_user_shapes_close_them() {
+    // Actual peer rows retain session provenance, including project projection.
+    // Legacy user/chat rows without owner proof are uncertain input boundaries.
     for (ty,projected) in [("session",false),("chat",false),("user",false),("session",true)] {
         let e=setup().await;
         e.type_in_pane(MAX_PANE,"wait").await;
@@ -126,12 +126,16 @@ async fn peer_messages_never_close_a_pending_request_window() {
             }).unwrap();
         }
         e.type_in_pane(MAX_PANE,"yes").await;
-        recorded_resolution(&e,"request_resolved");
+        recorded_resolution(&e,if ty == "session" { "request_resolved" } else { "request_no_candidate" });
         let (st,v)=apply(&e,DEV_LEAD,&id,DEV_B,json!({"tags":""})).await;
-        assert_allowed(st,&v,"peer input cannot close the owner's pending window");
+        if ty == "session" {
+            assert_allowed(st,&v,"peer input cannot close the owner's pending window");
+        } else {
+            assert_code(st,&v,"request_reply_not_owner_input","uncertain input consumes the window without funding");
+        }
         let conn=e.store.read().unwrap();
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM _amux_delegation_resolutions WHERE reply_row=?1",
-            [peer],|r|r.get::<_,i64>(0)).unwrap(),0,"peer must never acquire an owner resolution");
+            [peer],|r|r.get::<_,i64>(0)).unwrap(),i64::from(ty != "session"),"only uncertain input records a nonfunding boundary resolution");
     }
 }
 

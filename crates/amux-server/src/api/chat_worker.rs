@@ -200,10 +200,12 @@ pub(crate) async fn companion_route(
     }
     let msg_id: String = body.get("msg_id").and_then(Value::as_str).unwrap_or("").trim().chars().take(64).collect();
     if !msg_id.is_empty() && seen.contains(&msg_id) {
+        if let Some(error)=super::session_verbs::close_discarded_owner_input(state,worker,headers,"companion_deduplicated") { return error; }
         return (StatusCode::OK, Json(json!({"ok": true, "msg_id": msg_id, "message": "already delivered", "deduped": true}))).into_response();
     }
     let text = body.get("text").and_then(Value::as_str).unwrap_or("").to_string();
     if text.trim().is_empty() {
+        if let Some(error)=super::session_verbs::close_discarded_owner_input(state,worker,headers,"companion_empty") { return error; }
         return (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "error": "empty message"}))).into_response();
     }
     // WHO IS ASKING (AMUX-5432, found 2026-10-01): a send carrying a lane's
@@ -222,6 +224,7 @@ pub(crate) async fn companion_route(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": "chat adapter did not handle the send"}))).into_response();
     };
     if !ok {
+        if let Some(error)=super::session_verbs::close_discarded_owner_input(state,worker,headers,"companion_refused") { return error; }
         tracing::warn!(session = %key, error = %message, verdict = "chat_companion_send_failed", "a Chat tab send was not accepted");
         return (StatusCode::CONFLICT, Json(json!({"ok": false, "error": message, "msg_id": msg_id}))).into_response();
     }

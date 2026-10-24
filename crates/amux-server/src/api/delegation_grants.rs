@@ -512,7 +512,7 @@ pub(crate) fn begin_requested(state: &AppState, id: &str, actor: &str, change: &
     if row.session != super::delegation::OWNER_AGENT || row.incarnation != g.reply_incarnation {
         return Err(("request_reply_identity_changed", "reply is outside the stored owner incarnation".into()));
     }
-    super::max_ref::typed_by_max(state, &row).ok_or(("max_ref_not_human_typed", "reply is not owner input".into()))?;
+    super::max_ref::typed_by_max(&row).ok_or(("max_ref_not_human_typed", "reply is not owner input".into()))?;
     claim_pending(state, &g.code, &format!("owner:reply:{reply}"), Some(reply))?;
     if !arm(state, &g.code) { return Err(("grant_unavailable", "request could not be armed; reply remains spent".into())); }
     Ok(g.code)
@@ -526,6 +526,7 @@ fn resolution_refusal(code: Option<&str>) -> &'static str {
         Some("request_reply_identity_changed") => "request_reply_identity_changed",
         Some("request_reply_outside_window") => "request_reply_outside_window",
         Some("request_reply_not_owner_session") => "request_reply_not_owner_session",
+        Some("request_reply_not_owner_input") => "request_reply_not_owner_input",
         _ => "request_unresolved",
     }
 }
@@ -1564,7 +1565,7 @@ mod tests {
                 DeliveryMeta { process_origin:proof, ..DeliveryMeta::direct() }).await;
             assert!(load(&state,&id).unwrap().resolution_row.is_none(),"{ctype}/{proof:?} cannot supply owner provenance");
             assert_eq!(state.store.read().unwrap().query_row(
-                "SELECT COUNT(*) FROM _amux_delegation_resolutions WHERE reply_row=?1",[row],|r|r.get::<_,i64>(0)).unwrap(),0);
+                "SELECT COUNT(*) FROM _amux_delegation_resolutions WHERE reply_row=?1",[row],|r|r.get::<_,i64>(0)).unwrap(),i64::from(ctype != "session"));
         }
         // A Chat-tab wait closes the old window for a subsequent pane/send yes.
         cmd_hist_record_with_id(&state,"mrpopo","wait","chat","",true,
@@ -1573,7 +1574,7 @@ mod tests {
         let row=cmd_hist_record_with_id(&state,"mrpopo","yes","user","",true,
             DeliveryMeta { process_origin:Some("outside"), ..DeliveryMeta::direct() }).await;
         assert_eq!(load(&state,&next).unwrap().resolution_row,Some(row));
-        assert_eq!(load(&state,&id).unwrap().resolution_code.as_deref(),Some("request_reply_not_affirmative"));
+        assert_eq!(load(&state,&id).unwrap().resolution_code.as_deref(),Some("request_reply_not_owner_input"));
     }
 
     async fn record_reply(state: &AppState, text: &str, source: &str) -> i64 {

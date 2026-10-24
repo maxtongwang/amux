@@ -227,9 +227,12 @@ fn apply(
     }
     // Providers render outside amux. A non-input lifecycle edge conservatively
     // closes any displayed approval before later input can resolve it.
-    if event["event"] != "UserPromptSubmit" {
+    let native_input = if event["event"] != "UserPromptSubmit" {
         super::delegation_requests::output_boundary(conn, name)?;
-    }
+        None
+    } else {
+        super::delegation_requests::native_owner_input(conn, name, event, launch)?
+    };
     if event["event"] == "Stop" && event["subagent"] != true
         && event["worker_type"] != amux_core::worker_type::WorkerTypeId::CHAT {
         super::delegation_requests::native_assistant_turn(conn, name, event, launch)?;
@@ -288,15 +291,14 @@ fn apply(
         event["state"].as_str().unwrap_or(""),
         report,
     );
-    Ok(WriteOutcome {
-        applied: true,
-        events: vec![PendingEvent {
+    let mut events=vec![PendingEvent {
             entity_type: amux_core::revision::EntityType::Session,
             entity_id: name.to_owned(),
             mutation,
             payload,
-        }],
-    })
+        }];
+    if let Some(row)=native_input { events.push(super::delegation_requests::input_event(row)); }
+    Ok(WriteOutcome { applied:true, events })
 }
 
 /// The state event for one lifecycle observation. A real transition carries
@@ -327,6 +329,17 @@ pub(crate) fn history(conn: &rusqlite::Connection, name: &str) -> Vec<Value> {
         .collect()
 }
 
+fn title_native_input(state: &AppState, reply: &crate::db::WriteReply) {
+    if tokio::runtime::Handle::try_current().is_err() { return; }
+    for event in &reply.events {
+        if event.entity_type != amux_core::revision::EntityType::Message { continue; }
+        let Some(id)=event.entity_id.strip_prefix("MSG-").and_then(|id|id.parse().ok()) else { continue; };
+        if let Ok(Some(row))=super::max_ref::one(state,id) {
+            if row.source.is_some() { super::session_verbs::spawn_task_title(&row.session,&row.text); }
+        }
+    }
+}
+
 pub(crate) async fn post(state: &AppState, name: &str, body: &Value) -> Response {
     if !valid_name(name) {
         return (
@@ -345,19 +358,34 @@ pub(crate) async fn post(state: &AppState, name: &str, body: &Value) -> Response
         .await;
     match outcome {
         Ok(out) => {
+            title_native_input(state,&out);
             // Only an APPLIED edge: a duplicate or replayed observation of the
             // same submit must not write the prompt twice.
             if out.applied {
-                if let Some(prompt) = prompt {
+                if worker == super::delegation::OWNER_AGENT {
+                    if let Some(prompt) = prompt {
+                        super::session_verbs::reconcile_stuck_on_submit(state, &worker, &prompt).await;
+                    }
+                } else if let Some(prompt) = prompt {
                     super::pane_prompts::record(state, &worker, &prompt).await;
                 }
                 if event["event"] == "Stop" {
                     let sid = event["session_id"].as_str().unwrap_or("").to_string();
                     crate::db::interactions::spawn(super::turn_end::on_turn_end(
                         state.clone(),
-                        worker,
+                        worker.clone(),
                         sid,
                     ));
+                }
+            }
+            if event["event"] == "UserPromptSubmit" && worker == super::delegation::OWNER_AGENT {
+                let boundary=if out.applied { Ok(()) } else {
+                    super::delegation_requests::discarded_input(state,&worker,"native_submit_rejected_or_deduplicated")
+                };
+                if let Err(error) = boundary.and_then(|_|super::delegation_requests::resolve_session(state, &worker)) {
+                    tracing::warn!(session=worker,%error,verdict="delegation_request_resolution_failed",
+                        "native owner input is durable; ordered reconciliation must retry");
+                    return (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"error":error}))).into_response();
                 }
             }
             Json(json!({"ok":true,"applied":out.applied})).into_response()
@@ -428,6 +456,7 @@ fn replay_run(state: &AppState, name: &str, dir: &Path) {
         };
         let worker = name.to_owned();
         let prompt = submitted_prompt(&body);
+        let submitted=body["event"] == "UserPromptSubmit";
         let current = dir.parent().unwrap_or(dir).join("current.json");
         if let Ok(reply) = state.store.write(move |conn| {
             let launch = std::fs::read_to_string(current)
@@ -436,9 +465,19 @@ fn replay_run(state: &AppState, name: &str, dir: &Path) {
                 .unwrap_or(Value::Null);
             apply(conn, &worker, &body, &launch)
         }) {
+            title_native_input(state,&reply);
             // A prompt submitted while the server was down still belongs in
             // the ledger once the spool is replayed (F8(c)).
-            if let (true, Some(prompt), Ok(rt)) =
+            if name == super::delegation::OWNER_AGENT {
+                let boundary=if reply.applied || !submitted { Ok(()) } else {
+                    super::delegation_requests::discarded_input(state,name,"native_spool_submit_rejected_or_deduplicated")
+                };
+                if let Err(error) = boundary.and_then(|_|super::delegation_requests::resolve_session(state,name)) {
+                    tracing::warn!(session=name,%error,verdict="delegation_request_resolution_failed",
+                        "retaining native spool until owner input reconciliation succeeds");
+                    break;
+                }
+            } else if let (true, Some(prompt), Ok(rt)) =
                 (reply.applied, prompt, tokio::runtime::Handle::try_current())
             {
                 let (st, n) = (state.clone(), name.to_owned());

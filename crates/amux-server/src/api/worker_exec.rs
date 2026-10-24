@@ -209,7 +209,8 @@ pub(crate) mod fake_pane {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((name.to_string(), text.to_string(), origin));
-            Dispatch::Handled((true, "sent".into()))
+            let cfg=super::parse_env(name);
+            Dispatch::Handled((true, cfg.get("CC_TEST_FAKE_SEND_RESULT").unwrap_or("sent").to_string()))
         }
         fn running(&self, _: &str) -> Dispatch<bool> {
             Dispatch::Handled(true)

@@ -100,6 +100,28 @@ with recorded owner provenance, assistant output, and session output originating
 from the owner session. A peer delivery is neither owner input nor owner output.
 Missing or out-of-order resolver hooks cannot erase a stored owner boundary.
 
+Owner input with missing/uncertain provenance also closes the window, without
+funding. Discarded, empty, injected, truncated, disabled-history and duplicate
+submissions leave an `approval_input_uncertain` row when a window is open.
+Such input records `request_reply_not_owner_input`; a later yes cannot reuse
+the display. Verified peer history retains `type=session`, including when its
+sender explicitly requests history. Legacy user/chat rows lacking owner proof
+are treated conservatively as uncertain input rather than silently ignored.
+
+Verified owner process input never becomes a peer copy by matching message
+text. Native owner input commits with native run/provider/sequence acceptance,
+using the current launch incarnation and an explicit `prompt_truncated:false`
+from the hook. The hook preserves the native `session_id` for both terminal
+and provider Remote Control submissions; both use the same submit route and
+require a preceding pane or Messages receipt. Old hooks without truncation
+evidence close the window and fund nothing. The bundled observer is adopted
+by the existing native-status recovery path. Accepted input and discarded
+markers publish Message events, so the Messages view can show the boundary.
+Spool replay records input in the acceptance transaction before ACK deletion;
+failed input writes roll back acceptance, and failed reconciliation retains
+the spool. Replayed/rejected submit observations can close a newly opened
+window but cannot fund it or rearm an old receipt.
+
 The pending request must point to that latest event row, have no resolution row
 or refusal code, and precede the reply strictly. Two displayed questions select
 only the latest; an intervening owner question, wait, no or output means neither
@@ -170,6 +192,8 @@ window closure does not depend on that reconciliation running first.
 | `request_not_shown` | No surviving bound render receipt |
 | `request_no_candidate` / `request_unresolved` | No eligible immediately preceding display / request has no resolved reply |
 | `request_reply_not_affirmative` | Input is outside the complete affirmative allowlist |
+| `request_reply_not_owner_input` | Discarded or uncertain input consumed the displayed window without funding |
+| `request_input_boundary_failed` | A discarded send's boundary could not be stored; the send fails closed |
 | `request_reply_outside_window` | Display/reply freshness or clock ordering failed |
 | `request_reply_not_owner_session` | Input or legacy request bound outside the owner session |
 | `request_reply_identity_changed` | Receiving incarnation changed |

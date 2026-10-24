@@ -190,6 +190,68 @@ pub(crate) fn observe_output(state: &AppState, session: &str) -> Result<(), Stri
     }).map(|_| ()).map_err(|e| e.to_string())
 }
 
+/// Discarded/uncertain input consumes the window without retaining its text or
+/// claiming approval provenance. The marker participates in replay and ordering.
+pub(crate) fn input_boundary(conn: &rusqlite::Connection, session: &str, reason: &str) -> rusqlite::Result<()> {
+    if session != OWNER_AGENT { return Ok(()); }
+    conn.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts) VALUES(?1,'Discarded or uncertain owner input','user','pane','approval_input_uncertain',?2)", rusqlite::params![session,(crate::config::now_f64()*1000.0) as i64])?;
+    tracing::warn!(session, reason, reply_row=conn.last_insert_rowid(), verdict="delegation_request_input_boundary",
+        measured=true, n_considered=1, "discarded or uncertain input closed the approval window; funds nothing");
+    Ok(())
+}
+
+pub(crate) fn discarded_send(state: &AppState, session: &str, headers: &HeaderMap, reason: &str) -> Result<(), String> {
+    let session = super::chat_worker::companion_parent(session).unwrap_or(session);
+    if session != OWNER_AGENT || super::session_verbs::session_is_isolated(session)
+        || super::session_verbs::owner_input_process_origin(headers).is_none() { return Ok(()); }
+    discarded_input(state,session,reason)
+}
+
+pub(crate) fn discarded_input(state: &AppState, session: &str, reason: &str) -> Result<(), String> {
+    if session != OWNER_AGENT || super::session_verbs::session_is_isolated(session) { return Ok(()); }
+    let (session,reason)=(session.to_string(),reason.to_string());
+    state.store.write(move |conn| {
+        let open:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM _amux_delegation_grants WHERE reply_session=?1 AND shown_row IS NOT NULL AND status='pending' AND resolution_row IS NULL AND resolution_code IS NULL)",[&session],|r|r.get(0))?;
+        if !open { return Ok(crate::db::WriteOutcome { applied:false, events:vec![] }); }
+        input_boundary(conn,&session,&reason)?;
+        Ok(crate::db::WriteOutcome { applied:true, events:vec![input_event(conn.last_insert_rowid())] })
+    }).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Native run/provider/sequence validation has already succeeded. Owner input
+/// and native acceptance commit together, including on spool recovery. Never
+/// compare a proven owner prompt with delivery/history text (P5 pre-echo).
+pub(crate) fn native_owner_input(conn: &rusqlite::Connection, session: &str, event: &Value, launch: &Value) -> rusqlite::Result<Option<i64>> {
+    if session != OWNER_AGENT || super::session_verbs::session_is_isolated(session) { return Ok(None); }
+    let identity=incarnation(session);
+    let prompt=event["prompt"].as_str().unwrap_or("");
+    let verdict=super::pane_prompts::classify(prompt,&[]);
+    let proven=identity.is_some() && launch["incarnation"].as_str()==identity.as_deref()
+        && event["subagent"] != true && event["worker_type"] != amux_core::worker_type::WorkerTypeId::CHAT
+        && event["prompt_truncated"].as_bool() == Some(false);
+    if !proven || !super::session_verbs::scoped_gate_on(session,super::pane_prompts::GATE_KEY)
+        || verdict != super::pane_prompts::PaneVerdict::Record
+        || prompt.chars().count()>super::pane_prompts::MAX_PROMPT_CHARS {
+        let reason=if event["prompt_truncated"].as_bool() != Some(false) { "prompt_incomplete" }
+            else if !proven { "native_owner_proof_missing" }
+            else if prompt.chars().count()>super::pane_prompts::MAX_PROMPT_CHARS { "prompt_too_large" }
+            else if verdict == super::pane_prompts::PaneVerdict::Record { "history_disabled" }
+            else { verdict.as_str() };
+        input_boundary(conn,session,reason)?;
+        return Ok(Some(conn.last_insert_rowid()));
+    }
+    let text=super::session_verbs::redact_secrets(prompt.trim());
+    conn.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,ts,delivered_at,submit_verdict,delegation_session_incarnation) VALUES(?1,?2,'user','pane','pane',?3,?3,'confirmed',?4)", rusqlite::params![session,text,(event["event_ts"].as_f64().unwrap_or(0.0)*1000.0) as i64,identity])?;
+    tracing::info!(session,reply_row=conn.last_insert_rowid(),verdict="delegation_owner_native_input",measured=true,n_considered=1,
+        "native owner input retained independently of matching peer text");
+    Ok(Some(conn.last_insert_rowid()))
+}
+
+pub(crate) fn input_event(row: i64) -> crate::db::PendingEvent {
+    crate::db::PendingEvent { entity_type:amux_core::revision::EntityType::Message, entity_id:format!("MSG-{row}"),
+        mutation:amux_core::revision::MutationKind::Created, payload:None }
+}
+
 /// Applied native Stop only: the assistant row IS the pane receipt and ordering
 /// boundary. Native sequence acceptance, this row and its binding commit together.
 pub(crate) fn native_assistant_turn(conn: &rusqlite::Connection, session: &str, event: &Value, launch: &Value) -> rusqlite::Result<()> {
@@ -238,7 +300,7 @@ pub(crate) fn native_assistant_turn(conn: &rusqlite::Connection, session: &str, 
 pub(crate) fn resolve_session(state: &AppState, session: &str) -> Result<(), String> {
     let ids: Vec<i64> = {
         let conn = state.store.read().map_err(|e| e.to_string())?;
-        let mut st = conn.prepare("SELECT id FROM cmd_history WHERE session=?1 AND id >= (SELECT MIN(shown_row) FROM _amux_delegation_grants WHERE reply_session=?1 AND status='pending') AND COALESCE(delegation_message_type,type) IN ('user','chat') AND NOT EXISTS(SELECT 1 FROM _amux_delegation_resolutions dr WHERE dr.reply_row=cmd_history.id) ORDER BY id LIMIT ?2").map_err(|e| e.to_string())?;
+        let mut st = conn.prepare("SELECT id FROM cmd_history WHERE session=?1 AND id >= COALESCE((SELECT MIN(shown_row) FROM _amux_delegation_grants WHERE reply_session=?1 AND status='pending'), (SELECT MAX(id) FROM cmd_history WHERE session=?1)) AND COALESCE(delegation_message_type,type) IN ('user','chat') AND NOT EXISTS(SELECT 1 FROM _amux_delegation_resolutions dr WHERE dr.reply_row=cmd_history.id) ORDER BY id LIMIT ?2").map_err(|e| e.to_string())?;
         let rows = st.query_map(rusqlite::params![session, (RESOLUTION_SCAN_LIMIT + 1) as i64], |r| r.get(0)).map_err(|e| e.to_string())?;
         rows.collect::<rusqlite::Result<_>>().map_err(|e| e.to_string())?
     };
@@ -249,7 +311,7 @@ pub(crate) fn resolve_session(state: &AppState, session: &str) -> Result<(), Str
 
 /// Resolving and recording candidates uses the serialized writer transaction.
 /// No actor filter: only the latest owner event can identify a displayed request.
-fn resolve_reply(state: &AppState, row: &max_ref::Row) -> Result<(), String> {
+fn resolve_reply(state: &AppState, row: &max_ref::Row, owner_input: bool) -> Result<(), String> {
     let (reply, session, identity, text, ts) = (row.id, row.session.clone(), row.incarnation.clone(), row.text.clone(), row.ts);
     let affirmative = max_ref::reply_is_affirmative(&text);
     let at = crate::config::now_f64();
@@ -261,13 +323,15 @@ fn resolve_reply(state: &AppState, row: &max_ref::Row) -> Result<(), String> {
         }
         // Read the ledger, not processed outcomes: missed hooks cannot leave a
         // window open. Peer deliveries are not owner input or owner output.
-        let latest: i64 = conn.query_row("SELECT COALESCE(MAX(id),0) FROM cmd_history WHERE session=?1 AND id<?2 AND (delivery IN ('approval_display','approval_pane_display') OR (COALESCE(delegation_message_type,type) IN ('user','chat') AND ((origin='pane' AND delivery='pane') OR (origin<>'pane' AND delivery IN ('direct','queued') AND process_origin IN ('outside','remote','remote-forwarded')))) OR type='assistant' OR (type='session' AND origin=session AND delivery<>'approval_request'))", rusqlite::params![session, reply], |r| r.get(0))?;
+        let latest: i64 = conn.query_row("SELECT COALESCE(MAX(id),0) FROM cmd_history WHERE session=?1 AND id<?2 AND (delivery IN ('approval_display','approval_pane_display') OR COALESCE(delegation_message_type,type) IN ('user','chat') OR type='assistant' OR (type='session' AND origin=session AND delivery<>'approval_request'))", rusqlite::params![session, reply], |r| r.get(0))?;
         let candidates: Vec<(String, String, i64)> = {
             let mut st = conn.prepare("SELECT code,reply_incarnation,(SELECT ts FROM cmd_history WHERE id=shown_row) FROM _amux_delegation_grants WHERE reply_session=?1 AND shown_row=?2 AND shown_row<?3 AND status='pending' AND resolution_row IS NULL AND resolution_code IS NULL ORDER BY shown_row DESC")?;
-            let rows = st.query_map(rusqlite::params![if owner_reply { session.as_str() } else { "" }, latest, reply], |r| Ok((r.get(0)?,r.get(1)?,r.get::<_, Option<i64>>(2)?.unwrap_or(i64::MAX))))?;
+            let rows = st.query_map(rusqlite::params![if owner_reply || (!owner_input && session == OWNER_AGENT) { session.as_str() } else { "" }, latest, reply], |r| Ok((r.get(0)?,r.get(1)?,r.get::<_, Option<i64>>(2)?.unwrap_or(i64::MAX))))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        let (code, note) = if !owner_reply {
+        let (code, note) = if !owner_input {
+            ("request_reply_not_owner_input", "discarded or uncertain owner input closes the window and funds nothing")
+        } else if !owner_reply {
             ("request_reply_not_owner_session", "typed input outside the current owner session funds no request")
         } else if !affirmative {
             ("request_reply_not_affirmative", "reply is not an explicit affirmative; request remains pending")
@@ -296,15 +360,9 @@ fn resolve_reply(state: &AppState, row: &max_ref::Row) -> Result<(), String> {
 /// Hook path records outcomes; window boundaries come directly from history.
 pub(crate) fn resolve_observed(state: &AppState, id: i64) -> Result<(), String> {
     let row = max_ref::one(state, id).map_err(|e| e.code().to_string())?.ok_or("request_reply_missing")?;
-    if max_ref::typed_by_max(state, &row).is_none() {
-        if row.session == OWNER_AGENT && max_ref::reply_is_affirmative(&row.text) {
-            tracing::warn!(reply_row = id, session = row.session, code = "request_reply_not_owner_input",
-                verdict = "delegation_request_refused", measured = true, n_considered = 0,
-                "peer or echoed affirmative has no owner provenance; no window closed");
-        }
-        return Ok(());
-    }
-    resolve_reply(state,&row)
+    let owner_input=max_ref::typed_by_max(&row).is_some();
+    if !owner_input && row.source.is_none() && !row.input_boundary { return Ok(()); }
+    resolve_reply(state,&row,owner_input)
 }
 
 #[cfg(test)]

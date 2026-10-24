@@ -7744,6 +7744,11 @@ pub(crate) fn owner_input_process_origin(headers: &HeaderMap) -> Option<&str> {
     headers.get(super::process_identity::PROCESS_ORIGIN_HEADER).and_then(|v| v.to_str().ok())
 }
 
+pub(crate) fn close_discarded_owner_input(state: &AppState, name: &str, headers: &HeaderMap, reason: &str) -> Option<Response> {
+    super::delegation_requests::discarded_send(state,name,headers,reason).err().map(|error|
+        super::delegation_requests::refusal("request_input_boundary_failed",&error))
+}
+
 pub(crate) async fn cmd_hist_record_full(
     state: &AppState,
     session: &str,
@@ -7769,7 +7774,7 @@ pub(crate) async fn cmd_hist_record_full(
 /// message ... test against each active worker"): the title is a display label
 /// written to amux's own meta from text amux already holds, and nothing reaches
 /// the worker.
-fn spawn_task_title(session: &str, text: &str) {
+pub(crate) fn spawn_task_title(session: &str, text: &str) {
     if amux_core::board::is_conversational_ack(text) || text.trim().chars().count() < 12 {
         return;
     }
@@ -27090,6 +27095,14 @@ pub(crate) async fn steer_mutate(
     headers: &HeaderMap,
     body: &Value,
 ) -> Response {
+    let response=steer_mutate_inner(state,name,method,headers,body).await;
+    if *method == Method::POST && !response.status().is_success() {
+        return close_discarded_owner_input(state,name,headers,"steer_refused").unwrap_or(response);
+    }
+    response
+}
+
+async fn steer_mutate_inner(state: &AppState, name: &str, method: &Method, headers: &HeaderMap, body: &Value) -> Response {
     if *method == Method::POST && body.get("action").and_then(Value::as_str) == Some("abandon") {
         return super::delivery::ledger::abandon_action(state, name, headers, body).await;
     }
@@ -27288,7 +27301,10 @@ pub(crate) async fn steer_mutate(
             format!("steer:{client_id}")
         };
         if let Some(response) = send_dedup_gate(state, name, &dedup_id).await {
-            return response;
+            return close_discarded_owner_input(state,name,headers,"steer_deduplicated").unwrap_or(response);
+        }
+        if !body.get("record_history").map(py_truthy).unwrap_or(false) {
+            if let Some(error)=close_discarded_owner_input(state,name,headers,"steer_history_disabled") { return error; }
         }
         // IS THIS A PICKER ANSWER? Decide NOW, while the picker is still on
         // screen — intent is only knowable at the moment it existed (AMUX-2823).
@@ -28912,6 +28928,14 @@ async fn send_post_detached(
 }
 
 pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
+    let response=send_post_inner(state,name,headers,body).await;
+    if !response.status().is_success() {
+        return close_discarded_owner_input(state,name,headers,"send_refused").unwrap_or(response);
+    }
+    response
+}
+
+async fn send_post_inner(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
     if let Some(refusal) = probe_refusal(state, name, headers, &body_str(body, "text")).await {
         return refusal;
     }
@@ -29000,7 +29024,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
         msg_id = super::delivery::uuid();
     }
     if let Some(response) = send_dedup_gate(state, name, &msg_id).await {
-        return response;
+        return close_discarded_owner_input(state,name,headers,"send_deduplicated").unwrap_or(response);
     }
     if text.trim().starts_with("/compact") {
         let n = name.to_string();
@@ -29013,6 +29037,9 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
     let owner_history_default = owner_input_process_origin(headers).is_some()
         && body_str(body, "source_session").trim().is_empty();
     let record_history = body.get("record_history").map(py_truthy).unwrap_or(owner_history_default);
+    if !record_history {
+        if let Some(error)=close_discarded_owner_input(state,name,headers,"send_history_disabled") { return error; }
+    }
     if body.get("record_history").is_none() && owner_history_default {
         tracing::info!(session = name, verdict = "owner_send_history_defaulted", measured = true,
             n_considered = 1, "verified owner CLI/API input retained for reply resolution");
@@ -29196,6 +29223,8 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                     )
                     .await;
                     link_queued_message(state, name, row_id, &result.id).await;
+                } else if let Some(error)=close_discarded_owner_input(state,name,headers,"project_send_deduplicated") {
+                    return error;
                 }
                 if let Some(peer) = native_peer.as_ref() {
                     // Project steering stores the original prose. Its verified
@@ -29450,7 +29479,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             // The process verdict, recorded only for the OWNER's own send: no
             // member actor and no worker identity (a worker pane's request
             // carries its worker header after attribution, whatever it sent).
-            let process_origin = owner_input_process_origin(headers);
+            let process_origin = owner_input_process_origin(headers).filter(|_| message_acceptance_confirmed(ok,&msg));
             tracing::info!(session = %name, process_origin = process_origin.unwrap_or(""),
                 forwarded = process_origin == Some(super::process_identity::REMOTE_FORWARDED),
                 verdict = "owner_send_process_origin", measured = true, n_considered = 1,
@@ -29460,8 +29489,10 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                 process_origin,
                 ..meta
             };
+            // Explicit history does not turn a peer into uncertain owner input.
+            let caller=hdr_worker(headers);
             let row_id =
-                cmd_hist_record_with_id(state, name, &orig_text, "user", author, skip_board, meta)
+                cmd_hist_record_with_id(state, name, &orig_text, if caller.is_empty() { "user" } else { "session" }, if caller.is_empty() { author } else { &caller }, skip_board, meta)
                     .await;
             note_history_msg_id(state, row_id, &msg_id).await;
             if let Some(id) = queue_id.as_deref() {

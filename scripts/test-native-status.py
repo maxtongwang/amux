@@ -102,7 +102,22 @@ class NativeStatus(unittest.TestCase):
             observer.observe({'hook_event_name':'PostToolUse','prompt':'private prompt'},root,'worker','abc','claude',2.0)
             values=[json.loads(p.read_text()) for p in sorted((root/'status-events/worker/abc').glob('0*.json'))]
             self.assertEqual(len(values[0]['prompt']),20000)
+            self.assertTrue(values[0]['prompt_truncated'])
             self.assertNotIn('prompt',values[1])
+
+    def test_owner_submit_preserves_session_proof_and_reports_truncation(self):
+        for session in ['terminal-session', 'remote-control-session']:
+            with self.subTest(session=session), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for prompt in ['no', 'yes' + ' ' * 20000 + 'do not proceed']:
+                    self.assertTrue(observer.observe({'hook_event_name':'UserPromptSubmit',
+                        'session_id':session, 'prompt':prompt}, root, 'mrpopo', 'abc', 'claude', 1.0))
+                values=[json.loads(p.read_text()) for p in sorted((root/'status-events/mrpopo/abc').glob('0*.json'))]
+                self.assertEqual(len(values),2)
+                self.assertEqual(values[0]['prompt'],'no')
+                self.assertFalse(values[0]['prompt_truncated'])
+                self.assertTrue(values[1]['prompt_truncated'])
+                self.assertTrue(all(v['session_id']==session and v['run_id']=='abc' for v in values))
 
     def test_question_notification_preserves_waiting_but_real_permission_blocks(self):
         with tempfile.TemporaryDirectory() as tmp:
