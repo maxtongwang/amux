@@ -35,7 +35,7 @@ pub(crate) const GRANT_HEADER: &str = "x-amux-grant";
 pub(crate) const GRANT_CODE_HEADER: &str = "x-amux-grant-code";
 /// v3 short-code alphabet (no 0/O or 1/I/L).
 const ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
-const CODE_LEN: usize = 4;
+pub(super) const CODE_LEN: usize = 4;
 /// Bound random-code collision retries; existing request IDs are never replaced.
 const CODE_MINT_ATTEMPTS: usize = 10;
 /// Recent request/resolution rows returned by each list surface.

@@ -599,7 +599,7 @@ async fn multiple_open_plain_yes_confirms_coded_latest_funds() {
 
 #[tokio::test]
 async fn negations_waits_and_questions_never_fund_through_recorder() {
-    for text in ["no","don't","not yet","wait","yes?","yes but not yet","yes, don't proceed"] {
+    for text in ["no","don't","not yet","wait","yes?","yes, don't proceed"] {
         let f=Fixture::new(); let id=f.ask().await;
         accepted(f.owner_reply(text).await);
         f.resolution(OWNER_AGENT,"request_reply_not_affirmative",None);
@@ -1054,7 +1054,11 @@ async fn schedule_run_route_echo_is_non_owner() {
     }
     assert_eq!(f.request_resolution(&id),(None,None));
     // The schedule's stamped multi-line body is transport input, not a reply.
+    // Re-show after transport output so the echo follows this display directly.
+    accepted(f.hook(OWNER_AGENT,f.stop(&f.block(&id))).await);
     f.echo_never_funds(&id,"request_reply_not_owner_input").await;
+    assert_eq!(f.request_resolution(&id),(None,Some("request_reply_not_owner_input".into())));
+    assert!(!f.open(&id),"a schedule echo closes the shown request without approval");
 }
 
 #[tokio::test]
@@ -1337,7 +1341,7 @@ async fn session_exact_block_next_prompt_funds_allowlist_only() {
 
 #[tokio::test]
 async fn session_nonaffirmative_and_empty_enter_close_without_funding() {
-    for text in ["no", "yes please wait", "", "\n", "okay", "yep", "approved", "go ahead"] {
+    for text in ["no", "no thanks", "maybe", "", "\n", "okay", "yep", "approved", "go ahead"] {
         let f=Fixture::new(); let id=f.ask().await;
         f.type_in_pane(text,"owner-native-session").await;
         f.resolution(OWNER_AGENT,"request_reply_not_affirmative",None);
@@ -1765,23 +1769,39 @@ async fn v31_stop_submit_sequence_tie_or_unknown_never_funds() {
 }
 #[tokio::test]
 async fn v31_wrong_unknown_and_closed_codes_never_fall_back() {
-    for kind in ["wrong","INVALID","a7k","A7K23","A0K2","please","ab","123456789012","closed"] {
-        let f=Fixture::new();let id=f.ask().await;
+    for kind in ["wrong","0O1I","lLo0","A0K2","closed"] {
+        let f=Fixture::new();
+        let closed=if kind=="closed" {
+            let id=f.ask().await;accepted(f.owner_reply("no").await);Some(id)
+        } else { None };
+        let id=f.ask().await;
         let code=match kind {
-            "closed"=>{let code=f.short(&id);accepted(f.owner_reply("no").await);code},
+            "closed"=>f.short(closed.as_deref().unwrap()),
             "wrong"=>{let mut code=f.short(&id);let last=code.pop().unwrap();code.push(if last=='2' {'3'} else {'2'});code},
             _=>kind.into(),
         };
         let before=f.request_resolution(&id);
-        let suffix=if kind=="INVALID" {""} else {"."};
+        let suffix=if kind=="0O1I" { "" } else { "." };
         let (_,v)=f.owner_reply(&format!("yes {code}{suffix}")).await;
         assert_eq!(v["approval_context"],format!("[amux approval] no open approval {}",code.to_ascii_uppercase()));
         f.resolution(OWNER_AGENT,"request_no_open_code",None);
-        assert_eq!(f.request_resolution(&id),before,"unknown/malformed code cannot change the shown request");
-        assert_eq!(f.open(&id),kind!="closed","a failed code attempt must not close or reopen a request");
+        assert_eq!(f.request_resolution(&id),before,"unknown/closed code cannot change the shown request");
+        assert!(f.open(&id),"a failed code attempt must leave the shown request open");
+        if let Some(closed)=closed { assert!(!f.open(&closed),"a closed code must not reopen"); }
         assert_eq!(f.request_resolution(&id).0,None);
-        assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN,"unknown/malformed code funds nothing");
+        assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN,"unknown/closed code funds nothing");
     }
+}
+#[tokio::test]
+async fn v31_approve_word_with_other_text_confirms_and_stays_open() {
+    for text in ["yes INVALID","yes please do it","yes AB12CD","yes please","yes please wait","yes but not yet","yes A7K","yes A7K23","yes ab","yes A7K2!","yes Å7K2"] {
+        let f=Fixture::new();let id=f.ask().await;
+        f.expect_confirm(&id,text,"text-between").await;
+        f.resolution(OWNER_AGENT,"request_confirm_needed",None);
+        assert_eq!(f.request_resolution(&id),(None,Some("request_confirm_needed".into())),"{text}");
+    }
+    let f=Fixture::new();let id=f.ask().await;
+    f.expect_confirm(&id,&format!("yes {} extra",f.short(&id)),"text-between").await;
 }
 #[tokio::test]
 async fn v31_coded_wrapped_other_session_and_incarnation_never_fund() {
@@ -1797,10 +1817,12 @@ async fn v31_coded_wrapped_other_session_and_incarnation_never_fund() {
 }
 #[tokio::test]
 async fn v31_declines_and_coded_other_request_keeps_question_open() {
-    for text in ["other text",""] {
+    for text in ["no thanks","maybe","other text",""] {
         let f=Fixture::new();let id=f.ask().await;let (_,v)=f.owner_reply(text).await;
         assert_eq!(v["approval_context"],format!("[amux approval] declined {}",f.short(&id)));
+        f.resolution(OWNER_AGENT,"request_reply_not_affirmative",None);
         assert!(!f.open(&id));assert_eq!(f.request_resolution(&id).0,None);
+        assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
     }
     let f=Fixture::new();let a=f.ask().await;let b=f.ask().await;
     accepted(f.owner_reply(&format!("yes {}",f.short(&a))).await);

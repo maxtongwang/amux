@@ -42,17 +42,19 @@ boundary. All approval `*_at` timestamps are Unix seconds; history `ts` is ms.
 | Plain yes with doubt | Stays open, funds nothing, requires coded confirmation |
 | Owner prose containing an approve word plus a code, including after a pasted snippet | Doubt (`text-between`): stays open and requires a clean coded confirmation; never approves |
 | Another plain yes after confirmation | Confirmation again; never funds |
-| Wrong, unknown, malformed or closed code-like token | No open approval; leaves the shown request unchanged and never falls back to plain yes |
-| Non-approve text (e.g. `yes please wait`) or empty Enter immediately following a display | Declines/closes, never funds |
+| Wrong, unknown, never-issued or closed four-character alphanumeric token | No open approval; leaves the shown request unchanged and never falls back to plain yes |
+| Approve word followed by any other text (e.g. `yes INVALID`, `yes please do it`, `yes AB12CD`) | Doubt (`text-between`): stays open, funds nothing, requires coded confirmation |
+| No approve word at the start (e.g. `no thanks`, `maybe`) or empty Enter immediately following a display | Declines/closes, never funds |
 | Coded answer to another open request | Answers that request; leaves this question open |
 
-A coded attempt is exactly an approve word followed by one token of 2–12 ASCII
+A coded attempt is exactly an approve word followed by one token of four ASCII
 letters or digits, with an optional final period. Trim whitespace, strip that
 period and uppercase the token for matching and the error line. This grammar
-recognizes attempts independently of the allocated four-character alphabet:
-`yes INVALID`, `yes A0K2` and `yes please` report `no open approval` for the
-normalized token, without declining or closing the displayed request. Extra
-words, punctuation within the token and tokens outside that bound are other text.
+recognizes attempts independently of the allocator's alphabet, including
+ambiguous characters `0/O/1/I/L`: `yes 0O1I` reports `no open approval 0O1I`,
+without declining or closing the displayed request. Extra words, punctuation
+within the token and tokens of any other length require confirmation when the
+prompt starts with an approve word; they never approve or close the request.
 
 `plain_yes_without_doubt` checks every condition explicitly:
 

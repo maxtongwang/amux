@@ -9,9 +9,6 @@ const SHORT_CODE_ATTEMPTS: usize = 128;
 pub(super) const PLAIN_YES_WINDOW_MIN: i64 = 30;
 const SECONDS_PER_MINUTE: f64 = 60.0;
 const RESERVED_MARKER: &str = "[amux approval]";
-// Bound attempted codes separately from the four-character allocated alphabet.
-const CODE_TOKEN_MIN_LEN: usize = 2;
-const CODE_TOKEN_MAX_LEN: usize = 12;
 
 /// Allocator's clock and entropy seams are explicit. Expiry closes at its
 /// original Unix-second deadline, so delayed housekeeping cannot extend reuse.
@@ -84,15 +81,20 @@ fn open_requests(conn: &Connection, now_s: f64) -> rusqlite::Result<Vec<Request>
     Ok(rows)
 }
 
-/// One approve word plus a 2–12 ASCII alphanumeric token is a coded attempt,
-/// including malformed/unknown codes. Normalize case and one final period.
-fn approve_reply(text: &str) -> Option<Option<String>> {
+#[derive(Debug, PartialEq, Eq)]
+enum ApprovalReply { Plain, Coded(String), Doubt }
+
+/// Exactly four ASCII alphanumerics form a code, including allocator-excluded
+/// ambiguous characters; any other approve-word text requires confirmation.
+/// Normalize case and tolerate one final period.
+fn approve_reply(text: &str) -> Option<ApprovalReply> {
     let mut words=text.split_whitespace();
     let word=words.next()?;
     if !max_ref::reply_is_affirmative(word) { return None; }
-    let code=words.next().map(|s|s.strip_suffix('.').unwrap_or(s).to_ascii_uppercase());
-    if words.next().is_some() || code.as_deref().is_some_and(|value| !(CODE_TOKEN_MIN_LEN..=CODE_TOKEN_MAX_LEN).contains(&value.len()) || !value.bytes().all(|b| b.is_ascii_alphanumeric())) { return None; }
-    Some(code)
+    let Some(token)=words.next() else { return Some(ApprovalReply::Plain); };
+    let code=token.strip_suffix('.').unwrap_or(token).to_ascii_uppercase();
+    if words.next().is_some() || code.len()!=super::super::delegation_grants::CODE_LEN || !code.bytes().all(|b| b.is_ascii_alphanumeric()) { return Some(ApprovalReply::Doubt); }
+    Some(ApprovalReply::Coded(code))
 }
 
 /// Extra owner prose may quote a coded yes. It requests confirmation only;
@@ -112,9 +114,9 @@ pub(super) fn approve_shaped(text: &str) -> bool {
         && text.split_once('\n').is_some_and(|(_,body)|approve_reply(body).is_some()))
 }
 
-fn reply_without_doubt(facts: &PlainYesFacts, coded: bool, quoted: bool) -> Result<(), DoubtReason> {
+fn reply_without_doubt(facts: &PlainYesFacts, coded: bool, prose_doubt: bool) -> Result<(), DoubtReason> {
     if !facts.verifiable { return Err(DoubtReason::Unverifiable); }
-    if quoted { return Err(DoubtReason::FirstPrompt); }
+    if prose_doubt { return Err(DoubtReason::FirstPrompt); }
     if !coded { return plain_yes_without_doubt(facts); }
     if !facts.unchanged { return Err(DoubtReason::Changed); }
     Ok(())
@@ -141,7 +143,8 @@ pub(super) fn resolve(conn: &Connection, row: &max_ref::Row, owner_input: bool) 
         intent=row.text.split_once('\n').and_then(|(_,body)|approve_reply(body));
     }
     let quoted_code=if intent.is_none() { quoted_coded_reply(&row.text) } else { None };
-    if let Some(code)=&quoted_code { intent=Some(Some(code.clone())); }
+    if let Some(code)=&quoted_code { intent=Some(ApprovalReply::Coded(code.clone())); }
+    let prose_doubt=matches!(intent,Some(ApprovalReply::Doubt)) || quoted_code.is_some();
     let mut lines=Vec::new();
     let mut funded=None;
     let mut verdict="request_no_candidate";
@@ -150,7 +153,7 @@ pub(super) fn resolve(conn: &Connection, row: &max_ref::Row, owner_input: bool) 
         lines.push("[amux approval] ignored reserved marker in prompt".to_string());
         verdict="request_reserved_marker_ignored";
     } else if native && intent.is_some() {
-        let coded=intent.as_ref().and_then(|v|v.as_deref());
+        let coded=if let Some(ApprovalReply::Coded(code))=&intent { Some(code.as_str()) } else { None };
         let candidates:Vec<_>=requests.iter().filter(|q|coded.is_none_or(|c|q.short==c)).collect();
         if let Some(code)=coded.filter(|_|candidates.is_empty()) {
             lines.push(context("no open approval",code));
@@ -171,7 +174,7 @@ pub(super) fn resolve(conn: &Connection, row: &max_ref::Row, owner_input: bool) 
                 let facts=PlainYesFacts { first_prompt,latest_turn:q.shown==Some(latest),single_open:open_total==1,
                     recent:q.shown_s.is_some_and(|shown|row.ts>=shown && row.ts-shown<=PLAIN_YES_WINDOW_MIN as f64*SECONDS_PER_MINUTE),
                     unchanged:q.snapshot.as_deref()==Some(request_snapshot(conn,&q.id)?.as_str()),verifiable,confirm_required:q.confirm };
-                let decision=reply_without_doubt(&facts,coded.is_some(),quoted_code.is_some());
+                let decision=reply_without_doubt(&facts,coded.is_some(),prose_doubt);
                 match decision {
                     Ok(())=> {
                         conn.execute("UPDATE _amux_delegation_grants SET resolution_row=?2,resolution_code='request_resolved',resolution_note='native owner approval',approval_closed_at=?3 WHERE code=?1 AND approval_closed_at IS NULL",params![q.id,row.id,now_s])?;
@@ -240,17 +243,34 @@ mod tests {
         }
     }
     #[test]
-    fn approve_reply_recognizes_bounded_code_attempts_and_plain_allowlist() {
+    fn approve_word_with_other_text_is_approve_shaped() {
+        for text in ["yes INVALID", "yes please do it", "yes AB12CD", "yes A", "yes A7K2!", "yes A7K2 extra"] {
+            assert!(approve_shaped(text),"approve-word prose requires confirmation: {text}");
+        }
+    }
+    #[test]
+    fn approve_reply_recognizes_four_char_codes_and_plain_allowlist() {
         for word in ["yes","y","approve","ok","YES."] {
-            assert_eq!(approve_reply(word),Some(None));
-            for token in ["a7k2","INVALID","A7K","A7K23","A0K2","please","ab","123456789012"] {
+            assert_eq!(approve_reply(word),Some(ApprovalReply::Plain));
+            for token in ["a7k2","A0K2","0O1I","lLo0","1234"] {
                 for suffix in ["","."] {
-                    assert_eq!(approve_reply(&format!(" {word} {token}{suffix} ")),Some(Some(token.to_ascii_uppercase())),"code attempt: {word} {token}{suffix}");
+                    assert_eq!(approve_reply(&format!(" {word} {token}{suffix} ")),Some(ApprovalReply::Coded(token.to_ascii_uppercase())),"code attempt: {word} {token}{suffix}");
                 }
             }
         }
-        for text in ["yes A","yes 1234567890123","yes A7K2!","yes A_K2","yes Å7K2","yes A7K2 extra","maybe A7K2"] {
-            assert_eq!(approve_reply(text),None,"outside the code-attempt grammar: {text}");
+    }
+    #[test]
+    fn approve_reply_other_approve_word_text_is_doubt() {
+        for word in ["yes","y","approve","ok","YES."] {
+            for tail in ["INVALID","please do it","AB12CD","A","A7K","A7K23","please","ab","123456789012","A7K2!","A_K2","Å7K2","A7K2 extra","A7K2.."] {
+                assert_eq!(approve_reply(&format!(" {word} {tail} ")),Some(ApprovalReply::Doubt),"approve-word text: {word} {tail}");
+            }
+        }
+    }
+    #[test]
+    fn approve_reply_without_leading_approve_word_declines() {
+        for text in ["no thanks","maybe","","\n","yes?","yes, don't proceed","okay","yep","approved","go ahead"] {
+            assert_eq!(approve_reply(text),None,"no leading approve word: {text}");
         }
     }
     #[test] fn decision_lines_are_byte_exact() {
