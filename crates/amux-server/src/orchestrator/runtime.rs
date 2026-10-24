@@ -1793,6 +1793,10 @@ impl Runtime {
                     };
                     match body {
                         Ok(body) => {
+                            let body = {
+                                let conn = self.store.read()?;
+                                crate::api::messages::delivery_body(&conn,worker.as_str(),body)?
+                            };
                             delivered_body = Some(body.clone());
                             protocol
                                 .deliver_message(&worker, msg_id.clone(), body)

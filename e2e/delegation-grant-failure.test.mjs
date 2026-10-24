@@ -94,10 +94,12 @@ test('ambiguous requests and no-candidate replies remain visible in dashboard an
 });
 
 test('grant request CLI creates explicit records and propagates server refusals', () => {
-  const out = grantCli(['request', '--stdin'], {ok:true, request_id:'REQ1', sentence:'exact change', reply_session:'desk'});
+  const block = 'Approval needed — REQ1\nExact question\nwith another line\nReply "yes" to approve. Anything else declines.';
+  const out = grantCli(['request', '--stdin'], {ok:true, request_id:'REQ1', sentence:'exact change', reply_session:'desk', approval_block:block});
   assert.equal(out.status, 0, out.stderr);
   assert.ok(out.stderr.includes('POST') && out.stderr.includes('--data-binary @-'));
   assert.ok(out.stdout.includes('REQ1  pending') && out.stdout.includes('Reply session: desk'));
+  assert.ok(out.stdout.endsWith(block + '\n'), 'CLI must retain the server-rendered approval block verbatim');
   const no = grantCli(['request', '--stdin'], {ok:false, code:'request_identity_missing', error:'stable identity required'});
   assert.notEqual(no.status, 0);
   assert.ok(no.stderr.includes('request_identity_missing'));

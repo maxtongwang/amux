@@ -174,6 +174,16 @@ pub(crate) fn pending_receive_refusal(conn: &Connection, message: &str, target: 
     Ok(native_peer_input_refusal(conn, id.as_str(), target)?.map(|refusal| refusal.reason))
 }
 
+/// Durable Messages into the owner are server input, even from owner APIs.
+/// Resolve the current name at dispatch; preserve the original stored body.
+pub(crate) fn delivery_body(conn: &Connection, worker: &str, body: String) -> rusqlite::Result<String> {
+    let owner = queries::get_worker(conn,worker)?.is_some_and(|row| super::delegation_requests::is_owner_session(&row.display_name));
+    if !owner { return Ok(body); }
+    tracing::info!(worker, verdict="owner_messages_delivery_wrapped", measured=true, n_considered=1,
+        "durable Messages delivery is wrapped server input and cannot fund approval");
+    Ok(format!("[amux Messages delivery]\n{body}"))
+}
+
 /// Queue the AtTurnBoundary delivery command for one recipient. The
 /// idempotency key derives from the MessageId, so a replayed create can
 /// never double-queue a delivery (Invariant 9). Human-authored messages
@@ -184,6 +194,11 @@ fn enqueue_delivery(
     msg: &MessageId,
     now: DateTime<Utc>,
 ) -> rusqlite::Result<()> {
+    if let Some(row) = queries::get_worker(conn,worker.as_str())? {
+        if super::delegation_requests::is_owner_session(&row.display_name) {
+            super::delegation_requests::non_owner_submission(conn,&row.display_name,"messages_close_only")?;
+        }
+    }
     crate::db::commands::enqueue(
         conn,
         CommandId::from_ulid(ulid::Ulid::new()),
@@ -531,6 +546,13 @@ pub async fn create_message(
         Ok(r) => r,
         Err(e) => return internal(e),
     };
+    if reply.applied {
+        if let Err(error) = super::delegation_requests::resolve_session(&state,&super::native_status::owner_worker()) {
+            tracing::warn!(%error, verdict="delegation_request_resolution_failed", measured=false, n_considered=0,
+                "Messages closure is durable; ordered recovery must retry");
+            return internal(error);
+        }
+    }
     let outcome = slot.lock().expect("outcome slot poisoned").take();
     match outcome {
         None => internal("create produced no outcome"),
@@ -1719,6 +1741,23 @@ mod tests {
         }
         runtime.pump_commands(Utc::now(), &std::collections::BTreeMap::new()).await.unwrap();
         assert!(matches!(&protocol.calls()[..], [RecordedCall::DeliverMessage { body, .. }] if body == "retained owner input"));
+    }
+
+    #[tokio::test]
+    async fn native_owner_messages_real_pump_wraps_delivery() {
+        let (app,store,dir)=app();
+        let _home=crate::api::settings::test_env::set_home(dir.path());
+        let owner=crate::api::native_status::owner_worker();
+        let wid=create_worker(&app,&owner,None).await;
+        let (st,v)=send(&app,"POST","/api/messages",Some(json!({"to":wid,"body":"yes"}))).await;
+        assert_eq!(st,StatusCode::CREATED,"{v}");
+        let protocol=Arc::new(MockProtocol::new());
+        let worker=WorkerId::parse(&wid).unwrap();
+        protocol.register(worker,AgentState::Idle);
+        let runtime=pump_runtime(store.clone(),protocol.clone());
+        runtime.pump_commands(Utc::now(),&std::collections::BTreeMap::new()).await.unwrap();
+        assert!(matches!(&protocol.calls()[..], [RecordedCall::DeliverMessage { body, .. }]
+            if body == "[amux Messages delivery]\nyes"));
     }
 
     #[tokio::test]

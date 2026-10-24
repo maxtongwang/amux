@@ -404,6 +404,15 @@ if [ -d "$(dirname "$READ_ROUTER_DEST")" ] && [ -f "$READ_ROUTER_SRC" ]; then
   install -m 0755 "$READ_ROUTER_SRC" "$READ_ROUTER_DEST"
 fi
 
+# Publish the owner input guard atomically; never rewrite an executing hook.
+OWNER_GUARD_SRC="$ROOT/scripts/hooks/owner-input-guard.py"
+OWNER_GUARD_DEST="${AMUX_OWNER_GUARD_DEST:-$HOME/.amux/hooks/owner-input-guard.py}"
+if [ -d "$(dirname "$OWNER_GUARD_DEST")" ] && [ -f "$OWNER_GUARD_SRC" ]; then
+  _og=$(mktemp "${OWNER_GUARD_DEST}.XXXXXX") && install -m 0755 "$OWNER_GUARD_SRC" "$_og" \
+    && bash "$ROOT/scripts/atomic-replace.sh" "$_og" "$OWNER_GUARD_DEST" >/dev/null
+  cmp -s "$OWNER_GUARD_SRC" "$OWNER_GUARD_DEST" || exit 1
+fi
+
 # THE STATUS REPORT HOOK, same blind spot (2026-10-07). Every Claude lane's
 # lifecycle hooks run ~/.amux/hook-report.sh, and only install.sh placed it, so
 # the running copy was Oct 5's, from before it sent X-Amux-Worker-Token: on the

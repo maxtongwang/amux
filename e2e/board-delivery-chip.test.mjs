@@ -28,6 +28,6 @@ test('direct row is unchanged', () => {
 
 test('approval request explains display and next-input requirements', () => {
   assert.equal(label({ delivery: 'approval_request' }), 'approval request');
-  assert.match(chip({ delivery: 'approval_request' }), /Open owner Messages to display this question; only the very next owner input/);
+  assert.match(chip({ delivery: 'approval_request' }), /exact approval block; only its very next native prompt/);
   for (const delivery of ['__proto__', 'constructor']) assert.equal(label({delivery}), 'direct?');
 });

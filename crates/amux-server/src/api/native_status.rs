@@ -376,7 +376,7 @@ pub(crate) async fn post(state: &AppState, name: &str, body: &Value) -> Response
             // Only an APPLIED edge: a duplicate or replayed observation of the
             // same submit must not write the prompt twice.
             if out.applied {
-                if worker == super::delegation::OWNER_AGENT {
+                if super::delegation_requests::is_owner_session(&worker) {
                     if let Some(prompt) = prompt {
                         super::session_verbs::reconcile_stuck_on_submit(state, &worker, &prompt).await;
                     }
@@ -392,7 +392,7 @@ pub(crate) async fn post(state: &AppState, name: &str, body: &Value) -> Response
                     ));
                 }
             }
-            if event["event"] == "UserPromptSubmit" && worker == super::delegation::OWNER_AGENT {
+            if event["event"] == "UserPromptSubmit" && super::delegation_requests::is_owner_session(&worker) {
                 let boundary=if out.applied { Ok(()) } else {
                     super::delegation_requests::discarded_native_input(state,&worker,&event,"native_submit_rejected_or_deduplicated")
                 };
@@ -483,7 +483,7 @@ fn replay_run(state: &AppState, name: &str, dir: &Path) {
             title_native_input(state,&reply);
             // A prompt submitted while the server was down still belongs in
             // the ledger once the spool is replayed (F8(c)).
-            if name == super::delegation::OWNER_AGENT {
+            if super::delegation_requests::is_owner_session(name) {
                 let boundary=if reply.applied || !submitted { Ok(()) } else {
                     super::delegation_requests::discarded_native_input(state,name,&rejection_event,"native_spool_submit_rejected_or_deduplicated")
                 };

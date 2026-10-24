@@ -724,6 +724,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0129_delegation_explicit_requests",
         sql: include_str!("../../migrations/0129_delegation_explicit_requests.sql"),
     },
+    Migration {
+        version: 130,
+        name: "0130_delegation_native_session",
+        sql: include_str!("../../migrations/0130_delegation_native_session.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

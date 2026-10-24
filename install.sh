@@ -389,6 +389,14 @@ if [[ -f "$SCRIPT_DIR/scripts/hooks/large-read-guard.py" ]]; then
   say "read router: $AMUX_HOME/hooks/large-read-guard.py (sha ${_read_guard_sha:0:12})"
 fi
 
+# Owner native-session approval: prevent hook-mediated terminal injection.
+if [[ -f "$SCRIPT_DIR/scripts/hooks/owner-input-guard.py" ]]; then
+  mkdir -p "$AMUX_HOME/hooks"
+  install_hook_from_head scripts/hooks/owner-input-guard.py "$AMUX_HOME/hooks/owner-input-guard.py"
+  chmod +x "$AMUX_HOME/hooks/owner-input-guard.py"
+  say "owner input guard: $AMUX_HOME/hooks/owner-input-guard.py"
+fi
+
 # AskUserQuestion goal guard (AMUX-5234). While a /goal is active the question
 # becomes a needsyou card and the worker is told to proceed instead of parking
 # on a picker nobody is watching. The server decides; the script only asks.

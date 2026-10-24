@@ -23,7 +23,7 @@ class ReplyWindowStorage(unittest.TestCase):
         self.conn = sqlite3.connect(":memory:")
         self.addCleanup(self.conn.close)
         schema.migrate(self.conn)
-        self.candidates = schema.source_sql(REQUESTS, "SELECT code,reply_incarnation,(SELECT ts FROM cmd_history WHERE id=shown_row) FROM _amux_delegation_grants")
+        self.candidates = schema.source_sql(REQUESTS, "SELECT code,reply_incarnation,(SELECT ts FROM cmd_history WHERE id=shown_row),")
         self.current = 'SELECT COALESCE(MAX(id),0)' in REQUESTS.read_text()
         self.boundary = schema.source_sql(REQUESTS, "SELECT COALESCE(MAX(id),0)" if self.current else "SELECT COALESCE(MAX(reply_row),0)")
 
@@ -37,8 +37,9 @@ class ReplyWindowStorage(unittest.TestCase):
         self.conn.execute(schema.source_sql(GRANTS, "INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,why,created_at,expires_at,status,mode,target_incarnation,actor_incarnation"), args)
         shown = ask
         if displayed and self.current:
-            query = schema.source_sql(REQUESTS, "INSERT INTO cmd_history(text,type,session,ts,origin,delivery,delegation_session_incarnation,repeat_of,delivered_at)")
-            shown = self.conn.execute(query, [question[0],"desk",1500,"actor","inc-desk",ask]).lastrowid
+            query = schema.source_sql(REQUESTS, "INSERT INTO cmd_history(session,text,type,origin,delivery,ts,delegation_session_incarnation,approval_native_session)")
+            shown = self.conn.execute(query, ["desk",question[0],1500,"inc-desk","native-desk"]).lastrowid
+            self.conn.execute(schema.source_sql(REQUESTS,"UPDATE cmd_history SET delivery='approval_pane_display',repeat_of="),[shown,ask])
             self.conn.execute("UPDATE _amux_delegation_grants SET shown_row=? WHERE code=?", [shown,code])
         self.conn.execute("UPDATE _amux_delegation_grants SET resolution_code=? WHERE code=?", [refusal,code])
         return shown

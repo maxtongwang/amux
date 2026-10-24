@@ -1,0 +1,4 @@
+-- Max 2026-10-24 12:48: session-based approval, refs maxtongwang/ai-config#160.
+-- NULL on legacy/API rows is never native funding proof.
+-- ADDCOL: cmd_history approval_native_session TEXT
+-- ADDCOL: cmd_history approval_wrapped INTEGER

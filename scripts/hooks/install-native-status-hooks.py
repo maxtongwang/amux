@@ -27,10 +27,14 @@ def merge(data, provider, script, changes=None):
         if event in ('PreToolUse', 'PermissionRequest', 'PostToolUse', 'PostToolUseFailure'):
             group['matcher'] = '.*'
         desired[event] = [group]
+    guard = {'type': 'command', 'command': 'python3 ' + shlex.quote(str(Path(script).with_name('owner-input-guard.py'))), 'timeout': 5}
+    guard['statusMessage'] = 'amux owner input guard'
+    guard_count = reconcile(hooks, {'PreToolUse': [{'matcher': 'Bash', 'hooks': [guard]}]},
+                            lambda value: isinstance(value, str) and 'owner-input-guard.py' in value)
     if provider == 'codex':
         count = reconcile(hooks, desired, lambda value: isinstance(value, str) and 'native-status.py' in value)
         if changes is not None:
-            changes.append(count)
+            changes.append(count + guard_count)
         return data
     # This observer coexists with the managed subagent/token producer. That
     # producer yields main-state authority on native-instrumented launches.

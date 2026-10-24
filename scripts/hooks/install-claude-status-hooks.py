@@ -112,6 +112,12 @@ def canonical_codex(hook_path: str) -> dict[str, dict[str, Any]]:
     return events
 
 
+def owner_input_guard(provider):
+    handler = {"type": "command", "command": "python3 $HOME/.amux/hooks/owner-input-guard.py", "timeout": 5}
+    handler["statusMessage"] = "amux owner input guard"
+    return [{"matcher": "Bash", "hooks": [handler]}]
+
+
 def canonical_read_guard(hook_path: str, provider: str = "claude") -> list[dict[str, Any]]:
     quoted = '"' + hook_path.replace('"', '\\"') + '"'
     command = f"python3 {quoted}"
@@ -185,12 +191,14 @@ def merge(
     if not isinstance(raw_hooks, dict):
         raise ValueError("settings 'hooks' must be an object")
 
+    guard_count = reconcile(raw_hooks, {"PreToolUse": owner_input_guard(provider)},
+                            lambda command: isinstance(command, str) and "owner-input-guard.py" in command)
     if provider == "codex":
         report_groups = {event: [event_group] for event, event_group in canonical_codex(hook_path).items()}
         count = reconcile(raw_hooks, report_groups, lambda command: is_amux_report(command))
         count += reconcile(raw_hooks, {"PreToolUse": canonical_read_guard(read_guard_path, provider)}, is_amux_read_guard)
         if changes is not None:
-            changes.append(count)
+            changes.append(count + guard_count)
         return data
 
     # Remove only managed amux commands. A group can contain unrelated commands

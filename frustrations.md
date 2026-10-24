@@ -6272,3 +6272,23 @@ FIX: Use the complete provider hook payload and require an applied receipt.
   now announce these replies; the fixture fails at the rejected receipt itself.
   Native-hook tests (6), SQLite schema/SIGKILL probes and Rust parsing pass.
   Parent owns Rust regressions and the recorder-unhook mutation; no Cargo ran.
+
+## Native approval forced a Messages detour
+AREA: delegation
+SEVERITY: breaks
+STATUS: fixed
+DATE: 2026-10-24
+SESSION: pr18-r2
+CARD: maxtongwang/ai-config#160
+SYMPTOM: Max's native owner-session reply could not approve a displayed request;
+  the prior funding design required a separate Messages/send workflow. Max at
+  12:48: "Can't we have session based solution? No way I'm going to change my
+  behavior for a feature".
+COST: Owner behavior had become a prerequisite for delegation approval.
+FIX: Only the next unwrapped native prompt after an exact native assistant block
+  can fund. External routes close only; terminal paste fallback into the owner
+  is held, and a Bash guard refuses owner tmux injection. Logs record
+  delegation_native_prompt with wrapped/session proof, owner_native_delivery_held
+  and owner_tmux_input_refused. Same-uid processes outside the hook remain a
+  documented residual; only OS separation closes that boundary. Rust route
+  verification is parent-owned; this builder runs no Cargo.

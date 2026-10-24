@@ -7040,6 +7040,10 @@ if not d.get("ok") or not d.get("request_id"):
     sys.exit("amux grant request: %s: %s" % (d.get("code","invalid_response"),d.get("error",d)))
 print("%s  pending  %s" % (d["request_id"],d.get("sentence","")))
 print("Reply session: " + d.get("reply_session",""))
+block = d.get("approval_block")
+if isinstance(block, str):
+    print("Show this exact block as your entire next assistant reply:")
+    print(block)
 '
       return $? ;;
     list|ls) ;;

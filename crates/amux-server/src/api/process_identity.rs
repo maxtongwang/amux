@@ -82,7 +82,7 @@ use std::time::{Duration, Instant};
 pub(crate) const PROCESS_WORKER_HEADER: &str = "x-amux-process-worker";
 /// Internal verdict header (ai-config#160): `outside`, `remote`, `worker` or `automation`,
 /// set only by [`attribute`] and stripped from every inbound request first.
-/// The send path records it on the owner's Messages row so `max_ref::row_qualifies` can tell
+/// The send path records it on the owner's Messages row so history can tell
 /// a send the owner's own browser or phone made from one a worker made with
 /// the owner token. Absent means unproven, never the owner.
 pub(crate) const PROCESS_ORIGIN_HEADER: &str = "x-amux-process-origin";

@@ -13504,6 +13504,7 @@ async fn send_text_inner_bound(
         payload_kind: if mode.native_peer.is_some() { super::delivery::PayloadKind::PeerProse } else { super::delivery::PayloadKind::TerminalInput },
         sender_permission_class: None,
     }).await
+    }).await
 }
 
 /// TmuxPaste owns the complete legacy composer pipeline. Native prose never
@@ -13514,6 +13515,11 @@ pub(super) async fn send_text_paste_bound(ctx:&mut super::delivery::DeliveryCont
     let queue_id=&mut *ctx.queue_id;
     let SendMode { defer_if_busy, from_steering, allow_mid_turn, hook_confirmed_idle, origin, .. } = mode;
     let cfg = parse_env(name);
+    if super::delegation_requests::is_owner_session(name) {
+        tracing::warn!(session=name, delivery_id=delivery, verdict="owner_native_delivery_held", measured=true, n_considered=1,
+            "native delivery unavailable; owner input retained without terminal paste fallback");
+        return (false, "owner_native_delivery_held: native delivery unavailable; retain or queue input (#67)".into());
+    }
     if backend_of_cfg(&cfg) == "herdr" {
         return herdr_send(name, text).await;
     }
@@ -14551,7 +14557,6 @@ pub(super) async fn send_text_paste_bound(ctx:&mut super::delivery::DeliveryCont
         return send_outcome(second, generating, true);
     }
     send_outcome(first, generating, retried)
-    }).await
 }
 
 /// Lanes with a direct message waiting in the composer for its idle Enter.

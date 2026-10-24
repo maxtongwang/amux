@@ -23447,7 +23447,7 @@ function _msgDeliveryChip(e) {
   // busy->boundary hop and saying "0s" about them is noise.
   const waitTxt = wait > 1500 ? ' ' + _fmtDur(wait) : '';
   let label, color, bg, title;
-  const notices = { approval_request: ['approval request', 'Open owner Messages to display this question; only the very next owner input can approve it.'] };
+  const notices = { approval_request: ['approval request', 'Ask the owner session to show the exact approval block; only its very next native prompt can approve it.'] };
   const notice = Object.hasOwn(notices, rec) ? notices[rec] : null;
   if (e.delivery_receipt?.transport === 'claude_uds_v1') {
     const receipt = e.delivery_receipt;

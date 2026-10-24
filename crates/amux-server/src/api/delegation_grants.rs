@@ -2,8 +2,8 @@
 //! POST /api/delegation/requests derives a pending request through the real
 //! authorization table, stores the exact structured change, stable actor/target
 //! and owner-session incarnations, and queues a generated question in the owner
-//! session's Messages. A render receipt, not creation, establishes display. Asker-selected reply sessions and free-text funding are
-//! superseded (Max 2026-10-23 20:08).
+//! session's Messages for visibility. Only an exact native assistant block and
+//! the next unwrapped native prompt fund approval (Max 2026-10-24 12:48).
 //! Its grant code is the request ID. Free text never creates requests.
 //! Typed affirmative correlation lives in delegation_requests; passkey approval
 //! still requires a direct Remote owner. Every application cites request_id and
@@ -449,7 +449,7 @@ fn insert(state: &AppState, g: &NewGrant, c: &Captured) -> Result<(String, Strin
             conn.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery,delegation_session_incarnation) VALUES(?1,'session',?2,?3,?4,'approval_request',?5)",
                 rusqlite::params![question,reply_session,(created*1000.0) as i64,actor,reply_id])?;
             let ask = conn.last_insert_rowid();
-            conn.execute("INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,why,created_at,expires_at,status,mode,target_incarnation,actor_incarnation,reply_session,reply_incarnation,shown_row,change_spec,ask_row,ask_text,resolution_note) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'pending',?13,?14,?15,?16,?17,NULL,?19,?18,?20,'awaiting display in owner Messages')",
+            conn.execute("INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,why,created_at,expires_at,status,mode,target_incarnation,actor_incarnation,reply_session,reply_incarnation,shown_row,change_spec,ask_row,ask_text,resolution_note) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'pending',?13,?14,?15,?16,?17,NULL,?19,?18,?20,'awaiting exact native owner assistant turn')",
                 rusqlite::params![id,actor,class,action,target,method,path,body,sentence,why,created,created+GRANT_TTL_S,mode_str(mode()),target_id,actor_id,reply_session,reply_id,ask,change,question])?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![crate::db::PendingEvent {
                 entity_type: amux_core::revision::EntityType::Message, entity_id: format!("MSG-{ask}"),
@@ -491,9 +491,9 @@ pub(crate) fn request_explicit(state: &AppState, actor: &str, class: &str, targe
         why: super::delegation::request_why(body), reply_session, change, target_incarnation: target_id }, &c) {
         Ok(x) => x, Err(r) => return r,
     };
-    tracing::info!(request_id = %code, actor, reply_session, verdict = "delegation_request_created", measured = true, n_considered = 1, "approval question awaits an owner Messages or native assistant render receipt");
+    tracing::info!(request_id = %code, actor, reply_session, verdict = "delegation_request_created", measured = true, n_considered = 1, "approval question awaits the exact native owner assistant block");
     (StatusCode::ACCEPTED, Json(json!({"ok":true,"pending":true,"request_id":code,"grant_code":code,"sentence":text,
-        "reply_session":reply_session,"question":load(state, &code).and_then(|g|g.ask_text),"how":"Display the exact question in owner Messages or mrpopo's own assistant turn with its request ID, then reply yes as the very next owner input; apply with request_id"}))).into_response()
+        "reply_session":reply_session,"question":load(state, &code).and_then(|g|g.ask_text),"approval_block":super::delegation_requests::render_request(state, &code),"how":"Output approval_block verbatim as your entire next assistant reply. Only the very next native prompt in that same session decides. Apply with request_id"}))).into_response()
 }
 
 /// Cite-mode applications spend the request's resolved reply; no new grant
@@ -509,10 +509,12 @@ pub(crate) fn begin_requested(state: &AppState, id: &str, actor: &str, change: &
     let reply = g.resolution_row.ok_or((resolution_refusal(g.resolution_code.as_deref()), g.resolution_note.clone().unwrap_or_default()))?;
     let row = super::max_ref::one(state, reply).map_err(|e| (e.code(), "owner reply unavailable".into()))?
         .ok_or(("request_reply_missing", "owner reply unavailable".into()))?;
-    if row.session != super::delegation::OWNER_AGENT || row.incarnation != g.reply_incarnation {
+    if !super::delegation_requests::is_owner_session(&row.session) || row.incarnation != g.reply_incarnation {
         return Err(("request_reply_identity_changed", "reply is outside the stored owner incarnation".into()));
     }
-    super::max_ref::typed_by_max(&row).ok_or(("max_ref_not_human_typed", "reply is not owner input".into()))?;
+    if !row.native_prompt || row.wrapped || row.native_session.is_none() {
+        return Err(("max_ref_not_human_typed", "reply is not an unwrapped native owner prompt".into()));
+    }
     claim_pending(state, &g.code, &format!("owner:reply:{reply}"), Some(reply))?;
     if !arm(state, &g.code) { return Err(("grant_unavailable", "request could not be armed; reply remains spent".into())); }
     Ok(g.code)
@@ -532,13 +534,17 @@ fn resolution_refusal(code: Option<&str>) -> &'static str {
 }
 
 fn validate_request_identity(state: &AppState, g: &GrantRow, actor: &str) -> Result<(), (&'static str, String)> {
-    if g.reply_session.as_deref() != Some(super::delegation::OWNER_AGENT) {
+    if !g.reply_session.as_deref().is_some_and(super::delegation_requests::is_owner_session) {
         return Err(("request_reply_not_owner_session", "superseded asker-selected reply session; ask again in the owner session".into()));
     }
     if g.shown_row.is_none() { return Err(("request_not_shown", "request was never shown in a reply session".into())); }
     let conn = state.store.read().map_err(|_|("request_read_failed", "request message ledger unavailable".into()))?;
-    let shown: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM cmd_history WHERE id=?1 AND session=?2 AND delegation_session_incarnation=?5 AND repeat_of=?6 AND delivered_at=ts AND ((origin=?3 AND type='session' AND text=?4 AND delivery='approval_display') OR (origin=session AND type='assistant' AND delivery='approval_pane_display' AND instr(text,?4)>0 AND instr(text,?7)>0)))",
-        rusqlite::params![g.shown_row,g.reply_session,g.actor,g.ask_text,g.reply_incarnation,g.ask_row,g.code],|r|r.get(0))
+    let block = match g.ask_text.as_deref() {
+        Some(question) => super::delegation_requests::approval_block(&g.code,question),
+        None => return Err(("request_not_shown", "request has no question".into())),
+    };
+    let shown: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM cmd_history WHERE id=?1 AND session=?2 AND delegation_session_incarnation=?3 AND repeat_of=?4 AND delivered_at=ts AND origin=session AND type='assistant' AND delivery='approval_pane_display' AND text=?5 AND approval_native_session IS NOT NULL)",
+        rusqlite::params![g.shown_row,g.reply_session,g.reply_incarnation,g.ask_row,block],|r|r.get(0))
         .map_err(|_|("request_read_failed", "request message ledger unavailable".into()))?;
     if !shown { return Err(("request_not_shown", "the recorded question is absent from the reply session".into())); }
     drop(conn);
@@ -720,7 +726,7 @@ fn claim_pending(state: &AppState, code: &str, by: &str, evidence: Option<i64>) 
         let binding: (Option<i64>, Option<i64>, Option<String>) = conn.query_row(
             "SELECT shown_row,resolution_row,actor_incarnation FROM _amux_delegation_grants WHERE code=?1", [&owned_code],
             |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-        if binding.0.is_none() || binding.2.is_none() || (evidence.is_some() && evidence != binding.1) {
+        if binding.0.is_none() || binding.2.is_none() || evidence.is_none() || evidence != binding.1 {
             return Err(rusqlite::Error::InvalidParameterName("request_reply_mismatch".into()));
         }
         if let Some(reply) = evidence {
@@ -754,11 +760,22 @@ fn claim_pending(state: &AppState, code: &str, by: &str, evidence: Option<i64>) 
 
 /// Apply a pending grant: exactly the stored request, once.
 pub(crate) async fn apply(state: &AppState, code: &str, by: &str, evidence: Option<i64>) -> Result<Value, (&'static str, String)> {
-    let g = load(state, code).ok_or(("grant_not_found", format!("no grant {code}")))?;
+    let mut g = load(state, code).ok_or(("grant_not_found", format!("no grant {code}")))?;
+    if let Some(session) = g.reply_session.as_deref() {
+        super::delegation_requests::resolve_session(state,session).map_err(|e|("request_resolution_failed",e))?;
+        g = load(state,code).ok_or(("grant_not_found",format!("no grant {code}")))?;
+    }
     validate_request_identity(state,&g,&g.actor)?;
     if let Some(why) = not_applicable(state, &g) {
         return Err(why);
     }
+    let reply = g.resolution_row.ok_or(("request_unresolved", "only the next native owner prompt can approve this request".into()))?;
+    let row = super::max_ref::one(state,reply).map_err(|e|(e.code(),"native reply unavailable".into()))?
+        .ok_or(("request_reply_missing","native reply unavailable".into()))?;
+    if !row.native_prompt || row.wrapped || row.native_session.is_none() || row.incarnation != g.reply_incarnation {
+        return Err(("request_reply_not_owner_input","application requires the resolved native owner prompt".into()));
+    }
+    let evidence = evidence.or(Some(reply));
     claim_pending(state, &g.code, by, evidence)?;
     log_transition(state, &g.code, "approved", by, "owner", &g.target, json!({"sentence": g.sentence, "evidence_row": evidence}), None);
     let mut req = Request::builder()
@@ -811,21 +828,14 @@ pub(crate) fn claim_applying(state: &AppState, code: &str, actor: &str, action: 
     Ok(g.evidence_row)
 }
 
-/// Every recorded human reply is correlated, even if it names no request.
-/// Passkey mode additionally requires the direct Remote owner proof before replay.
+/// Native replies resolve requests; all other observed input only closes.
+/// Passkey mode retains its separate Remote application gate.
 pub(crate) async fn on_row(state: &AppState, row_id: i64) {
     if let Err(e) = super::delegation_requests::resolve_observed(state, row_id) {
         tracing::warn!(row_id, error = %e, verdict = "delegation_request_resolution_failed", measured = false, n_considered = 0, "reply correlation failed closed");
         return;
     }
-    if mode() != Mode::Passkey || super::max_ref::row_qualifies(state, row_id).is_err() { return; }
-    let code: Option<String> = state.store.read().ok().and_then(|conn| conn.query_row(
-        "SELECT request_id FROM _amux_delegation_resolutions WHERE reply_row=?1", [row_id], |r| r.get(0)).ok()).flatten();
-    if let Some(code) = code {
-        if let Err((c, why)) = apply(state, &code, &format!("owner:sent:{row_id}"), Some(row_id)).await {
-            tracing::warn!(row_id, request_id = %code, code = c, why, verdict = "delegation_grant_sent_not_applied", measured = true, n_considered = 1, "resolved approval did not apply");
-        }
-    }
+
 }
 
 fn owner_refusal(state: &AppState, headers: &HeaderMap, uri: &Uri) -> Option<Response> {
@@ -1070,6 +1080,7 @@ fn request_view(g: &GrantRow) -> Value {
             "target_incarnation": g.target_incarnation, "cite_spent_at": g.cite_spent_at,
             "request_id": g.code, "created_at":g.created_at, "actor_incarnation":g.actor_incarnation, "reply_session":g.reply_session, "reply_incarnation":g.reply_incarnation,
             "shown_row":g.shown_row, "change":g.change_spec.as_deref().and_then(|s|serde_json::from_str::<Value>(s).ok()),
+            "approval_block":g.ask_text.as_deref().map(|question| super::delegation_requests::approval_block(&g.code,question)),
             "resolution_row":g.resolution_row,"resolution_code":g.resolution_code,"resolution_note":g.resolution_note,
             "cited_excerpt": g.cited_excerpt, "ask_row": g.ask_row, "ask_text": g.ask_text, "reply_text": g.reply_text, "body": serde_json::from_str::<Value>(&g.body).unwrap_or(Value::Null)})
 }
@@ -1451,20 +1462,8 @@ mod tests {
             "method":"PATCH","path":"/api/sessions/test-dev-a/config","body":body}),None).await;
         assert_eq!(st,StatusCode::ACCEPTED,"{v}");
         let id = v["request_id"].as_str().unwrap().to_string();
-        let grant = load(state, &id).unwrap();
-        let mut prepare = Request::builder().method("POST").uri("/api/delegation/questions/render")
-            .header(axum::http::header::CONTENT_TYPE,"application/json")
-            .body(Body::from(json!({"surface":"owner-messages"}).to_string())).unwrap();
-        prepare.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([192,0,2,1],41001))));
-        let res=app.clone().oneshot(prepare).await.unwrap(); assert!(res.status().is_success());
-        let bytes=axum::body::to_bytes(res.into_body(),usize::MAX).await.unwrap();
-        let after_row=serde_json::from_slice::<Value>(&bytes).unwrap()["after_row"].as_i64().unwrap();
-        let mut req = Request::builder().method("POST").uri(format!("/api/delegation/questions/{}/display",grant.ask_row.unwrap()))
-            .header(axum::http::header::CONTENT_TYPE,"application/json")
-            .body(Body::from(json!({"surface":"owner-messages","text":grant.ask_text,"after_row":after_row}).to_string())).unwrap();
-        req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([192,0,2,1],41001))));
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert!(res.status().is_success(),"fixture must display request before replying");
+        native_event(app,"Stop",super::super::delegation_requests::render_request(state,&id).unwrap()).await;
+
         id
     }
 
@@ -1536,7 +1535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_input_recorder_resolves_send_chat_and_queued_replies_once() {
+    async fn owner_input_recorder_closes_send_chat_and_queued_replies_once() {
         use super::super::session_verbs::{cmd_hist_record_with_id, DeliveryMeta};
         let tmp=tempfile::tempdir().unwrap();
         let _home=crate::api::settings::test_env::set_home(tmp.path());
@@ -1554,7 +1553,8 @@ mod tests {
             };
             let row=cmd_hist_record_with_id(&state,"mrpopo","yes",ctype,"",true,meta).await;
             // No GET or explicit resolver call before this assertion.
-            assert_eq!(load(&state,&id).unwrap().resolution_row,Some(row),"{ctype}/{queued}/{proof}");
+            assert_eq!(load(&state,&id).unwrap().resolution_row,None,"{ctype}/{queued}/{proof}");
+            assert_eq!(load(&state,&id).unwrap().resolution_code.as_deref(),Some("request_reply_not_owner_input"));
             on_row(&state,row).await;
             assert_eq!(state.store.read().unwrap().query_row(
                 "SELECT COUNT(*) FROM _amux_delegation_resolutions WHERE reply_row=?1",[row],|r|r.get::<_,i64>(0)).unwrap(),1);
@@ -1574,25 +1574,29 @@ mod tests {
         let next=explicit_request(&app,&state,json!({"worktree_verify":"three"})).await;
         let row=cmd_hist_record_with_id(&state,"mrpopo","yes","user","",true,
             DeliveryMeta { process_origin:Some("outside"), ..DeliveryMeta::direct() }).await;
-        assert_eq!(load(&state,&next).unwrap().resolution_row,Some(row));
+        assert_eq!(load(&state,&next).unwrap().resolution_row,None);
+        assert!(row>0);
         assert_eq!(load(&state,&id).unwrap().resolution_code.as_deref(),Some("request_reply_not_owner_input"));
     }
 
-    async fn record_reply(state: &AppState, text: &str, source: &str) -> i64 {
-        let session="mrpopo".to_string();
-        let text=text.to_string();
-        let source=source.to_string();
-        let id=Arc::new(std::sync::atomic::AtomicI64::new(0));
-        let out=id.clone();
-        state.store.write(move|c| {
-            c.execute("INSERT INTO cmd_history(session,text,type,origin,delivery,process_origin,ts,delegation_session_incarnation) VALUES(?1,?2,'user',?3,?4,?5,?6,'inc-mrpopo')",
-                rusqlite::params![session,text,if source=="pane" {"pane"} else {""},if source=="pane" {"pane"} else {"direct"},source,(now()*1000.0) as i64])?;
-            out.store(c.last_insert_rowid(),std::sync::atomic::Ordering::SeqCst);
-            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
-        }).unwrap();
-        let id=id.load(std::sync::atomic::Ordering::SeqCst);
-        on_row(state,id).await;
-        id
+    async fn native_event(app: &Router, event: &str, text: String) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let sequence=SEQ.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+        let home=crate::config::amux_home();
+        let folder=home.join("status-events/mrpopo"); std::fs::create_dir_all(&folder).unwrap();
+        let launch=folder.join("current.json");
+        if !launch.exists() { std::fs::write(launch,json!({"run_id":"grant-test-run","provider":"claude","started":now()-100.0,"incarnation":"inc-mrpopo"}).to_string()).unwrap(); }
+        let payload=json!({"native_status":true,"run_id":"grant-test-run","provider":"claude","sequence":sequence,
+            "event":event,"state":if event=="Stop" {"idle"} else {"active"},"event_ts":now(),"session_id":"grant-test-native",
+            "turn_id":"","prompt":text,"prompt_truncated":false,"assistant_message":text});
+        let (st,v,_)=call(app,"POST","/api/sessions/mrpopo/report",Some("mrpopo"),payload,None).await;
+        assert!(st.is_success() && v["applied"]==true,"{v}");
+    }
+
+    async fn record_reply(state: &AppState, text: &str) -> i64 {
+        let app=super::super::router(state.clone());
+        native_event(&app,"UserPromptSubmit",text.into()).await;
+        state.store.read().unwrap().query_row("SELECT MAX(id) FROM cmd_history WHERE delivery='approval_native_prompt'",[],|r|r.get(0)).unwrap()
     }
 
     #[tokio::test]
@@ -1613,19 +1617,24 @@ mod tests {
             assert_eq!(st,StatusCode::FORBIDDEN,"{v}");
             assert_eq!(v["code"],"grant_approve_requires_remote");
         }
+        let (st,_,_)=call(&app,"POST",&format!("/api/delegation/grants/{id}/approve"),None,Value::Null,Some(41002)).await;
+        assert_eq!(st,StatusCode::CONFLICT,"button alone cannot fund");
+        record_reply(&state,"yes").await;
         let (st,v,_)=call(&app,"POST",&format!("/api/delegation/grants/{id}/approve"),None,Value::Null,Some(41002)).await;
         assert!(st.is_success(),"{v}");
         assert_eq!(load(&state,&id).unwrap().status,"applied");
         let id2=explicit_request(&app,&state,json!({"worktree_verify":"two"})).await;
-        record_reply(&state,"yes","pane").await;
+        record_reply(&state,"yes").await;
         assert_eq!(load(&state,&id2).unwrap().status,"pending","pane lacks passkey proof");
         let (st,v,_)=call(&app,"POST",&format!("/api/delegation/grants/{id2}/approve"),None,Value::Null,Some(41002)).await;
         assert!(st.is_success(),"{v}");
         let id3=explicit_request(&app,&state,json!({"worktree_verify":"three"})).await;
-        let reply=record_reply(&state,"yes","remote").await;
+        let reply=record_reply(&state,"yes").await;
         let row=load(&state,&id3).unwrap();
-        assert_eq!(row.status,"applied");
-        assert_eq!(row.evidence_row,Some(reply));
+        assert_eq!(row.status,"pending","native approval still needs the passkey application gate");
+        let (st,v,_)=call(&app,"POST",&format!("/api/delegation/grants/{id3}/approve"),None,Value::Null,Some(41002)).await;
+        assert!(st.is_success(),"{v}");
+        assert_eq!(load(&state,&id3).unwrap().evidence_row,Some(reply));
         on_row(&state,reply).await;
         assert_eq!(load(&state,&id3).unwrap().status,"applied");
         assert_eq!(state.store.read().unwrap().query_row("SELECT COUNT(*) FROM _amux_delegation_grants WHERE evidence_row=?1",[reply],|r|r.get::<_,i64>(0)).unwrap(),1);
@@ -1638,7 +1647,7 @@ mod tests {
         let state=test_state(tmp.path());
         let app=super::super::router(state.clone());
         let id=explicit_request(&app,&state,json!({"worktree_verify":"one"})).await;
-        record_reply(&state,"yes","outside").await;
+        record_reply(&state,"yes").await;
         let path=tmp.path().join("sessions/test-dev-a.env");
         let before=std::fs::read(&path).unwrap();
         let body=json!({"worktree_verify":"one","request_id":id});
@@ -1663,7 +1672,7 @@ mod tests {
         let state=test_state(tmp.path());
         let app=super::super::router(state.clone());
         let id=explicit_request(&app,&state,json!({"worktree_verify":"one"})).await;
-        let reply=record_reply(&state,"yes","outside").await;
+        let reply=record_reply(&state,"yes").await;
         state.store.write(move|c| {
             c.execute("INSERT INTO _amux_delegation_grants(code,actor,class,action,target,method,path,body,sentence,created_at,expires_at,status,evidence_row,legacy_duplicate) VALUES('old','old','old','old','old','PATCH','/old','{}','old',1,2,'undone',?1,1)",[reply])?;
             Ok(crate::db::WriteOutcome{applied:true,events:vec![]})

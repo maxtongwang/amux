@@ -153,6 +153,11 @@ const PROVIDER_PREFIXES: [&str; 6] = [
     "this session is being continued from a previous conversation",
 ];
 
+/// Provider-authored prompts are non-owner even without an amux envelope.
+pub(crate) fn provider_stamped(text: &str) -> bool {
+    PROVIDER_PREFIXES.iter().any(|prefix| text.starts_with(prefix))
+}
+
 /// A long paste reaches the hook wrapped as `<pasted_content id="..">...`, so
 /// the stamp a peer envelope starts with sits behind the wrapper. One such
 /// peer message was recorded as Human before this.
