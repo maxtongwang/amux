@@ -98,6 +98,7 @@ pub mod tailnet_watch;
 pub mod telegram_poll;
 pub mod telegram_relay;
 pub mod token_ledger;
+pub(crate) mod work_attribution;
 pub mod tunnel;
 
 pub use scheduler::{

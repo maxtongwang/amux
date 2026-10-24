@@ -248,6 +248,22 @@ fn apply(
     if event["turn_id"].as_str().unwrap_or("").is_empty() && prev["run_id"] == event["run_id"] {
         report["turn_id"] = prev["turn_id"].clone();
     }
+    if matches!(
+        event["event"].as_str(),
+        Some("SessionStart" | "UserPromptSubmit")
+    ) {
+        let cfg = super::session_verbs::parse_env(name);
+        let home = crate::config::amux_home();
+        let usage_context = crate::runtime_jobs::work_attribution::NativeContext {
+            incarnation: super::rename_identity::incarnation(&home, name),
+            historical_aliases: super::rename_identity::attribution_aliases(&home, name),
+            external_references: cfg
+                .get(crate::runtime_jobs::work_attribution::EXTERNAL_REFS_KEY)
+                .map(str::to_owned),
+            isolated: super::session_verbs::session_is_isolated(name),
+        };
+        crate::runtime_jobs::work_attribution::capture_native(conn, name, &report, &usage_context)?;
+    }
     reports[name] = report.clone();
     conn.execute("INSERT INTO prefs(key,value) VALUES('session_reports',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [reports.to_string()])?;
     conn.execute("INSERT INTO session_events(ts,session,type,data,source) VALUES(?1,?2,'session.native_status',?3,'native-hook')",

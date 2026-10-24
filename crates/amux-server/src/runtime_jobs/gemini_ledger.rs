@@ -295,6 +295,10 @@ pub(crate) async fn index_once_at(
                     model: t.model,
                     tokens: t.tokens,
                     cost,
+                    request_id: None,
+                    parent_conversation: None,
+                    parent_started_at: None,
+                    compaction: None,
                     message_id: Some(t.message_id),
                 }
             })
@@ -308,7 +312,7 @@ pub(crate) async fn index_once_at(
     }
 
     token_ledger::warn_unpriced("gemini", &table, &batches);
-    token_ledger::commit_ledger_batch(store, batches).await
+    token_ledger::commit_ledger_batch(store, batches, table).await
 }
 
 #[cfg(test)]

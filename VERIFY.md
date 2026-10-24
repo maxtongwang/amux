@@ -240,3 +240,23 @@ would print.
 Name what should appear BESIDE the answer if the probe really ran, and check for
 THAT: a count beside a zero, a hash beside "adopted", a PASS line beside a green
 suite.
+
+## Cost attribution
+
+```bash
+node --check crates/amux-dashboard/static/app.js
+node --test e2e/cost-attribution.test.mjs
+CARGO_TARGET_DIR=$HOME/.amux/rust-build-target scripts/safe-cargo.sh check --workspace
+CARGO_TARGET_DIR=$HOME/.amux/rust-build-target scripts/safe-cargo.sh test -p amux-server --lib ledger
+CARGO_TARGET_DIR=$HOME/.amux/rust-build-target scripts/safe-cargo.sh test -p amux-server --lib work_attribution
+CARGO_TARGET_DIR=$HOME/.amux/rust-build-target scripts/safe-cargo.sh test -p amux-server --lib observability
+CARGO_TARGET_DIR=$HOME/.amux/rust-build-target scripts/safe-cargo.sh test -p amux-server --lib usage_report_tests
+CARGO_TARGET_DIR=$HOME/.amux/rust-build-target scripts/safe-cargo.sh test -p amux-server --lib api::usage::tests
+CARGO_TARGET_DIR=$HOME/.amux/rust-build-target scripts/safe-cargo.sh test -p amux-server --lib api::review::tests
+```
+
+Pass: JavaScript syntax exits 0, Node reports zero failures, and each Rust command
+exits 0 with a nonzero test count. These are targeted checks, not a full server
+suite. Follow the Rust server shipping gates above before publication. A sandbox
+lock refusal means Rust checks did not run; report the exact refused path.
+The [usage contract](docs/usage-attribution.md) defines the human and agent surfaces.

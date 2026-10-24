@@ -90,6 +90,23 @@ fn incarnation_in(path: &Path) -> Option<String> {
         .map(String::from)
 }
 
+/// Attribution may display retained aliases bound to this exact incarnation.
+/// This read never migrates records or follows a name into a different worker.
+pub(crate) fn attribution_aliases(home: &Path, name: &str) -> Vec<String> {
+    let Some(inc) = incarnation(home, name) else {
+        return vec![];
+    };
+    let mut aliases: Vec<_> = load(home)
+        .into_iter()
+        .filter(|r| r.inc.as_deref() == Some(inc.as_str()))
+        .flat_map(|r| std::iter::once(r.old).chain(r.new))
+        .filter(|n| n != name)
+        .collect();
+    aliases.sort();
+    aliases.dedup();
+    aliases
+}
+
 /// A live worker's incarnation, if it has one.
 pub(crate) fn incarnation(home: &Path, name: &str) -> Option<String> {
     incarnation_in(&env_file(home, name))
