@@ -169,3 +169,7 @@ pub(crate) fn resolve_observed(state: &AppState, id: i64) -> Result<(), String> 
     }
     resolve_reply(state,&row)
 }
+
+#[cfg(test)]
+#[path = "delegation_reply_tests.rs"]
+mod tests;
