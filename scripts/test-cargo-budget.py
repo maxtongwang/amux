@@ -502,6 +502,17 @@ class TargetBudgetDefaultTests(unittest.TestCase):
         self.assertEqual(budget.MAX_TARGET_GB_DEFAULT, 56)
         self.assertEqual(guard.MAX_TARGET_GB_DEFAULT, budget.MAX_TARGET_GB_DEFAULT)
 
+    def test_reclaim_floor_is_36_in_all_three_scripts(self):
+        gspec = importlib.util.spec_from_file_location('guard', ROOT / 'cargo-target-guard.py')
+        guard = importlib.util.module_from_spec(gspec)
+        gspec.loader.exec_module(guard)
+        self.assertEqual(guard.RECLAIM_TO_GB_DEFAULT, 36)
+        for script, name in (('rust-auto-build.sh', 'RECLAIM_TO_GB_DEFAULT'),
+                             ('safe-cargo.sh', '_RECLAIM_TO_GB_DEFAULT')):
+            lines = [l.strip() for l in (ROOT / script).read_text().splitlines()
+                     if l.strip().startswith(name + '=')]
+            self.assertEqual(lines, [f'{name}=36'], script)
+
     def test_unset_env_gives_the_default_in_bytes(self):
         clean = {k: v for k, v in os.environ.items()
                  if k not in ('AMUX_CARGO_MAX_TARGET_GB', 'AMUX_CARGO_MAX_TARGET_MB')}
