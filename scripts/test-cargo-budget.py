@@ -432,13 +432,14 @@ class BuildRetryTests(unittest.TestCase):
                 AMUX_RS_DISK_CLEAR_ONLY='1', AMUX_RS_DISK_CLEAR_DRYRUN='1',
                 AMUX_RS_BUILD_LOG=str(base / 'build.log'))
             env.pop('AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB', None)
-            for gb in (20, 33):
+            # 34 GiB is a warm incremental cache: it must survive the 48 GiB default.
+            for gb in (34, 49):
                 (base / 'build.log').unlink(missing_ok=True)
                 subprocess.run(['bash', str(ROOT / 'rust-auto-build.sh')],
                                env=env | dict(FIXTURE_TARGET_KB=str(gb * 1024**2)),
                                check=True, capture_output=True, timeout=20)
                 log = (base / 'build.log').read_text()
-                self.assertEqual('DEBUG ARTIFACTS' in log, gb > 32, log)
+                self.assertEqual('DEBUG ARTIFACTS' in log, gb > 48, log)
                 self.assertEqual(marker.read_text(), 'warm cache')
 
     def test_failed_inputs_back_off_changed_inputs_retry_and_success_clears(self):
@@ -488,6 +489,26 @@ class BuildRetryTests(unittest.TestCase):
             self.assertEqual(trace.read_text().count('attempt'), 3)
             self.assertFalse(failure.exists())
             self.assertTrue((base / 'stamp').exists())
+
+
+class TargetBudgetDefaultTests(unittest.TestCase):
+    """The combined target budget has one value in two standalone scripts
+    (the server embeds cargo-target-guard.py): both must default to 56 GiB."""
+
+    def test_budget_and_guard_share_the_default(self):
+        gspec = importlib.util.spec_from_file_location('guard', ROOT / 'cargo-target-guard.py')
+        guard = importlib.util.module_from_spec(gspec)
+        gspec.loader.exec_module(guard)
+        self.assertEqual(budget.MAX_TARGET_GB_DEFAULT, 56)
+        self.assertEqual(guard.MAX_TARGET_GB_DEFAULT, budget.MAX_TARGET_GB_DEFAULT)
+
+    def test_unset_env_gives_the_default_in_bytes(self):
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ('AMUX_CARGO_MAX_TARGET_GB', 'AMUX_CARGO_MAX_TARGET_MB')}
+        with patch.dict(os.environ, clean, clear=True):
+            self.assertEqual(budget.max_target_bytes(), 56 * 1024**3)
+        with patch.dict(os.environ, clean | {'AMUX_CARGO_MAX_TARGET_GB': '7'}, clear=True):
+            self.assertEqual(budget.max_target_bytes(), 7 * 1024**3)
 
 
 if __name__ == '__main__':

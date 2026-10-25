@@ -72,12 +72,16 @@ def write_verdict(**fields):
             pass  # without the file safe-cargo simply does not retry; the refusal stands
 
 
+# Default combined target budget: incremental state is about 34 GiB plus headroom (ai-config#261).
+MAX_TARGET_GB_DEFAULT = 56
+
+
 def max_target_bytes():
     """AMUX_CARGO_MAX_TARGET_MB, when set, so a test can exceed the cap with a few
     megabytes instead of tens of gigabytes; otherwise AMUX_CARGO_MAX_TARGET_GB."""
     if os.environ.get('AMUX_CARGO_MAX_TARGET_MB'):
         return positive('AMUX_CARGO_MAX_TARGET_MB', 1) * 1024**2
-    return positive('AMUX_CARGO_MAX_TARGET_GB', 40) * 1024**3
+    return positive('AMUX_CARGO_MAX_TARGET_GB', MAX_TARGET_GB_DEFAULT) * 1024**3
 
 
 def positive(name, default):

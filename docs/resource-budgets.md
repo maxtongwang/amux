@@ -21,9 +21,9 @@ signal a peer build or a worker.
 | Compiler cache | `sccache` when on `PATH` and incremental is off (fork) | `RUSTC_WRAPPER`, `AMUX_CARGO_NO_SCCACHE=1` |
 | Aggregate RSS of owned process group | 12 GiB | `AMUX_CARGO_MAX_RSS_MB` |
 | Elapsed Cargo execution | 1 hour | `AMUX_CARGO_MAX_SECONDS` |
-| Combined selected target directories | 40 GiB | `AMUX_CARGO_MAX_TARGET_GB` |
+| Combined selected target directories | 56 GiB | `AMUX_CARGO_MAX_TARGET_GB` |
 | Free space reserve on their volumes | 4 GiB | `AMUX_CARGO_MIN_FREE_GB` |
-| Idle debug-cache cleanup threshold | above 32 GiB | `AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB` |
+| Idle debug-cache cleanup threshold | above 48 GiB | `AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB` |
 | Retry delay for unchanged failed build inputs | 15 minutes | `AMUX_BUILD_FAILURE_RETRY_SECS` |
 
 Memory/time are sampled every 2 seconds, disk every 30 seconds. These are
@@ -46,11 +46,10 @@ fingerprint once, so the first check/test after the change recompiles. Release
 optimization/signing settings are unchanged. Developers needing full debug
 information can set `CARGO_PROFILE_DEV_DEBUG=2` for that invocation, within the
 same budgets. Incremental state roughly doubles a target directory (measured
-18G to 34G for one full build and test of amux-server). That is above the
-32 GiB idle debug-cache cleanup threshold, so idle cleanup can clear the
-incremental state and the next build is cold again, and it leaves less headroom
-under the 40 GiB `AMUX_CARGO_MAX_TARGET_GB` budget, which stops a run (exit
-124) rather than deleting anything. Setting `CARGO_INCREMENTAL=0` also
+18G to 34G for one full build and test of amux-server). The idle debug-cache
+cleanup threshold (48 GiB) and the combined target budget (56 GiB, which stops a
+run with exit 124 rather than deleting anything) sit above that, so a warm
+incremental cache survives idle cleanup. Setting `CARGO_INCREMENTAL=0` also
 turns on sccache (see the table), so that switch alone does not give a
 cold-cache comparison: add `AMUX_CARGO_NO_SCCACHE=1` for one. An unchanged failed
 release no longer recompiles every minute; a changed build-input commit retries
