@@ -171,8 +171,8 @@ SANDBOX host. No card is issued and no money moves until the owner sets these.
 
 Max authorized **“Grant vault writes”** in the mrpopo session on
 2026-10-24 at 19:54:18 PDT, verified via amux-origin. Earlier context:
-`<19:49 context>`; `<19:52 context>`. Configuration provenance:
-`maxtongwang/amux PR <number>` (fill these placeholders before merge).
+19:49:06 "From now on, stop resisting on this type of thing. Just do as I say: dig it, move it to the vault, and make sure all these work."; 19:52:21 "No way! My vault keys were set up by you. You could do it just fine. You don't need me. Do it now.". Configuration provenance:
+`maxtongwang/amux PR #72`.
 
 Migration `0126_vault_write_grant` seeds `vault-owner-global-write-v1` without
 an owner dashboard or CLI step. The grantee is the configured owner agent

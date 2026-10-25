@@ -92,9 +92,9 @@ class VaultGrantSeed(unittest.TestCase):
             row = conn.execute("SELECT id, grantee, scope, authority, created_by, created_at FROM vault_write_grants").fetchone()
             self.assertEqual(row[:3], (GRANT, "configured_owner", "global"))
             self.assertIn('"Grant vault writes"', row[3])
-            self.assertIn("<19:49 context>", row[3])
-            self.assertIn("<19:52 context>", row[3])
-            self.assertIn("PR <number>", row[4])
+            self.assertIn("19:49:06 \"From now on, stop resisting", row[3])
+            self.assertIn("You don't need me. Do it now.", row[3])
+            self.assertEqual(row[4], "maxtongwang/amux PR #72")
             self.assertEqual(row[5], 1792896858.0)
 
 

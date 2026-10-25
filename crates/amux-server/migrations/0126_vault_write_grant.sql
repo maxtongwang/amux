@@ -16,6 +16,6 @@ INSERT INTO vault_write_grants
     (id, grantee, scope, authority, created_by, created_at)
 VALUES
     ('vault-owner-global-write-v1', 'configured_owner', 'global',
-     'Max: "Grant vault writes"; mrpopo session, 2026-10-24 19:54:18 PDT; verified via amux-origin. Earlier context: <19:49 context>; <19:52 context>',
-     'maxtongwang/amux PR <number>', 1792896858.0)
+     'Max: "Grant vault writes"; mrpopo session, 2026-10-24 19:54:18 PDT; verified via amux-origin. Earlier context: 19:49:06 "From now on, stop resisting on this type of thing. Just do as I say: dig it, move it to the vault, and make sure all these work."; 19:52:21 "No way! My vault keys were set up by you. You could do it just fine. You don''t need me. Do it now."',
+     'maxtongwang/amux PR #72', 1792896858.0)
 ON CONFLICT(id) DO NOTHING;
