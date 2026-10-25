@@ -28,7 +28,7 @@ def source_sql(path, prefix):
 
 def migrate(conn):
     conn.execute("CREATE TABLE cmd_history(id INTEGER PRIMARY KEY,session TEXT,text TEXT,type TEXT,origin TEXT,delivery TEXT,process_origin TEXT,ts INTEGER,repeat_of INTEGER,delivered_at INTEGER)")
-    for number in range(125, 131):
+    for number in range(128, 134):
         files = list(MIGRATIONS.glob(f"{number:04}_*.sql"))
         assert len(files) == 1, files
         sql = files[0].read_text()
@@ -140,7 +140,7 @@ def main():
             duplicate[17] = None
             conn.execute(request, duplicate)
             expect_constraint(conn, claim, ["actor", 3, reply, "REQ2"])
-    print("PASS: 0125-0130 schema, request/reply uniqueness, actual query boundaries and SIGKILL question/native-display/resolution rollback and receipt adoption (SQLite only)")
+    print("PASS: 0128-0133 schema, request/reply uniqueness, actual query boundaries and SIGKILL question/native-display/resolution rollback and receipt adoption (SQLite only)")
 
 
 if __name__ == "__main__":

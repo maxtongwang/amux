@@ -1,5 +1,5 @@
 -- Preserve historical grants while reserving each used reply once. Runs even
--- when the DB already completed the shipped 0127 with its full reply index.
+-- when the DB already completed the shipped 0130 with its full reply index.
 -- ADDCOL: _amux_delegation_grants legacy_duplicate INTEGER NOT NULL DEFAULT 0
 UPDATE _amux_delegation_grants
 SET legacy_duplicate = 1

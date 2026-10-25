@@ -6203,11 +6203,11 @@ FIX: Reserve one pair with its spent timestamp and exact request in the grant
 
   Opus delta review of edc942b2 follow-up: all citation actions now use one
   target/value/direction matcher, including negation refusal; passing mentions
-  cannot fund YOLO on another worker. Restored the original 0126 and moved all
-  later schema additions to 0127 so an already-stamped DB upgrades. Env CAS
+  cannot fund YOLO on another worker. Restored the original 0129 and moved all
+  later schema additions to 0130 so an already-stamped DB upgrades. Env CAS
   compares touched keys plus identity and merges unrelated writes. Ask binding
   reads existing incarnations on demand without fleet scans or env writes.
-  The populated-old-0126 SQLite probe passed, its reply-index mutation failed
+  The populated-old-0129 SQLite probe passed, its reply-index mutation failed
   and reverted; the parent still owns Cargo and Rust regression verification.
 
 ## Typed yes bound to another approval
@@ -6227,8 +6227,8 @@ FIX: Max 2026-10-23: approval identity resolution. Supersedes the free-text
   resolves only one question in its own unanswered session window; ambiguous
   and absent candidates fund nothing. Distinct request refusal codes and
   delegation_request_resolution verdicts survive in the API, CLI and existing
-  dashboard list. 0129 adds the request bindings and resolution receipts;
-  0124-0128 remain unchanged. Rust regressions/mutations await the parent;
+  dashboard list. 0132 adds the request bindings and resolution receipts;
+  0127-0131 remain unchanged. Rust regressions/mutations await the parent;
   local CLI/dashboard and SQLite uniqueness/SIGKILL boundary probes pass.
 
 

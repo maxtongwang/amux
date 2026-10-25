@@ -224,7 +224,7 @@ the server records unverified/replayed observations as `approval_status_only`.
 Stop transcript fallback is disabled because transcript files are mutable. Native Stop
 receipt/snapshot binding is atomic with its accepted sequence too.
 
-Migration 0130 is extended in place; numbering remains dense. It adds native
+Migration 0133 is extended in place; numbering remains dense. It adds native
 run/sequence, short codes, closure timestamps, snapshots, sticky confirmation and
 context audit storage, plus v3.2 confirmation/reminder receipts. Legacy NULLs cannot prove funding. Unique indexes protect
 open short codes, display rows and spent replies. Approval closes the code even

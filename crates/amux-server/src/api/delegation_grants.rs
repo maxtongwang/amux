@@ -8,7 +8,7 @@
 //! Typed affirmative correlation lives in delegation_requests; passkey approval
 //! still requires a direct Remote owner. Every application cites request_id and
 //! compares operands plus method/path/body; internal replay rechecks identities.
-//! A reply is spent once in the grant claim transaction (0127/0128). Failed,
+//! A reply is spent once in the grant claim transaction (0130/0131). Failed,
 //! interrupted and undone grants retain their evidence. Handler/filesystem
 //! writes are separate resources: applying grants are never blindly replayed.
 //! Undo restores the original recorded delta only while identities and current
@@ -592,7 +592,7 @@ pub(crate) struct GrantRow {
     pub evidence_row: Option<i64>,
     pub cited_excerpt: Option<String>,
     pub changes: Option<String>,
-    /// The citation pair (0126): the ask's row and both texts.
+    /// The citation pair (0129): the ask's row and both texts.
     pub ask_row: Option<i64>,
     pub ask_text: Option<String>,
     pub reply_text: Option<String>,

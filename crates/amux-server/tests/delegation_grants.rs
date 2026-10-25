@@ -167,7 +167,7 @@ async fn negated_free_text_never_creates_or_funds_a_request() {
     let e=setup().await;
     // Keep this specimen runnable against faba94781: seed only shipped
     // columns, with the original N2 binding, so the pre-fix failure is the
-    // unauthorized config write rather than a missing 0129 fixture column.
+    // unauthorized config write rather than a missing 0132 fixture column.
     let pair=std::sync::Arc::new(std::sync::Mutex::new((0i64,0i64)));
     let out=pair.clone();
     let ask=format!("Max, rather than enable yolo for {DEV_A}, may I enable yolo for {DEV_B}?");

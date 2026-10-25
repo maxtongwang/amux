@@ -1,4 +1,4 @@
--- 0124_cmd_history_process_origin.sql: which process sent an owner message
+-- 0127_cmd_history_process_origin.sql: which process sent an owner message
 -- (maxtongwang/ai-config#160).
 --
 -- An owner-delegated change cites the owner's own words (max_ref). A worker

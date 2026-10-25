@@ -1,4 +1,4 @@
--- 0126_delegation_grant_citation_pair.sql: a cite-mode grant stores BOTH halves
+-- 0129_delegation_grant_citation_pair.sql: a cite-mode grant stores BOTH halves
 -- of its citation (maxtongwang/ai-config#160, PR #18 review B4).
 --
 -- Ruling (dev-lead, 2026-10-19): a citation is the PAIR of (1) the asking
@@ -6,8 +6,8 @@
 -- and the setting in plain words, and (2) Max's own FIRST typed message in
 -- that session after it, within 2 hours. The grant keeps the ask's row id and
 -- both texts so the audit shows what Max answered and what he was asked.
--- `evidence_row` and `cited_excerpt` (0125) keep the reply's row and excerpt.
--- NULL on every passkey-mode grant and on rows written before 0126.
+-- `evidence_row` and `cited_excerpt` (0128) keep the reply's row and excerpt.
+-- NULL on every passkey-mode grant and on rows written before 0129.
 -- ADDCOL: _amux_delegation_grants ask_row INTEGER
 -- ADDCOL: _amux_delegation_grants ask_text TEXT
 -- ADDCOL: _amux_delegation_grants reply_text TEXT

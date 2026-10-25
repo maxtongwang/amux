@@ -1,5 +1,5 @@
 -- PR #18 Opus delta review of edc942b2: migration reversal. Keep the shipped
--- 0126 immutable so databases already stamped 126 receive these additions.
+-- 0129 immutable so databases already stamped 129 receive these additions.
 -- One owner reply reserves one request across actors, modes and statuses.
 -- ADDCOL: _amux_delegation_grants cite_spent_at REAL
 -- ADDCOL: _amux_delegation_grants target_incarnation TEXT

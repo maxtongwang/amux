@@ -6859,7 +6859,7 @@ pub(crate) fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Resu
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN msg_id TEXT", []);
     // Same migration: set when a row's delivery was inferred from its TEXT.
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN reconciled_at INTEGER", []);
-    // Migration 0124 carries the same ADDCOL for migrated DBs (ai-config#160).
+    // Migration 0127 carries the same ADDCOL for migrated DBs (ai-config#160).
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN process_origin TEXT", []);
     // Dead-lettered vs delivered must be distinguishable in history
     // (AMUX-3110; migration 0024 carries the same ADDCOL for migrated DBs,
@@ -7157,9 +7157,9 @@ pub(crate) struct DeliveryMeta<'a> {
     pub repeat_of: Option<i64>,
     /// The process-attribution verdict of the request that sent an OWNER
     /// message (`outside`, `remote` or `remote-forwarded`, from
-    /// `process_identity`), migration 0124. `max_ref` accepts an owner send as
+    /// `process_identity`), migration 0127. `max_ref` accepts an owner send as
     /// the owner's own words only with one of those. None on every other row:
-    /// peer, member, schedule, pane, and every row written before 0124.
+    /// peer, member, schedule, pane, and every row written before 0127.
     pub process_origin: Option<&'a str>,
 }
 

@@ -1,9 +1,9 @@
--- A DB that completed shipped 0127 has no duplicate replies, already has
--- the full index, and skips 0127. A DB with duplicates failed index creation
--- and was never stamped 127. Remove only that failing index here; 0128 adds
+-- A DB that completed shipped 0130 has no duplicate replies, already has
+-- the full index, and skips 0130. A DB with duplicates failed index creation
+-- and was never stamped 130. Remove only that failing index here; 0131 adds
 -- legacy_duplicate, backfills spent replies and replaces the index for both.
 -- PR #18 Opus delta review of edc942b2: migration reversal. Keep the shipped
--- 0126 immutable so databases already stamped 126 receive these additions.
+-- 0129 immutable so databases already stamped 129 receive these additions.
 -- One owner reply reserves one request across actors, modes and statuses.
 -- ADDCOL: _amux_delegation_grants cite_spent_at REAL
 -- ADDCOL: _amux_delegation_grants target_incarnation TEXT
