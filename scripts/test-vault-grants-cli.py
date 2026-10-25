@@ -63,6 +63,12 @@ else:
         calls = [json.loads(s) for s in self.calls.read_text().splitlines()]
         self.assertTrue(all(c[-1] == "http://vault-fixture.invalid/api/vault/grants" for c in calls))
 
+    def test_vault_grants_regrant_help(self):
+        out = subprocess.run(["bash", str(REPO / "amux"), "--help"], env=self.env,
+                             capture_output=True, text=True, timeout=20)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("amux vault grants regrant <id>", out.stdout)
+
     def test_vault_grants_preserves_worker_origin_and_errors(self):
         sessions = self.root / "amux" / "sessions"
         sessions.mkdir(parents=True, exist_ok=True)

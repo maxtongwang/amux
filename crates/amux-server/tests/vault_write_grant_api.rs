@@ -202,7 +202,7 @@ impl Fixture {
     }
 }
 fn secret(scope: &str, target: &str) -> Value {
-    json!({"key": "GRANTED_KEY", "scope": scope, "target": target, "value": SENTINEL})
+    json!({"key": "STRIPE_API_KEY", "scope": scope, "target": target, "value": SENTINEL})
 }
 
 #[tokio::test]
@@ -220,6 +220,324 @@ async fn vault_grantee_global_create_and_update_allowed() {
             .await;
         assert_eq!(status, 200, "grantee global update");
         assert_eq!(body["item"]["version"], version);
+    }
+}
+
+#[tokio::test]
+async fn vault_grantee_key_policy_all_write_paths() {
+    let _serial = SERIAL.lock().await;
+    let log = logs();
+    let f = Fixture::new(true);
+    let safe_id = f.create().await;
+    for (key, rule) in [
+        ("NODE_OPTIONS", "injection_sensitive"),
+        ("BASH_ENV", "injection_sensitive"),
+        ("DYLD_INSERT_LIBRARIES", "injection_sensitive"),
+        ("ANTHROPIC_BASE_URL", "client_auth_or_endpoint"),
+        ("ANTHROPIC_API_KEY", "client_auth_or_endpoint"),
+        ("ANTHROPIC_AUTH_TOKEN", "client_auth_or_endpoint"),
+        ("OPENAI_API_KEY", "client_auth_or_endpoint"),
+    ] {
+        let payload = json!({"key": key, "scope": "global", "value": SENTINEL});
+        let (status, body) = f
+            .grantee("POST", "/api/vault/secrets", Some(payload.clone()))
+            .await;
+        assert_key_refusal(status, &body, rule);
+        // Owner-created process-control keys cannot be rotated or edited by
+        // the grantee. This also proves the owner path remains unchanged.
+        let (status, body) = f
+            .call("POST", "/api/vault/secrets", Some(payload), None)
+            .await;
+        assert_eq!(status, 201, "owner can create {key}");
+        let unsafe_id = body["item"]["id"].as_str().unwrap();
+        for method in ["PUT", "PATCH"] {
+            let (status, body) = f
+                .grantee(
+                    method,
+                    &format!("/api/vault/secrets/{unsafe_id}"),
+                    Some(json!({"value": SENTINEL})),
+                )
+                .await;
+            assert_key_refusal(status, &body, rule);
+        }
+        let (status, body) = f
+            .grantee(
+                "PATCH",
+                &format!("/api/vault/secrets/{safe_id}"),
+                Some(json!({"key": key, "value": SENTINEL})),
+            )
+            .await;
+        assert_key_refusal(status, &body, rule);
+    }
+    let tracing = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    for rule in ["injection_sensitive", "client_auth_or_endpoint"] {
+        assert!(tracing
+            .lines()
+            .any(|l| l.contains("vault_grant_key_not_permitted") && l.contains(rule)));
+    }
+    assert!(!tracing.contains(SENTINEL));
+}
+
+fn assert_key_refusal(status: u16, body: &Value, rule: &str) {
+    assert_eq!(status, 403);
+    assert_eq!(body["code"], "vault_grant_key_not_permitted");
+    assert_eq!(body["rule"], rule);
+}
+
+#[tokio::test]
+async fn vault_grantee_key_shape_and_reserved_patterns() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(true);
+    let id = f.create().await;
+    // Credential-shaped reserved names prove the explicit deny rules, rather
+    // than relying on the suffix filter to exclude runtime controls.
+    for (rule, keys) in [
+        (
+            "not_credential_shaped",
+            vec![
+                "_STRIPE_TOKEN",
+                "stripe_TOKEN",
+                "9STRIPE_TOKEN",
+                "STRIPE-TOKEN",
+                "STRIPE_Å_TOKEN",
+                "STRIPE_KEY",
+                "STRIPE_PASSWORD",
+                "STRIPE_OPTIONS",
+                "",
+            ],
+        ),
+        (
+            "client_auth_or_endpoint",
+            vec![
+                "CLAUDE_API_KEY",
+                "CODEX_TOKEN",
+                "STRIPE_BASE_URL",
+                "STRIPE_API_BASE",
+            ],
+        ),
+        (
+            "injection_sensitive",
+            vec![
+                "PATH",
+                "HOME",
+                "SHELL",
+                "USER",
+                "TMPDIR",
+                "ENV",
+                "ZDOTDIR",
+                "LD_API_KEY",
+                "DYLD_TOKEN",
+                "NODE_SECRET",
+                "PYTHONPATH_TOKEN",
+                "BASH_TOKEN",
+                "PROMPT_COMMAND",
+                "GIT_CLIENT_ID",
+                "SSH_CLIENT_SECRET",
+                "PERL5LIB_TOKEN",
+                "RUBYOPT_TOKEN",
+                "CC_TOKEN",
+                "AMUX_TOKEN",
+            ],
+        ),
+    ] {
+        for key in keys {
+            for (method, path) in [
+                ("POST", "/api/vault/secrets".to_string()),
+                ("PATCH", format!("/api/vault/secrets/{id}")),
+            ] {
+                let (status, body) = f
+                    .grantee(method, &path, Some(json!({"key": key, "value": SENTINEL})))
+                    .await;
+                assert_key_refusal(status, &body, rule);
+            }
+        }
+    }
+    for key in [
+        "PAYMENTS_API_KEY",
+        "PAYMENTS_TOKEN",
+        "PAYMENTS_SECRET",
+        "PAYMENTS_CLIENT_ID",
+        "PAYMENTS_CLIENT_SECRET",
+    ] {
+        let (status, body) = f
+            .grantee(
+                "POST",
+                "/api/vault/secrets",
+                Some(json!({"key": key, "value": SENTINEL})),
+            )
+            .await;
+        assert_eq!(status, 201, "permitted suffix: {key}");
+        let created = body["item"]["id"].as_str().unwrap();
+        assert_eq!(
+            f.grantee(
+                "PATCH",
+                &format!("/api/vault/secrets/{created}"),
+                Some(json!({"key": format!("RENAMED_{key}"), "value": SENTINEL}))
+            )
+            .await
+            .0,
+            200
+        );
+    }
+}
+
+#[tokio::test]
+async fn vault_grant_bad_receipts_quarantined_without_blocking_writes() {
+    let _serial = SERIAL.lock().await;
+    let log = logs();
+    let mut f = Fixture::new(true);
+    let id = f.create().await;
+    let path = f.home.join("vault/secrets.json");
+    let invalid = vec![
+        json!({"receipt_id": "bad-id"}),
+        json!({"receipt_id": "vault-grant:bad-fields", "event": "wrong-event"}),
+        json!({"receipt_id": "vault-grant:bad-time", "event": "secret_granted_write", "key": "STRIPE_API_KEY",
+            "item": id, "grantee": "mrpopo", "grantee_id": f.worker_id, "ts": "invalid"}),
+        json!({"receipt_id": "vault-grant:bad-scope", "event": "secret_granted_write", "key": "STRIPE_API_KEY",
+            "item": id, "grantee": "mrpopo", "grantee_id": f.worker_id, "ts": 1.0, "scope": "worker",
+            "grant_id": GRANT, "version": 1}),
+        Value::Null,
+    ];
+    let mut doc: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    doc["grant_receipts"] = json!(invalid);
+    std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    assert_eq!(
+        f.grantee(
+            "PUT",
+            &format!("/api/vault/secrets/{id}"),
+            Some(json!({"value": SENTINEL}))
+        )
+        .await
+        .0,
+        200
+    );
+    let doc: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(doc["grant_receipts_quarantine"], json!(invalid));
+    assert_eq!(doc["grant_receipts"], json!([]));
+    // A malformed queue container is quarantined on startup too. It cannot
+    // poison the next save, and restarts never duplicate the quarantine.
+    let malformed = json!({"not": "a queue"});
+    let mut doc = doc;
+    doc["grant_receipts"] = malformed.clone();
+    std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    f.app = router(f.state.clone());
+    f.app = router(f.state.clone());
+    assert_eq!(
+        f.grantee(
+            "POST",
+            "/api/vault/secrets",
+            Some(json!({"key": "OTHER_API_KEY", "value": SENTINEL}))
+        )
+        .await
+        .0,
+        201
+    );
+    let doc: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut expected = invalid;
+    expected.push(malformed);
+    assert_eq!(doc["grant_receipts_quarantine"], json!(expected));
+    assert_eq!(doc["grant_receipts"], json!([]));
+    let conn = f.state.store.read().unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM session_events WHERE type='vault.granted_write'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        3
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM conversation_posts WHERE author_key='system:vault'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        3
+    );
+    let tracing = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert!(tracing.contains("vault_grant_receipt_quarantined"));
+    assert!(!tracing.contains(SENTINEL));
+}
+
+#[tokio::test]
+async fn vault_regrant_missing_owner_is_actionable_conflict() {
+    let _serial = SERIAL.lock().await;
+    let log = logs();
+    let f = Fixture::new(true);
+    assert_eq!(
+        f.call(
+            "POST",
+            &format!("/api/vault/grants/{GRANT}/revoke"),
+            None,
+            None
+        )
+        .await
+        .0,
+        200
+    );
+    std::fs::remove_file(f.home.join("sessions/mrpopo.env")).unwrap();
+    let (status, body) = f
+        .call(
+            "POST",
+            &format!("/api/vault/grants/{GRANT}/regrant"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 409);
+    assert_eq!(body["code"], "vault_grant_owner_unregistered");
+    assert!(body["error"].as_str().unwrap().contains("register"));
+    let (_, listing) = f.call("GET", "/api/vault/grants", None, None).await;
+    assert!(listing["grants"][0]["revoked_at"].as_f64().is_some());
+    assert!(String::from_utf8(log.0.lock().unwrap().clone())
+        .unwrap()
+        .contains("vault_grant_owner_unregistered"));
+}
+
+#[tokio::test]
+async fn vault_grant_listing_requires_owner_auth() {
+    let _serial = SERIAL.lock().await;
+    let mut f = Fixture::new(true);
+    std::env::set_var("AMUX_RS_NO_LOOPBACK_BYPASS", "0");
+    assert_eq!(f.call("GET", "/api/vault/grants", None, None).await.0, 200);
+    assert_eq!(f.grantee("GET", "/api/vault/grants", None).await.0, 403);
+    for tokenless_host in [false, true] {
+        if tokenless_host {
+            f.state.auth_token = None;
+            f.app = router(f.state.clone());
+        }
+        for auth in [None, Some("Bearer invalid")] {
+            // Localhost can bypass the outer middleware; the route must still
+            // protect pinned identities independently of transport locality.
+            let mut req =
+                Request::builder()
+                    .uri("/api/vault/grants")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        12345,
+                    ))));
+            if let Some(auth) = auth {
+                req = req.header("authorization", auth);
+            }
+            let response = f
+                .app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 403);
+            let raw = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(body["code"], "vault_grants_auth_required");
+            assert!(body.get("grants").is_none());
+            for identity in [INC, f.worker_id.as_str(), "mrpopo"] {
+                assert!(!String::from_utf8_lossy(&raw).contains(identity));
+            }
+        }
     }
 }
 
@@ -363,7 +681,7 @@ async fn vault_revoked_seed_stays_revoked_and_worker_cannot_regrant() {
         .0,
         403
     );
-    let (_, listing) = f.grantee("GET", "/api/vault/grants", None).await;
+    let (_, listing) = f.call("GET", "/api/vault/grants", None, None).await;
     assert_eq!(listing["grants"].as_array().unwrap().len(), 1);
     assert!(listing["grants"][0]["revoked_at"].as_f64().is_some());
     assert_eq!(
@@ -458,7 +776,7 @@ async fn vault_legacy_owner_uses_pinned_token_bound_incarnation() {
     let _serial = SERIAL.lock().await;
     let mut f = Fixture::new(false);
     f.create().await;
-    let (_, listing) = f.grantee("GET", "/api/vault/grants", None).await;
+    let (_, listing) = f.call("GET", "/api/vault/grants", None, None).await;
     assert_eq!(listing["grants"][0]["grantee_id"], INC);
     std::fs::copy(
         f.home.join("sessions/peer.env"),
@@ -491,7 +809,7 @@ async fn vault_granted_writes_audit_feed_events_and_listing_never_leak() {
         Some(json!({"value": SENTINEL})),
     )
     .await;
-    let (status, listing) = f.grantee("GET", "/api/vault/grants", None).await;
+    let (status, listing) = f.call("GET", "/api/vault/grants", None, None).await;
     assert_eq!(status, 200);
     let row = &listing["grants"][0];
     assert_eq!(row["grantee_id"], f.worker_id);
@@ -521,7 +839,7 @@ async fn vault_granted_writes_audit_feed_events_and_listing_never_leak() {
         assert_eq!(event["grant_id"], GRANT);
         assert_eq!(event["grantee_id"], f.worker_id);
         assert_eq!(event["version"], i + 1);
-        assert_eq!(event["key"], "GRANTED_KEY");
+        assert_eq!(event["key"], "STRIPE_API_KEY");
         assert_eq!(event["scope"], "global");
         assert!(event["ts"].as_f64().is_some());
     }
@@ -534,7 +852,7 @@ async fn vault_granted_writes_audit_feed_events_and_listing_never_leak() {
     assert_eq!(feed.len(), 2, "every write posts to leads");
     assert!(feed
         .iter()
-        .all(|s| !s.contains(SENTINEL) && s.contains(GRANT) && s.contains("GRANTED_KEY")));
+        .all(|s| !s.contains(SENTINEL) && s.contains(GRANT) && s.contains("STRIPE_API_KEY")));
     let audit = std::fs::read_to_string(f.home.join("logs/vault-audit.jsonl")).unwrap();
     assert!(!audit.contains(SENTINEL), "audit leaked the canary");
     assert_eq!(
@@ -562,6 +880,15 @@ async fn vault_grant_crash_child() {
     let root =
         PathBuf::from(std::env::var_os("VAULT_CRASH_ROOT").expect("parent supplies private root"));
     let f = Fixture::from_temp(tempfile::tempdir_in(&root).unwrap(), true);
+    std::fs::create_dir_all(f.home.join("vault")).unwrap();
+    std::fs::write(
+        f.home.join("vault/secrets.json"),
+        serde_json::to_vec(&json!({
+            "items": [], "grant_receipts": [{"receipt_id": "bad-before-crash"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     // The DB event + feed commit, but the file audit cannot. This is a real
     // failure boundary after the encrypted save, not a test-only source hook.
     std::fs::create_dir_all(f.home.join("logs/vault-audit.jsonl")).unwrap();
@@ -573,6 +900,10 @@ async fn vault_grant_crash_child() {
     assert_eq!(body["code"], "vault_grant_audit_failed");
     let store = std::fs::read_to_string(f.home.join("vault/secrets.json")).unwrap();
     assert!(!store.contains(SENTINEL));
+    assert_eq!(
+        serde_json::from_str::<Value>(&store).unwrap()["grant_receipts_quarantine"],
+        json!([{"receipt_id": "bad-before-crash"}])
+    );
     assert_eq!(
         serde_json::from_str::<Value>(&store).unwrap()["grant_receipts"]
             .as_array()
@@ -639,6 +970,10 @@ async fn vault_grant_sigkill_replays_receipt_once() {
         serde_json::from_str(&std::fs::read_to_string(home.join("vault/secrets.json")).unwrap())
             .unwrap();
     assert!(store["grant_receipts"].as_array().unwrap().is_empty());
+    assert_eq!(
+        store["grant_receipts_quarantine"],
+        json!([{"receipt_id": "bad-before-crash"}])
+    );
     assert_eq!(store["items"].as_array().unwrap().len(), 1);
     assert_eq!(store["items"][0]["version"], 1);
     let conn = state.store.read().unwrap();

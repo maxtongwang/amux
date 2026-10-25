@@ -6548,6 +6548,7 @@ ${BOLD}Interaction:${RESET}
   amux peek <name> [lines]       View last N lines without attaching (default: 30)
   amux vault grants [--json]    List standing vault grants (metadata, Unix seconds)
   amux vault grants revoke <id> Revoke a grant (owner origin only)
+  amux vault grants regrant <id> Rebind and reactivate a grant (owner origin only)
   amux post <conv> [text]        Post to Messages: g:<group>, #group or w:<worker> (text or stdin)
   amux send <name> --stdin       Send a message read from stdin ${GREEN}(preferred)${RESET}
                                  ${DIM}amux send api --stdin <<'EOF'${RESET}

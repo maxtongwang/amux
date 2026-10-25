@@ -324,7 +324,8 @@ fn pending_grant_receipts(home: &Path) -> Result<Vec<Value>, String> {
     match doc.get("grant_receipts") {
         None => Ok(vec![]),
         Some(Value::Array(a)) => Ok(a.clone()),
-        Some(_) => Err("invalid grant receipts in secrets.json".into()),
+        // Preserve a malformed queue as one invalid receipt for quarantine.
+        Some(other) => Ok(vec![other.clone()]),
     }
 }
 
@@ -339,10 +340,28 @@ fn save_with_receipt(home: &Path, items: &[Value], receipt: Option<Value>) -> Re
 }
 
 fn save_state(home: &Path, items: &[Value], pending: &[Value]) -> Result<(), String> {
+    save_state_with_quarantine(home, items, pending, &[])
+}
+
+fn save_state_with_quarantine(home: &Path, items: &[Value], pending: &[Value], invalid: &[Value]) -> Result<(), String> {
+    let mut quarantined = match std::fs::read(store_path(home)) {
+        Ok(raw) => {
+            let doc: Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+            match doc.get("grant_receipts_quarantine") {
+                None => vec![],
+                Some(Value::Array(entries)) => entries.clone(),
+                Some(other) => vec![other.clone()],
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+        Err(e) => return Err(e.to_string()),
+    };
+    quarantined.extend_from_slice(invalid);
     let dir = super::vault::vault_dir(home);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let tmp = dir.join(format!(".secrets.json.{}", std::process::id()));
-    let body = serde_json::to_vec_pretty(&json!({"version": STORE_VERSION, "items": items, "grant_receipts": pending})).map_err(|e| e.to_string())?;
+    let body = serde_json::to_vec_pretty(&json!({"version": STORE_VERSION, "items": items,
+        "grant_receipts": pending, "grant_receipts_quarantine": quarantined})).map_err(|e| e.to_string())?;
     std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
@@ -849,12 +868,21 @@ pub(crate) fn recover_granted_writes(state: &super::AppState, home: &Path) -> Re
 fn publish_pending_grants(state: &super::AppState, home: &Path) -> Result<(), String> {
     let pending = pending_grant_receipts(home)?;
     if pending.is_empty() { return Ok(()); }
-    for receipt in &pending {
+    let (valid, invalid): (Vec<_>, Vec<_>) = pending.into_iter().partition(|receipt|
+        super::grants::vault_write::validated_receipt(receipt).is_ok());
+    if !invalid.is_empty() {
+        // One atomic save moves bad receipts out of the active queue. Crashing
+        // before it retains the originals; after it retains the quarantine.
+        save_state_with_quarantine(home, &load(home)?, &valid, &invalid)?;
+        tracing::warn!(verdict = "vault_grant_receipt_quarantined", measured = true,
+            n_considered = invalid.len(), "invalid vault grant receipts preserved outside the replay queue");
+    }
+    for receipt in &valid {
         super::grants::vault_write::publish_receipt(state, home, receipt).map_err(|e| e.to_string())?;
     }
     let items = load(home)?;
     save_state(home, &items, &[])?;
-    tracing::info!(verdict = "vault_grant_audit_recovered", measured = true, n_considered = pending.len(),
+    tracing::info!(verdict = "vault_grant_audit_recovered", measured = true, n_considered = valid.len(),
         "pending vault grant receipts published without duplicate notices");
     Ok(())
 }
@@ -1029,6 +1057,9 @@ async fn create(State(state): State<super::AppState>, uri: Uri, headers: HeaderM
     };
     let by = grant.as_ref().map(|g| g.name.as_str()).unwrap_or("owner");
     let key = body.get("key").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if let Err((c, v)) = super::grants::vault_write::permitted_keys(&home, grant.as_ref(), &[&key]) {
+        return err(c, v);
+    }
     if let Err(e) = valid_key(&key) {
         return err(StatusCode::BAD_REQUEST, json!({"error": e, "field": "key"}));
     }
@@ -1104,6 +1135,7 @@ async fn replace(State(state): State<super::AppState>, uri: Uri, headers: Header
             let pos = items.iter().position(|i| i["id"] == id.as_str())
                 .ok_or((StatusCode::NOT_FOUND, json!({"error": "no such secret"})))?;
             let (key, scope) = (items[pos]["key"].as_str().unwrap_or("").to_string(), item_scope(&items[pos]).ok_or((StatusCode::CONFLICT, json!({"error": "item has no valid scope"})))?);
+            super::grants::vault_write::permitted_keys(&home, grant.as_ref(), &[&key])?;
             check_write_scope(&state, &home, &headers, grant.as_ref(), &[&scope])?;
             // PUT cannot request a scope change either.
             if body.get("scope").is_some() {
@@ -1166,6 +1198,9 @@ async fn update(State(state): State<super::AppState>, uri: Uri, headers: HeaderM
     };
     let new_key = body.get("key").and_then(Value::as_str).map(|k| k.trim().to_string());
     if let Some(k) = &new_key {
+        if let Err((c, v)) = super::grants::vault_write::permitted_keys(&home, grant.as_ref(), &[k]) {
+            return err(c, v);
+        }
         if let Err(e) = valid_key(k) {
             return err(StatusCode::BAD_REQUEST, json!({"error": e, "field": "key"}));
         }
@@ -1177,6 +1212,7 @@ async fn update(State(state): State<super::AppState>, uri: Uri, headers: HeaderM
             let pos = items.iter().position(|i| i["id"] == id.as_str())
                 .ok_or((StatusCode::NOT_FOUND, json!({"error": "no such secret"})))?;
             let old_key = items[pos]["key"].as_str().unwrap_or("").to_string();
+            super::grants::vault_write::permitted_keys(&home, grant.as_ref(), &[&old_key])?;
             let old_scope = item_scope(&items[pos]).ok_or((StatusCode::CONFLICT, json!({"error": "item has no valid scope"})))?;
             let scope = if body.get("scope").is_some() {
                 parse_body_scope(&home, &body, "global", "")?

@@ -185,7 +185,16 @@ a replacement with a different ID or incarnation cannot inherit the grant.
 An absent registration fails closed with `vault_grant_owner_unregistered`.
 
 The grant covers **global secrets create, PUT replace, and PATCH update**.
-Both the existing and destination scopes must be global. Import, reveal,
+Both the existing and destination scopes must be global. Granted key names
+must match `^[A-Z][A-Z0-9_]*$` and end in `_API_KEY`, `_TOKEN`, `_SECRET`,
+`_CLIENT_ID` or `_CLIENT_SECRET`. The policy constants in
+`api/grants_vault_write.rs` additionally exclude client auth/endpoint controls
+and shell/runtime controls, including credential-shaped names in those families.
+Existing PUT/PATCH keys and PATCH rename targets receive the same check.
+Refusals return `vault_grant_key_not_permitted` with `rule` equal to
+`not_credential_shaped`, `client_auth_or_endpoint` or `injection_sensitive`,
+and log that rule without the value. Owner-origin writes keep their existing rules.
+Import, reveal,
 delete, access and audit reads remain owner-only; payment cards and logins
 retain their separate rules. Every granted write records the key name,
 scope, Unix-seconds timestamp, grantee identity, grant ID and resulting
@@ -195,12 +204,21 @@ saved atomically with the ciphertext; startup or the next granted write replays
 unfinished audit publication without duplicate events or leads notices. A failed
 publication returns `write_committed: true`, retains the receipt, and logs
 `vault_granted_write_audit_failed`. Recovery never opens the value.
+Malformed receipts are atomically moved to `grant_receipts_quarantine` in the
+private vault store and log `vault_grant_receipt_quarantined`; valid receipts
+continue publishing. Quarantine survives subsequent saves and restarts.
 
-List with `amux vault grants` (`--json` for structured metadata). Revoke from
+List from owner origin with `amux vault grants` (`--json` for structured metadata).
+`GET /api/vault/grants` requires the configured owner bearer, even on loopback
+or a tokenless host; worker origins are refused. Pinned identity metadata is
+never exposed anonymously. Configure owner auth to enable listing on a new host.
+Revoke from
 owner origin with `amux vault grants revoke vault-owner-global-write-v1`, or
 `POST /api/vault/grants/vault-owner-global-write-v1/revoke` using the owner
 auth path. Worker origins cannot revoke, create or re-activate grants.
 Restarting or replaying the seed preserves revocation. Only an explicit
 owner-origin `amux vault grants regrant vault-owner-global-write-v1` can
-re-activate it and bind the current owner identity. Grant timestamps use
+re-activate it and bind the current owner identity. Without a registered owner,
+regrant returns 409 `vault_grant_owner_unregistered` and leaves the grant intact.
+Grant timestamps use
 Unix seconds; the existing Messages channel uses Unix milliseconds.
