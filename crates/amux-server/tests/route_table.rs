@@ -280,7 +280,11 @@ const KNOWN_UNTABLED: &[&str] = &[];
 
 #[test]
 fn every_directly_routed_api_path_is_in_the_table() {
-    let src = include_str!("../src/api/mod.rs");
+    // Test-only routers are probes, not mounted routes (same cutoff as request_log).
+    fn shipped_source(src: &str) -> &str {
+        src.split("#[cfg(test)]").next().unwrap_or(src)
+    }
+    let src = shipped_source(include_str!("../src/api/mod.rs"));
     let tabled: std::collections::HashSet<&str> = ROUTE_TABLE.iter().map(|e| e.path).collect();
     // SCANS THE WHOLE SOURCE, NOT LINE BY LINE. The first version of this test
     // read one line at a time and so missed every multi-line declaration —
@@ -470,6 +474,7 @@ fn every_directly_routed_api_path_is_in_the_table() {
 
     /// The body of `fn <func>(`, braces balanced.
     fn fn_body<'a>(msrc: &'a str, func: &str) -> Option<&'a str> {
+        let msrc = shipped_source(msrc);
         let fstart = msrc.find(&format!("fn {func}("))?;
         let start = fstart + msrc[fstart..].find('{')?;
         let mut depth = 0i32;
@@ -684,13 +689,13 @@ fn every_directly_routed_api_path_is_in_the_table() {
                 missing.push(format!("<unreadable module for merge {callee}>"));
                 continue;
             };
-            // The WHOLE FILE, not the named fn's body — deliberately different
+            // The shipped source, not the named fn's body — deliberately different
             // from the nest walk above. Merged paths carry no prefix, so an
-            // absolute `/api/` literal anywhere in a merged module is a real
-            // route, and fn-body scoping is what let this family hide:
+            // absolute `/api/` literals before the test module are checked,
+            // and fn-body scoping is what let this family hide:
             // `routes()` delegating to `routes_with(ctx)` has no `.route()`
             // calls of its own, which is exactly the gmail_auth/gmail shape.
-            for (sub, handler) in route_literals(&msrc) {
+            for (sub, handler) in route_literals(shipped_source(&msrc)) {
                 // Merged paths are absolute-as-written; anything not under
                 // /api/ is not this table's business.
                 if !sub.starts_with("/api/") || is_404_answerer(&handler) {
