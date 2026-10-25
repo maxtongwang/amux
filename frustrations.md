@@ -6181,7 +6181,7 @@ SEVERITY: breaks
 STATUS: fixed
 DATE: 2026-10-23
 SESSION: pr18-r4
-CARD: maxtongwang/ai-config#160
+CARD: DDP-1 (maxtongwang/ai-config#160)
 SYMPTOM: One cited ask/reply pair could mint repeated grants, including after
   the owner restored removed membership. Mutable target names and incidental
   setting mentions also let the request diverge from the cited ask.
@@ -6216,7 +6216,7 @@ SEVERITY: breaks
 STATUS: fixed
 DATE: 2026-10-23
 SESSION: pr18-r4
-CARD: maxtongwang/ai-config#160
+CARD: DDP-1 (maxtongwang/ai-config#160)
 SYMPTOM: PR #18 review B1 let one actor spend Max's yes under another actor's
   question; B2 treated a contrast clause as approval of the excluded change.
 COST: Another review round; free-text matching could not establish approval identity.
@@ -6238,7 +6238,7 @@ SEVERITY: breaks
 STATUS: fixed
 DATE: 2026-10-23
 SESSION: pr18-r4
-CARD: maxtongwang/ai-config#160
+CARD: DDP-1 (maxtongwang/ai-config#160)
 SYMPTOM: Three parent lib tests and explicit request creation returned 409
   Interaction could not be recorded before deriving an approval request.
 COST: Parent test round blocked; integration fixtures also retained removed
@@ -6258,7 +6258,7 @@ SEVERITY: breaks
 STATUS: fixed
 DATE: 2026-10-23
 SESSION: pr18-r4
-CARD: maxtongwang/ai-config#160
+CARD: DDP-1 (maxtongwang/ai-config#160)
 SYMPTOM: Parent integration tests got HTTP 200 after pane yes/approve but no
   request resolution. The helper omitted native state=active; the real handler
   answered applied=false, with native_status_refused reason=invalid_state.
@@ -6279,7 +6279,7 @@ SEVERITY: breaks
 STATUS: fixed
 DATE: 2026-10-24
 SESSION: pr18-r2
-CARD: maxtongwang/ai-config#160
+CARD: DDP-1 (maxtongwang/ai-config#160)
 SYMPTOM: Max's native owner-session reply could not approve a displayed request;
   the prior funding design required a separate Messages/send workflow. Max at
   12:48: "Can't we have session based solution? No way I'm going to change my
@@ -6300,7 +6300,7 @@ SEVERITY: breaks
 STATUS: fixed
 DATE: 2026-10-24
 SESSION: pr18-r2
-CARD: maxtongwang/ai-config#160
+CARD: DDP-1 (maxtongwang/ai-config#160)
 SYMPTOM: The parent's first full test run compiled the session-based stack but
   fixtures still tried to approve through Messages receipts or payloads without
   live native proof. A real native doubt decision also lost its request-scoped

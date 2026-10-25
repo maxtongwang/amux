@@ -66,6 +66,18 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_approvalObserve": {
+      "kind": "command._approvalObserve",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_approvalRender": {
+      "kind": "command._approvalRender",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_approvalsBoot": {
       "kind": "command._approvalsBoot",
       "feedback_required": true,
