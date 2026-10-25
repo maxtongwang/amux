@@ -176,7 +176,7 @@ Max authorized **“Grant vault writes”** in the mrpopo session on
 
 Migration `0126_vault_write_grant` seeds `vault-owner-global-write-v1` without
 an owner dashboard or CLI step. The grantee is the configured owner agent
-(`session_verbs::OWNER_AGENT`), pinned once at startup to its registered
+(`delegation::OWNER_AGENT`), pinned once at startup to its registered
 immutable worker ID and token-bound incarnation. Main's legacy env-only
 workers have no `wrk_` row: for those, the pinned `CC_INCARNATION` is the
 identity. Both paths require the worker token on each request, even when

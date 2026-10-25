@@ -130,7 +130,7 @@ fn owner_identity(
     conn: &Connection,
     home: &Path,
 ) -> rusqlite::Result<Option<(String, String, String)>> {
-    let owner = crate::api::session_verbs::OWNER_AGENT;
+    let owner = crate::api::delegation::OWNER_AGENT;
     let Some(inc) = crate::api::rename_identity::incarnation(home, owner) else {
         return Ok(None);
     };
@@ -200,7 +200,7 @@ pub(crate) fn check(
     let name = worker_identity::verified_worker(headers)
         .ok()
         .flatten()
-        .filter(|n| n == crate::api::session_verbs::OWNER_AGENT)
+        .filter(|n| n == crate::api::delegation::OWNER_AGENT)
         .ok_or_else(|| {
             refusal(
                 home,
@@ -426,7 +426,7 @@ async fn list(State(state): State<AppState>, uri: Uri, headers: HeaderMap) -> Re
         // Names, IDs, scopes, timestamps only. No arbitrary JSON from disk.
         let mut stmt = conn.prepare("SELECT id, grantee_id, scope, created_at, revoked_at FROM vault_write_grants ORDER BY id")?;
         let grants = stmt.query_map([], |r| Ok(json!({"id": r.get::<_, String>(0)?,
-            "grantee": crate::api::session_verbs::OWNER_AGENT, "grantee_id": r.get::<_, Option<String>>(1)?,
+            "grantee": crate::api::delegation::OWNER_AGENT, "grantee_id": r.get::<_, Option<String>>(1)?,
             "scope": r.get::<_, String>(2)?,
             "created_at": r.get::<_, f64>(3)?, "revoked_at": r.get::<_, Option<f64>>(4)?})))?
             .collect::<Result<Vec<_>, _>>()?;
