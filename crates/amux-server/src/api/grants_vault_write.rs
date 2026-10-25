@@ -405,7 +405,7 @@ pub(crate) fn publish_receipt(
 async fn list(State(state): State<AppState>, uri: Uri, headers: HeaderMap) -> Response {
     // Unlike mutation bootstrap on a tokenless host, listing pinned identities
     // always requires an owner credential, including from loopback clients.
-    if !super::auth::has_owner_token(&state, &headers, &uri) {
+    if !crate::api::auth::has_owner_token(&state, &headers, &uri) {
         tracing::warn!(
             verdict = "vault_grants_auth_required",
             measured = true,
