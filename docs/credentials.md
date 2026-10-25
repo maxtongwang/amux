@@ -186,22 +186,29 @@ An absent registration fails closed with `vault_grant_owner_unregistered`.
 
 The grant covers **global secrets create, PUT replace, and PATCH update**.
 Both the existing and destination scopes must be global. Granted key names
-must match `^[A-Z][A-Z0-9_]*$` and end in `_API_KEY`, `_TOKEN`, `_SECRET`,
-`_CLIENT_ID` or `_CLIENT_SECRET`. The policy constants in
-`api/grants_vault_write.rs` additionally exclude client auth/endpoint controls
-and shell/runtime controls, including credential-shaped names in those families.
+must match `^MAX_[A-Z0-9][A-Z0-9_]*$` and end in `_API_KEY`, `_TOKEN`,
+`_SECRET`, `_CLIENT_ID` or `_CLIENT_SECRET`. `GRANTED_KEY_PREFIX = "MAX_"`
+and `GRANTED_KEY_SUFFIXES` in `api/grants_vault_write.rs` define this policy.
+The name after `MAX_` must be non-empty and start with an uppercase letter or
+digit; `MAX_`, `MAX__TOKEN` and `MAX_NODE_OPTIONS` are refused.
 Existing PUT/PATCH keys and PATCH rename targets receive the same check.
-Use `MAX_<VENDOR>_API_KEY` for mrpopo's vendor credentials, for example
-`MAX_ANTHROPIC_API_KEY` and `MAX_GEMINI_API_KEY`; both are permitted by the grant.
-Client-auth names `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `OPENAI_API_KEY`,
-`GEMINI_API_KEY` and `GOOGLE_API_KEY` are refused as `client_auth_or_endpoint`,
-as are `*_BASE_URL`, `*_API_BASE`, `CLAUDE_*` and `CODEX_*`. SDKs read the
-unprefixed client-auth names implicitly, and `provider::live_catalog` polls
-Google when `GEMINI_API_KEY` is set. The `MAX_` convention stores credentials
-without selecting them implicitly for those clients.
-Refusals return `vault_grant_key_not_permitted` with `rule` equal to
-`not_credential_shaped`, `client_auth_or_endpoint` or `injection_sensitive`,
-and log that rule without the value. Owner-origin writes keep their existing rules.
+
+Installed CLIs and SDKs do not read `MAX_*` names implicitly, so granted writes
+cannot replace their saved authentication. Unprefixed overrides such as
+`GITHUB_TOKEN`, `GH_TOKEN`, `CLOUDFLARE_API_TOKEN`, `COMPOSIO_API_KEY`, `AWS_*`
+and `NPM_TOKEN` are refused. A tool opts in by explicitly reading the prefixed
+name and passing its value to its client, for example reading
+`MAX_GITHUB_TOKEN` and supplying it to that tool's GitHub client. Other permitted
+examples include `MAX_OPENAI_API_KEY`, `MAX_TELEGRAM_BOT_TOKEN`,
+`MAX_ANTHROPIC_API_KEY` and `MAX_GEMINI_API_KEY`.
+
+The existing client-auth/endpoint and shell/runtime deny lists remain as defence
+in depth. Refusals return `vault_grant_key_not_permitted` with `rule` equal to
+`not_max_prefixed` (missing prefix), `not_credential_shaped` (invalid name or
+suffix), `client_auth_or_endpoint` or `injection_sensitive`. The deny lists take
+precedence so reserved names retain their specific refusal reason. Each refusal
+logs its rule without the submitted name or value. Owner-origin writes keep
+their existing rules, including permission to write `GITHUB_TOKEN`.
 Import, reveal,
 delete, access and audit reads remain owner-only; payment cards and logins
 retain their separate rules. Every granted write records the key name,

@@ -202,7 +202,7 @@ impl Fixture {
     }
 }
 fn secret(scope: &str, target: &str) -> Value {
-    json!({"key": "STRIPE_API_KEY", "scope": scope, "target": target, "value": SENTINEL})
+    json!({"key": "MAX_STRIPE_API_KEY", "scope": scope, "target": target, "value": SENTINEL})
 }
 
 #[tokio::test]
@@ -230,6 +230,15 @@ async fn vault_grantee_key_policy_all_write_paths() {
     let f = Fixture::new(true);
     let safe_id = f.create().await;
     for (key, rule) in [
+        ("GITHUB_TOKEN", "not_max_prefixed"),
+        ("GH_TOKEN", "not_max_prefixed"),
+        ("CLOUDFLARE_API_TOKEN", "not_max_prefixed"),
+        ("CLOUDFLARE_ACCOUNT_ID", "not_max_prefixed"),
+        ("COMPOSIO_API_KEY", "not_max_prefixed"),
+        ("AWS_ACCESS_KEY_ID", "not_max_prefixed"),
+        ("AWS_SECRET_ACCESS_KEY", "not_max_prefixed"),
+        ("AWS_SESSION_TOKEN", "not_max_prefixed"),
+        ("NPM_TOKEN", "not_max_prefixed"),
         ("NODE_OPTIONS", "injection_sensitive"),
         ("BASH_ENV", "injection_sensitive"),
         ("DYLD_INSERT_LIBRARIES", "injection_sensitive"),
@@ -245,7 +254,7 @@ async fn vault_grantee_key_policy_all_write_paths() {
             .grantee("POST", "/api/vault/secrets", Some(payload.clone()))
             .await;
         assert_key_refusal(status, &body, rule);
-        // Owner-created process-control keys cannot be rotated or edited by
+        // Owner-created auth overrides and process controls cannot be edited by
         // the grantee. This also proves the owner path remains unchanged.
         let (status, body) = f
             .call("POST", "/api/vault/secrets", Some(payload), None)
@@ -272,7 +281,11 @@ async fn vault_grantee_key_policy_all_write_paths() {
         assert_key_refusal(status, &body, rule);
     }
     let tracing = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
-    for rule in ["injection_sensitive", "client_auth_or_endpoint"] {
+    for rule in [
+        "injection_sensitive",
+        "client_auth_or_endpoint",
+        "not_max_prefixed",
+    ] {
         assert!(tracing
             .lines()
             .any(|l| l.contains("vault_grant_key_not_permitted") && l.contains(rule)));
@@ -290,7 +303,11 @@ fn assert_key_refusal(status: u16, body: &Value, rule: &str) {
 async fn vault_grantee_max_vendor_keys_allowed() {
     let _serial = SERIAL.lock().await;
     let f = Fixture::new(true);
-    for key in ["MAX_ANTHROPIC_API_KEY", "MAX_GEMINI_API_KEY"] {
+    for key in [
+        "MAX_GITHUB_TOKEN",
+        "MAX_ANTHROPIC_API_KEY",
+        "MAX_GEMINI_API_KEY",
+    ] {
         let (status, body) = f
             .grantee(
                 "POST",
@@ -318,7 +335,7 @@ async fn vault_grantee_max_vendor_keys_allowed() {
             .grantee(
                 "PATCH",
                 &format!("/api/vault/secrets/{id}"),
-                Some(json!({"key": format!("ROTATED_{key}")})),
+                Some(json!({"key": format!("MAX_ROTATED_{key}")})),
             )
             .await;
         assert_eq!(status, 200, "free rename target {key}");
@@ -346,16 +363,21 @@ async fn vault_grantee_key_shape_and_reserved_patterns() {
         (
             "not_credential_shaped",
             vec![
-                "_STRIPE_TOKEN",
-                "stripe_TOKEN",
-                "9STRIPE_TOKEN",
-                "STRIPE-TOKEN",
-                "STRIPE_Å_TOKEN",
-                "STRIPE_KEY",
-                "STRIPE_PASSWORD",
-                "STRIPE_OPTIONS",
-                "",
+                "MAX_",
+                "MAX__TOKEN",
+                "MAX_NODE_OPTIONS",
+                "MAX__STRIPE_TOKEN",
+                "MAX_stripe_TOKEN",
+                "MAX_STRIPE-TOKEN",
+                "MAX_STRIPE_Å_TOKEN",
+                "MAX_STRIPE_KEY",
+                "MAX_STRIPE_PASSWORD",
+                "MAX_STRIPE_OPTIONS",
             ],
+        ),
+        (
+            "not_max_prefixed",
+            vec!["STRIPE_TOKEN", "9STRIPE_TOKEN", ""],
         ),
         (
             "client_auth_or_endpoint",
@@ -404,11 +426,12 @@ async fn vault_grantee_key_shape_and_reserved_patterns() {
         }
     }
     for key in [
-        "PAYMENTS_API_KEY",
-        "PAYMENTS_TOKEN",
-        "PAYMENTS_SECRET",
-        "PAYMENTS_CLIENT_ID",
-        "PAYMENTS_CLIENT_SECRET",
+        "MAX_PAYMENTS_API_KEY",
+        "MAX_PAYMENTS_TOKEN",
+        "MAX_PAYMENTS_SECRET",
+        "MAX_PAYMENTS_CLIENT_ID",
+        "MAX_PAYMENTS_CLIENT_SECRET",
+        "MAX_9_TOKEN",
     ] {
         let (status, body) = f
             .grantee(
@@ -423,7 +446,7 @@ async fn vault_grantee_key_shape_and_reserved_patterns() {
             f.grantee(
                 "PATCH",
                 &format!("/api/vault/secrets/{created}"),
-                Some(json!({"key": format!("RENAMED_{key}"), "value": SENTINEL}))
+                Some(json!({"key": format!("MAX_RENAMED_{key}"), "value": SENTINEL}))
             )
             .await
             .0,
@@ -442,9 +465,9 @@ async fn vault_grant_bad_receipts_quarantined_without_blocking_writes() {
     let invalid = vec![
         json!({"receipt_id": "bad-id"}),
         json!({"receipt_id": "vault-grant:bad-fields", "event": "wrong-event"}),
-        json!({"receipt_id": "vault-grant:bad-time", "event": "secret_granted_write", "key": "STRIPE_API_KEY",
+        json!({"receipt_id": "vault-grant:bad-time", "event": "secret_granted_write", "key": "MAX_STRIPE_API_KEY",
             "item": id, "grantee": "mrpopo", "grantee_id": f.worker_id, "ts": "invalid"}),
-        json!({"receipt_id": "vault-grant:bad-scope", "event": "secret_granted_write", "key": "STRIPE_API_KEY",
+        json!({"receipt_id": "vault-grant:bad-scope", "event": "secret_granted_write", "key": "MAX_STRIPE_API_KEY",
             "item": id, "grantee": "mrpopo", "grantee_id": f.worker_id, "ts": 1.0, "scope": "worker",
             "grant_id": GRANT, "version": 1}),
         Value::Null,
@@ -477,7 +500,7 @@ async fn vault_grant_bad_receipts_quarantined_without_blocking_writes() {
         f.grantee(
             "POST",
             "/api/vault/secrets",
-            Some(json!({"key": "OTHER_API_KEY", "value": SENTINEL}))
+            Some(json!({"key": "MAX_OTHER_API_KEY", "value": SENTINEL}))
         )
         .await
         .0,
@@ -726,7 +749,7 @@ async fn vault_revoked_seed_stays_revoked_and_worker_cannot_regrant() {
         f.grantee(
             "POST",
             "/api/vault/secrets",
-            Some(json!({"key":"NEW_KEY", "value": SENTINEL}))
+            Some(json!({"key":"MAX_NEW_API_KEY", "value": SENTINEL}))
         )
         .await
         .0,
@@ -783,7 +806,7 @@ async fn vault_replacement_registry_id_or_incarnation_cannot_inherit() {
         f.grantee(
             "POST",
             "/api/vault/secrets",
-            Some(json!({"key":"REPLACEMENT_KEY", "value": SENTINEL}))
+            Some(json!({"key":"MAX_REPLACEMENT_API_KEY", "value": SENTINEL}))
         )
         .await
         .0,
@@ -813,7 +836,7 @@ async fn vault_replacement_registry_id_or_incarnation_cannot_inherit() {
         f.call(
             "POST",
             "/api/vault/secrets",
-            Some(json!({"key":"FORGED_KEY", "value": SENTINEL})),
+            Some(json!({"key":"MAX_FORGED_API_KEY", "value": SENTINEL})),
             Some(("mrpopo", Some(OTHER_TOKEN)))
         )
         .await
@@ -839,7 +862,7 @@ async fn vault_legacy_owner_uses_pinned_token_bound_incarnation() {
         f.call(
             "POST",
             "/api/vault/secrets",
-            Some(json!({"key":"NEW_KEY", "value": SENTINEL})),
+            Some(json!({"key":"MAX_NEW_API_KEY", "value": SENTINEL})),
             Some(("mrpopo", Some(OTHER_TOKEN)))
         )
         .await
@@ -890,7 +913,7 @@ async fn vault_granted_writes_audit_feed_events_and_listing_never_leak() {
         assert_eq!(event["grant_id"], GRANT);
         assert_eq!(event["grantee_id"], f.worker_id);
         assert_eq!(event["version"], i + 1);
-        assert_eq!(event["key"], "STRIPE_API_KEY");
+        assert_eq!(event["key"], "MAX_STRIPE_API_KEY");
         assert_eq!(event["scope"], "global");
         assert!(event["ts"].as_f64().is_some());
     }
@@ -903,7 +926,7 @@ async fn vault_granted_writes_audit_feed_events_and_listing_never_leak() {
     assert_eq!(feed.len(), 2, "every write posts to leads");
     assert!(feed
         .iter()
-        .all(|s| !s.contains(SENTINEL) && s.contains(GRANT) && s.contains("STRIPE_API_KEY")));
+        .all(|s| !s.contains(SENTINEL) && s.contains(GRANT) && s.contains("MAX_STRIPE_API_KEY")));
     let audit = std::fs::read_to_string(f.home.join("logs/vault-audit.jsonl")).unwrap();
     assert!(!audit.contains(SENTINEL), "audit leaked the canary");
     assert_eq!(

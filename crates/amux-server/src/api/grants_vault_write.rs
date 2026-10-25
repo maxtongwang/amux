@@ -16,7 +16,9 @@ use std::path::Path;
 pub(crate) const ID: &str = "vault-owner-global-write-v1";
 
 // Granted global values reach every worker; allow credentials, never process
-// controls or implicit client authentication/endpoint settings.
+// controls or implicit client authentication/endpoint settings. MAX_ names
+// require tools to opt in instead of overriding their installed authentication.
+const GRANTED_KEY_PREFIX: &str = "MAX_";
 const GRANTED_KEY_SUFFIXES: &[&str] = &[
     "_API_KEY",
     "_TOKEN",
@@ -65,6 +67,28 @@ fn key_matches(key: &str, pattern: &str) -> bool {
         })
 }
 
+fn key_refusal_rule(key: &str) -> Option<&'static str> {
+    let denied = [
+        ("client_auth_or_endpoint", GRANTED_CLIENT_AUTH_OR_ENDPOINT),
+        ("injection_sensitive", GRANTED_INJECTION_SENSITIVE),
+    ]
+    .into_iter()
+    .find_map(|(rule, patterns)| patterns.iter().any(|p| key_matches(key, p)).then_some(rule));
+    if denied.is_some() {
+        return denied;
+    }
+    let Some(name) = key.strip_prefix(GRANTED_KEY_PREFIX) else {
+        return Some("not_max_prefixed");
+    };
+    let credential_shaped = name
+        .starts_with(|c: char| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        && GRANTED_KEY_SUFFIXES.iter().any(|s| key.ends_with(*s));
+    (!credential_shaped).then_some("not_credential_shaped")
+}
+
 pub(crate) fn permitted_keys(
     home: &Path,
     grant: Option<&GrantUse>,
@@ -74,22 +98,12 @@ pub(crate) fn permitted_keys(
         return Ok(());
     };
     for key in keys {
-        let denied = [
-            ("client_auth_or_endpoint", GRANTED_CLIENT_AUTH_OR_ENDPOINT),
-            ("injection_sensitive", GRANTED_INJECTION_SENSITIVE),
-        ]
-        .into_iter()
-        .find_map(|(rule, patterns)| patterns.iter().any(|p| key_matches(key, p)).then_some(rule));
-        let credential_shaped = key.starts_with(|c: char| c.is_ascii_uppercase())
-            && key
-                .bytes()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-            && GRANTED_KEY_SUFFIXES.iter().any(|s| key.ends_with(*s));
-        if let Some(rule) = denied.or((!credential_shaped).then_some("not_credential_shaped")) {
+        if let Some(rule) = key_refusal_rule(key) {
             // Neither the submitted name nor value is needed in this refusal.
             let (status, mut body) = refusal(home, &grant.name, "vault_grant_key_not_permitted");
             body["rule"] = json!(rule);
-            body["error"] = json!("granted writes require a permitted credential name");
+            body["error"] =
+                json!("granted writes require a permitted MAX_ prefixed credential name");
             tracing::warn!(
                 rule,
                 verdict = "vault_grant_key_not_permitted",
