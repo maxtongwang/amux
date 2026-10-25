@@ -211,6 +211,15 @@ impl Fixture {
     }
 
     async fn hook_with_applied(&self, session: &str, report: Value, applied: bool) -> (StatusCode,Value) {
+        let result=self.hook_result(session,report).await;
+        assert!(result.0.is_success(),"hook HTTP failure: {result:?}");
+        assert_eq!(result.1["applied"],applied,"hook must reach the expected observation outcome: {result:?}");
+        result
+    }
+
+    // Failure-injection tests need the same live transport as successful hooks,
+    // but must inspect the error instead of asserting success at this boundary.
+    async fn hook_result(&self, session: &str, report: Value) -> (StatusCode,Value) {
         let d = self.home.path().join("status-events").join(session);
         std::fs::create_dir_all(&d).unwrap();
         if !d.join("current.json").exists() {
@@ -221,10 +230,38 @@ impl Fixture {
         report["approval_nonce"]=json!(format!("{:032x}",SEQ.fetch_add(1,Ordering::SeqCst)));
         let managed=crate::db::queries::get_worker(&self.state.store.read().unwrap(),session).unwrap().is_some();
         let path=format!("/api/{}/{session}/report",if managed { "workers" } else { "sessions" });
-        let result=self.call(None,Some(session),&path,report).await;
-        assert!(result.0.is_success(),"hook HTTP failure: {result:?}");
-        assert_eq!(result.1["applied"],applied,"hook must reach the expected observation outcome: {result:?}");
-        result
+        self.call(None,Some(session),&path,report).await
+    }
+
+    fn native_report(&self) -> Value {
+        let raw:String=self.state.store.read().unwrap().query_row(
+            "SELECT value FROM prefs WHERE key='session_reports'",[],|r|r.get(0)).unwrap();
+        serde_json::from_str::<Value>(&raw).unwrap()[OWNER_AGENT].clone()
+    }
+
+    fn replay_status(&self, report: &Value) {
+        let dir=self.home.path().join(format!("status-events/{OWNER_AGENT}/reply-run"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path=dir.join(format!("{:020}.json",report["sequence"].as_u64().unwrap()));
+        // Deliberately retain legacy approval facts: the server must strip them.
+        std::fs::write(&path,report.to_string()).unwrap();
+        crate::api::native_status::replay(&self.state);
+        assert!(!path.exists(),"status ACK only after replay completes");
+        let recovered=self.native_report();
+        assert_eq!(recovered["sequence"],report["sequence"]);
+        assert_eq!(recovered["state"],report["state"]);
+        assert_eq!(recovered["approval_live"],false);
+        for field in ["prompt","assistant_message","approval_nonce"] {
+            assert!(recovered.get(field).is_none(),"recovered approval fact: {recovered}");
+        }
+        std::fs::write(&path,report.to_string()).unwrap();
+        crate::api::native_status::replay(&self.state);
+        assert!(!path.exists(),"duplicate status must also be acknowledged");
+        assert_eq!(self.native_report(),recovered,"duplicate status replay must be idempotent");
+        let events:i64=self.state.store.read().unwrap().query_row(
+            "SELECT COUNT(*) FROM session_events WHERE session=?1 AND type='session.native_status' AND json_extract(data,'$.run_id')=?2 AND json_extract(data,'$.sequence')=?3",
+            rusqlite::params![OWNER_AGENT,report["run_id"].as_str().unwrap(),report["sequence"].as_i64().unwrap()],|r|r.get(0)).unwrap();
+        assert_eq!(events,1,"non-approval status must recover exactly once");
     }
 }
 
@@ -414,14 +451,24 @@ async fn pane_stop_replay_adopts_receipt_without_rearming() {
 async fn pane_receipt_write_failure_rolls_back_native_observation() {
     let f=Fixture::new(); let id=f.ask_hidden().await;
     accepted(f.hook(OWNER_AGENT,f.start()).await);
+    let before=f.native_report();
     f.write(|c|c.execute_batch("CREATE TRIGGER fail_pane_binding BEFORE UPDATE OF shown_row ON _amux_delegation_grants BEGIN SELECT RAISE(ABORT,'pane receipt write failed'); END;"));
     let stop=f.stop(&f.block(&id));
-    let (st,_)=f.call(None,Some(OWNER_AGENT),&format!("/api/sessions/{OWNER_AGENT}/report"),stop.clone()).await;
+    let (st,error)=f.hook_result(OWNER_AGENT,stop.clone()).await;
     assert_eq!(st,StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(error.to_string().contains("pane receipt write failed"),"{error}");
+    assert_eq!(f.native_report(),before,"native acceptance must roll back with the receipt");
     assert_eq!(f.shown(&id),None);
     let turns:i64=f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history WHERE delivery IN ('native_assistant','approval_pane_display')",[],|r|r.get(0)).unwrap();
     assert_eq!(turns,0,"assistant row and native acceptance must roll back together");
     f.write(|c|c.execute_batch("DROP TRIGGER fail_pane_binding;"));
+    // Dev-lead B1 of the bb83665c Opus review: failed approval facts are
+    // dropped; status may recover, but only a fresh live Stop may show again.
+    f.replay_status(&stop);
+    assert_eq!(f.shown(&id),None);
+    assert_eq!(f.request_resolution(&id),(None,None));
+    assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
+    let stop=f.stop(&f.block(&id));
     accepted(f.hook(OWNER_AGENT,stop.clone()).await);
     accepted(f.hook_with_applied(OWNER_AGENT,stop,false).await);
     assert!(f.shown(&id).is_some());
@@ -937,30 +984,28 @@ async fn transport_receipt_write_failure_refuses_before_owner_pane() {
 }
 
 #[tokio::test]
-async fn transport_echo_spool_recovery_closes_the_question_across_replay() {
+async fn transport_echo_spool_recovery_is_status_only_across_replay() {
     let (logs,_scope,_peer)=capture_reply_logs();
     let f=Fixture::new();
     accepted(f.hook(OWNER_AGENT,f.report("initialize run")).await);
     let id=f.ask().await;
     accepted(f.send(OWNER_AGENT,PEER,"yes","spooled-peer-echo").await);
-    let report=f.report(&f.transported());
-    let dir=f.home.path().join(format!("status-events/{OWNER_AGENT}/reply-run"));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path=dir.join(format!("{:020}.json",report["sequence"].as_u64().unwrap()));
     for replay in 0..2 {
         let request=if replay==0 { id.clone() } else { f.ask().await };
-        std::fs::write(&path,report.to_string()).unwrap();
-        crate::api::native_status::replay(&f.state);
-        assert!(!path.exists(),"receipt ACK only after replay completes");
-        assert_eq!(f.request_resolution(&request),(None,Some("request_reply_not_owner_input".into())));
-        let row=f.resolution(OWNER_AGENT,"request_reply_not_owner_input",None);
-        assert_eq!(f.state.store.read().unwrap().query_row("SELECT origin FROM cmd_history WHERE id=?1",[row],|r|r.get::<_,String>(0)).unwrap(),"amux","replayed receipt must stay known non-owner input");
-        accepted(f.owner_reply("yes").await);
-        f.resolution(OWNER_AGENT,"request_no_candidate",None);
+        let report=f.report(&f.transported());
+        let shown=f.shown(&request);
+        // Dev-lead B1 of the bb83665c Opus review: even a known non-owner
+        // prompt is an approval fact; disk replay cannot revive its closure.
+        f.replay_status(&report);
+        assert_eq!(f.request_resolution(&request),(None,None));
+        assert!(f.open(&request));
+        assert_eq!(f.shown(&request),shown,"status replay cannot add a display receipt");
+        let rows:i64=f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history WHERE approval_run='reply-run' AND approval_sequence=?1",[report["sequence"].as_i64().unwrap()],|r|r.get(0)).unwrap();
+        assert_eq!(rows,0,"status replay cannot revive a prompt");
         assert_eq!(f.apply(&request).await.0,StatusCode::FORBIDDEN);
     }
     let logs=String::from_utf8(logs.lock().unwrap().clone()).unwrap();
-    assert!(logs.contains("native_transport_replayed"),"replay must retain transport classification: {logs}");
+    assert!(logs.contains("approval_status_only"),"dropped approval facts must be observable: {logs}");
 }
 
 #[tokio::test]
@@ -1554,16 +1599,24 @@ async fn native_owner_plain_yes_without_launch_proof_confirms() {
 #[tokio::test]
 async fn owner_native_input_commits_with_acceptance_and_recovers_once() {
     let f=Fixture::new(); let id=f.ask().await;
-    // Initialize the launch without applying this event.
-    let d=f.home.path().join(format!("status-events/{OWNER_AGENT}"));
-    std::fs::create_dir_all(&d).unwrap();
-    std::fs::write(d.join("current.json"),json!({"run_id":"reply-run","provider":"claude",
-        "started":crate::config::now_f64()-100.0,"incarnation":incarnation(OWNER_AGENT)}).to_string()).unwrap();
+    let before=f.native_report();
     f.write(|c|c.execute_batch("CREATE TRIGGER fail_owner_input BEFORE INSERT ON cmd_history WHEN NEW.origin='pane' BEGIN SELECT RAISE(ABORT,'input boundary write failed'); END;"));
     let input=f.report("no");
-    assert_eq!(f.call(None,Some(OWNER_AGENT),&format!("/api/sessions/{OWNER_AGENT}/report"),input.clone()).await.0,StatusCode::INTERNAL_SERVER_ERROR);
+    let (status,error)=f.hook_result(OWNER_AGENT,input.clone()).await;
+    assert_eq!(status,StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(error.to_string().contains("input boundary write failed"),"{error}");
+    assert_eq!(f.native_report(),before,"native acceptance must roll back with the input");
     assert_eq!(f.request_resolution(&id),(None,None));
     f.write(|c|c.execute_batch("DROP TRIGGER fail_owner_input;"));
+    // Dev-lead B1 of the bb83665c Opus review: no failed prompt is revived,
+    // including a non-approve. Only its non-approval status recovers once.
+    f.replay_status(&input);
+    assert_eq!(f.request_resolution(&id),(None,None));
+    assert!(f.open(&id));
+    let prompts:i64=f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history WHERE delivery='approval_native_prompt'",[],|r|r.get(0)).unwrap();
+    assert_eq!(prompts,0,"failed native input must stay dropped after status recovery");
+    assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
+    let input=f.report("no");
     accepted(f.hook(OWNER_AGENT,input.clone()).await);
     let row=f.resolution(OWNER_AGENT,"request_reply_not_affirmative",None);
     accepted(f.hook_with_applied(OWNER_AGENT,input,false).await);
@@ -1947,13 +2000,26 @@ async fn v31_invalid_format_makes_coded_yes_ineligible() {
 #[tokio::test]
 async fn v31_decision_failure_rolls_back_native_acceptance_and_prompt() {
     let f=Fixture::new();let id=f.ask().await;let prompt=f.report("yes");
+    let before=f.native_report();
     f.write(|c|c.execute_batch("CREATE TRIGGER fail_decision BEFORE INSERT ON _amux_delegation_resolutions BEGIN SELECT RAISE(ABORT,'decision write unavailable'); END;"));
-    let (status,_)=f.call(None,Some(OWNER_AGENT),&format!("/api/sessions/{OWNER_AGENT}/report"),prompt.clone()).await;
+    let (status,error)=f.hook_result(OWNER_AGENT,prompt.clone()).await;
     assert_eq!(status,StatusCode::INTERNAL_SERVER_ERROR);assert_eq!(f.request_resolution(&id),(None,None));
+    assert!(error.to_string().contains("decision write unavailable"),"{error}");
+    assert_eq!(f.native_report(),before,"native acceptance must roll back with the decision");
     let rows:i64=f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history WHERE approval_run='reply-run' AND approval_sequence=?1",[prompt["sequence"].as_i64()],|r|r.get(0)).unwrap();
     assert_eq!(rows,0);
     f.write(|c|c.execute_batch("DROP TRIGGER fail_decision;"));
-    accepted(f.hook(OWNER_AGENT,prompt).await);accepted(f.apply(&id).await);
+    // Dev-lead B1 of the bb83665c Opus review: a rolled-back yes is dropped,
+    // never recovered as a prompt or decision when status replays.
+    f.replay_status(&prompt);
+    assert_eq!(f.request_resolution(&id),(None,None));
+    assert!(f.open(&id));
+    let rows:i64=f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history WHERE delivery='approval_native_prompt'",[],|r|r.get(0)).unwrap();
+    assert_eq!(rows,0);
+    assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
+    // A new live display and prompt can approve; the failed payload is unused.
+    accepted(f.hook(OWNER_AGENT,f.stop(&f.block(&id))).await);
+    accepted(f.owner_reply("yes").await);accepted(f.apply(&id).await);
 }
 #[tokio::test]
 async fn v31_lost_ack_adopts_exact_decision_without_funding_twice() {
