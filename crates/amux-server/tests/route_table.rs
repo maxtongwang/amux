@@ -740,6 +740,29 @@ fn every_directly_routed_api_path_is_in_the_table() {
         );
     }
 
+    // THE NEGATIVE CONTROL — test-only probes must stay outside the walk.
+    const TEST_ONLY_CANARIES: &[(&str, &str, &str)] = &[(
+        "route literal inside a merged module's #[cfg(test)] mod",
+        "delegation_grants.rs",
+        "/api/sessions/test-dev-a/config",
+    )];
+    for &(shape, module, canary) in TEST_ONLY_CANARIES {
+        let raw = std::fs::read_to_string(api_dir.join(module))
+            .unwrap_or_else(|e| panic!("cannot read negative canary module {module}: {e}"));
+        assert!(
+            raw.split_once("#[cfg(test)]")
+                .is_some_and(|(_, tests)| tests.contains(&format!(".route(\"{canary}\""))),
+            "negative canary no longer exercises {shape} — {module} must contain \
+             .route(\"{canary}\" after its first #[cfg(test)]. Move the canary to \
+             another test-only probe of the same shape if this one was removed."
+        );
+        assert!(
+            !mounted.iter().any(|m| m == canary) && !missing.iter().any(|m| m == canary),
+            "the walk included {shape}: {canary} — test-only probes are not mounted \
+             routes and must appear in neither mounted nor missing"
+        );
+    }
+
     missing.extend(
         mounted
             .iter()
