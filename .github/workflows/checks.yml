@@ -20,6 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Owner input provenance and CLI refusal fixtures (standalone rustc)
+        run: python3 -B scripts/test-owner-input-origin.py
       - name: Native delivery crash and receipt fixtures
         run: bash scripts/test-native-delivery.sh --locked
   macos-codesign:
@@ -610,6 +612,12 @@ jobs:
           set -euo pipefail
           python3 scripts/test-native-delivery-cli.py
           python3 scripts/test-native-delivery-schema.py
+      - name: Delegation reply-window storage and reshow receipts
+        run: python3 -B scripts/test-delegation-reply-window.py
+      - name: Delegation request schema and SIGKILL atomicity (SQLite only)
+        run: python3 -B scripts/test-delegation-request-schema.py
+      - name: Owner input guard with fake tmux targets
+        run: python3 -B scripts/test-owner-input-guard.py
       - name: board help never registers an artifact
         run: python3 scripts/test-board-help.py
       - name: Board linked source messages
