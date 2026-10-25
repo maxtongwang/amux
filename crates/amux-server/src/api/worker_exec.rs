@@ -171,12 +171,20 @@ async fn list_types() -> Response {
 #[cfg(test)]
 pub(crate) mod fake_pane {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex, Weak};
 
     pub(crate) const ENV_KEY: &str = "CC_TEST_FAKE_PANE";
     pub(crate) struct FakePane;
     pub(crate) static FAKE: FakePane = FakePane;
-    static TYPED: Mutex<Vec<(String, String, &'static str)>> = Mutex::new(Vec::new());
+    struct Delivery {
+        // A weak identity cannot be reused while this record exists, and does
+        // not keep a fixture's database writer alive after its tasks finish.
+        store: Weak<crate::db::Store>,
+        name: String,
+        text: String,
+        origin: &'static str,
+    }
+    static TYPED: Mutex<Vec<Delivery>> = Mutex::new(Vec::new());
     static KEYS: Mutex<Vec<(String,String)>> = Mutex::new(Vec::new());
 
     pub(crate) fn note_key(name: &str, key: &str) {
@@ -189,12 +197,24 @@ pub(crate) mod fake_pane {
 
     /// Every `(text, origin)` delivered to `name` so far.
     pub(crate) fn typed(name: &str) -> Vec<(String, &'static str)> {
+        typed_in(None, name)
+    }
+
+    /// Includes every attempt from this fixture, including detached tasks.
+    /// Use the originating state, never the process-global current AMUX_HOME:
+    /// an earlier fixture's background send may run after the home changes.
+    pub(crate) fn typed_for(state: &AppState, name: &str) -> Vec<(String, &'static str)> {
+        typed_in(Some(&Arc::downgrade(&state.store)), name)
+    }
+
+    fn typed_in(store: Option<&Weak<crate::db::Store>>, name: &str) -> Vec<(String, &'static str)> {
         TYPED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|(n, _, _)| n == name)
-            .map(|(_, t, o)| (t.clone(), *o))
+            .filter(|delivery| delivery.name == name
+                && store.is_none_or(|store| Weak::ptr_eq(store, &delivery.store)))
+            .map(|delivery| (delivery.text.clone(), delivery.origin))
             .collect()
     }
 
@@ -209,7 +229,7 @@ pub(crate) mod fake_pane {
         async fn stop(&self, _: &str) -> Dispatch<(bool, String)> {
             Dispatch::Handled((true, "fake pane".into()))
         }
-        async fn deliver(&self, _: &AppState, name: &str, text: &str, origin: SendOrigin) -> Dispatch<(bool, String)> {
+        async fn deliver(&self, state: &AppState, name: &str, text: &str, origin: SendOrigin) -> Dispatch<(bool, String)> {
             let origin = match origin {
                 SendOrigin::Owner => "owner",
                 SendOrigin::Automation => "amux",
@@ -217,7 +237,16 @@ pub(crate) mod fake_pane {
             TYPED
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push((name.to_string(), text.to_string(), origin));
+                .push(Delivery {
+                    store: Arc::downgrade(&state.store),
+                    name: name.to_string(),
+                    text: text.to_string(),
+                    origin,
+                });
+            tracing::debug!(session = name, fixture = ?Arc::as_ptr(&state.store),
+                test_thread = ?std::thread::current().name(),
+                verdict = "fake_pane_delivery", measured = true, n_considered = 1,
+                "fake pane attempt recorded with its originating fixture");
             let cfg=super::parse_env(name);
             Dispatch::Handled((cfg.get("CC_TEST_FAKE_SEND_OK") != Some("0"), cfg.get("CC_TEST_FAKE_SEND_RESULT").unwrap_or("sent").to_string()))
         }

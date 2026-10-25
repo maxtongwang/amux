@@ -895,7 +895,7 @@ async fn peer_paste_and_chat_relay_echoes_are_recorded_non_owner() {
         f.peer_recorded(&text,"session");
         let sender=actor.unwrap_or(LEAD);
         if isolated {
-            let typed=crate::api::worker_exec::fake_pane::typed(OWNER_AGENT);
+            let typed=f.typed();
             let (text,origin)=typed.last().unwrap();
             assert_eq!(*origin,"owner","Chat speaks for the owner into isolated workers");
             assert!(text.starts_with(&format!("[amux-origin: the owner, relayed by {sender}")));
@@ -904,7 +904,7 @@ async fn peer_paste_and_chat_relay_echoes_are_recorded_non_owner() {
             continue;
         }
         assert!(f.transported().contains(&format!("[amux-origin: {sender} —")),"self and active Chat relays also need a worker stamp");
-        assert_eq!(crate::api::worker_exec::fake_pane::typed(OWNER_AGENT).last().unwrap().1,"amux");
+        assert_eq!(f.typed().last().unwrap().1,"amux");
         f.echo_never_funds(&id,"request_reply_not_owner_input").await;
     }
 }
@@ -938,7 +938,7 @@ async fn schedule_and_goal_configuration_are_not_max_typing_now() {
             }
             assert_eq!(f.request_resolution(&id),(None,None));
             if isolated {
-                let typed=crate::api::worker_exec::fake_pane::typed(OWNER_AGENT);
+                let typed=f.typed();
                 assert_eq!(typed.last().unwrap(), &("yes".into(),"owner"),"configured exception preserves owner transport and bytes");
                 accepted(f.hook(OWNER_AGENT,f.report("yes")).await);
                 assert_eq!(f.request_resolution(&id),(None,None),"status-only observer cannot close or fund an isolated approval");
@@ -973,11 +973,11 @@ async fn transport_envelopes_at_start_confirm_midtext_remains_owner() {
 #[tokio::test]
 async fn transport_receipt_write_failure_refuses_before_owner_pane() {
     let f=Fixture::new(); let id=f.ask().await;
-    let before=crate::api::worker_exec::fake_pane::typed(OWNER_AGENT).len();
+    let before=f.typed().len();
     f.write(|c|c.execute_batch("CREATE TRIGGER fail_transport_receipt BEFORE INSERT ON cmd_history WHEN NEW.delivery='approval_transport' BEGIN SELECT RAISE(ABORT,'transport receipt failed'); END;"));
     let (st,_)=f.send(OWNER_AGENT,PEER,"y","receipt-failure").await;
     assert!(!st.is_success());
-    assert_eq!(before,crate::api::worker_exec::fake_pane::typed(OWNER_AGENT).len());
+    assert_eq!(before,f.typed().len());
     assert_eq!(f.request_resolution(&id),(None,None));
     f.write(|c|c.execute_batch("DROP TRIGGER fail_transport_receipt;"));
     accepted(f.owner_reply("yes").await);
@@ -1139,10 +1139,10 @@ async fn internal_raw_control_text_is_refused_before_transport() {
     use crate::api::session_verbs::{send_text,SendOrigin};
     for text in ["", "\r", "\u{1b}[200~y\r"] {
         let f=Fixture::new(); let id=f.ask().await;
-        let before=crate::api::worker_exec::fake_pane::typed(OWNER_AGENT).len();
+        let before=f.typed().len();
         let (ok,message)=send_text(&f.state,OWNER_AGENT,text,false,SendOrigin::Automation).await;
         assert!(!ok); assert!(message.starts_with("owner_session_keys_refused"),"{message}");
-        assert_eq!(before,crate::api::worker_exec::fake_pane::typed(OWNER_AGENT).len());
+        assert_eq!(before,f.typed().len());
         assert_eq!(f.request_resolution(&id),(None,None));
         accepted(f.owner_reply("yes").await);
         f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
@@ -1245,7 +1245,7 @@ async fn opus_peer_send_flag_matrix_fires_native_hook_and_never_funds() {
             for now in [None,Some(false),Some(true)] {
                 for held in [false,true] {
                     let f=Fixture::new(); let id=f.ask().await;
-                    let before=crate::api::worker_exec::fake_pane::typed(OWNER_AGENT).len();
+                    let before=f.typed().len();
                     let path=f.home.path().join(format!("sessions/{OWNER_AGENT}.env"));
                     let original=std::fs::read_to_string(&path).unwrap();
                     if held { std::fs::write(&path,original.clone()+"CC_PAUSED=1\nAMUX_SEND_QUEUE_FOR_PAUSED=1\n").unwrap(); }
@@ -1254,11 +1254,11 @@ async fn opus_peer_send_flag_matrix_fires_native_hook_and_never_funds() {
                     assert!(status.is_success(),"{prefix}/{history:?}/{now:?}/held={held}: {value}");
                     assert_eq!(f.request_resolution(&id),(None,None),"delivery alone is not a submission");
                     if held {
-                        assert_eq!(crate::api::worker_exec::fake_pane::typed(OWNER_AGENT).len(),before,"held relay must really queue");
+                        assert_eq!(f.typed().len(),before,"held relay must really queue");
                         std::fs::write(path,original).unwrap();
                         assert!(crate::api::session_verbs::steer_deliver_for_session(&f.state,OWNER_AGENT).await,"real held-queue drain");
                     }
-                    let typed=crate::api::worker_exec::fake_pane::typed(OWNER_AGENT);
+                    let typed=f.typed();
                     assert_eq!(typed.len(),before+1,"exactly one pane delivery per flag case");
                     let (text,origin)=typed.last().unwrap();
                     // Fire first: on e0ef6497 this is the lead approving itself.
@@ -1284,12 +1284,12 @@ async fn opus_empty_peer_send_flag_matrix_never_submits_owner_draft() {
             for now in [None,Some(false),Some(true)] {
                 for text in [""," \t","[no-board]"] {
                     let f=Fixture::new(); let id=f.ask().await;
-                    let before=crate::api::worker_exec::fake_pane::typed(OWNER_AGENT).len();
+                    let before=f.typed().len();
                     let keys=crate::api::worker_exec::fake_pane::keys(OWNER_AGENT);
                     let (status,value)=f.send_flags(prefix,history,now,text).await;
                     assert_eq!(status,StatusCode::FORBIDDEN,"{history:?}/{now:?}: {value}");
                     assert_eq!(value["code"],"owner_session_keys_refused");
-                    assert_eq!(crate::api::worker_exec::fake_pane::typed(OWNER_AGENT).len(),before,"Max's unsent draft must not be submitted");
+                    assert_eq!(f.typed().len(),before,"Max's unsent draft must not be submitted");
                     assert_eq!(crate::api::worker_exec::fake_pane::keys(OWNER_AGENT),keys);
                     assert_eq!(f.request_resolution(&id),(None,None),"no actual submission, so window stays open");
                 }
@@ -1298,6 +1298,36 @@ async fn opus_empty_peer_send_flag_matrix_never_submits_owner_draft() {
     }
     let logs=String::from_utf8(logs.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("WARN") && logs.contains("owner_session_keys_refused"),"empty peer refusal must be logged: {logs}");
+}
+
+#[tokio::test]
+async fn fake_pane_scope_keeps_late_fixture_attempts_separate_without_hiding_current_sends() {
+    use crate::api::{worker_exec::{fake_pane, ExecutionAdapter}, session_verbs::SendOrigin};
+    let previous=Fixture::new();
+    let previous_state=previous.state.clone();
+    let (release,ready)=tokio::sync::oneshot::channel();
+    // Reproduce a detached delivery reaching the adapter after its fixture
+    // dropped, with the original state but the next fixture's AMUX_HOME.
+    let late=tokio::spawn(async move {
+        ready.await.unwrap();
+        fake_pane::FAKE.deliver(&previous_state,OWNER_AGENT,"late previous-fixture send",SendOrigin::Automation).await
+    });
+    drop(previous);
+    let f=Fixture::new();
+    let before=f.typed();
+    release.send(()).unwrap();
+    assert!(matches!(late.await.unwrap(),crate::api::worker_exec::Dispatch::Handled((true,_))));
+    assert!(fake_pane::typed(OWNER_AGENT).contains(&("late previous-fixture send".into(),"amux")),"control: the old task really typed into the shared worker name");
+    assert_eq!(f.typed(),before,"an old fixture cannot change this fixture's pane oracle");
+
+    let (status,value)=f.send_flags("sessions",None,None,"").await;
+    assert_eq!(status,StatusCode::FORBIDDEN,"{value}");
+    assert_eq!(f.typed(),before,"a refused send must type nothing");
+    accepted(f.send_flags("sessions",Some(false),Some(true),"current fixture send").await);
+    let typed=f.typed();
+    assert_eq!(typed.len(),before.len()+1,"control: every current-fixture attempt is still visible");
+    assert!(typed.last().unwrap().0.contains("current fixture send"));
+    assert_eq!(typed.last().unwrap().1,"amux");
 }
 
 #[tokio::test]
@@ -1339,8 +1369,12 @@ impl Fixture {
         self.call(Some(PEER),None,&format!("/api/{prefix}/{OWNER_AGENT}/send"),body).await
     }
 
+    fn typed(&self) -> Vec<(String, &'static str)> {
+        crate::api::worker_exec::fake_pane::typed_for(&self.state, OWNER_AGENT)
+    }
+
     fn transported(&self) -> String {
-        let typed=crate::api::worker_exec::fake_pane::typed(OWNER_AGENT);
+        let typed=self.typed();
         let text=typed.last().expect("producer must reach the fake pane").0.clone();
         assert!(text.starts_with("[amux-input-receipt:"),"shipped transport must carry its durable receipt: {text}");
         text
@@ -1511,10 +1545,10 @@ async fn session_no_paste_fallback_when_native_delivery_unavailable() {
     let name="review-native-unavailable-owner";
     std::fs::rename(f.home.path().join(format!("sessions/{OWNER_AGENT}.env")),f.home.path().join(format!("sessions/{name}.env"))).unwrap();
     crate::api::rename_identity::record(f.home.path(),OWNER_AGENT,name,&format!("inc-{OWNER_AGENT}")).unwrap();
-    let before=crate::api::worker_exec::fake_pane::typed(name);
+    let before=crate::api::worker_exec::fake_pane::typed_for(&f.state,name);
     let (ok,message)=crate::api::session_verbs::send_text(&f.state,name,"peer relay",false,crate::api::session_verbs::SendOrigin::Automation).await;
     assert!(!ok && message.starts_with("owner_native_delivery_held"),"{message}");
-    assert_eq!(crate::api::worker_exec::fake_pane::typed(name),before);
+    assert_eq!(crate::api::worker_exec::fake_pane::typed_for(&f.state,name),before);
     assert_eq!(f.request_resolution(&id),(None,None));
     let logs=String::from_utf8(logs.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("owner_native_delivery_held"),"{logs}");
