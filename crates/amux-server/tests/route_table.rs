@@ -280,11 +280,173 @@ const KNOWN_UNTABLED: &[&str] = &[];
 
 #[test]
 fn every_directly_routed_api_path_is_in_the_table() {
-    // Test-only routers are probes, not mounted routes (same cutoff as request_log).
-    fn shipped_source(src: &str) -> &str {
-        src.split("#[cfg(test)]").next().unwrap_or(src)
+    // Strip test-gated items: test modules can sit above a router fn, as in
+    // browser_routing.rs. Cutting at the first test marker loses shipped routes.
+    fn shipped_source(src: &str, file: &std::path::Path) -> String {
+        const TEST_ATTRIBUTE: &str = "#[cfg(test)]";
+        let mut out = String::with_capacity(src.len());
+        let mut kept = 0;
+        let mut pos = 0;
+        while let Some(marker) = next_delimiter(src, pos, b"#") {
+            pos = marker + 1;
+            if !src[marker..].starts_with(TEST_ATTRIBUTE) {
+                continue;
+            }
+            let unclosed = || panic!("unclosed #[cfg(test)] item in {}", file.display());
+            let mut item = marker + TEST_ATTRIBUTE.len();
+            loop {
+                item += src[item..].len() - src[item..].trim_start().len();
+                if !src[item..].starts_with("#[") {
+                    break;
+                }
+                item = matching_delimiter(src, item + 1, b'[', b']')
+                    .unwrap_or_else(unclosed)
+                    + 1;
+            }
+            let first = next_delimiter(src, item, b";{").unwrap_or_else(unclosed);
+            let end = if src.as_bytes()[first] == b';' {
+                first + 1
+            } else {
+                matching_delimiter(src, first, b'{', b'}').unwrap_or_else(unclosed) + 1
+            };
+            out.push_str(&src[kept..marker]);
+            kept = end;
+            pos = end;
+        }
+        out.push_str(&src[kept..]);
+        out
     }
-    let src = shipped_source(include_str!("../src/api/mod.rs"));
+
+    // Find syntax outside strings, char literals and comments. Raw strings and
+    // quoted braces in test fixtures must not close the item being stripped.
+    fn next_delimiter(src: &str, mut i: usize, delimiters: &[u8]) -> Option<usize> {
+        let b = src.as_bytes();
+        while i < b.len() {
+            if b[i..].starts_with(b"//") {
+                i += src[i..].find('\n').unwrap_or(src.len() - i);
+            } else if b[i..].starts_with(b"/*") {
+                i += 2;
+                let mut depth = 1;
+                while depth > 0 {
+                    if b.get(i..i + 2) == Some(b"/*") {
+                        depth += 1;
+                        i += 2;
+                    } else if b.get(i..i + 2) == Some(b"*/") {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        b.get(i)?;
+                        i += 1;
+                    }
+                }
+            } else if b[i] == b'r'
+                && b.get(i + 1).is_some_and(|c| *c == b'#' || *c == b'"')
+            {
+                let mut quote = i + 1;
+                while b.get(quote) == Some(&b'#') {
+                    quote += 1;
+                }
+                if b.get(quote) == Some(&b'"') {
+                    let close = format!("\"{}", "#".repeat(quote - i - 1));
+                    i = quote + 1 + src[quote + 1..].find(&close)? + close.len();
+                } else {
+                    i += 1;
+                }
+            } else if b[i] == b'"' {
+                i += 1;
+                loop {
+                    match *b.get(i)? {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            } else if b[i] == b'\'' {
+                let first = src[i + 1..].chars().next()?;
+                let close = i + 1 + if first == '\\' { 2 } else { first.len_utf8() };
+                // A lifetime has no closing quote; do not consume its body.
+                i = if b.get(close) == Some(&b'\'') {
+                    close + 1
+                } else {
+                    i + 1
+                };
+            } else if delimiters.contains(&b[i]) {
+                return Some(i);
+            } else {
+                i += 1;
+            }
+        }
+        None
+    }
+
+    fn matching_delimiter(src: &str, open: usize, left: u8, right: u8) -> Option<usize> {
+        let mut depth = 1;
+        let mut pos = open + 1;
+        while let Some(i) = next_delimiter(src, pos, &[left, right]) {
+            if src.as_bytes()[i] == left {
+                depth += 1;
+            } else {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            pos = i + 1;
+        }
+        None
+    }
+
+    // Exercise removal without relying on how today's router modules are laid out.
+    let fixture_file = std::path::Path::new("test-gated-items.rs");
+    let fixture = r###"
+pub fn before() {}
+#[cfg(test)]
+#[allow(dead_code)]
+mod tests {
+    fn probe() {
+        let escaped = "\"};";
+        let raw = r#""}{"#;
+        let chars = ('{', '}', '"', '\'');
+        // }
+        /* { /* } */ } */
+    }
+}
+pub fn routes() {}
+#[cfg(test)] mod probes;
+#[cfg(test)] use test_helpers;
+#[cfg(test)] const PROBE: &str = "{;}";
+pub fn after() {}
+"###;
+    assert_eq!(
+        shipped_source(fixture, fixture_file)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>(),
+        ["pub fn before() {}", "pub fn routes() {}", "pub fn after() {}"],
+        "strip each gated item while retaining production before, between and after them"
+    );
+    for malformed in [
+        "#[cfg(test)] mod tests {",
+        "#[cfg(test)] mod tests",
+        "#[cfg(test)] #[allow(dead_code) mod tests {}",
+    ] {
+        let panic = std::panic::catch_unwind(|| shipped_source(malformed, fixture_file))
+            .expect_err("an unclosed test-gated item must fail loudly");
+        let message = panic.downcast_ref::<String>().expect("formatted panic");
+        assert!(
+            message.contains("unclosed") && message.contains("test-gated-items.rs"),
+            "malformed-item panic must identify its source: {message}"
+        );
+    }
+
+    let source = shipped_source(
+        include_str!("../src/api/mod.rs"),
+        std::path::Path::new("src/api/mod.rs"),
+    );
+    let src = source.as_str();
     let tabled: std::collections::HashSet<&str> = ROUTE_TABLE.iter().map(|e| e.path).collect();
     // SCANS THE WHOLE SOURCE, NOT LINE BY LINE. The first version of this test
     // read one line at a time and so missed every multi-line declaration —
@@ -453,7 +615,10 @@ fn every_directly_routed_api_path_is_in_the_table() {
     /// Resolves the FULL module path, not just the last segment: the first cut
     /// of the merge scanner looked only under src/api/ and reported four
     /// perfectly readable runtime_jobs modules as unreadable.
-    fn module_source(api_dir: &std::path::Path, callee: &str) -> Option<String> {
+    fn module_source(
+        api_dir: &std::path::Path,
+        callee: &str,
+    ) -> Option<(std::path::PathBuf, String)> {
         let segs: Vec<&str> = callee.split("::").map(str::trim).collect();
         let module = segs[segs.len() - 2];
         let src_dir = api_dir.parent().expect("src/api has a parent");
@@ -465,16 +630,18 @@ fn every_directly_routed_api_path_is_in_the_table() {
             .join("/");
         // `push` is a DIRECTORY module (src/push/mod.rs), so try both layouts
         // before declaring it unreadable.
-        std::fs::read_to_string(api_dir.join(format!("{module}.rs")))
-            .or_else(|_| std::fs::read_to_string(api_dir.join(module).join("mod.rs")))
-            .or_else(|_| std::fs::read_to_string(src_dir.join(format!("{joined}.rs"))))
-            .or_else(|_| std::fs::read_to_string(src_dir.join(&joined).join("mod.rs")))
-            .ok()
+        [
+            api_dir.join(format!("{module}.rs")),
+            api_dir.join(module).join("mod.rs"),
+            src_dir.join(format!("{joined}.rs")),
+            src_dir.join(&joined).join("mod.rs"),
+        ]
+        .into_iter()
+        .find_map(|file| std::fs::read_to_string(&file).ok().map(|src| (file, src)))
     }
 
     /// The body of `fn <func>(`, braces balanced.
     fn fn_body<'a>(msrc: &'a str, func: &str) -> Option<&'a str> {
-        let msrc = shipped_source(msrc);
         let fstart = msrc.find(&format!("fn {func}("))?;
         let start = fstart + msrc[fstart..].find('{')?;
         let mut depth = 0i32;
@@ -570,12 +737,13 @@ fn every_directly_routed_api_path_is_in_the_table() {
                         other => directory.push(other),
                     }
                 }
-                let file = directory.with_extension("rs");
-                let source = std::fs::read_to_string(&file)
-                    .or_else(|_| std::fs::read_to_string(directory.join("mod.rs")))
-                    .unwrap_or_else(|e| {
-                        panic!("unreadable nested router {nested_prefix} -> {callee}: {e}")
+                let (file, source) = [directory.with_extension("rs"), directory.join("mod.rs")]
+                    .into_iter()
+                    .find_map(|file| std::fs::read_to_string(&file).ok().map(|src| (file, src)))
+                    .unwrap_or_else(|| {
+                        panic!("unreadable nested router {nested_prefix} -> {callee}")
                     });
+                let source = shipped_source(&source, &file);
                 let child = fn_body(&source, func)
                     .unwrap_or_else(|| panic!("no fn {func} in nested router {callee}"));
                 for (path, handler) in route_literals(child) {
@@ -628,7 +796,7 @@ fn every_directly_routed_api_path_is_in_the_table() {
         }
         for callee in callees_of(&stripped[end..]) {
             let func = callee.rsplit("::").next().unwrap_or_default();
-            let Some(msrc) = module_source(&api_dir, &callee) else {
+            let Some((file, msrc)) = module_source(&api_dir, &callee) else {
                 // A module we cannot read is NOT a pass — a silently skipped
                 // nest is the failure this block exists to fix.
                 missing.push(format!("<unreadable module for nest {prefix} -> {callee}>"));
@@ -641,6 +809,7 @@ fn every_directly_routed_api_path_is_in_the_table() {
             // nest prefix glued on — producing "/api/cal-events/api/calendar.ics"
             // and "/api/logs/api/board", paths that exist nowhere. A check that
             // invents paths is worse than the blindness it replaced.
+            let msrc = shipped_source(&msrc, &file);
             let Some(body) = fn_body(&msrc, func) else {
                 // Previously a silent `continue`, which is the same silence the
                 // whole test exists to remove: a renamed router fn would have
@@ -685,17 +854,18 @@ fn every_directly_routed_api_path_is_in_the_table() {
             continue;
         };
         for callee in callees_of(&src[open + 1..close]) {
-            let Some(msrc) = module_source(&api_dir, &callee) else {
+            let Some((file, msrc)) = module_source(&api_dir, &callee) else {
                 missing.push(format!("<unreadable module for merge {callee}>"));
                 continue;
             };
             // The shipped source, not the named fn's body — deliberately different
             // from the nest walk above. Merged paths carry no prefix, so an
-            // absolute `/api/` literals before the test module are checked,
+            // absolute `/api/` literals outside test-gated items are checked,
             // and fn-body scoping is what let this family hide:
             // `routes()` delegating to `routes_with(ctx)` has no `.route()`
             // calls of its own, which is exactly the gmail_auth/gmail shape.
-            for (sub, handler) in route_literals(shipped_source(&msrc)) {
+            let msrc = shipped_source(&msrc, &file);
+            for (sub, handler) in route_literals(&msrc) {
                 // Merged paths are absolute-as-written; anything not under
                 // /api/ is not this table's business.
                 if !sub.starts_with("/api/") || is_404_answerer(&handler) {
