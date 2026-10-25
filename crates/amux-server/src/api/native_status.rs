@@ -215,6 +215,34 @@ fn refusal(event: &Value, previous: &Value, launch: &Value, now: f64) -> Option<
     None
 }
 
+/// A live nonce is an invocation/transport discriminator, not same-uid authentication.
+/// Queue readers never send this header; a body flag alone is never sufficient.
+pub(crate) fn approval_transport(body: &Value, headers: &axum::http::HeaderMap, self_report: bool) -> Value {
+    const INVOCATION_NONCE_HEX_LEN: usize = 32; // 128 bits, matching the hook wire format.
+    let nonce = body["approval_nonce"].as_str().unwrap_or("");
+    let live = self_report && nonce.len() == INVOCATION_NONCE_HEX_LEN && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+        && headers.get("x-amux-approval-nonce").and_then(|v|v.to_str().ok()) == Some(nonce);
+    let mut event = body.clone();
+    if !live { status_only(&mut event); }
+    event["approval_live"] = json!(live);
+    if let Some(fields)=event.as_object_mut() { fields.remove("approval_nonce"); }
+    event
+}
+
+fn status_only(event: &mut Value) {
+    let Some(fields)=event.as_object_mut() else {
+        tracing::warn!(verdict="native_status_malformed", measured=true, n_considered=1,
+            "status replay is not an object; no approval facts accepted");
+        return;
+    };
+    for field in ["prompt", "prompt_truncated", "approval_reserved_marker", "assistant_message", "approval_nonce"] {
+        fields.remove(field);
+    }
+    event["approval_live"]=json!(false); // Offline replay is never a live approval hook.
+    tracing::info!(verdict="approval_status_only", measured=true, n_considered=1,
+        "queued or unverified observation cannot show or fund approval");
+}
+
 fn apply(
     conn: &rusqlite::Connection,
     name: &str,
@@ -244,11 +272,11 @@ fn apply(
     let native_input = if event["event"] != "UserPromptSubmit" {
         super::delegation_requests::output_boundary(conn, name)?;
         None
-    } else {
+    } else if event["approval_live"] == true {
         super::delegation_requests::native_owner_input(conn, name, event, launch)?
-    };
+    } else { None };
     if let Some(row)=native_input { super::delegation_requests::resolve_native(conn,row)?; }
-    if event["event"] == "Stop" && event["subagent"] != true
+    if event["event"] == "Stop" && event["approval_live"] == true && event["subagent"] != true
         && event["worker_type"] != amux_core::worker_type::WorkerTypeId::CHAT {
         super::delegation_requests::native_assistant_turn(conn, name, event, launch)?;
     }
@@ -396,7 +424,7 @@ pub(crate) async fn post(state: &AppState, name: &str, body: &Value) -> Response
                     }
                 }
             }
-            if !out.applied && event["event"] == "UserPromptSubmit" && super::delegation_requests::is_owner_session(&worker) {
+            if !out.applied && event["approval_live"] == true && event["event"] == "UserPromptSubmit" && super::delegation_requests::is_owner_session(&worker) {
                 match super::delegation_requests::ambiguous_native_input(state,&worker,&event) {
                     Ok(Some(context))=>return Json(json!({"ok":true,"applied":false,"approval_context":context})).into_response(),
                     Ok(None)=>{},
@@ -423,7 +451,7 @@ pub(crate) async fn post(state: &AppState, name: &str, body: &Value) -> Response
                     ));
                 }
             }
-            if event["event"] == "UserPromptSubmit" && super::delegation_requests::is_owner_session(&worker) {
+            if event["approval_live"] == true && event["event"] == "UserPromptSubmit" && super::delegation_requests::is_owner_session(&worker) {
                 let boundary=if out.applied { Ok(()) } else {
                     super::delegation_requests::discarded_native_input(state,&worker,&event,"native_submit_rejected_or_deduplicated")
                 };
@@ -511,11 +539,8 @@ fn replay_run(state: &AppState, name: &str, dir: &Path) {
         let Ok(mut body) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
-        body["approval_live"]=json!(false); // Offline replay is never a live approval hook.
+        status_only(&mut body); // Disk replay carries lifecycle status only.
         let worker = name.to_owned();
-        let prompt = submitted_prompt(&body);
-        let submitted=body["event"] == "UserPromptSubmit";
-        let rejection_event=body.clone();
         let current = dir.parent().unwrap_or(dir).join("current.json");
         if let Ok(reply) = state.store.write(move |conn| {
             let launch = std::fs::read_to_string(current)
@@ -525,23 +550,7 @@ fn replay_run(state: &AppState, name: &str, dir: &Path) {
             apply(conn, &worker, &body, &launch)
         }) {
             title_native_input(state,&reply);
-            // A prompt submitted while the server was down still belongs in
-            // the ledger once the spool is replayed (F8(c)).
-            if super::delegation_requests::is_owner_session(name) {
-                let boundary=if reply.applied || !submitted { Ok(()) } else {
-                    super::delegation_requests::discarded_native_input(state,name,&rejection_event,"native_spool_submit_rejected_or_deduplicated")
-                };
-                if let Err(error) = boundary.and_then(|_|super::delegation_requests::resolve_session(state,name)) {
-                    tracing::warn!(session=name,%error,verdict="delegation_request_resolution_failed",
-                        "retaining native spool until owner input reconciliation succeeds");
-                    break;
-                }
-            } else if let (true, Some(prompt), Ok(rt)) =
-                (reply.applied, prompt, tokio::runtime::Handle::try_current())
-            {
-                let (st, n) = (state.clone(), name.to_owned());
-                rt.spawn(async move { super::pane_prompts::record(&st, &n, &prompt).await });
-            }
+            // Approval facts have no durable recovery path. Replays update status only.
             let _ = std::fs::remove_file(path);
         } else {
             break;

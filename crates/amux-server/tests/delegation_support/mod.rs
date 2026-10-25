@@ -233,6 +233,7 @@ impl Env {
         if let Who::Worker(name) = who {
             b = b.header("X-Amux-Session", name);
         }
+        if let Some(nonce) = body.as_ref().and_then(|v|v["approval_nonce"].as_str()) { b = b.header("x-amux-approval-nonce",nonce); }
         let req = match body {
             Some(v) => b.header(header::CONTENT_TYPE, "application/json").body(Body::from(v.to_string())).unwrap(),
             None => b.body(Body::empty()).unwrap(),
@@ -378,7 +379,7 @@ impl Env {
                 "incarnation":format!("inc-{lane}")}).to_string()).unwrap();
         }
         let seq = PANE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let mut report = json!({"native_status": true, "approval_live": true, "event": event,
+        let mut report = json!({"native_status": true, "approval_live": true, "approval_nonce": format!("{seq:032x}"), "event": event,
             "state": if event == "Stop" { "idle" } else { "active" }, "run_id": run, "provider": "claude",
             "sequence": seq, "event_ts": now, "session_id": format!("native-{lane}"), "turn_id": ""});
         if event == "Stop" {

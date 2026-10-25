@@ -2,8 +2,9 @@
 """Refuse hook-mediated tmux injection into the configured native owner session.
 
 Same-uid processes outside PreToolUse remain outside this boundary. No commands
-are executed except read-only tmux target resolution for pane/window ids.
+are executed except read-only tmux target resolution. Indirection is out of scope.
 """
+import getopt
 import json
 import os
 from pathlib import Path
@@ -13,33 +14,55 @@ import subprocess
 import sys
 import time
 
-INJECTION_VERBS = frozenset(('send-keys', 'paste-buffer', 'load-buffer', 'set-buffer'))
+# tmux 3.6a cmd.c cmd_find + cmd-{send-keys,paste-buffer,load-buffer,set-buffer}.c.
+# Aliases match exactly before canonical-name prefix lookup. The shortest unique
+# canonical prefixes account for competing names (send-prefix, lock-*, set-*).
+COMMANDS = {
+    'send-keys': ('send', 'send-k'),
+    'paste-buffer': ('pasteb', 'pa'),
+    'load-buffer': ('loadb', 'loa'),
+    'set-buffer': ('setb', 'set-b'),
+}
+
+
+def injection_verb(word):
+    for name, (alias, shortest) in COMMANDS.items():
+        if word == alias or (len(word) >= len(shortest) and name.startswith(word)):
+            return name
+    return None
+
+
 BUFFER_VERBS = frozenset(('load-buffer', 'set-buffer'))
 TARGET_OPTIONS = frozenset(('-t', '-b'))
 SOCKET_OPTIONS = frozenset(('-L', '-S'))
+GLOBAL_OPTIONS = '2c:CDdf:hlL:NqS:T:uUvV'  # tmux 3.6a tmux.c
+# Client/mouse key dispatch cannot be attested by a pane/session lookup.
+UNRESOLVABLE_OPTIONS = {'send-keys': frozenset(('-c', '-K', '-M'))}
+COMMAND_OPTIONS = {  # tmux 3.6a command entry .args strings
+    'send-keys': 'c:FHKlMN:Rt:X', 'paste-buffer': 'db:prs:t:',
+    'load-buffer': 'b:t:w', 'set-buffer': 'ab:t:n:w',
+}
 AUDIT_VERDICT = 'owner_tmux_input_refused'
 
 
 def owner_target(target, owner, socket_args):
-    target = target.lstrip('=')
-    if target.split(':', 1)[0] in (owner, 'amux-' + owner):
-        return True
-    if target.startswith(('%', '@')) or not target:
-        # An omitted send target means the current pane, not "no target".
-        args = ['tmux', *socket_args, 'display-message', '-p']
-        if target:
-            args.extend(('-t', target))
-        args.append('#{session_name}')
-        if any(c in target for c in ('\x00', '\r', '\n')):
-            return True
-        try:
-            result = subprocess.run(args, capture_output=True, text=True, timeout=2, check=False)
-            if result.returncode != 0:
-                return True  # unresolved identity is not permission to type
-            return result.stdout.strip() in (owner, 'amux-' + owner)
-        except (OSError, subprocess.TimeoutExpired):
-            return True
-    return False
+    # Ask tmux even for literal names: it owns exact/prefix/fnmatch/id semantics.
+    args = ['tmux', *socket_args, 'display-message', '-p']
+    if target:
+        args.extend(('-t', target))
+    args.append('#{session_name}')
+    if any(c in target for c in ('\x00', '\r', '\n')):
+        return 'target_unresolved'
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=2, check=False)
+        if result.returncode != 0:
+            return 'target_unresolved'  # unresolved or ambiguous identity is not permission to type
+        sessions = result.stdout.strip().splitlines()
+        if len(sessions) != 1 or not sessions[0]:
+            return 'target_unresolved'  # empty/multiple results are unresolved too
+        return result.stdout.strip() in (owner, 'amux-' + owner)
+    except (OSError, subprocess.TimeoutExpired):
+        return 'target_unresolved'
 
 
 def refused(command, owner):
@@ -52,7 +75,7 @@ def refused(command, owner):
         lexer.commenters = ''
         tokens = list(lexer)
     except ValueError:
-        return 'unparseable tmux injection' if re.search(r'\btmux\b.*\b(?:send-keys|paste-buffer|load-buffer|set-buffer)\b', command) else None
+        return 'unparseable tmux injection' if re.search(r'\btmux\b', command) else None
     for i, token in enumerate(tokens):
         if Path(token).name != 'tmux':
             if 'tmux ' in token and token != command:
@@ -60,26 +83,40 @@ def refused(command, owner):
                 if nested:
                     return nested
             continue
-        socket_args = []
-        verb = None
-        targets = []
-        j = i + 1
+        try:
+            options, rest = getopt.getopt(tokens[i + 1:], GLOBAL_OPTIONS)
+        except getopt.GetoptError:
+            return 'tmux:unparseable_options'
+        socket_args = [part for opt, value in options if opt in SOCKET_OPTIONS for part in (opt, value)]
+        segments = [[]]
+        j = len(tokens) - len(rest)
         while j < len(tokens):
             item = tokens[j]
-            if item in SOCKET_OPTIONS and j + 1 < len(tokens):
-                socket_args.extend((item, tokens[j + 1])); j += 2; continue
-            if item.startswith(('-L', '-S')) and len(item) > 2:
-                socket_args.extend((item[:2], item[2:])); j += 1; continue
-            if item in INJECTION_VERBS:
-                verb = item
-            elif item in TARGET_OPTIONS and j + 1 < len(tokens):
-                targets.append(tokens[j + 1]); j += 2; continue
-            elif item.startswith(('-t', '-b')) and len(item) > 2:
-                targets.append(item[2:])
+            if item in (';', '&&', '||', '|', ')', '\n'):
+                segments.append([]); j += 1; continue
+            if Path(item).name == 'tmux':
+                break  # the next invocation owns its socket options
+            segments[-1].append(item)
             j += 1
-        if verb and (not owner or (not targets and verb in BUFFER_VERBS)
-                     or any(owner_target(t, owner, socket_args) for t in (targets or ['']))):
-            return verb
+        for segment in segments:
+            operation = next(((index, injection_verb(item)) for index, item in enumerate(segment)
+                              if injection_verb(item)), None)
+            if operation is None:
+                continue
+            index, verb = operation
+            try:
+                options, _ = getopt.getopt(segment[index + 1:], COMMAND_OPTIONS[verb])
+            except getopt.GetoptError:
+                return verb + ':target_unresolved'
+            if any(opt in UNRESOLVABLE_OPTIONS.get(verb, ()) for opt, _ in options):
+                return verb + ':target_unresolved'
+            targets = [value for opt, value in options if opt in TARGET_OPTIONS]
+            if not owner or (not targets and verb in BUFFER_VERBS):
+                return verb
+            for target in targets or ['']:
+                result = owner_target(target, owner, socket_args)
+                if result:
+                    return verb + (':target_unresolved' if isinstance(result, str) else '')
     return None
 
 

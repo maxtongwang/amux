@@ -78,6 +78,7 @@ impl Fixture {
     async fn call(&self, port: Option<u16>, actor: Option<&str>, path: &str, body: Value) -> (StatusCode, Value) {
         let mut b = Request::builder().method("POST").uri(path).header(header::CONTENT_TYPE,"application/json");
         if let Some(a) = actor { b = b.header("x-amux-session",a); }
+        if let Some(nonce) = body["approval_nonce"].as_str() { b = b.header("x-amux-approval-nonce",nonce); }
         let mut req = b.body(Body::from(body.to_string())).unwrap();
         if let Some(p) = port {
             req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127,0,0,1],p))));
@@ -174,15 +175,15 @@ impl Fixture {
             "provider":"claude","sequence":seq,"event_ts":crate::config::now_f64(),"turn_id":format!("reply-{seq}"),"prompt":text,"prompt_truncated":false,"session_id":"owner-native-session"})
     }
 
-    // Exercise the shipped hook producer before routing its exact spool payload.
-    // observe() only writes private files; it starts no provider or delivery task.
+    // Exercise the shipped hook producer, retaining its in-memory return only.
+    // Approval facts are never recovered from the status spool.
     fn observed_payload(&self, session: &str, data: Value) -> Value {
         let seq=SEQ.fetch_add(1,Ordering::SeqCst);
         let folder=self.home.path().join(format!("status-events/{session}/reply-run"));
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("counter.json"),json!({"sequence":seq-1}).to_string()).unwrap();
         let hook=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/hooks/native-status.py");
-        let code="import importlib.util,json,sys,time; from pathlib import Path; s=importlib.util.spec_from_file_location('observer',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); assert m.observe(json.load(sys.stdin),Path(sys.argv[2]),sys.argv[3],'reply-run','claude',time.time())";
+        let code="import importlib.util,json,sys,time; from pathlib import Path; s=importlib.util.spec_from_file_location('observer',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); payload=m.observe(json.load(sys.stdin),Path(sys.argv[2]),sys.argv[3],'reply-run','claude',time.time()); assert payload; print(json.dumps(payload))";
         // The SAME env prefix the real provider inherits, including owner config.
         let command=format!("{}exec python3 -B -c {} {} {} {}",
             crate::api::native_status::observer_env(session,"reply-run"),
@@ -191,11 +192,11 @@ impl Fixture {
         use std::io::Write;
         let mut process=std::process::Command::new("sh").args(["-c",&command])
             .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
         process.stdin.take().unwrap().write_all(data.to_string().as_bytes()).unwrap();
         let output=process.wait_with_output().unwrap();
         assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
-        serde_json::from_slice(&std::fs::read(folder.join(format!("{seq:020}.json"))).unwrap()).unwrap()
+        serde_json::from_slice(&output.stdout).unwrap()
     }
 
     async fn type_in_pane(&self, text: &str, session_id: &str) {
@@ -217,6 +218,7 @@ impl Fixture {
                 "incarnation":incarnation(session)}).to_string()).unwrap();
         }
         let mut report=report; report["approval_live"]=json!(true);
+        report["approval_nonce"]=json!(format!("{:032x}",SEQ.fetch_add(1,Ordering::SeqCst)));
         let managed=crate::db::queries::get_worker(&self.state.store.read().unwrap(),session).unwrap().is_some();
         let path=format!("/api/{}/{session}/report",if managed { "workers" } else { "sessions" });
         let result=self.call(None,Some(session),&path,report).await;
@@ -1487,10 +1489,11 @@ async fn session_prompt_and_stop_atomic_recovery_preserves_proof() {
     assert_eq!(f.request_resolution(&id),(None,None));
     f.write(|c| c.execute_batch("DROP TRIGGER fail_native_input;"));
     crate::api::native_status::replay(&f.state);
-    let row=f.resolution(OWNER_AGENT,"request_confirm_needed",None);
+    // Status replay cannot resurrect a failed live prompt or its decision.
     crate::api::native_status::replay(&f.state);
     assert_eq!(f.request_resolution(&id).0,None);
-    assert!(max_ref::one(&f.state,row).unwrap().unwrap().native_session.is_some());
+    let count:i64=f.state.store.read().unwrap().query_row("SELECT COUNT(*) FROM cmd_history WHERE session=?1 AND type='user'",[OWNER_AGENT],|r|r.get(0)).unwrap();
+    assert_eq!(count,0,"failed live facts are dropped, never recovered from disk");
     assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
 }
 
@@ -2187,4 +2190,152 @@ async fn v32_reshow_retired_owner_incarnation_is_held() {
     f.write(move |c| {c.execute("UPDATE _amux_delegation_grants SET reply_incarnation='retired' WHERE code=?1",[request])?;Ok(())});
     let d=ReshowDelivery::default();f.reshow_tick(due,&d).await;
     assert_eq!(f.reshow_at(&id),None);assert!(d.notices.lock().unwrap().is_empty());assert!(d.pushes.lock().unwrap().is_empty());
+}
+
+
+// Opus bb83665c B1: the real Python hook emits requests; the actual router and
+// database decide whether they can show or fund. Only HTTP transport is fake.
+impl Fixture {
+    async fn hook_actions(&self, actions: Value) -> Vec<Value> {
+        let seq=SEQ.fetch_add(100,Ordering::SeqCst);
+        let dir=self.home.path().join(format!("status-events/{OWNER_AGENT}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        if !dir.join("current.json").exists() {
+            std::fs::write(dir.join("current.json"),json!({"run_id":"reply-run","provider":"claude",
+                "started":crate::config::now_f64()-100.0,"incarnation":incarnation(OWNER_AGENT)}).to_string()).unwrap();
+        }
+        let script=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/native-approval-fixture.py");
+        use std::io::Write;
+        let mut process=std::process::Command::new("python3").arg("-B").arg(script).arg(self.home.path())
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        process.stdin.take().unwrap().write_all(json!({"actions":actions,"sequence":seq}).to_string().as_bytes()).unwrap();
+        let output=process.wait_with_output().unwrap();
+        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+        let requests:Vec<Value>=serde_json::from_slice(&output.stdout).unwrap();
+        assert!(!requests.is_empty(),"hook driver must emit requests");
+        let mut results=vec![];
+        for r in requests {
+            if r["nonce"].is_null() {
+                for field in ["prompt","assistant_message","approval_nonce"] {
+                    assert!(r["body"].get(field).is_none(),"disk facts escaped the real hook: {r}");
+                }
+            }
+            results.push(self.report_transport(r["body"].clone(),r["nonce"].as_str()).await);
+        }
+        results
+    }
+
+    async fn report_transport(&self, body: Value, nonce: Option<&str>) -> Value {
+        let mut req=Request::builder().method("POST").uri(format!("/api/sessions/{OWNER_AGENT}/report"))
+            .header(header::CONTENT_TYPE,"application/json").header("x-amux-session",OWNER_AGENT);
+        if let Some(nonce)=nonce { req=req.header("x-amux-approval-nonce",nonce); }
+        let response=self.app.clone().oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert!(response.status().is_success());
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap()).unwrap()
+    }
+}
+
+fn hook_action(op: &str, event: &str, text: &str) -> Value {
+    let mut data=json!({"hook_event_name":event,"session_id":"owner-native-session"});
+    data[if event=="Stop" {"last_assistant_message"} else {"prompt"}]=json!(text);
+    json!({"op":op,"data":data})
+}
+
+#[tokio::test]
+async fn opus_b1_planted_stop_queue_never_shows_or_funds() {
+    let f=Fixture::new();let id=f.ask_hidden().await;
+    f.hook_actions(json!([hook_action("queue","Stop",&f.block(&id)),hook_action("live","UserPromptSubmit","yes")])).await;
+    assert_eq!(f.shown(&id),None);
+    assert_eq!(f.request_resolution(&id).0,None);
+    assert!(f.open(&id));
+    assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn opus_b1_rewritten_queued_no_never_funds() {
+    let f=Fixture::new();let id=f.ask_hidden().await;
+    let mut tamper=hook_action("tamper","UserPromptSubmit","no");tamper["rewrite"]=json!({"prompt":"yes"});
+    let result=f.hook_actions(json!([hook_action("live","Stop",&f.block(&id)),tamper])).await;
+    assert_eq!(result.last().unwrap()["approval_context"],format!("[amux approval] declined {}",f.short(&id)));
+    assert!(!f.open(&id));assert_eq!(f.request_resolution(&id).0,None);
+    // An abandoned rewritten prompt is status only too, even with a forged live flag.
+    let id=f.ask().await;
+    let mut queued=hook_action("queue","UserPromptSubmit","no");queued["rewrite"]=json!({"prompt":"yes"});
+    f.hook_actions(json!([queued,{"op":"replay"}])).await;
+    assert_eq!(f.request_resolution(&id).0,None);
+    assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn opus_b1_live_memory_block_then_yes_funds() {
+    let f=Fixture::new();let id=f.ask_hidden().await;
+    let result=f.hook_actions(json!([hook_action("live","Stop",&f.block(&id)),hook_action("live","UserPromptSubmit","yes")])).await;
+    assert!(f.shown(&id).is_some());
+    assert_eq!(result.last().unwrap()["approval_context"],format!("[amux approval] approved {}",f.short(&id)));
+    assert!(f.request_resolution(&id).0.is_some());accepted(f.apply(&id).await);
+}
+
+#[tokio::test]
+async fn opus_b1_failed_live_send_is_not_revived_by_replay() {
+    for failed_stop in [true,false] {
+        let f=Fixture::new();let id=f.ask_hidden().await;
+        let stop=hook_action(if failed_stop {"failed-live"} else {"live"},"Stop",&f.block(&id));
+        let submit=hook_action(if failed_stop {"live"} else {"failed-live"},"UserPromptSubmit","yes");
+        f.hook_actions(json!([stop,{"op":"replay"},submit,{"op":"replay"}])).await;
+        crate::api::native_status::replay(&f.state);
+        assert_eq!(f.request_resolution(&id).0,None);
+        assert_eq!(f.shown(&id).is_none(),failed_stop);
+        assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
+        let errors=std::fs::read_to_string(f.home.path().join("status-observer-errors.jsonl")).unwrap();
+        assert!(errors.contains("approval_live_dropped"));
+    }
+}
+
+#[tokio::test]
+async fn opus_b1_report_route_requires_live_nonce_even_for_claimed_owner() {
+    for mismatched in [false,true] {
+        let f=Fixture::new();let id=f.ask_hidden().await;
+        // Initialize launch, but never grant this body a live transport header.
+        let mut stop=f.observed_payload(OWNER_AGENT,json!({"hook_event_name":"Stop","session_id":"owner-native-session","last_assistant_message":f.block(&id)}));
+        let dir=f.home.path().join(format!("status-events/{OWNER_AGENT}"));
+        std::fs::write(dir.join("current.json"),json!({"run_id":"reply-run","provider":"claude","started":crate::config::now_f64()-100.0,"incarnation":incarnation(OWNER_AGENT)}).to_string()).unwrap();
+        stop["approval_live"]=json!(true);
+        f.report_transport(stop,if mismatched {Some("00000000000000000000000000000000")} else {None}).await;
+        assert_eq!(f.shown(&id),None);
+        f.owner_reply("yes").await;
+        assert_eq!(f.request_resolution(&id).0,None);
+    }
+}
+
+#[tokio::test]
+async fn v32_reshow_job_fires_once_at_30_minutes_pushes_once_and_wraps_notice() {
+    let f=Fixture::new();let id=f.ask_hidden().await;
+    f.expect_confirm(&id,"yes","unverifiable").await;
+    let due=f.confirmation_at(&id)+30.0*60.0;
+    let d=ReshowDelivery::default();
+    f.reshow_tick(due-0.001,&d).await;
+    assert_eq!(f.reshow_at(&id),None);
+    assert!(d.notices.lock().unwrap().is_empty());assert!(d.pushes.lock().unwrap().is_empty());
+    f.reshow_tick(due,&d).await;f.reshow_tick(due+60.0,&d).await;
+    assert_eq!(f.reshow_at(&id),Some(due));
+    assert_eq!(*d.pushes.lock().unwrap(),vec![id.clone()]);
+    let notices=d.notices.lock().unwrap();
+    assert_eq!(notices.as_slice(),[format!("<amux-native-delivery kind=\"approval-reshow\" id=\"{id}\">\n[amux approval] reshow {}\n</amux-native-delivery>",f.short(&id))]);
+    assert!(prompt_wrapped(&notices[0]));
+}
+
+
+#[tokio::test]
+async fn opus_b1_server_replay_strips_legacy_approval_facts() {
+    let f=Fixture::new();let id=f.ask_hidden().await;
+    accepted(f.hook(OWNER_AGENT,f.stop("unrelated output")).await);
+    let folder=f.home.path().join(format!("status-events/{OWNER_AGENT}/reply-run"));
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("00000000000000000000.json"),"[]").unwrap();
+    for event in [f.stop(&f.block(&id)),f.report("yes")] {
+        std::fs::write(folder.join(format!("{:020}.json",event["sequence"].as_u64().unwrap())),event.to_string()).unwrap();
+    }
+    crate::api::native_status::replay(&f.state);
+    assert_eq!(f.shown(&id),None);assert_eq!(f.request_resolution(&id).0,None);
+    assert_eq!(f.apply(&id).await.0,StatusCode::FORBIDDEN);
 }

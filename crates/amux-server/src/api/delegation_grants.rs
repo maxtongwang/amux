@@ -1440,6 +1440,7 @@ mod tests {
         if let Some(w) = who {
             b = b.header("x-amux-session", w);
         }
+        if let Some(nonce) = body["approval_nonce"].as_str() { b = b.header("x-amux-approval-nonce",nonce); }
         let mut req = b.body(if body.is_null() { Body::empty() } else { Body::from(body.to_string()) }).unwrap();
         if let Some(p) = port {
             req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], p))));
@@ -1609,7 +1610,7 @@ mod tests {
         let folder=home.join("status-events/mrpopo"); std::fs::create_dir_all(&folder).unwrap();
         let launch=folder.join("current.json");
         if !launch.exists() { std::fs::write(launch,json!({"run_id":"grant-test-run","provider":"claude","started":now()-100.0,"incarnation":"inc-mrpopo"}).to_string()).unwrap(); }
-        let payload=json!({"native_status":true,"approval_live":true,"run_id":"grant-test-run","provider":"claude","sequence":sequence,
+        let payload=json!({"native_status":true,"approval_live":true,"approval_nonce":format!("{sequence:032x}"),"run_id":"grant-test-run","provider":"claude","sequence":sequence,
             "event":event,"state":if event=="Stop" {"idle"} else {"active"},"event_ts":now(),"session_id":"grant-test-native",
             "turn_id":"","prompt":text,"prompt_truncated":false,"assistant_message":text});
         let (st,v,_)=call(app,"POST","/api/sessions/mrpopo/report",Some("mrpopo"),payload,None).await;

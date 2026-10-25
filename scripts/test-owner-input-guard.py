@@ -19,9 +19,7 @@ class OwnerInputGuard(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
         fake = self.home / 'tmux'
-        fake.write_text('#!/usr/bin/env python3\nimport sys\na=sys.argv[1:]\n'
-                        'assert "display-message" in a, a\n'
-                        'print("amux-owner-configured" if "%7" in a or "@8" in a else "amux-other")\n')
+        fake.write_text("#!/usr/bin/env python3\nimport json, os, sys\na = sys.argv[1:]\nassert 'display-message' in a, a\nassert a[-1] == '#{session_name}', a\nwith open(os.path.join(os.path.dirname(__file__), 'resolutions.jsonl'), 'a') as f:\n    f.write(json.dumps(a)+'\\n')\nt = a[a.index('-t')+1] if '-t' in a else '%7'\nif t in ('missing', 'ambiguous'):\n    sys.exit(1)\nif t == 'empty':\n    sys.exit(0)\nif t == 'multiple':\n    print('amux-other\\namux-owner-configured'); sys.exit(0)\ns = t.lstrip('=').split(':')[0]\nprint('amux-owner-configured' if s in ('owner-configured', 'amux-owner-configured', 'amux-owner-conf', 'amux-owner*', '%7', '@8') else 'amux-other')\n")
         fake.chmod(0o755)
         self.env = dict(os.environ, PATH=str(self.home) + os.pathsep + os.environ['PATH'],
                         AMUX_STATUS_HOME=str(self.home), AMUX_STATUS_OWNER='owner-configured')
@@ -45,6 +43,25 @@ class OwnerInputGuard(unittest.TestCase):
             with self.subTest(verb=verb):
                 self.assert_blocked(f'tmux {verb} -t amux-owner-configured yes')
 
+    def test_aliases_and_every_unambiguous_prefix(self):
+        spellings = ['send', 'pasteb', 'loadb', 'setb']
+        for name, shortest in [('send-keys', 'send-k'), ('paste-buffer', 'pa'),
+                               ('load-buffer', 'loa'), ('set-buffer', 'set-b')]:
+            spellings += [name[:n] for n in range(len(shortest), len(name)+1)]
+        for verb in spellings:
+            with self.subTest(verb=verb):
+                self.assert_blocked(f'tmux {verb} -t amux-owner-conf yes')
+                self.assertEqual(self.run_guard(f'tmux {verb} -t amux-other yes').returncode, 0)
+
+    def test_every_target_is_resolved_and_failures_refused(self):
+        for verb in ('send-keys', 'paste-buffer', 'load-buffer', 'set-buffer'):
+            for target in ('amux-owner-configured', 'amux-owner-conf', 'amux-owner*',
+                           'missing', 'ambiguous', 'empty', 'multiple'):
+                with self.subTest(verb=verb, target=target):
+                    self.assert_blocked(f'tmux {verb} -t "{target}" yes')
+        resolutions = [json.loads(line) for line in (self.home/'resolutions.jsonl').read_text().splitlines()]
+        self.assertEqual(len(resolutions), 28)
+
     def test_target_socket_and_quoting_forms(self):
         for command in (
             'tmux send-keys -t owner-configured yes',
@@ -60,6 +77,46 @@ class OwnerInputGuard(unittest.TestCase):
             r'tmux list-panes \; send-keys -t amux-owner-configured yes',
         ):
             with self.subTest(command=command): self.assert_blocked(command)
+
+    def test_socket_flags_belong_to_each_invocation(self):
+        commands = [
+            ('tmux -Lprivate send-key -t amux-other yes; tmux -S "/tmp/socket path" pasteb -t amux-other',
+             [['-L','private'], ['-S','/tmp/socket path']]),
+        ]
+        for command, sockets in commands:
+            self.assertEqual(self.run_guard(command).returncode, 0)
+            resolutions=[json.loads(line) for line in (self.home/'resolutions.jsonl').read_text().splitlines()]
+            self.assertEqual(len(resolutions), 2)
+            for args, socket in zip(resolutions, sockets):
+                self.assertEqual(args[:2], socket)
+        for socket in ('-Lprivate', '-S"/tmp/socket path"'):
+            self.assert_blocked(f'tmux {socket} send -t "amux-owner*" yes')
+
+    def test_separators_do_not_mix_owner_and_nonowner_targets(self):
+        for separator in (';', '&&', '||', r'\;'):
+            for verb in ('send', 'pasteb', 'loadb', 'setb'):
+                self.assert_blocked(f'tmux {verb} -t "amux-owner*" yes {separator} tmux {verb} -t amux-other yes')
+                self.assertEqual(self.run_guard(f'tmux {verb} -t amux-other yes {separator} tmux {verb} -t amux-other yes').returncode, 0)
+
+    def test_bundled_target_and_global_options(self):
+        for verb, flags in [('send', '-lt'), ('pasteb', '-dt'), ('loadb', '-wt'), ('setb', '-at')]:
+            for target in ('amux-owner*', 'amux-other'):
+                command=f'tmux -uLprivate {verb} {flags} "{target}" yes'
+                if target == 'amux-owner*': self.assert_blocked(command)
+                else: self.assertEqual(self.run_guard(command).returncode, 0)
+        resolutions=[json.loads(line) for line in (self.home/'resolutions.jsonl').read_text().splitlines()]
+        self.assertEqual(len(resolutions), 8)
+        self.assertTrue(all(args[:2] == ['-L','private'] for args in resolutions))
+
+    def test_client_and_mouse_key_dispatch_fail_closed(self):
+        for flags in ('-K', '-M', '-c owner-client'):
+            self.assert_blocked(f'tmux send {flags} -t amux-other yes')
+
+    def test_unresolved_target_reason_is_logged(self):
+        for target in ('missing', 'ambiguous', 'empty', 'multiple'):
+            self.assert_blocked(f'tmux send -t {target} yes')
+            audit=json.loads((self.home/'logs/owner-input-guard.log').read_text().splitlines()[-1])
+            self.assertEqual(audit['operation'], 'send-keys:target_unresolved')
 
     def test_pane_and_window_ids_resolve_to_owner(self):
         self.assert_blocked('tmux -L private send-keys -t %7 yes')

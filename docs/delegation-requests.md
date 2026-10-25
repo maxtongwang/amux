@@ -26,7 +26,9 @@ The native Stop hook binds the display and its request/requester snapshot.
 A later native prompt must have a strictly larger hook sequence in the same
 run, native session and current owner incarnation. Wall-clock ties alone do
 not prove this order. Missing/tied sequence or unknown identity cannot fund.
-A queued mid-turn yes therefore cannot approve a subsequently completed block.
+A submit hook observed before a completed block cannot approve that later block.
+This orders hook invocations, not physical keystrokes: provider behavior when
+dequeuing mid-turn input has not been verified live here.
 
 Short codes contain exactly four characters from
 `23456789ABCDEFGHJKMNPQRSTUVWXYZ`. Matching is case-insensitive. The serialized
@@ -208,8 +210,18 @@ Native acceptance, prompt proof, decision and context now commit atomically.
 A failed decision write rolls back acceptance. Exact run/sequence/body receipts
 recover a lost ACK with `approval_context_receipt_adopted`; no new request is
 funded. The hook's bounded synchronous request emits no context on unreachable
-server. Its persisted spool has no live funding flag: offline replay retains
-proof and confirmation/closure evidence but never creates approval. Native Stop
+server. Approval facts (submitted prompt and Stop assistant text) travel only from that
+hook invocation's in-memory payload, with a fresh 128-bit nonce in both the body
+and `X-Amux-Approval-Nonce` header. The report route verifies the pair and the
+self-report origin; a body `approval_live` claim alone is insufficient. The
+spool contains lifecycle status only, without prompt, assistant text or nonce.
+Synchronous events remain out of the queue while their live send is pending, so
+replay cannot consume their sequence first. A failed send then queues status only.
+Both hook delivery and server replay strip those fields even from planted or
+legacy files. Replay cannot show a block, fund a request or revive failed live
+facts. A failed live send drops those facts and logs `approval_live_dropped`;
+the server records unverified/replayed observations as `approval_status_only`.
+Stop transcript fallback is disabled because transcript files are mutable. Native Stop
 receipt/snapshot binding is atomic with its accepted sequence too.
 
 Migration 0130 is extended in place; numbering remains dense. It adds native
@@ -219,17 +231,58 @@ open short codes, display rows and spent replies. Approval closes the code even
 before application; a failed application or undo never restores the spent reply.
 Application still rechecks the exact mutation and stable actor/target identities.
 
-The worker Bash guard remains installed by both hook installers, blocks raw
-owner tmux input and logs `owner_tmux_input_refused`. Same-uid processes outside
-these hooks remain an OS boundary; this does not authenticate physical hands.
+The worker Bash guard remains installed by both hook installers and logs
+`owner_tmux_input_refused` (including `target_unresolved` on resolution failure).
+It canonicalizes these tmux spellings, following tmux 3.6a's command table and
+[`cmd_find` resolution rules](https://github.com/tmux/tmux/blob/3.6a/cmd.c):
+
+| Command | Built-in alias | Shortest unambiguous canonical prefix |
+| --- | --- | --- |
+| [`send-keys`](https://github.com/tmux/tmux/blob/3.6a/cmd-send-keys.c) | `send` | `send-k` |
+| [`paste-buffer`](https://github.com/tmux/tmux/blob/3.6a/cmd-paste-buffer.c) | `pasteb` | `pa` |
+| [`load-buffer`](https://github.com/tmux/tmux/blob/3.6a/cmd-load-buffer.c) | `loadb` | `loa` |
+| [`set-buffer`](https://github.com/tmux/tmux/blob/3.6a/cmd-set-buffer.c) | `setb` | `set-b` |
+
+Every longer prefix through the full canonical name is recognized. Aliases
+match exactly before canonical-name prefixes; ambiguous prefixes such as
+`send-` and `set-` are not executable spellings of these commands. For every
+recognized operation the guard runs `tmux [-L name | -S path] display-message -p
+-t <target> '#{session_name}'`, passing arguments separately. This resolves
+literal, prefix, pattern and pane/window targets through tmux itself. A result
+naming the configured owner is refused; failed, ambiguous, empty or multiple
+results fail closed. Omitted pane targets resolve the current pane. Global
+buffer writes with no target are refused. Each tmux invocation keeps its own
+socket flags across shell and tmux separators, including bundled short options.
+Client/mouse-directed key dispatch (`-c`, `-K`, `-M`) fails closed because a
+pane/session lookup cannot attest that destination.
+
+### Same-user residual
+
+This text guard does not authenticate physical hands. Variables (`$cmd`),
+`eval`, interpreter calls such as `python -c`, scripts, encoded commands and
+other indirection are beyond a text guard. A same-user process can bypass
+PreToolUse and type into the owner pane directly.
+
+A same-user launchd-spawned process can also read local bearer/run/session
+state and call the report route with a claimed owner header. It can invent a
+matching live nonce/header pair and forge live Stop or prompt reports; the
+nonce distinguishes live transport from replay, not OS-level identity. Such a
+forgery still needs the existing current run/incarnation, sequence, exact block,
+request snapshot and reply checks to fund. Merely planting or rewriting queue
+files, supplying a body live flag without its header, or replaying a failed
+live send can neither show a block nor fund. These protections do not close the
+same-user OS trust boundary.
 
 | Check | Coverage |
 | --- | --- |
-| `python3 -B scripts/test-native-status.py` | Producer, synchronous response, additionalContext, unreachable endpoint, reserved prefix before truncation |
+| `python3 -B scripts/test-native-status.py` | In-memory-only facts, transcript refusal, planted Stop/rewrite/failed-send transport, synchronous response, additionalContext, reserved prefix before truncation |
 | `python3 -B scripts/test-delegation-request-schema.py` | Actual schema/SQL, SIGKILL rollback/adoption |
 | `python3 -B scripts/test-delegation-reply-window.py` | Actual code uniqueness/reuse, snapshots, confirmation/reminder clocks, once-only reservations, SIGKILL rollback/adoption and ignored-input queries |
-| `python3 -B scripts/test-owner-input-guard.py` | Raw tmux refusal, audit, installer wiring |
+| `python3 -B scripts/test-owner-input-guard.py` | Full verbs/aliases/every valid prefix, exact/prefix/pattern targets, socket forwarding, quoting/separators, unresolved refusal, audit and installer wiring |
+| `scripts/test-contended.sh -p amux-server opus_b1` | Real hook transport into report route: planted Stop, rewritten no, live yes, failed send/replay and nonce enforcement (parent executes Rust) |
+| `scripts/test-contended.sh -p amux-server reshow` | Timer boundary, once-only push and wrapped native notice (parent executes Rust) |
 | `scripts/test-contended.sh -p amux-server api::delegation_requests` | Actual report/router behavior, individual doubt conditions and coded/decline matrices (parent executes Rust) |
 
 The untracked `.pr18-b1-notes.md` is the sole current mutation/coverage handoff;
-it is never staged. No cargo, push, host installation or deployment ran here.
+it is never staged. Full Rust verification remains with the parent; this
+handoff does not publish, install or deploy the change.

@@ -32708,11 +32708,11 @@ pub(crate) async fn report_post(
         );
     }
     if body["native_status"].as_bool() == Some(true) {
-        let mut observation = body.clone();
-        if origin != name && observation.as_object_mut().and_then(|m|m.remove("assistant_message")).is_some() {
+        if origin != name && body.get("assistant_message").is_some() {
             tracing::warn!(session=name, verdict="delegation_pane_report_not_self", measured=true,
                 n_considered=1, "outside report cannot attest an owner assistant turn");
         }
+        let observation = super::native_status::approval_transport(body, headers, origin == name);
         return super::native_status::post(state, name, &observation).await;
     }
     let report_provider = body_str(body, "provider");
