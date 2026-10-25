@@ -16,7 +16,7 @@ use std::path::Path;
 pub(crate) const ID: &str = "vault-owner-global-write-v1";
 
 // Granted global values reach every worker; allow credentials, never process
-// controls or keys that replace Claude/Codex subscription authentication.
+// controls or implicit client authentication/endpoint settings.
 const GRANTED_KEY_SUFFIXES: &[&str] = &[
     "_API_KEY",
     "_TOKEN",
@@ -28,6 +28,8 @@ const GRANTED_CLIENT_AUTH_OR_ENDPOINT: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
     "*_BASE_URL",
     "*_API_BASE",
     "CLAUDE_*",

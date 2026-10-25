@@ -237,6 +237,8 @@ async fn vault_grantee_key_policy_all_write_paths() {
         ("ANTHROPIC_API_KEY", "client_auth_or_endpoint"),
         ("ANTHROPIC_AUTH_TOKEN", "client_auth_or_endpoint"),
         ("OPENAI_API_KEY", "client_auth_or_endpoint"),
+        ("GEMINI_API_KEY", "client_auth_or_endpoint"),
+        ("GOOGLE_API_KEY", "client_auth_or_endpoint"),
     ] {
         let payload = json!({"key": key, "scope": "global", "value": SENTINEL});
         let (status, body) = f
@@ -282,6 +284,55 @@ fn assert_key_refusal(status: u16, body: &Value, rule: &str) {
     assert_eq!(status, 403);
     assert_eq!(body["code"], "vault_grant_key_not_permitted");
     assert_eq!(body["rule"], rule);
+}
+
+#[tokio::test]
+async fn vault_grantee_max_vendor_keys_allowed() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new(true);
+    for key in ["MAX_ANTHROPIC_API_KEY", "MAX_GEMINI_API_KEY"] {
+        let (status, body) = f
+            .grantee(
+                "POST",
+                "/api/vault/secrets",
+                Some(json!({"key": key, "scope": "global", "value": SENTINEL})),
+            )
+            .await;
+        assert_eq!(status, 201, "grantee can create {key}");
+        assert_eq!(body["item"]["key"], key);
+        let id = body["item"]["id"].as_str().unwrap();
+        for (method, version) in [("PUT", 2), ("PATCH", 3)] {
+            let (status, body) = f
+                .grantee(
+                    method,
+                    &format!("/api/vault/secrets/{id}"),
+                    Some(json!({"value": SENTINEL})),
+                )
+                .await;
+            assert_eq!(status, 200, "grantee can {method} {key}");
+            assert_eq!(body["item"]["key"], key);
+            assert_eq!(body["item"]["version"], version);
+        }
+        // Free the target name so the rename checks permission, not a duplicate.
+        let (status, _) = f
+            .grantee(
+                "PATCH",
+                &format!("/api/vault/secrets/{id}"),
+                Some(json!({"key": format!("ROTATED_{key}")})),
+            )
+            .await;
+        assert_eq!(status, 200, "free rename target {key}");
+        let safe_id = f.create().await;
+        let (status, body) = f
+            .grantee(
+                "PATCH",
+                &format!("/api/vault/secrets/{safe_id}"),
+                Some(json!({"key": key, "value": SENTINEL})),
+            )
+            .await;
+        assert_eq!(status, 200, "grantee can rename to {key}");
+        assert_eq!(body["item"]["key"], key);
+    }
 }
 
 #[tokio::test]

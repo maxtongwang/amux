@@ -191,6 +191,14 @@ must match `^[A-Z][A-Z0-9_]*$` and end in `_API_KEY`, `_TOKEN`, `_SECRET`,
 `api/grants_vault_write.rs` additionally exclude client auth/endpoint controls
 and shell/runtime controls, including credential-shaped names in those families.
 Existing PUT/PATCH keys and PATCH rename targets receive the same check.
+Use `MAX_<VENDOR>_API_KEY` for mrpopo's vendor credentials, for example
+`MAX_ANTHROPIC_API_KEY` and `MAX_GEMINI_API_KEY`; both are permitted by the grant.
+Client-auth names `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `OPENAI_API_KEY`,
+`GEMINI_API_KEY` and `GOOGLE_API_KEY` are refused as `client_auth_or_endpoint`,
+as are `*_BASE_URL`, `*_API_BASE`, `CLAUDE_*` and `CODEX_*`. SDKs read the
+unprefixed client-auth names implicitly, and `provider::live_catalog` polls
+Google when `GEMINI_API_KEY` is set. The `MAX_` convention stores credentials
+without selecting them implicitly for those clients.
 Refusals return `vault_grant_key_not_permitted` with `rule` equal to
 `not_credential_shaped`, `client_auth_or_endpoint` or `injection_sensitive`,
 and log that rule without the value. Owner-origin writes keep their existing rules.
