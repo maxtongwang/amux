@@ -34,6 +34,22 @@ def shell_function(name):
     return matches[0].group()
 
 
+def delivery_constants_module(names):
+    """Keep sibling-module paths and quarantine constants from shipped code."""
+    source = (SOURCE / 'crates/amux-server/src/api/delivery/mod.rs').read_text()
+    constants = []
+    for name in names:
+        matches = re.findall(r'^pub\(super\) const ' + name + r': &str =.*;$', source, re.M)
+        if len(matches) != 1:
+            raise AssertionError((name, len(matches)))
+        constants.extend(matches)
+    return 'mod delivery {\n' + '\n'.join(constants) + '\n}\n'
+
+
+def session_verbs_module(code, constants=('QUARANTINE_PREFIX', 'QUARANTINE_CODE')):
+    return 'mod api {\n' + delivery_constants_module(constants) + 'mod session_verbs {\n' + code + '\n}}\n'
+
+
 class OwnerOrigin(unittest.TestCase):
     def test_held_relay_refusals_keep_policy_and_identity_statuses(self):
         path = SOURCE / 'crates/amux-server/src/api/session_verbs.rs'
@@ -45,6 +61,7 @@ class OwnerOrigin(unittest.TestCase):
             constants.extend(matches)
         # Compile the shipped classifier and its Rust regression test; only
         # HTTP's numeric StatusCode wrapper is replaced, with no Cargo build.
+        # Preserve the sibling delivery module for #67's refusal classifier.
         code = '''#[derive(Debug,PartialEq,Eq,Clone,Copy)] pub(crate) struct StatusCode(u16);
 impl StatusCode {
     const BAD_REQUEST: Self=Self(400);
@@ -59,7 +76,7 @@ impl StatusCode {
         code += '\n#[test]\n' + function(ROOT / 'crates/amux-server/src/api/session_verbs.rs', 'held_relay_refusals_keep_policy_and_identity_statuses', indent='    ')
         with tempfile.TemporaryDirectory(prefix='held-relay-status-') as tmp:
             src, binary = Path(tmp)/'check.rs', Path(tmp)/'check'
-            src.write_text(code)
+            src.write_text(session_verbs_module(code, ('QUARANTINE_PREFIX',)))
             subprocess.run(['rustc','--edition','2021','--test',str(src),'-o',str(binary)],check=True)
             subprocess.run([str(binary)],check=True)
 
@@ -81,6 +98,12 @@ impl StatusCode {
 #[macro_export] macro_rules! quiet { ($($t:tt)*) => {} }
 mod tracing { pub(crate) use crate::quiet as info; }
 mod api {
+mod delivery { pub mod ledger {
+    pub fn candidate(store:&Option<()>, queue:&str)->Option<()> {
+        assert_eq!(queue,"queued-message");
+        *store
+    }
+}}
 pub mod delegation_requests { pub fn is_owner_session(s:&str)->bool { s=="configured-owner" } }
 pub mod session_verbs {
 use crate::tracing;
@@ -100,11 +123,16 @@ pub fn dispatch(defer_busy:bool, headers:&str)->(String,SendOrigin) {
     (text,send_origin)
 }
 ''' + function(path, 'is_schedule_guard') + '\n' + function(path, 'is_owner_configured_guard') + '\n' + queue_helper + '''
-pub fn drain_origin(session:&str, sender:&str, guard:&str)->(SendOrigin,String) {
-    struct Mode { origin:SendOrigin }
-    let mut mode=Mode { origin:SendOrigin::Owner };
+pub fn drain_origin(session:&str, sender:&str, guard:&str, native_peer:Option<()>)->(SendOrigin,String) {
+    // Only the native ledger lookup is a fixture; compile its shipped caller.
+    struct State { store:Option<()> }
+    struct Mode { origin:SendOrigin, native_peer:Option<()> }
+    let state=State { store:native_peer };
+    let id="queued-message";
+    let mut mode=Mode { origin:SendOrigin::Owner, native_peer:None };
     let text="yep";
 ''' + drain + '''
+    assert_eq!(mode.native_peer,native_peer,"retain the queued native identity");
     (mode.origin,text.into())
 }
 }}
@@ -117,13 +145,15 @@ pub fn drain_origin(session:&str, sender:&str, guard:&str)->(SendOrigin,String) 
             assert!(text.starts_with(&format!("[amux-origin: {peer} —")),"{text}");
         }
     }
-    for guard in ["","project-steering","sched:owner-config","goal:owner-config"] {
-        let (origin,text)=drain_origin("configured-owner","lead",guard);
-        assert_eq!(origin,SendOrigin::Automation,"worker sender guard={guard}");
-        assert!(text.starts_with("[amux-origin: lead —"),"queued worker stamp: {text}");
-        assert_eq!(drain_origin("configured-owner","",guard),(SendOrigin::Owner,"yep".into()),"configured owner transport guard={guard}");
+    for native_peer in [None,Some(())] {
+        for guard in ["","project-steering","sched:owner-config","goal:owner-config"] {
+            let (origin,text)=drain_origin("configured-owner","lead",guard,native_peer);
+            assert_eq!(origin,SendOrigin::Automation,"worker sender guard={guard}");
+            assert!(text.starts_with("[amux-origin: lead —"),"queued worker stamp: {text}");
+            assert_eq!(drain_origin("configured-owner","",guard,native_peer),(SendOrigin::Owner,"yep".into()),"configured owner transport guard={guard}");
+        }
+        assert_eq!(drain_origin("isolated-peer","lead","",native_peer),(SendOrigin::Owner,"yep".into()),"preserve other lanes' admitted Chat-as-owner transport");
     }
-    assert_eq!(drain_origin("isolated-peer","lead",""),(SendOrigin::Owner,"yep".into()),"preserve other lanes' admitted Chat-as-owner transport");
 }
 '''
         with tempfile.TemporaryDirectory(prefix='owner-dispatch-') as tmp:
@@ -165,7 +195,7 @@ pub fn drain_origin(session:&str, sender:&str, guard:&str)->(SendOrigin,String) 
         end=source.index("\n];",start)+3
         declarations=source[start:end]
         variants=sorted(set(re.findall(r"StatusCode::([A-Z_]+)",status)))
-        stub="#[allow(non_camel_case_types)] #[derive(Debug,PartialEq)] enum StatusCode {"+",".join(variants)+"}\n"
+        stub="#[allow(non_camel_case_types)] #[derive(Debug,PartialEq)] pub(crate) enum StatusCode {"+",".join(variants)+"}\n"
         for name in ["ISOLATED_REFUSAL_PREFIX","HERDR_NOT_ADDRESSABLE","BG_VIEW_REFUSAL_PREFIX"]:
             matches=re.findall(r"^(?:pub\(crate\) )?const "+name+r": &str =.*;$",source,re.M)
             self.assertEqual(len(matches),1,name)
@@ -181,7 +211,7 @@ pub fn drain_origin(session:&str, sender:&str, guard:&str)->(SendOrigin,String) 
 '''
         with tempfile.TemporaryDirectory(prefix="owner-refusal-") as tmp:
             src,binary=Path(tmp)/"check.rs",Path(tmp)/"check"
-            src.write_text(stub+declarations+"\n"+classifier+"\n"+status+"\n"+code+test)
+            src.write_text(session_verbs_module(stub+declarations+"\n"+classifier+"\n"+status+"\n"+code+test))
             subprocess.run(["rustc","--edition","2021","--test",str(src),"-o",str(binary)],check=True)
             subprocess.run([str(binary)],check=True)
 
