@@ -29924,9 +29924,7 @@ pub(crate) async fn resize_verb(name: &str, body: &Value) -> Response {
     j200(json!({"ok": true, "resized": ok, "message": msg}))
 }
 
-/// `keys` as a callable verb, so the promoted `/api/workers/{id}/keys`
-/// route and the legacy `/api/sessions/{name}/keys` spelling run ONE
-/// implementation instead of a route alias and a re-implementation (AF-288).
+// Scope owner-pane writes to the current owner incarnation.
 tokio::task_local! { static OWNER_PANE_WRITE: String; }
 
 fn owner_pane_write_allowed(name: &str) -> bool {
@@ -29966,6 +29964,9 @@ pub(crate) async fn submit_held_relay_non_owner(_state: &AppState, name: &str) -
     result
 }
 
+/// `keys` as a callable verb, so the promoted `/api/workers/{id}/keys`
+/// route and the legacy `/api/sessions/{name}/keys` spelling run ONE
+/// implementation instead of a route alias and a re-implementation (AF-288).
 pub(crate) async fn keys_verb(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
     if let Some(refusal)=super::delegation_requests::owner_keys_refusal(name,headers) { return refusal; }
     if let Some(refusal) = peer_input_gate(headers, name, "keys") {

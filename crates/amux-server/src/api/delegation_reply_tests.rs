@@ -1,7 +1,7 @@
 // Real owner-input routes and reply-matching class sweep — refs maxtongwang/ai-config#160.
 // Only process discovery and provider execution are fixtures; recorder/resolver/router are production.
 use super::*;
-use crate::api::{process_identity::{self, test_support, Origin}, settings::test_env, chat_worker};
+use crate::api::{process_identity::{test_support, Origin}, settings::test_env, chat_worker};
 use crate::api::session_verbs::sh_quote;
 use crate::db::{Store, WriteOutcome};
 use axum::http::header;
@@ -374,6 +374,7 @@ async fn project_send_closes_only_in_owner_session() {
     accepted(f.send(OWNER_AGENT,OUTSIDE,"yes","project-reply").await);
     let row=f.resolution(OWNER_AGENT,"request_reply_not_owner_input",None);
     assert_eq!(f.state.store.read().unwrap().query_row("SELECT delivery FROM cmd_history WHERE id=?1",[row],|r|r.get::<_,String>(0)).unwrap(),"queued");
+    assert_eq!(f.request_resolution(&id),(None,Some("request_reply_not_owner_input".into())));
     let next=f.ask().await;
     // Recover a stable queue receipt with a missing transport reservation.
     f.write(|c| { c.execute("DELETE FROM send_dedup WHERE msg_id='project-reply'",[])?; Ok(()) });
@@ -661,7 +662,7 @@ async fn replaced_asker_cannot_spend_owner_reply() {
     let f=Fixture::new(); let id=f.ask().await;
     let p=f.home.path().join(format!("sessions/{LEAD}.env"));
     std::fs::rename(&p,f.home.path().join("sessions/retired-asker.env")).unwrap();
-    std::fs::write(&p,format!("CC_TAGS=leads,dev\nCC_ORCHESTRATOR=1\nCC_INCARNATION=replacement-asker\n")).unwrap();
+    std::fs::write(&p,"CC_TAGS=leads,dev\nCC_ORCHESTRATOR=1\nCC_INCARNATION=replacement-asker\n").unwrap();
     accepted(f.owner_reply("yes").await);
     let (st,v)=f.apply(&id).await;
     assert_eq!(st,StatusCode::FORBIDDEN); assert_eq!(v["code"],"request_actor_identity_changed");

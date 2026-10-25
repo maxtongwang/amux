@@ -849,9 +849,7 @@ pub(crate) fn claim_applying(state: &AppState, code: &str, actor: &str, action: 
 pub(crate) async fn on_row(state: &AppState, row_id: i64) {
     if let Err(e) = super::delegation_requests::resolve_observed(state, row_id) {
         tracing::warn!(row_id, error = %e, verdict = "delegation_request_resolution_failed", measured = false, n_considered = 0, "reply correlation failed closed");
-        return;
     }
-
 }
 
 fn owner_refusal(state: &AppState, headers: &HeaderMap, uri: &Uri) -> Option<Response> {
