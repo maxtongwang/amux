@@ -1,4 +1,6 @@
 //! Ad-hoc, owner-approved permission grants (AMUX-3997).
+//! Standing vault-write configuration is the separate `vault_write` module;
+//! its reviewed seed never enters the one-shot approval queue.
 //!
 //! # Why this exists
 //!
@@ -60,6 +62,9 @@
 //! omit its own origin header, and a worker that does so is lying about its
 //! identity — which the audit trail treats as a forensics flag. This closes the
 //! honest case: a lane that hits a wall, asks, and waits.
+
+#[path = "grants_vault_write.rs"]
+pub(crate) mod vault_write;
 
 use crate::config::{amux_home, now_f64};
 use axum::extract::Path as AxPath;
@@ -490,6 +495,7 @@ async fn reject(headers: HeaderMap, AxPath(id): AxPath<String>) -> Response {
 
 pub fn routes() -> Router<super::AppState> {
     Router::new()
+        .merge(vault_write::routes())
         .route("/api/grants", get(list))
         .route("/api/grants/{id}/approve", post(approve))
         .route("/api/grants/{id}/reject", post(reject))

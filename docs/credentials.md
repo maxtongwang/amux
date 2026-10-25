@@ -166,3 +166,41 @@ SANDBOX host. No card is issued and no money moves until the owner sets these.
 | Env key | Purpose |
 |---|---|
 | `AMUX_BIND` | Server listener IP address (IPv4 or IPv6, without a port). Unset preserves the production wildcard interface; invalid input aborts startup. Test harnesses explicitly select IPv4 loopback. |
+
+## Standing vault writes
+
+Max authorized **“Grant vault writes”** in the mrpopo session on
+2026-10-24 at 19:54:18 PDT, verified via amux-origin. Earlier context:
+`<19:49 context>`; `<19:52 context>`. Configuration provenance:
+`maxtongwang/amux PR <number>` (fill these placeholders before merge).
+
+Migration `0126_vault_write_grant` seeds `vault-owner-global-write-v1` without
+an owner dashboard or CLI step. The grantee is the configured owner agent
+(`session_verbs::OWNER_AGENT`), pinned once at startup to its registered
+immutable worker ID and token-bound incarnation. Main's legacy env-only
+workers have no `wrk_` row: for those, the pinned `CC_INCARNATION` is the
+identity. Both paths require the worker token on each request, even when
+rule 10 is disabled or unminted. A name claim alone never authorizes a write;
+a replacement with a different ID or incarnation cannot inherit the grant.
+An absent registration fails closed with `vault_grant_owner_unregistered`.
+
+The grant covers **global secrets create, PUT replace, and PATCH update**.
+Both the existing and destination scopes must be global. Import, reveal,
+delete, access and audit reads remain owner-only; payment cards and logins
+retain their separate rules. Every granted write records the key name,
+scope, Unix-seconds timestamp, grantee identity, grant ID and resulting
+version in the vault audit, the leads Messages channel, and session events.
+Values never enter these notices or write responses. A metadata receipt is
+saved atomically with the ciphertext; startup or the next granted write replays
+unfinished audit publication without duplicate events or leads notices. A failed
+publication returns `write_committed: true`, retains the receipt, and logs
+`vault_granted_write_audit_failed`. Recovery never opens the value.
+
+List with `amux vault grants` (`--json` for structured metadata). Revoke from
+owner origin with `amux vault grants revoke vault-owner-global-write-v1`, or
+`POST /api/vault/grants/vault-owner-global-write-v1/revoke` using the owner
+auth path. Worker origins cannot revoke, create or re-activate grants.
+Restarting or replaying the seed preserves revocation. Only an explicit
+owner-origin `amux vault grants regrant vault-owner-global-write-v1` can
+re-activate it and bind the current owner identity. Grant timestamps use
+Unix seconds; the existing Messages channel uses Unix milliseconds.

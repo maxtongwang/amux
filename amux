@@ -6546,6 +6546,8 @@ ${BOLD}Interaction:${RESET}
   amux attach <name>             Attach to a running worker (detach: Ctrl-b d)
   amux grid [-c N] <name>...     Tile those workers' terminals in a grid (macOS/iTerm2)
   amux peek <name> [lines]       View last N lines without attaching (default: 30)
+  amux vault grants [--json]    List standing vault grants (metadata, Unix seconds)
+  amux vault grants revoke <id> Revoke a grant (owner origin only)
   amux post <conv> [text]        Post to Messages: g:<group>, #group or w:<worker> (text or stdin)
   amux send <name> --stdin       Send a message read from stdin ${GREEN}(preferred)${RESET}
                                  ${DIM}amux send api --stdin <<'EOF'${RESET}
@@ -9716,6 +9718,40 @@ PY
   esac
 }
 
+# Standing vault grants expose metadata only; values never pass through this CLI.
+cmd_vault() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  [[ "$sub" == "grants" ]] || { echo "Usage: amux vault grants [--json | revoke <id> | regrant <id>]"; return 1; }
+  local me="${AMUX_WORKER:-${AMUX_SESSION:-}}"
+  local action="${1:-list}"; shift 2>/dev/null || true
+  case "$action" in
+    list|ls|--json)
+      [[ $# -eq 0 ]] || die "Usage: amux vault grants [--json]"
+      _curl -fsk -H "X-Amux-Worker: $me" "$AMUX_API/api/vault/grants" | python3 -c '
+import json, sys
+mode = sys.argv[1]
+d = json.load(sys.stdin)
+if d.get("measured") is not True or not isinstance(d.get("grants"), list):
+    sys.exit("vault grants: no measured grant listing")
+fields = ("id", "grantee", "grantee_id", "scope", "created_at", "revoked_at")
+rows = [{k: g.get(k) for k in fields} for g in d["grants"]]
+if mode == "--json":
+    print(json.dumps({"grants": rows, "timestamp_unit": "unix_seconds"}, indent=2))
+else:
+    print("ID  GRANTEE  STABLE ID  SCOPE  CREATED (unix seconds)  REVOKED (unix seconds)")
+    for g in rows:
+        print("  ".join(str(g[k]) if g[k] is not None else "-" for k in ("id", "grantee", "grantee_id", "scope", "created_at", "revoked_at")))
+' "$action"
+      ;;
+    revoke|regrant)
+      local id="${1:-}"
+      [[ $# -eq 1 && "$id" =~ ^[a-zA-Z0-9_-]+$ ]] || die "Usage: amux vault grants $action <id>"
+      _curl -fsk -H "X-Amux-Worker: $me" -X POST "$AMUX_API/api/vault/grants/$id/$action" | python3 -m json.tool
+      ;;
+    *) echo "Usage: amux vault grants [--json | revoke <id> | regrant <id>]"; return 1 ;;
+  esac
+}
+
 # AF-928's actual check: everything below this point (dispatch, and the
 # tail's unconditional `exit "$?"`) must never run when sourced. Placed here,
 # not near the top comment, because every function above — including
@@ -9751,6 +9787,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     send)             shift; cmd_send "$@" ;;
     delivery)         shift; cmd_delivery "$@" ;;
     post)             shift; cmd_post "$@" ;;
+    vault)            shift; cmd_vault "$@" ;;
     stop|kill)        shift; cmd_stop "$@" ;;
     pause)            shift; cmd_pause "$@" ;;
     resume|unpause)   shift; cmd_resume "$@" ;;

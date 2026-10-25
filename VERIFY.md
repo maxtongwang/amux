@@ -256,3 +256,20 @@ would print.
 Name what should appear BESIDE the answer if the probe really ran, and check for
 THAT: a count beside a zero, a hash beside "adopted", a PASS line beside a green
 suite.
+
+## Standing vault grant
+
+```bash
+scripts/safe-cargo.sh test -p amux-server --test vault_write_grant_api
+python3 scripts/test-vault-grants-cli.py
+```
+
+Pass on Unix: Rust reports `9 passed; 0 failed; 1 ignored` (the ignored test
+is the subprocess fixture invoked by `vault_grant_sigkill_replays_receipt_once`);
+Python reports `Ran 3 tests` and `OK`. The route tests cover global create,
+PUT/PATCH, wrong or forged identity, narrower scopes, owner-only operations,
+revocation, seed replay and metadata-only audit/feed/events/responses. The
+SIGKILL test recovers a committed encrypted write and unfinished audit without
+duplicate notices or events. All homes, token fixtures and keystores are private
+temporary files; no real vault or Keychain is used. The CLI tests execute the
+shipped Bash dispatch against a fake HTTP transport.
