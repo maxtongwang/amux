@@ -575,6 +575,10 @@ async fn vault_grant_listing_requires_owner_auth() {
     let _serial = SERIAL.lock().await;
     let mut f = Fixture::new(true);
     std::env::set_var("AMUX_RS_NO_LOOPBACK_BYPASS", "0");
+    // The loopback requests below carry a synthetic ConnectInfo no process
+    // holds, so process attribution would refuse them before the route on some
+    // hosts; this test pins the route's own owner-bearer rule.
+    std::env::set_var("AMUX_PROCESS_ATTRIBUTION", "0");
     assert_eq!(f.call("GET", "/api/vault/grants", None, None).await.0, 200);
     assert_eq!(f.grantee("GET", "/api/vault/grants", None).await.0, 403);
     for tokenless_host in [false, true] {
