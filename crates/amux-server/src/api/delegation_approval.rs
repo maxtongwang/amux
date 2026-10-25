@@ -25,13 +25,14 @@ pub(crate) fn allocate_short_code(conn: &Connection, now_s: f64, mut next: impl 
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum DoubtReason { FirstPrompt, LatestTurn, SeveralOpen, Stale, Changed, Unverifiable }
+pub(super) enum DoubtReason { FirstPrompt, LatestTurn, SeveralOpen, Stale, Changed, Unverifiable, ExtraText }
 impl DoubtReason {
     fn as_str(self) -> &'static str {
         match self {
             Self::FirstPrompt | Self::LatestTurn => "text-between",
             Self::SeveralOpen => "several-open", Self::Stale => "stale-30min",
             Self::Changed => "changed", Self::Unverifiable => "unverifiable",
+            Self::ExtraText => "extra-text",
         }
     }
 }
@@ -86,11 +87,15 @@ enum ApprovalReply { Plain, Coded(String), Doubt }
 
 /// Exactly four ASCII alphanumerics form a code, including allocator-excluded
 /// ambiguous characters; any other approve-word text requires confirmation.
-/// Normalize case and tolerate one final period.
+/// Normalize case and tolerate one final period. Other attached punctuation
+/// starts extra text; longer words (e.g. "yep") are not approve words.
 fn approve_reply(text: &str) -> Option<ApprovalReply> {
     let mut words=text.split_whitespace();
     let word=words.next()?;
-    if !max_ref::reply_is_affirmative(word) { return None; }
+    if !max_ref::reply_is_affirmative(word) {
+        let end=word.find(|c: char| !c.is_alphanumeric()).unwrap_or(word.len());
+        return max_ref::reply_is_affirmative(&word[..end]).then_some(ApprovalReply::Doubt);
+    }
     let Some(token)=words.next() else { return Some(ApprovalReply::Plain); };
     let code=token.strip_suffix('.').unwrap_or(token).to_ascii_uppercase();
     if words.next().is_some() || code.len()!=super::super::delegation_grants::CODE_LEN || !code.bytes().all(|b| b.is_ascii_alphanumeric()) { return Some(ApprovalReply::Doubt); }
@@ -114,9 +119,9 @@ pub(super) fn approve_shaped(text: &str) -> bool {
         && text.split_once('\n').is_some_and(|(_,body)|approve_reply(body).is_some()))
 }
 
-fn reply_without_doubt(facts: &PlainYesFacts, coded: bool, prose_doubt: bool) -> Result<(), DoubtReason> {
+fn reply_without_doubt(facts: &PlainYesFacts, coded: bool, prose_doubt: Option<DoubtReason>) -> Result<(), DoubtReason> {
     if !facts.verifiable { return Err(DoubtReason::Unverifiable); }
-    if prose_doubt { return Err(DoubtReason::FirstPrompt); }
+    if let Some(reason)=prose_doubt { return Err(reason); }
     if !coded { return plain_yes_without_doubt(facts); }
     if !facts.unchanged { return Err(DoubtReason::Changed); }
     Ok(())
@@ -144,7 +149,8 @@ pub(super) fn resolve(conn: &Connection, row: &max_ref::Row, owner_input: bool) 
     }
     let quoted_code=if intent.is_none() { quoted_coded_reply(&row.text) } else { None };
     if let Some(code)=&quoted_code { intent=Some(ApprovalReply::Coded(code.clone())); }
-    let prose_doubt=matches!(intent,Some(ApprovalReply::Doubt)) || quoted_code.is_some();
+    let prose_doubt=if matches!(intent,Some(ApprovalReply::Doubt)) { Some(DoubtReason::ExtraText) }
+        else { quoted_code.as_ref().map(|_|DoubtReason::FirstPrompt) };
     let mut lines=Vec::new();
     let mut funded=None;
     let mut verdict="request_no_candidate";
@@ -226,10 +232,10 @@ mod tests {
     }
     #[test]
     fn quoted_coded_yes_with_valid_proof_still_requires_confirmation() {
-        assert_eq!(reply_without_doubt(&clear(),true,true),Err(DoubtReason::FirstPrompt));
-        assert_eq!(reply_without_doubt(&clear(),true,false),Ok(()));
+        assert_eq!(reply_without_doubt(&clear(),true,Some(DoubtReason::FirstPrompt)),Err(DoubtReason::FirstPrompt));
+        assert_eq!(reply_without_doubt(&clear(),true,None),Ok(()));
         let mut facts=clear();facts.verifiable=false;
-        assert_eq!(reply_without_doubt(&facts,true,true),Err(DoubtReason::Unverifiable));
+        assert_eq!(reply_without_doubt(&facts,true,Some(DoubtReason::FirstPrompt)),Err(DoubtReason::Unverifiable));
     }
     #[test]
     fn quoted_coded_reply_uses_allowlist_code_shape_and_leading_boundary() {
@@ -241,6 +247,21 @@ mod tests {
             "Max says maybe A7K2 after quoting","<system-reminder>\nyes A7K2"] {
             assert_eq!(quoted_coded_reply(prompt),None,"{prompt}");
         }
+    }
+    #[test]
+    fn question_mark_is_approve_word_doubt() {
+        assert_eq!(approve_reply("yes?"),Some(ApprovalReply::Doubt));
+        assert!(approve_shaped("yes?"));
+    }
+    #[test]
+    fn single_trailing_period_is_plain_approval() {
+        assert_eq!(approve_reply("yes."),Some(ApprovalReply::Plain));
+        assert_eq!(plain_yes_without_doubt(&clear()),Ok(()));
+    }
+    #[test]
+    fn extra_text_context_line_is_byte_exact() {
+        assert_eq!(confirm("A7K2",DoubtReason::ExtraText),"[amux approval] confirm needed A7K2 (reason: extra-text)");
+        assert_eq!(reply_without_doubt(&clear(),false,Some(DoubtReason::ExtraText)),Err(DoubtReason::ExtraText));
     }
     #[test]
     fn approve_word_with_other_text_is_approve_shaped() {
@@ -261,6 +282,11 @@ mod tests {
     }
     #[test]
     fn approve_reply_other_approve_word_text_is_doubt() {
+        for word in ["yes","y","approve","ok","YES"] {
+            for tail in ["?","!?",", don't proceed",",don't proceed","!","..",".please","_please"] {
+                assert_eq!(approve_reply(&format!(" {word}{tail} ")),Some(ApprovalReply::Doubt),"attached extra text: {word}{tail}");
+            }
+        }
         for word in ["yes","y","approve","ok","YES."] {
             for tail in ["INVALID","please do it","AB12CD","A","A7K","A7K23","please","ab","123456789012","A7K2!","A_K2","Å7K2","A7K2 extra","A7K2.."] {
                 assert_eq!(approve_reply(&format!(" {word} {tail} ")),Some(ApprovalReply::Doubt),"approve-word text: {word} {tail}");
@@ -269,7 +295,7 @@ mod tests {
     }
     #[test]
     fn approve_reply_without_leading_approve_word_declines() {
-        for text in ["no thanks","maybe","","\n","yes?","yes, don't proceed","okay","yep","approved","go ahead"] {
+        for text in ["no thanks","maybe","","\n","okay","yep","approved","yesplease","yes1","go ahead"] {
             assert_eq!(approve_reply(text),None,"no leading approve word: {text}");
         }
     }
@@ -279,7 +305,7 @@ mod tests {
         assert_eq!(context("no open approval","A7K2"),"[amux approval] no open approval A7K2");
         for (reason,name) in [(DoubtReason::FirstPrompt,"text-between"),(DoubtReason::LatestTurn,"text-between"),
             (DoubtReason::SeveralOpen,"several-open"),(DoubtReason::Stale,"stale-30min"),
-            (DoubtReason::Changed,"changed"),(DoubtReason::Unverifiable,"unverifiable")] {
+            (DoubtReason::Changed,"changed"),(DoubtReason::Unverifiable,"unverifiable"),(DoubtReason::ExtraText,"extra-text")] {
             assert_eq!(confirm("A7K2",reason),format!("[amux approval] confirm needed A7K2 (reason: {name})"));
         }
     }

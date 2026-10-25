@@ -43,7 +43,7 @@ boundary. All approval `*_at` timestamps are Unix seconds; history `ts` is ms.
 | Owner prose containing an approve word plus a code, including after a pasted snippet | Doubt (`text-between`): stays open and requires a clean coded confirmation; never approves |
 | Another plain yes after confirmation | Confirmation again; never funds |
 | Wrong, unknown, never-issued or closed four-character alphanumeric token | No open approval; leaves the shown request unchanged and never falls back to plain yes |
-| Approve word followed by any other text (e.g. `yes INVALID`, `yes please do it`, `yes AB12CD`) | Doubt (`text-between`): stays open, funds nothing, requires coded confirmation |
+| Approve word followed by any other text, including attached punctuation (e.g. `yes?`, `yes!?`, `yes, don't proceed`, `yes but not yet`, `yes please`, `yes INVALID`, `yes AB12CD`) | Doubt (`extra-text`): stays open, funds nothing, requires coded confirmation |
 | No approve word at the start (e.g. `no thanks`, `maybe`) or empty Enter immediately following a display | Declines/closes, never funds |
 | Coded answer to another open request | Answers that request; leaves this question open |
 
@@ -55,6 +55,10 @@ ambiguous characters `0/O/1/I/L`: `yes 0O1I` reports `no open approval 0O1I`,
 without declining or closing the displayed request. Extra words, punctuation
 within the token and tokens of any other length require confirmation when the
 prompt starts with an approve word; they never approve or close the request.
+Only a single trailing period is tolerated: `yes.` retains the plain-yes path,
+and `yes A7K2.` retains the coded path. A longer word such as `yep` is not an
+approve word. Extra-text doubt uses the existing provenance checks; unverifiable
+input still reports `unverifiable`.
 
 `plain_yes_without_doubt` checks every condition explicitly:
 
@@ -86,13 +90,17 @@ The fixed line forms are:
 ```text
 [amux approval] approved A7K2
 [amux approval] confirm needed A7K2 (reason: text-between)
+[amux approval] confirm needed A7K2 (reason: extra-text)
 [amux approval] no open approval A7K2
 [amux approval] declined A7K2
 [amux approval] ignored reserved marker in prompt
 ```
 
-The confirm reason enum is exactly `text-between`, `several-open`, `stale-30min`,
-`changed`, `unverifiable`. Several open requests produce a separate context line
+The confirm reason enum has exactly six entries: `text-between`, `several-open`,
+`stale-30min`, `changed`, `unverifiable`, `extra-text`. Its single code owner is
+`DoubtReason::as_str` in `api/delegation_approval.rs`. `extra-text` means an approve
+word followed by anything beyond a plain reply or a clean coded reply. Several
+open requests produce a separate context line
 for each request, for mrpopo to handle in separate replies. Decisions and reasons
 are retained in `_amux_delegation_resolutions.approval_context` and logged as
 `delegation_request_resolution`. Context is never pasted, sent as keys, or

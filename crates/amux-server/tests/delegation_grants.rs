@@ -307,12 +307,29 @@ async fn lead_requests_retain_team_only_own_groups_and_leads_exclusion() {
 
 #[tokio::test]
 async fn nonaffirmative_replies_and_unshown_requests_never_fund() {
-    for text in ["no","wait","yes?","yes, don't proceed","yes but not yet"] {
+    // dev-lead ruling (2026-10-24, v3.1 rule 4 refinement): only a prompt with
+    // no approve word at the start declines; an approve word followed by other
+    // text is doubt (confirm step), which neither funds nor closes.
+    for text in ["no","wait"] {
         let e=setup().await;
         let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"})).await;
         owner_reply(&e,text).await;
         let (st,v)=apply(&e,MRPOPO,&id,DEV_A,json!({"worktree_verify":"one"})).await;
         assert_code(st,&v,"request_reply_not_affirmative",text);
+    }
+    for text in ["yes?","yes, don't proceed","yes but not yet"] {
+        let e=setup().await;
+        let id=e.request(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"})).await;
+        let (reply_st,reply)=owner_reply(&e,text).await;
+        assert!(reply_st.is_success(),"{text}: {reply}");
+        assert_eq!(reply["approval_context"],format!("[amux approval] confirm needed {} (reason: extra-text)",e.short_code(&id)),"{text}");
+        let (st,v)=apply(&e,MRPOPO,&id,DEV_A,json!({"worktree_verify":"one"})).await;
+        assert_code(st,&v,"request_unresolved",text);
+        let request=view(&e,&id).await;
+        assert_eq!(request["resolution_note"],"extra-text","{text}");
+        assert_eq!(request["confirm_required"],true,"{text}");
+        assert_eq!(request["open"],true,"{text}");
+        assert!(request["resolution_row"].is_null(),"{text}");
     }
     let e=setup().await;
     let (st,v)=e.request_result(MRPOPO,"PATCH",&cfg(DEV_A),json!({"worktree_verify":"one"})).await;

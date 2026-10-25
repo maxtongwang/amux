@@ -599,7 +599,7 @@ async fn multiple_open_plain_yes_confirms_coded_latest_funds() {
 
 #[tokio::test]
 async fn negations_waits_and_questions_never_fund_through_recorder() {
-    for text in ["no","don't","not yet","wait","yes?","yes, don't proceed"] {
+    for text in ["no","don't","not yet","wait"] {
         let f=Fixture::new(); let id=f.ask().await;
         accepted(f.owner_reply(text).await);
         f.resolution(OWNER_AGENT,"request_reply_not_affirmative",None);
@@ -1794,14 +1794,33 @@ async fn v31_wrong_unknown_and_closed_codes_never_fall_back() {
 }
 #[tokio::test]
 async fn v31_approve_word_with_other_text_confirms_and_stays_open() {
-    for text in ["yes INVALID","yes please do it","yes AB12CD","yes please","yes please wait","yes but not yet","yes A7K","yes A7K23","yes ab","yes A7K2!","yes Å7K2"] {
+    for text in ["yes!?","yes, don't proceed","yes INVALID","yes please do it","yes AB12CD","yes please","yes please wait","yes but not yet","yes A7K","yes A7K23","yes ab","yes A7K2!","yes Å7K2"] {
         let f=Fixture::new();let id=f.ask().await;
-        f.expect_confirm(&id,text,"text-between").await;
+        f.expect_confirm(&id,text,"extra-text").await;
         f.resolution(OWNER_AGENT,"request_confirm_needed",None);
         assert_eq!(f.request_resolution(&id),(None,Some("request_confirm_needed".into())),"{text}");
     }
     let f=Fixture::new();let id=f.ask().await;
-    f.expect_confirm(&id,&format!("yes {} extra",f.short(&id)),"text-between").await;
+    f.expect_confirm(&id,&format!("yes {} extra",f.short(&id)),"extra-text").await;
+}
+#[tokio::test]
+async fn v31_question_mark_confirms_extra_text_and_stays_open_unfunded() {
+    let (logs,_guard,_peer)=capture_reply_logs();
+    let f=Fixture::new();let id=f.ask().await;
+    f.expect_confirm(&id,"yes?","extra-text").await;
+    f.resolution(OWNER_AGENT,"request_confirm_needed",None);
+    assert_eq!(f.request_resolution(&id),(None,Some("request_confirm_needed".into())));
+    let logs=String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("delegation_request_resolution") && logs.contains("request_confirm_needed") && logs.contains("extra-text"),"extra-text doubt must be observable: {logs}");
+}
+#[tokio::test]
+async fn v31_single_trailing_period_approves_without_doubt() {
+    let f=Fixture::new();let id=f.ask().await;
+    let (_,v)=f.owner_reply("yes.").await;
+    assert_eq!(v["approval_context"],format!("[amux approval] approved {}",f.short(&id)));
+    f.resolution(OWNER_AGENT,"request_resolved",Some(&id));
+    assert!(!f.open(&id));
+    accepted(f.apply(&id).await);
 }
 #[tokio::test]
 async fn v31_coded_wrapped_other_session_and_incarnation_never_fund() {
