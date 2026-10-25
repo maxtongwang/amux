@@ -402,9 +402,10 @@ class CargoBudgetTests(unittest.TestCase):
         data = json.loads(result.stdout)
         self.assertEqual(data['CARGO_BUILD_JOBS'], '2')
         self.assertEqual(data['RUST_TEST_THREADS'], '2')
-        self.assertEqual(data['CARGO_INCREMENTAL'], '0')
-        self.assertEqual(data['CARGO_PROFILE_DEV_DEBUG'], '0')
-        self.assertEqual(data['CARGO_PROFILE_TEST_DEBUG'], '0')
+        # Fork defaults from fork-build-speed.sh (ai-config#261), one per setting.
+        self.assertEqual(data['CARGO_INCREMENTAL'], '1')
+        self.assertEqual(data['CARGO_PROFILE_DEV_DEBUG'], 'line-tables-only')
+        self.assertEqual(data['CARGO_PROFILE_TEST_DEBUG'], 'line-tables-only')
         self.assertIn('cargo_budget_started', result.stderr)
         self.assertFalse(list((self.base / '.amux/cargo-throttle').glob('slot-*')))
         env['AMUX_CARGO_MAX_SECONDS'] = '0'

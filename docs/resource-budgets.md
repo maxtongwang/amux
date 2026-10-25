@@ -41,10 +41,18 @@ target name, including names outside the two conventional target paths. Cleanup
 defers while a build/test is active or the process probe cannot run. Native lock
 files remain in place. The canonical target remains excluded from age retention.
 
-Disabling incremental compilation and dev/test DWARF changes the fingerprint
-once, so the first check/test recompiles. Release optimization/signing settings
-are unchanged. Developers needing source-line debug information can explicitly
-enable it for that invocation, within the same budgets. An unchanged failed
+The fork defaults (incremental on, `line-tables-only` debug info) change the
+fingerprint once, so the first check/test after the change recompiles. Release
+optimization/signing settings are unchanged. Developers needing full debug
+information can set `CARGO_PROFILE_DEV_DEBUG=2` for that invocation, within the
+same budgets. Incremental state roughly doubles a target directory (measured
+18G to 34G for one full build and test of amux-server). That is above the
+32 GiB idle debug-cache cleanup threshold, so idle cleanup can clear the
+incremental state and the next build is cold again, and it leaves less headroom
+under the 40 GiB `AMUX_CARGO_MAX_TARGET_GB` budget, which stops a run (exit
+124) rather than deleting anything. Setting `CARGO_INCREMENTAL=0` also
+turns on sccache (see the table), so that switch alone does not give a
+cold-cache comparison: add `AMUX_CARGO_NO_SCCACHE=1` for one. An unchanged failed
 release no longer recompiles every minute; a changed build-input commit retries
 immediately. The failure marker is cleared only after a successful installation.
 

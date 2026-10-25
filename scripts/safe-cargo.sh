@@ -29,7 +29,8 @@ set -euo pipefail
 
 # A concurrency slot bounds invocations, not rustc's internal parallelism or
 # libtest's threads. Cargo otherwise defaults to every CPU on the host, per
-# invocation. Avoid full DWARF and incremental trees for routine fleet checks.
+# invocation. The fork file below turns incremental on, with line-table debug
+# info only (ai-config#261); the defaults after it apply only where it sets nothing.
 # Fork build-speed defaults first, so they win over the ones below (ai-config#261).
 . "$(dirname "$0")/fork-build-speed.sh"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
