@@ -1,7 +1,8 @@
 name: checks
 # Contribution gate. The Python-era steps (ast.parse of amux-server.py, inline
 # <script> extraction, check_client_refs, pytest) were removed with the Python
-# server on 2026-08-09 — the Rust build/lint/test gates live in rust.yml.
+# server on 2026-08-09 — Rust workspace gates live in rust.yml; the native
+# delivery fixtures below also exercise macOS socket semantics.
 # What remains is the repo-wide SECRET SCAN, which is language-agnostic and
 # must run on every push: collaborators push straight to main (no local hook
 # guaranteed), and AC-239 was four credentials committed in a PUBLIC repo that
@@ -12,6 +13,15 @@ on:
   pull_request:
 
 jobs:
+  native-delivery:
+    # Exercise the reviewed macOS UDS credentials; allow a cold Rust build.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Native delivery crash and receipt fixtures
+        run: bash scripts/test-native-delivery.sh --locked
   macos-codesign:
     runs-on: macos-latest
     timeout-minutes: 5
@@ -593,6 +603,11 @@ jobs:
         run: |
           set -uo pipefail
           python3 scripts/test-send-retry-identity.py
+      - name: Native CLI receipt dispositions and ledger upgrades
+        run: |
+          set -euo pipefail
+          python3 scripts/test-native-delivery-cli.py
+          python3 scripts/test-native-delivery-schema.py
       - name: board help never registers an artifact
         run: python3 scripts/test-board-help.py
       - name: Board linked source messages

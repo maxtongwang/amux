@@ -1837,6 +1837,40 @@ cmd_post() {
   esac
 }
 
+# Owner-only ordering release; the original write is never cancelled or retried.
+cmd_delivery() {
+  if [[ "${1:-}" == --help || "${1:-}" == -h || "${1:-}" == help ]]; then
+    echo 'Usage: amux delivery abandon <worker> <attempt-id>'
+    echo 'Owner only. Releases ordering; the message may have been delivered. Never resend.'
+    return 0
+  fi
+  [[ "${1:-}" == abandon && $# == 3 ]] || { echo 'Usage: amux delivery abandon <worker> <attempt-id>' >&2; return 2; }
+  local name body resp token
+  local auth=()
+  if [[ -s "$CC_HOME/auth_token" ]]; then
+    token="$(tr -d '\r\n' < "$CC_HOME/auth_token")"
+    [[ -n "$token" ]] && auth=(-H "Authorization: Bearer $token")
+  fi
+  name=$(resolve_session "$2") || return 1
+  body=$(python3 -c 'import json,sys; print(json.dumps({"action":"abandon","attempt_id":sys.argv[1]}))' "$3") || return 1
+  resp=$(_curl -sk -m 15 ${auth[@]+"${auth[@]}"} -X POST -H 'Content-Type: application/json' \
+    -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
+    -d "$body" "$AMUX_API/api/workers/$name/steer") || { echo 'delivery abandon refused or unavailable' >&2; return 1; }
+  RESP="$resp" python3 - <<'PYEOF'
+import json, os, sys
+try:
+    reply = json.loads(os.environ["RESP"])
+except ValueError:
+    print("delivery abandon: unreadable response; check the receipt before retrying", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(reply, dict):
+    print("delivery abandon: invalid response", file=sys.stderr)
+    sys.exit(1)
+print(json.dumps(reply, indent=2))
+sys.exit(0 if reply.get("ok") else 1)
+PYEOF
+}
+
 cmd_send() {
   # --help must not be parsed as a session name (it used to error with
   # "session '--help' not found", so the safe form was undiscoverable).
@@ -2121,6 +2155,37 @@ except Exception:
 PY
 }
 
+# Structured delivery evidence is shared by first, retried and late replies.
+# stdout is a shell disposition (none/0/1); readable evidence goes to stderr.
+_report_delivery_receipt() {
+  RESP="$1" TGT="$2" python3 - <<'PYEOF'
+import json, os, sys
+try:
+    response = json.loads(os.environ["RESP"])
+except (ValueError, TypeError):
+    print("none"); raise SystemExit
+if not isinstance(response, dict) or "delivery_receipt" not in response:
+    print("none"); raise SystemExit
+receipt = response["delivery_receipt"]
+state = receipt.get("state") if isinstance(receipt, dict) else "unknown"
+# Evidence states are a transport-neutral receipt contract, not provider routing.
+positive = {"admitted": "ADMITTED to the receiver queue; model consumption is unconfirmed",
+            "consumed": "RECEIVED with exact receiver evidence"}
+negative = {"denied", "refused", "expired", "dropped"}
+known_pending = {"reserved", "written_unconfirmed", "held", "unknown", "uncertain"}
+if not isinstance(state, str) or state not in positive.keys() | negative | known_pending:
+    state = "unknown"
+message = positive.get(state)
+if message is None:
+    disposition = "REFUSED" if state in negative else "UNCONFIRMED"
+    if state == "uncertain":
+        disposition = "MAY HAVE BEEN DELIVERED"
+    message = f"{disposition}; accepted into Amux, state={state}. Do NOT resend or paste around this receipt"
+print(f"delivery_receipt: {os.environ['TGT']} state={state}: {message}", file=sys.stderr)
+print(0 if state in positive or state == "written_unconfirmed" else 1)
+PYEOF
+}
+
 _send_via_api() {
   local name="$1" text="$2" nb="${3:-}"
   _warn_second_person_resend "$name" "$text"
@@ -2137,6 +2202,12 @@ print(json.dumps(d))")
     -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
     -d "$body" "$AMUX_API/api/workers/$name/send" 2>/dev/null) || resp=""
   if [[ -n "$resp" ]]; then
+    local receipt_rc
+    receipt_rc=$(_report_delivery_receipt "$resp" "$name")
+    if [[ "$receipt_rc" != none ]]; then
+      [[ "$receipt_rc" == 0 ]] && { _flush_unstamped_ledger || true; }
+      return "$receipt_rc"
+    fi
     rc=0
     RESP="$resp" TGT="$name" python3 - <<'PYEOF' || rc=$?
 import json, os, sys
@@ -2191,6 +2262,11 @@ PYEOF
       -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
       -d "$body" "$AMUX_API/api/workers/$name/send" 2>/dev/null) || resp=""
     if [[ -n "$resp" ]]; then
+      receipt_rc=$(_report_delivery_receipt "$resp" "$name")
+      if [[ "$receipt_rc" != none ]]; then
+        [[ "$receipt_rc" == 0 ]] && { _flush_unstamped_ledger || true; }
+        return "$receipt_rc"
+      fi
       rc=0
       # AF-556: `_R` is PASSED here. It used to be read from the environment and
       # nothing in this file ever set it, so the attempt number interpolated to
@@ -2334,6 +2410,8 @@ try:
     d = json.loads(os.environ["RESP"])
 except Exception:
     print("unknown"); raise SystemExit
+if "delivery_receipt" in d:
+    print("receipt:" + json.dumps(d)); raise SystemExit
 if d.get("accepted") is True: print("accepted")
 elif d.get("stranded") is True: print("stranded")
 elif d.get("expired") is True: print("unknown")
@@ -2352,6 +2430,12 @@ _send_settle_by_receipt() {
   id=$(BODY="$body" python3 -c 'import json,os; print(json.loads(os.environ["BODY"])["msg_id"])')
   text=$(BODY="$body" python3 -c 'import json,os,sys; sys.stdout.write(json.loads(os.environ["BODY"])["text"])')
   state=$(_await_send_receipt "$api" "$name" "$id" "$max" "$text")
+  if [[ "$state" == receipt:* ]]; then
+    local receipt_rc
+    receipt_rc=$(_report_delivery_receipt "${state#receipt:}" "$name")
+    [[ "$receipt_rc" == 0 ]] && { _flush_unstamped_ledger || true; }
+    return "$receipt_rc"
+  fi
   case "$state" in
     accepted)
       echo "sent to $name (origin-stamped; confirmed by the server's durable receipt after ${waited}s — the reply itself was slow)"
@@ -6471,6 +6555,7 @@ ${BOLD}Interaction:${RESET}
   amux send <name> <text>        Send inline text. ${DIM}Your SHELL expands \`backticks\`${RESET}
                                  ${DIM}and \$(...) BEFORE amux sees them — use --stdin for${RESET}
                                  ${DIM}anything long, multi-line, or containing code.${RESET}
+  amux delivery abandon <name> <attempt-id>  Owner releases uncertain ordering (may have been delivered)
   amux send <name> --keys 'C-c'  Send raw key sequence (e.g., Ctrl-C)
 
 ${BOLD}Coordination:${RESET}
@@ -9664,6 +9749,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     grid)             shift; cmd_grid "$@" ;;
     peek|p)           shift; cmd_peek "$@" ;;
     send)             shift; cmd_send "$@" ;;
+    delivery)         shift; cmd_delivery "$@" ;;
     post)             shift; cmd_post "$@" ;;
     stop|kill)        shift; cmd_stop "$@" ;;
     pause)            shift; cmd_pause "$@" ;;

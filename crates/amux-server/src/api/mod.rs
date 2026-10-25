@@ -82,6 +82,7 @@ pub mod needs_input;
 pub mod needs_input_auto;
 pub mod memories;
 pub mod messages;
+pub(crate) mod delivery;
 pub(crate) mod native_status;
 pub mod metrics;
 pub mod traces;

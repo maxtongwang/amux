@@ -1235,6 +1235,15 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("layout_presets", "created_at", false),
     ("logs", "ts", false),
     ("mdai_runs", "ts", false),
+    // SECONDS: api/delivery::now() uses SystemTime::as_secs_f64(); ledger
+    // writes and observation/finalization deadlines all use that same clock.
+    ("native_delivery_attempts", "created_at", false),
+    ("native_delivery_attempts", "updated_at", false),
+    ("native_delivery_attempts", "write_attempted_at", false),
+    ("native_delivery_attempts", "evidence_at", false),
+    ("native_delivery_attempts", "finalized_at", false),
+    ("native_delivery_attempts", "next_observation_at", false),
+    ("native_delivery_quarantine", "created_at", false),
     ("org", "created_at", false),
     ("org_invites", "created_at", false),
     ("org_invites", "expires_at", false),
