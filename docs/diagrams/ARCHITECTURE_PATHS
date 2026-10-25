@@ -4,6 +4,8 @@ crates/amux-server/src/backend/*
 crates/amux-server/src/provider/*
 crates/*/Cargo.toml
 amux
-migrations/*
-# Actual server migration location.
 crates/amux-server/migrations/*
+crates/amux-server/src/db/*
+crates/amux-server/src/runtime_jobs/*
+crates/amux-server/src/orchestrator/*
+crates/amux-dashboard/static/*

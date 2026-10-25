@@ -30,7 +30,7 @@ The shared ai-config **System diagrams** rule owns maintenance: update these dia
 Run the shared guard from the repo root after committing; it checks committed history, not working-tree edits:
 
 ```sh
-python3 /Users/mwang/GitHub/ai-config/.claude/worktrees/diagram-rule/scripts/check-diagrams.py --repo . --base origin/main
+python3 "$AI_CONFIG/scripts/check-diagrams.py" --repo . --base origin/main
 ```
 
-On another machine, resolve `scripts/check-diagrams.py` from the ai-config checkout. Exit 0 with JSON `status: pass` is the expected result. Run Diagram Design's `scripts/self_check.py <file>` on each HTML file as well. The automated checks establish inventory, accessible SVG and single-file structure; source review establishes the truth of each relationship.
+`AI_CONFIG` is your ai-config checkout (maxtongwang/ai-config). Exit 0 with JSON `status: pass` is the expected result. Run Diagram Design's `scripts/self_check.py <file>` on each HTML file as well. The automated checks establish inventory, accessible SVG and single-file structure; source review establishes the truth of each relationship.
