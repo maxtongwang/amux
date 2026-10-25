@@ -1,0 +1,9 @@
+# Python fnmatch globs; * includes nested paths.
+crates/amux-server/src/api/*
+crates/amux-server/src/backend/*
+crates/amux-server/src/provider/*
+crates/*/Cargo.toml
+amux
+migrations/*
+# Actual server migration location.
+crates/amux-server/migrations/*

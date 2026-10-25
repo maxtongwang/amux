@@ -10,6 +10,8 @@
 
 **amux is the open-source control plane for AI coding agents.** Run an AI engineering team: dozens of parallel workers (Claude Code, Codex, Gemini CLI, OpenCode, Ollama) coordinated from one web dashboard or your phone. Local-first, self-hosted, SQLite-backed, one Rust binary.
 
+[System diagrams](docs/diagrams/README.md) — topology, message delivery and data flow.
+
 What the fleet gets that a single agent never had:
 
 - **Atomic tasks**: a shared kanban board where claiming is compare-and-swap, so two workers can never grab the same card; `done` requires evidence, `verified` requires a peer check
