@@ -28,7 +28,7 @@ DIAGRAMS = Path('docs/diagrams')
 VIEWS = ('topology.html', 'runtime-sequence.html', 'data-flow.html')
 SVG_NS = '{http://www.w3.org/2000/svg}'
 EXCLUDE_PREFIX = '# exclude:'
-# Named files the fixture must also probe, e.g. a past miss: '# probe: inbox/lock.py'.
+# Named files the fixture must also probe, e.g. a past miss: '# probe: src/lock.py'.
 PROBE_PREFIX = '# probe:'
 REASON_SEP = ' — '
 # Arrow heads stop short of a box edge by the marker length; starts sit on the edge.
@@ -267,7 +267,7 @@ def read_inventory(repo):
 
 
 def cited_paths(repo, files):
-    """Tracked files named by a box subtitle or caption, e.g. 'inbox/cli.py' or 'engines/*/render.cjs'."""
+    """Tracked files named by a box subtitle or caption, e.g. 'src/cli.py' or 'tools/*/render.cjs'."""
     cited = {}
     for name in VIEWS:
         svg = parse_svg((repo / DIAGRAMS / name).read_text())

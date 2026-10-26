@@ -130,6 +130,7 @@ scripts/rust-auto-build-authority.sh
 scripts/rust-auto-build.sh
 scripts/rust-remote-build.sh
 scripts/safe-cargo.sh
+scripts/write-test-receipt.sh
 scripts/scratch-reaper.py
 scripts/select-checks-cells.sh
 scripts/seo-data.js
@@ -163,10 +164,12 @@ scripts/diagram-checks.py
 # probe: crates/amux-server/src/api/session_verbs.rs — on the send path; the first draft left it out
 # probe: crates/amux-server/src/api/workers.rs — left out by the first draft
 # probe: scripts/hooks/hook-report.sh — the report hook in all three diagrams
+# probe: scripts/write-test-receipt.sh — called by safe-cargo.sh; the first draft's substring test exclusion hid it
 #
 # exclude: crates/*/tests/* — tests
 # exclude: crates/amux-server/examples/* — examples, not built into the server
-# exclude: scripts/*test* — tests and test runners
+# exclude: scripts/test-* — tests and test runners
+# exclude: scripts/*/test_* — tests
 # exclude: scripts/fixtures/* — test fixtures
 # exclude: scripts/tests/* — tests
 # exclude: tests/* — tests
