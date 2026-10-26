@@ -1099,7 +1099,7 @@ fn steer_text(sentence: &str, lead: Option<&str>) -> String {
     // A worker with a lead sends new decisions there, not to an owner card
     // (ask_route; Max, 2026-10-26).
     let route = match lead {
-        Some(lead) => format!("send the question to your lead {lead} (`amux send {lead} --stdin`)"),
+        Some(lead) => format!("send the question to your lead {lead} with native SendMessage (never `amux send`)"),
         None => "file the question and what unblocks it on a card".to_string(),
     };
     format!(
@@ -1920,7 +1920,8 @@ mod tests {
     #[test]
     fn a_worker_with_a_lead_is_reminded_to_ask_the_lead_not_a_card() {
         let t = steer_text("Want me to pick the schema?", Some("dev-lead"));
-        assert!(t.contains("send the question to your lead dev-lead"), "{t}");
+        assert!(t.contains("send the question to your lead dev-lead with native SendMessage"), "{t}");
+        assert!(!t.contains("--stdin"), "{t}");
         assert!(!t.contains("on a card"), "{t}");
         assert!(steer_text("Want me to pick the schema?", None).contains("on a card"));
     }

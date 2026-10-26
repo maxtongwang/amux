@@ -106,7 +106,7 @@ pub(crate) fn lead_text(worker: &str, question: &str, boundary: Option<&str>, co
     let touches = boundary.map(|b| format!(" It touches: {b}.")).unwrap_or_default();
     format!(
         "[amux lead-ask] {worker} asked the owner: \"{}\".{touches} Worker questions go to their lead \
-         first (Max, 2026-10-26), so it came to you. Answer it with `amux send {worker} --stdin`. Decide \
+         first (Max, 2026-10-26), so it came to you. Answer it with native SendMessage to {worker}, never `amux send`. Decide \
          reversible internal choices yourself and report them to mrpopo; bring the owner only {OWNER_ONLY_ASKS}.\n\n\
          {worker}'s context:\n\n{}",
         clip(question, 280),
@@ -281,7 +281,7 @@ mod tests {
     fn the_lead_is_told_what_it_may_still_escalate() {
         let t = lead_text("dev-fix-x", "Should I pay $16 for embeddings?", Some("money"), "ctx");
         assert!(t.contains("dev-fix-x asked the owner"));
-        assert!(t.contains("amux send dev-fix-x --stdin"));
+        assert!(t.contains("SendMessage to dev-fix-x"));
         assert!(t.contains(OWNER_ONLY_ASKS));
         assert!(t.contains("It touches: money."));
         let w = worker_text("dev-lead", "Should I pay $16 for embeddings?");

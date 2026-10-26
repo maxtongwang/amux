@@ -5475,7 +5475,7 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
     let role_env = crate::api::session_verbs::parse_env(session);
     if role_env.get("CC_EPHEMERAL") == Some("1") {
         if let Some(parent) = role_env.get("CC_PARENT") {
-            prompt.push_str(&format!("\n\n[orchestration] Your orchestrator is {parent}. For conflicting requirements or direction, send one concise question with this card ID and your attempted remedies using `amux send {parent} --no-board --stdin`; continue independent work. This is guidance, not an outside dependency or mandatory sign-off."));
+            prompt.push_str(&format!("\n\n[orchestration] Your orchestrator is {parent}. For conflicting requirements or direction, send one concise question with this card ID and your attempted remedies with native SendMessage to {parent} (never `amux send`); continue independent work. This is guidance, not an outside dependency or mandatory sign-off."));
         }
         prompt.push_str("\n\n[fan-out workspace] Own the entire board in your dedicated amux/fanout branch. Preserve the worktree across pauses. Resolve implementation dependencies locally and never create a task on another worker board. Commit your changes and record test evidence; configure CC_WORKTREE_VERIFY with the appropriate repository verification command. When completed outcomes have evidence and no implementation is active, the harness merges an isolated candidate, runs those checks, and pushes main without changing the shared checkout. Resolve returned conflicts/check failures yourself; keep driving to the resolved terminal gates. Only actual spend/customer-outbound authorization remains an approval.");
     }

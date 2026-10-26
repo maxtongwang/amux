@@ -966,7 +966,7 @@ fn takeover_refusal(
     };
     let options: Vec<String> = if named {
         vec![
-            format!("message the holder: amux send {owner} --stdin"),
+            format!("message the holder with native SendMessage to {owner} (never `amux send`)"),
             "drive the running browser via the session-scoped verbs instead of starting your own"
                 .into(),
             "if they agree, or you judge the risk acceptable: {\"takeover\": true}".into(),
@@ -5979,7 +5979,7 @@ mod tests {
         assert_eq!(named["running"]["attribution"], json!("session"));
         let nopts = serde_json::to_string(&named["your_options"]).unwrap();
         assert!(
-            nopts.contains("amux send mvs-research"),
+            nopts.contains("SendMessage to mvs-research"),
             "naming the holder turns a dead end into 'go message that session': {nopts}"
         );
         // The PROPERTY, not the wording: the tab evidence has to reach the
