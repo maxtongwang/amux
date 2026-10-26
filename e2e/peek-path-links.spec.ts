@@ -1,4 +1,5 @@
 // peek-path-links.spec coverage — use shared browser defaults and route diagnostics.
+// Await resolved folder navigation before sampling (refs ai-config #340).
 import { test, expect } from './fixtures';
 
 // AMUX-3663. Ethan, with a screenshot of these exact links in the Terminal tab:
@@ -91,8 +92,13 @@ test('a RELATIVE file path in session output opens the file, not its folder', as
   expect(r.links, 'the render pipeline must have produced a clickable path').toBeGreaterThan(0);
   expect(r.clicked).toContain('poster.jpg');
 
-  await page.waitForTimeout(500);
+  await expect.poll(async () => {
+    const { subpath, subClickable } = await overlayState(page);
+    return { subpath, subClickable };
+  }).toEqual({ subpath: DIR_PATH, subClickable: true });
   const s = await overlayState(page);
+  console.log('[e2e] verdict=peek_folder_ready measured=true subpath=' + JSON.stringify(s.subpath)
+    + ' clickable=' + s.subClickable);
 
   expect(s.fileOverlay, 'clicking a file must open the file viewer').toBe(true);
   // Name the FILE, not the folder. False before the fix: the old handler never

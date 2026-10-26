@@ -1,3 +1,4 @@
+// Interaction receipts — await registry-derived declarations before coverage (refs ai-config #340).
 import { test, expect, Page } from './fixtures';
 
 async function boot(page: Page): Promise<void> {
@@ -12,6 +13,7 @@ async function openRecentActions(page: Page): Promise<void> {
   await expect(panel).toBeVisible();
   const hub = panel.locator('#interaction-feedback');
   if (!await hub.evaluate((element: HTMLDetailsElement) => element.open)) await hub.locator(':scope > summary').click();
+  // The separate disclosure/open failure is tracked in ai-config #340.
   await expect(hub).toHaveAttribute('open', '');
 }
 
@@ -272,7 +274,11 @@ test('Request and URL inputs receive correlation without losing response bodies'
 
 test('reachable controls have feedback declarations and missing declarations fail the inventory',async({page},testInfo)=>{
   await boot(page);
+  // Settings has no command kind in markup; this value appears only after
+  // the async command registry arrives and refresh derives its declaration.
+  await expect(page.locator('#settings-btn')).toHaveAttribute('data-interaction-kind', 'command.toggleSettings');
   const coverage=await page.evaluate(()=>(window as any).__amuxState.coverage());
+  console.log('[e2e] verdict=interaction_registry_ready measured=true declared_command_controls=' + coverage.declared_command_controls);
   expect(coverage.measured).toBe(true);
   expect(coverage.n_considered).toBeGreaterThan(10);
   expect(coverage.declared_command_controls).toBeGreaterThan(0);
