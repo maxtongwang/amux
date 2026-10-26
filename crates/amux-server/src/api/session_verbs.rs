@@ -224,6 +224,10 @@ fn install_shims(dir: &Path, names: &[&str], body: &str) -> std::io::Result<()> 
 /// kill-server`. Inside a pane $TMUX beats TMUX_TMPDIR, so it killed the
 /// fleet's server and every lane, at 14:31 and again at 14:51. The command
 /// guard saw only `reset.sh`; a shim on PATH also covers what scripts run.
+///
+/// FORK: not installed. scripts/worker-bin/tmux (#21) is this fork's one tmux
+/// guard; the constant stays for the shim's own test and for removing a copy
+/// an earlier build installed (`remove_stale_tmux_fleet_shim`).
 pub(crate) const TMUX_FLEET_SHIM: &str = include_str!("../../../../scripts/shims/tmux-fleet-shim.sh");
 
 /// PKILL/PGREP GUARD, installed beside the tmux shim in the same directory
@@ -250,18 +254,31 @@ pub(crate) fn tmux_fleet_exports(name: &str) -> String {
             verdict = "pkill_guard_shim_install_failed",
             "the pkill/pgrep guard could not be installed; a misordered pkill from this worker can kill the whole machine");
     }
-    match install_shims(&dir, &["tmux"], TMUX_FLEET_SHIM) {
-        Ok(()) => format!(
-            "export AMUX_FLEET_TMUX_SOCKET={}; export PATH={}:\"$PATH\"; ",
-            sh_quote(&crate::backend::tmux_health::default_socket()),
-            sh_quote(&dir.to_string_lossy())
-        ),
-        Err(e) => {
-            tracing::warn!(session = name, error = %e, dir = %dir.display(), measured = true, n_considered = 1,
-                verdict = "tmux_fleet_shim_install_failed",
-                "the fleet tmux shim could not be installed; this worker can kill the fleet's tmux server");
-            String::new()
-        }
+    // FORK: the worker tmux guard is ours (scripts/worker-bin/tmux, #21), so
+    // upstream's `tmux` shim is not installed here. Chaining both is weaker,
+    // not only noisy: the shim drops $TMUX before calling the next tmux on
+    // PATH, so in the `TMUX_TMPDIR=... tmux kill-server` case our guard would
+    // no longer see the live server. The shim file stays in the tree.
+    remove_stale_tmux_fleet_shim(name, &dir);
+    format!(
+        "export AMUX_FLEET_TMUX_SOCKET={}; export PATH={}:\"$PATH\"; ",
+        sh_quote(&crate::backend::tmux_health::default_socket()),
+        sh_quote(&dir.to_string_lossy())
+    )
+}
+
+/// Removes a `tmux` left in the shim dir by an earlier upstream build, only
+/// when its bytes are exactly the shipped shim; any other file is kept.
+fn remove_stale_tmux_fleet_shim(name: &str, dir: &Path) {
+    let stale = dir.join("tmux");
+    if std::fs::read_to_string(&stale).ok().as_deref() != Some(TMUX_FLEET_SHIM) {
+        return;
+    }
+    match std::fs::remove_file(&stale) {
+        Ok(()) => tracing::info!(session = name, path = %stale.display(), measured = true, n_considered = 1,
+            verdict = "tmux_fleet_shim_removed", "removed upstream's tmux shim; worker-bin/tmux is the one tmux guard"),
+        Err(e) => tracing::warn!(session = name, error = %e, path = %stale.display(), measured = true, n_considered = 1,
+            verdict = "tmux_fleet_shim_remove_failed", "could not remove upstream's tmux shim; two tmux guards may chain"),
     }
 }
 
@@ -60759,10 +60776,11 @@ mod agents_grace_tests {
 mod tmux_fleet_shim_tests {
     use super::*;
 
-    /// Every launch path that runs in a pane puts the shim first on PATH and
-    /// names the fleet's socket; the installed bytes are the shipped shim.
+    /// Every launch path that runs in a pane puts the shim dir first on PATH
+    /// and names the fleet's socket. The dir holds the pkill/pgrep guard but no
+    /// `tmux`: this fork's one tmux guard is scripts/worker-bin/tmux.
     #[test]
-    fn worker_shells_get_the_fleet_tmux_shim_first_on_path() {
+    fn worker_shells_get_the_fleet_shim_dir_first_on_path_without_a_tmux_shim() {
         let home = tempfile::tempdir().unwrap();
         let _home = crate::api::settings::test_env::set_home(home.path());
         std::fs::create_dir_all(home.path().join("sessions")).unwrap();
@@ -60771,7 +60789,7 @@ mod tmux_fleet_shim_tests {
         let ex = tmux_fleet_exports("lane");
         assert!(ex.contains(&format!("export PATH={}:", sh_quote(&dir.to_string_lossy()))), "{ex}");
         assert!(ex.contains("export AMUX_FLEET_TMUX_SOCKET="), "{ex}");
-        assert_eq!(std::fs::read_to_string(dir.join("tmux")).unwrap(), TMUX_FLEET_SHIM);
+        assert!(!dir.join("tmux").exists(), "no tmux shim: worker-bin/tmux is the one tmux guard");
         // The pkill/pgrep guard rides the same PATH entry (RCA 20261021-105917).
         assert_eq!(std::fs::read_to_string(dir.join("pkill")).unwrap(), PKILL_GUARD_SHIM);
         assert_eq!(std::fs::read_to_string(dir.join("pgrep")).unwrap(), PKILL_GUARD_SHIM);
@@ -60779,7 +60797,23 @@ mod tmux_fleet_shim_tests {
         assert!(rc.ends_with(&ex), "a restarted shell gets the shim last, so first on PATH: {rc}");
     }
 
-    /// The shim itself, driven through bash with a fake real `tmux` behind it
+    /// A leftover `tmux` with the shipped shim's exact bytes is removed; a file
+    /// with any other content is not ours to delete and is kept.
+    #[test]
+    fn a_leftover_tmux_shim_is_removed_only_when_it_is_the_shipped_shim() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let dir = tmux_fleet_shim_dir();
+        install_shims(&dir, &["tmux"], TMUX_FLEET_SHIM).unwrap();
+        tmux_fleet_exports("lane");
+        assert!(!dir.join("tmux").exists(), "the shipped shim is removed");
+        std::fs::write(dir.join("tmux"), "#!/bin/bash\n# someone else's tmux\n").unwrap();
+        tmux_fleet_exports("lane");
+        assert_eq!(std::fs::read_to_string(dir.join("tmux")).unwrap(), "#!/bin/bash\n# someone else's tmux\n",
+            "other content is kept");
+    }
+
+    /// The shim file (kept in the tree, no longer installed), driven through bash with a fake real `tmux` behind it
     /// that prints what it was given. The fake fleet socket is a path only.
     #[test]
     fn the_shim_refuses_fleet_kills_and_honours_a_chosen_tmux_tmpdir() {
