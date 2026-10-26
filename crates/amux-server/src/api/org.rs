@@ -99,14 +99,14 @@ pub(crate) fn local_member_actor(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-<<<<<<< HEAD
 /// Drop every verified-member marker: a request attributed to a worker process
 /// (api/process_identity.rs) is that worker, never a human member.
 pub(crate) fn strip_member_headers(headers: &mut HeaderMap) {
     for h in [VERIFIED_MEMBER_HEADER, MEMBER_ACTOR_HEADER, MEMBER_SCOPE_LEVEL_HEADER, MEMBER_SCOPE_NAME_HEADER] {
         headers.remove(h);
     }
-=======
+}
+
 /// The automated policy that made this internal call, if one did.
 pub(crate) fn policy_actor(headers: &HeaderMap) -> Option<&str> {
     headers
@@ -121,7 +121,6 @@ pub(crate) fn policy_headers(actor: &'static str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(POLICY_ACTOR_HEADER, axum::http::HeaderValue::from_static(actor));
     headers
->>>>>>> upstream/main
 }
 
 /// Stamp a verified member identity onto headers for an INTERNAL call made on

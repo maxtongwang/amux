@@ -157,13 +157,13 @@ pub(crate) fn export_doc(state: &AppState) -> Result<Value, String> {
 }
 
 /// Who may write instance configuration: the human. A request that names a
-/// session is an agent, refused unless AMUX_SCOPE_WRITE_AGENTS=1 (same policy
+/// worker is an agent, refused unless AMUX_SCOPE_WRITE_AGENTS=1 (same policy
 /// as /api/scope). Returns the refusal text, or None when allowed.
+/// Attribution is the shared rule (X-Amux-Worker canonical, X-Amux-Session
+/// honoured): reading only X-Amux-Session let a worker sending just
+/// X-Amux-Worker apply as the human.
 pub(crate) fn agent_write_refusal(headers: &HeaderMap, what: &str) -> Option<String> {
-    let actor = headers
-        .get("x-amux-session")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let actor = super::groups::hdr_worker(headers);
     (!actor.is_empty() && std::env::var("AMUX_SCOPE_WRITE_AGENTS").ok().as_deref() != Some("1"))
         .then(|| {
             format!(
@@ -171,6 +171,45 @@ pub(crate) fn agent_write_refusal(headers: &HeaderMap, what: &str) -> Option<Str
                  human (same policy as /api/scope). Set AMUX_SCOPE_WRITE_AGENTS=1 to allow it."
             )
         })
+}
+
+/// Worker declarations in a config document hold even under
+/// AMUX_SCOPE_WRITE_AGENTS=1: a NEW worker goes through the shared create rule
+/// (only leads, only inside their team), `tags` on an EXISTING worker through
+/// the shared membership rule. Returns the refusal response, or None.
+pub(crate) fn worker_declaration_refusal(headers: &HeaderMap, doc: &Value) -> Option<(StatusCode, Json<Value>)> {
+    let home = super::groups::amux_home();
+    for w in doc.get("workers").and_then(Value::as_array).into_iter().flatten() {
+        let Some(name) = w.get("name").and_then(Value::as_str) else { continue };
+        // The name becomes a path under sessions/, and the tags are parsed by
+        // the one parser the writer uses: a number or object is refused, not
+        // read as "no tags" and then written (review N1).
+        if !super::session_verbs::valid_session_name(name) {
+            return Some((StatusCode::BAD_REQUEST, Json(json!({"error": format!("'{name}' is not a worker name")}))));
+        }
+        let tags = match super::session_verbs::tags_of(w.get("tags")) {
+            Ok(t) => t,
+            Err(e) => return Some((StatusCode::BAD_REQUEST, Json(json!({"error": format!("worker '{name}': {e}")}))),
+        };
+        for key in ["dir", "flags", "creator"] {
+            if let Some(why) = w.get(key).and_then(Value::as_str).and_then(|v| super::session_verbs::EnvFile::value_error(key, v)) {
+                return Some((StatusCode::BAD_REQUEST, Json(json!({"code": "env_value_invalid", "error": format!("worker '{name}': {why}")}))));
+            }
+        }
+        let refusal = if home.join("sessions").join(format!("{name}.env")).exists() {
+            super::session_verbs::peer_config_refusal_body(headers, name, "the worker declaration")
+                .or_else(|| super::session_verbs::membership_refusal_body(headers, w.get("tags").is_some()))
+        } else {
+            super::session_verbs::worker_create_refusal_body(
+                headers,
+                &super::session_verbs::CreateRequest { name: None, tags: &tags, owner_only: None },
+            )
+        };
+        if let Some(body) = refusal {
+            return Some((StatusCode::FORBIDDEN, Json(body)));
+        }
+    }
+    None
 }
 
 /// Apply a config document. Reports per-item `changed` vs `unchanged` so a
@@ -182,61 +221,13 @@ pub async fn apply(
 ) -> (StatusCode, Json<Value>) {
     // Writing global/group configuration is the human's, matching
     // /api/scope's own policy: a session may not reshape the whole instance.
-<<<<<<< HEAD
-    //
-    // Attribution is the shared rule (X-Amux-Worker canonical, X-Amux-Session
-    // honoured): reading only X-Amux-Session let a worker sending just
-    // X-Amux-Worker apply as the human. Worker declarations hold even under
-    // AMUX_SCOPE_WRITE_AGENTS=1: a NEW worker goes through the shared create
-    // rule (only leads, only inside their team), `tags` on an EXISTING worker
-    // through the shared membership rule.
-    let actor = super::groups::hdr_worker(&headers);
-    let home = super::groups::amux_home();
-    for w in doc.get("workers").and_then(Value::as_array).into_iter().flatten() {
-        let Some(name) = w.get("name").and_then(Value::as_str) else { continue };
-        // The name becomes a path under sessions/, and the tags are parsed by
-        // the one parser the writer uses: a number or object is refused, not
-        // read as "no tags" and then written (review N1).
-        if !super::session_verbs::valid_session_name(name) {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("'{name}' is not a worker name")})));
-        }
-        let tags = match super::session_verbs::tags_of(w.get("tags")) {
-            Ok(t) => t,
-            Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("worker '{name}': {e}")}))),
-        };
-        for key in ["dir", "flags", "creator"] {
-            if let Some(why) = w.get(key).and_then(Value::as_str).and_then(|v| super::session_verbs::EnvFile::value_error(key, v)) {
-                return (StatusCode::BAD_REQUEST, Json(json!({"code": "env_value_invalid", "error": format!("worker '{name}': {why}")})));
-            }
-        }
-        let refusal = if home.join("sessions").join(format!("{name}.env")).exists() {
-            super::session_verbs::peer_config_refusal_body(&headers, name, "the worker declaration")
-                .or_else(|| super::session_verbs::membership_refusal_body(&headers, w.get("tags").is_some()))
-        } else {
-            super::session_verbs::worker_create_refusal_body(
-                &headers,
-                &super::session_verbs::CreateRequest { name: None, tags: &tags, owner_only: None },
-            )
-        };
-        if let Some(body) = refusal {
-            return (StatusCode::FORBIDDEN, Json(body));
-        }
+    // Worker declarations are checked first, since they hold even under
+    // AMUX_SCOPE_WRITE_AGENTS=1.
+    if let Some(refusal) = worker_declaration_refusal(&headers, &doc) {
+        return refusal;
     }
-    if !actor.is_empty() && std::env::var("AMUX_SCOPE_WRITE_AGENTS").ok().as_deref() != Some("1") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": format!(
-                    "session '{actor}' may not apply instance config — global and group \
-                     layers belong to the human (same policy as /api/scope). Set \
-                     AMUX_SCOPE_WRITE_AGENTS=1 to allow it."
-                ),
-            })),
-        );
-=======
     if let Some(error) = agent_write_refusal(&headers, "apply instance config") {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": error })));
->>>>>>> upstream/main
     }
     let (ok, report) = apply_doc(&state, &doc, false).await;
     let status = if ok {
@@ -420,19 +411,11 @@ pub(crate) async fn apply_doc(state: &AppState, doc: &Value, dry_run: bool) -> (
                 unchanged.push(tag);
                 continue;
             }
-<<<<<<< HEAD
-            match env.write(&f) {
-=======
             if dry_run {
                 changed.push(tag);
                 continue;
             }
-            let body: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-            if let Some(p) = f.parent() {
-                let _ = std::fs::create_dir_all(p);
-            }
-            match std::fs::write(&f, body) {
->>>>>>> upstream/main
+            match env.write(&f) {
                 Ok(_) => changed.push(tag),
                 Err(e) => errors.push(json!({"item": tag, "error": e.to_string()})),
             }

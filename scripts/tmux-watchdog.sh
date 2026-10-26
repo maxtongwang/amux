@@ -27,7 +27,6 @@
 
 set -uo pipefail
 
-<<<<<<< HEAD
 # >>> amux-endpoint-guard (rule: scripts/lib/amux-endpoint.sh; every copy identical, test-enforced)
 _ae_dir=$(dirname "$0")
 for _ae in "$_ae_dir/amux-endpoint.sh" "$_ae_dir/lib/amux-endpoint.sh" "$_ae_dir/../lib/amux-endpoint.sh" \
@@ -55,11 +54,8 @@ command -v amux_endpoint_guard >/dev/null 2>&1 || amux_endpoint_guard() {  # sta
   fi
 }
 # <<< amux-endpoint-guard
-LOG="${HOME}/.amux/logs/tmux-watchdog.log"
-=======
 AMUX_DIR="${AMUX_WATCHDOG_HOME:-${HOME}/.amux}"
 LOG="${AMUX_DIR}/logs/tmux-watchdog.log"
->>>>>>> upstream/main
 AMUX_BIN="${AMUX_BIN:-$(cd "$(dirname "$0")/.." && pwd)/amux}"
 STAGGER="${AMUX_START_ALL_STAGGER:-2}"
 COOLDOWN_FILE="${AMUX_DIR}/tmux-watchdog-last-recovery"
@@ -104,7 +100,7 @@ if ! tmux list-sessions &>/dev/null; then
 
     date +%s > "$COOLDOWN_FILE"
 
-    base="$("$AMUX_BIN" url 2>/dev/null || echo "https://localhost:8824")"
+    base=$(amux_endpoint_guard "$("$AMUX_BIN" url 2>/dev/null || echo "https://localhost:8824")" tmux-watchdog)
     curl -sk --max-time 5 -X POST -H 'Content-Type: application/json' \
         -d '{"level":"warn","message":"tmux-watchdog: tmux server was dead, recovered and restarting fleet","source":"tmux-watchdog"}' \
         "$base/api/log" >/dev/null 2>&1 || true
@@ -214,27 +210,7 @@ fi
 log "=== dead worker processes detected: ${dead_workers[*]} (not judged: ${skipped_provider} non-claude, ${skipped_isolated} isolated) ==="
 log "memory_pressure: $(memory_pressure 2>/dev/null | grep 'free percentage' || echo 'unavailable')"
 
-<<<<<<< HEAD
-# Start a keepalive session to bring the tmux server back.
-tmux new-session -d -s keepalive 'exec bash' 2>/dev/null
-sleep 1
-
-if ! tmux list-sessions &>/dev/null; then
-    log "FAILED to restart tmux server -- cannot recover"
-    exit 1
-fi
-
-session_count=$(tmux list-sessions 2>/dev/null | wc -l | tr -d ' ')
-log "tmux server restored (${session_count} sessions). Starting fleet..."
-
-# Record recovery time for cooldown.
-date +%s > "$COOLDOWN_FILE"
-
-# Notify the amux server so this shows up in the log analyzer.
 base=$(amux_endpoint_guard "$("$AMUX_BIN" url 2>/dev/null || echo "https://localhost:8824")" tmux-watchdog)
-=======
-base="$("$AMUX_BIN" url 2>/dev/null || echo "https://localhost:8824")"
->>>>>>> upstream/main
 curl -sk --max-time 5 -X POST -H 'Content-Type: application/json' \
     -d "{\"level\":\"warn\",\"message\":\"tmux-watchdog: ${#dead_workers[@]} worker(s) have dead Claude processes, restarting: ${dead_workers[*]}\",\"source\":\"tmux-watchdog\"}" \
     "$base/api/log" >/dev/null 2>&1 || true
@@ -257,7 +233,7 @@ for name in "${dead_workers[@]}"; do
             log "HOLD $name: ${recent} restarts in ${WORKER_RESTART_WINDOW}s, not restarting again (verdict=worker_restart_held)"
             curl -sk --max-time 5 -X POST -H 'Content-Type: application/json' \
                 -d "{\"level\":\"warn\",\"message\":\"tmux-watchdog: $name died after each of ${recent} restarts; held for a human\",\"source\":\"tmux-watchdog\"}" \
-                "$("$AMUX_BIN" url 2>/dev/null || echo "https://localhost:8824")/api/log" >/dev/null 2>&1 || true
+                "$(amux_endpoint_guard "$("$AMUX_BIN" url 2>/dev/null || echo "https://localhost:8824")" tmux-watchdog)/api/log" >/dev/null 2>&1 || true
         fi
         continue
     fi

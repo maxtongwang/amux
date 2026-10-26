@@ -387,7 +387,7 @@ VM_IDLE_MIN=${AMUX_CLEANUP_VM_IDLE_MIN:-60}
 VM_LOAD_CMD=${AMUX_CLEANUP_VM_LOAD_CMD:-colima ssh -p PROFILE -- cat /proc/loadavg /proc/uptime}
 # check_utilization: who is using the CPU (GET /api/resources), and when the CPU
 # is UTIL_ACT_SHARE busy, detached trees at UTIL_RENICE_MIN_PCT+ lowered to nice 10.
-UTIL_CMD=${AMUX_CLEANUP_UTIL_CMD:-curl -sk --max-time 20 -H X-Amux-Session:desktop $(amux url 2>/dev/null || echo https://localhost:8824)/api/resources}
+UTIL_CMD=${AMUX_CLEANUP_UTIL_CMD:-curl -sk --max-time 20 -H X-Amux-Session:desktop $(amux_endpoint_guard "$(amux url 2>/dev/null || echo https://localhost:8824)" mac-cleanup-tick)/api/resources}
 UTIL_ACT_SHARE=${AMUX_CLEANUP_UTIL_ACT_SHARE:-0.85}
 # The census sums per-process samples, so a job that starts a fresh short-lived
 # child every few seconds falls between them. RCA 20261024-170152: a lane's
@@ -579,7 +579,7 @@ ESCALATE_CMD=${AMUX_CLEANUP_ESCALATE_CMD:-amux send TARGET --file FILE}
 RECLAIM_SCHEDULE=${AMUX_CLEANUP_RECLAIM_SCHEDULE:-SCHED-783}
 reclaim_trigger_default() { # prints the HTTP status of the run request
   curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -X POST -H "X-Amux-Session: desktop" \
-    "$(amux url 2>/dev/null || echo https://localhost:8824)/api/schedules/$RECLAIM_SCHEDULE/run"
+    "$(amux_endpoint_guard "$(amux url 2>/dev/null || echo https://localhost:8824)" mac-cleanup-tick)/api/schedules/$RECLAIM_SCHEDULE/run"
 }
 RECLAIM_TRIGGER_CMD=${AMUX_CLEANUP_RECLAIM_TRIGGER_CMD:-reclaim_trigger_default}
 RECLAIM_TRIGGER_COOLDOWN_H=${AMUX_CLEANUP_RECLAIM_TRIGGER_COOLDOWN_H:-3}
@@ -3524,16 +3524,10 @@ cpu_idle=$($CPU_IDLE_CMD 2>/dev/null | awk '/^CPU usage/ {for (i=1;i<=NF;i++) if
 ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 0)
 STATE="$STATE_DIR/state"
 prev_ts=$(state_get "$STATE" last_ts); prev_free=$(state_get "$STATE" last_disk_free_gb)
-<<<<<<< HEAD
-HISTORY_CMD=${AMUX_CLEANUP_HISTORY_CMD:-curl -sk --max-time 15 $(amux_endpoint_guard "$(amux url 2>/dev/null || echo https://localhost:8824)" mac-cleanup-tick)/api/metrics/host/history?since_h=2}
-read -r burn htf hist_n hist_span <<EOF
-$($HISTORY_CMD 2>/dev/null | burn_from_history "$BURN_MIN_GBH")
-=======
 prev_swt=$(state_get "$STATE" last_swap_total_mb || true)   # read before this run's state write below
-HISTORY_CMD=${AMUX_CLEANUP_HISTORY_CMD:-curl -sk --max-time 15 $(amux url 2>/dev/null || echo https://localhost:8824)/api/metrics/host/history?since_h=2}
+HISTORY_CMD=${AMUX_CLEANUP_HISTORY_CMD:-curl -sk --max-time 15 $(amux_endpoint_guard "$(amux url 2>/dev/null || echo https://localhost:8824)" mac-cleanup-tick)/api/metrics/host/history?since_h=2}
 read -r burn htf hist_n hist_span hist_run <<EOF
 $($HISTORY_CMD 2>/dev/null | burn_from_history "$BURN_MIN_GBH" "$(date +%s)" "$disk_now")
->>>>>>> upstream/main
 EOF
 burn_src="history ${hist_n} samples over ${hist_span}h"
 [ "${hist_run:-}" = "run" ] && burn_src="$burn_src + this run's post-cleanup ${disk_now}G"

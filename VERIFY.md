@@ -137,7 +137,6 @@ Pass: the spec name and `N passed`. If e2e infra is genuinely unavailable, say
 so in the evidence and why — that is a legitimate `verified` note, not a failure
 to hide.
 
-<<<<<<< HEAD
 ### e2e worker control (hosted)
 
 Whether CI should run fewer Playwright workers per shard is measured, not
@@ -182,7 +181,7 @@ unmeasured runs. If workers=1 does not fit, keep 2 and rebalance or add shards
 from measured wall time (`scripts/e2e-durations.mjs`); never drop tests to fit.
 Failures that persist at workers=1 are not load; look at isolation instead.
 Twenty clean runs support a change; they do not prove zero flake.
-=======
+
 ## Mac app (`desktop/`)
 
 ```bash
@@ -207,7 +206,6 @@ Pass: `test result: ok` for the module tests, which cover sign-in on
 `/pages/<name>`, refused `ATTACH`, and asks delivered once. Then `N passed` on
 desktop, mobile and iOS Safari, including the sandbox probe line
 `api:blocked parent:blocked storage:blocked`.
->>>>>>> upstream/main
 
 ## Vault secrets (`api/vault_secrets.rs`)
 

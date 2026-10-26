@@ -132,10 +132,6 @@ lane_idx=0
 
 for f in "${lane_files[@]}"; do
     name=$(basename "$f" .env)
-<<<<<<< HEAD
-    echo "$(date): Calling amux API to start worker: $name..." >> "$LOG_FILE"
-    RESPONSE=$(/usr/bin/curl -sk --connect-timeout 5 --max-time 10 -X POST "$AMUX_START_BASE/api/sessions/$name/start" \
-=======
 
     # Stagger: wait between launches (skip the first one)
     if [ "$lane_idx" -gt 0 ] && [ "$STAGGER_DELAY" -gt 0 ] 2>/dev/null; then
@@ -145,8 +141,7 @@ for f in "${lane_files[@]}"; do
     lane_idx=$((lane_idx + 1))
 
     echo "$(date): Calling amux API to start worker: $name ($lane_idx/${#lane_files[@]})..." >> "$LOG_FILE"
-    RESPONSE=$(/usr/bin/curl -sk --connect-timeout 5 --max-time 10 -X POST "https://localhost:8824/api/sessions/$name/start" \
->>>>>>> upstream/main
+    RESPONSE=$(/usr/bin/curl -sk --connect-timeout 5 --max-time 10 -X POST "$AMUX_START_BASE/api/sessions/$name/start" \
       -H "Content-Type: application/json" \
       -d '{"backend": "tmux"}' 2>&1)
     CURL_RC=$?
