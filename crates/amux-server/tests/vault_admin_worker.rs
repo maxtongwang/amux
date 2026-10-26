@@ -4,6 +4,10 @@
 //! real session env files.
 //!
 //! One test function on purpose: it sets AMUX_HOME for this process.
+//!
+//! Fork (maxtongwang/amux): admin reach is behind AMUX_ADMIN_WORKERS_AS_OWNER=1
+//! (security rule 1, default off), so this upstream case runs with it on. The
+//! default-off behaviour is tests/vault_admin_worker_gate_off.rs.
 
 use amux_server::api::{router, AppState};
 use axum::body::Body;
@@ -75,6 +79,7 @@ async fn admin_group_workers_add_edit_and_remove_vault_items_and_others_cannot()
     std::env::set_var("TMUX_TMPDIR", &tmux_dir);
     std::env::remove_var("TMUX");
     std::env::set_var("AMUX_HOME", &home);
+    std::env::set_var("AMUX_ADMIN_WORKERS_AS_OWNER", "1");
     let logs = Buf::default();
     let sink = logs.clone();
     let _ = tracing_subscriber::fmt()

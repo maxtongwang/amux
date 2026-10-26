@@ -943,7 +943,8 @@ cmd_register() {
   if ! python3 - "$file" "$name" "$resolved_dir" "$CC_FLAGS_STR" "$wt" "$wt_profile" "$prov" <<'PYREGISTER'
 import fcntl, os, re, secrets, sys, tempfile
 from pathlib import Path
-path, name, directory, flags, wt, profile, provider = sys.argv[1:]
+path, name, directory, flags, wt, profile, *rest = sys.argv[1:]
+provider = rest[0] if rest else ""  # --provider; older callers pass six
 p = Path(path)
 p.parent.mkdir(parents=True, exist_ok=True)
 def quote(value):

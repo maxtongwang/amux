@@ -22811,10 +22811,12 @@ mod rate_limit_hold_tests {
     #[test]
     fn the_send_path_checks_the_hold_before_its_first_keystroke() {
         let src = include_str!("session_verbs.rs");
-        let body = &src[src.find("async fn send_text_inner_bound(").unwrap()..];
+        // This fork moved the keystroke pipeline out of send_text_inner_bound
+        // into send_text_paste_bound (native delivery dispatch).
+        let body = &src[src.find("async fn send_text_paste_bound(").unwrap()..];
         let body = &body[..body.find("\n}\n").unwrap()];
         let hold = body.find("rate_limit_hold_for(name,").expect("send path must call the hold");
-        let esc = body.find("send_key(name, \"Escape\").await;\n            esc_at").unwrap();
+        let esc = body.find("esc_at = Some(std::time::Instant::now());").unwrap();
         let clear = body.find("send_key(name, \"C-u\")").unwrap();
         let paste = body.find("paste_into_composer(name,").unwrap();
         assert!(hold < esc && hold < clear && hold < paste);
