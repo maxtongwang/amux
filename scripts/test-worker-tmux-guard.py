@@ -87,6 +87,12 @@ class WorkerTmuxGuardTests(unittest.TestCase):
     def test_kill_session_refused(self):
         self.assert_refused('kill-session', '-t', 'amux-x')
 
+    def test_agent_kill_of_a_worker_session_stays_refused(self):
+        # The argv `amux rm` ran before ai-config #378/#387. A lead's delete now
+        # goes through the server, which closes the session on its own socket;
+        # the guard gives agents no exception for the exact target.
+        self.assert_refused('kill-session', '-t', '=amux-dev-worker')
+
     def test_kill_pane_and_alias_refused(self):
         self.assert_refused('kill-pane', '-t', '%3')
         self.assert_refused('killp')

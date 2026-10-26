@@ -31258,11 +31258,12 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
     if let Err(error) = super::rename_identity::ensure_migrated(&home()) {
         return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": error.to_string()}));
     }
+    // The owner deletes anything; an agent only through the lead delete rule
+    // (api/agent_delete.rs), which logs every decision.
     if !session_destructive_allowed(state, headers) {
-        return jresp(
-            StatusCode::FORBIDDEN,
-            json!({"error": "deleting a session must be initiated by a human in the dashboard; sessions/agents cannot delete sessions (set AMUX_ALLOW_AGENT_SESSION_DELETE=1 in ~/.amux/server.env to allow automation)"}),
-        );
+        if let Err(refusal) = super::agent_delete::gate(headers, name).await {
+            return refusal;
+        }
     }
     let cfg = parse_env(name);
     // A project owns one checkout shared by all of its task executors.
@@ -34113,8 +34114,19 @@ pub(crate) fn peer_config_refusal_unless_lead_rename(
 /// shared groups, or `None`. `origin` is [`worker_origin`]'s verified identity
 /// (an unverified claim names no lane, so it has no groups).
 pub(crate) fn lead_team_rename(origin: &str, target: &str, to: &str) -> Option<std::collections::BTreeSet<String>> {
+    if sanitize_session_name(to).trim().eq_ignore_ascii_case(OWNER_AGENT) {
+        return None;
+    }
+    lead_team(origin, target)
+}
+
+/// Whether verified worker `origin` is `target`'s lead: `origin` is in
+/// `leads`, `target` is not, they share a group other than `leads`, and
+/// neither is the owner agent. The shared groups, or `None`. Shared by the
+/// lead rename and the lead delete (api/agent_delete.rs).
+pub(crate) fn lead_team(origin: &str, target: &str) -> Option<std::collections::BTreeSet<String>> {
     let owner_agent = |n: &str| n.trim().eq_ignore_ascii_case(OWNER_AGENT);
-    if owner_agent(origin) || owner_agent(target) || owner_agent(&sanitize_session_name(to)) {
+    if owner_agent(origin) || owner_agent(target) {
         return None;
     }
     let (caller, theirs) = (lane_groups(origin), lane_groups(target));

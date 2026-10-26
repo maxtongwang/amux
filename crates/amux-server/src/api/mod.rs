@@ -13,6 +13,7 @@ pub mod scratchpad;
 pub mod prompt_block;
 pub mod land_queue;
 pub mod worker_identity;
+pub mod agent_delete;
 pub mod rename_identity;
 pub mod contract_fresh;
 pub mod prod_change;
