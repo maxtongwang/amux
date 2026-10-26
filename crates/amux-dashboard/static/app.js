@@ -26324,7 +26324,7 @@ function _msgDeliveryChip(e) {
       expired:'expired in Claude', dropped:'dropped by Claude', unknown:'native delivery unknown', uncertain:'may have been delivered'};
     const confirmed = receipt.state === 'admitted' || receipt.state === 'consumed';
     label = labels[receipt.state] || 'native delivery unknown';
-    color = confirmed ? '#3fb950' : '#d29922'; bg = confirmed ? 'rgba(63,185,80,0.14)' : 'rgba(210,153,34,0.16)';
+    color = confirmed ? 'var(--green)' : 'var(--yellow)'; bg = 'color-mix(in srgb, ' + color + ' ' + (confirmed ? 14 : 16) + '%, transparent)';
     title = 'Native Claude delivery: ' + String(receipt.reason || receipt.state).replace(/[&"<>]/g, c => ({'&':'&amp;', '"':'&quot;', '<':'&lt;', '>':'&gt;'}[c])) + '. '
       + (confirmed ? 'Queue admission does not prove model consumption.' : 'No automatic resend or paste is permitted.');
   } else if (rec === 'fallback') {
