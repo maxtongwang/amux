@@ -369,7 +369,6 @@ pub fn router_with_connector_transport(
         .merge(land_queue::routes())
         .merge(vault::routes())
         .merge(vault_secrets::routes())
-        .merge(secret_jobs::routes())
         .merge(chatgpt_app::routes())
         .merge(chat_delegate::routes())
         .merge(self_update::routes())
@@ -552,6 +551,16 @@ pub fn router_with_connector_transport(
             auth::require_bearer,
         ));
 
+    // Independently authenticated jobs have no owner/worker identity. Keep this
+    // exact route outside those layers, like the token-authenticated subrouters
+    // below, but retain request logging (including credential refusals).
+    let job_routes = secret_jobs::routes()
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            request_log::RequestLogger::spawn(store_for_reqlog.clone()),
+            request_log::middleware,
+        ));
+
     let app = Router::new()
         // Public: the PWA shell + health must load before auth happens.
         .route("/health", axum::routing::get(health::health))
@@ -703,7 +712,9 @@ pub fn router_with_connector_transport(
     // Inside member identity, so it can drop a member marker from a worker
     // process; outside auth, rule 10, the request log and every handler, so
     // each of them reads the attributed identity rather than a claimed one.
-    let app = app.layer(axum::middleware::from_fn(process_identity::attribute));
+    let app = app
+        .layer(axum::middleware::from_fn(process_identity::attribute))
+        .merge(job_routes);
 
     // Outermost so verified member headers exist before BOTH auth and the
     // request logger inspect the request. The middleware strips its internal

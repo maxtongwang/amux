@@ -32,10 +32,13 @@ async fn call(
     token: &str,
     peer: Option<&str>,
 ) -> (u16, Value, String) {
-    let mut req = Request::builder()
-        .method("POST")
-        .uri(path)
-        .header("authorization", "Bearer fake-owner")
+    let mut builder = Request::builder().method("POST").uri(path);
+    // Job requests carry only their job token, never an owner credential.
+    // Empty-token calls also prove that the owner bearer cannot authorize jobs.
+    if token.is_empty() {
+        builder = builder.header("authorization", "Bearer fake-owner");
+    }
+    let mut req = builder
         .header("x-amux-worker-token", token)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
@@ -106,6 +109,18 @@ async fn registered_jobs_are_scoped_authenticated_and_never_logged_as_values() {
         assert_eq!(status, 201, "{response}");
         assert!(!response.to_string().contains(CANARY));
     }
+    // A job credential does not exempt sibling vault routes from owner attribution.
+    let (status, response, _) = call(
+        &app,
+        "/api/vault/secrets",
+        json!({"key": "MAX_JOB_WRITE", "scope": "global", "target": "", "value": CANARY}),
+        JOB_TOKEN,
+        Some("127.0.0.1:12345"),
+    )
+    .await;
+    assert_eq!(status, 403, "{response}");
+    assert_eq!(response["code"], "worker_origin_unattributed");
+    assert!(!response.to_string().contains(CANARY));
     let payload = |job: &str, names: &[&str]| json!({"job": job, "names": names});
     let route = "/api/vault/job-secrets";
     let (status, result, cache) = call(

@@ -46,3 +46,25 @@ CLI tests verify only the requested value is injected, argv with spaces/quotes i
 The lead must run the Rust commands above outside this sandbox before claiming verification or publishing. The denied lock is `/Users/mwang/.amux/.rust-build-target.reclaim.lock`; the pending lock and test-receipt directory are also unwritable. No lock bypass or alternate build-cache workaround attempted. `test-results.py failures search --repo amux --text vault` also failed with permission denied on its `.lock`; durable evidence is retained here instead. GitNexus executable/index and an amux project-memory routing entry were not available.
 
 Independent reviewer should inspect the same-UID trust limit and verify the new endpoint through the full middleware stack, plus run the full server suite and route-table assertion. Caller should carry the authentication decision above into the PR. Existing-suite green is not claimed.
+
+## Round 2 middleware fix
+
+Moved only `secret_jobs::routes()` from the owner/worker-protected router into its own authenticated subrouter, merged after process attribution. This uses the existing subrouter/layer composition mechanism, without an attribution allowlist or caller-controlled bypass. The endpoint still enforces loopback peer metadata, registry token, names and groups itself; it never invokes an owner/worker handler. Its existing `secret_job_delivered` and `secret_job_refused` tracing and request logging remain active. The logger middleware is applied directly so its fallback wrapper cannot shadow or conflict with the main router fallback.
+
+Added an assertion that `/api/vault/secrets` with the same job token and loopback metadata returns 403 `worker_origin_unattributed`. Job test requests now omit the owner bearer; empty-token requests retain it to test that an owner credential alone cannot deliver job secrets. Both in-process and real HTTP cases continue using `api::router`, the builder called by production `lib.rs:780`; no test-only middleware ordering or attribution disable was introduced.
+
+Class sweep: inspected all vault route mounts, owner bearer, worker identity/policy, outer process attribution and member identity, the existing independently authenticated callback/ChatGPT subrouters, and request logger composition. Only the job route leaves those owner/worker layers. The outer member-header sanitizer remains in place; the job handler does not use its identity.
+
+Pre-fix evidence: lead/tests.log records the allowed-job assertion failing (403 instead of 200, exit 101); the brief supplies the `worker_origin_unattributed` body. The local pre-fix run (`round2-before.log`) and all post-fix Rust attempts stopped before compilation, exit 75, on the same sandbox-denied shared reclaim lock and receipt directory. No red-to-green execution is claimed. GitNexus is unavailable (no local index); failure-history search also cannot acquire its lock.
+
+| Round 2 command (prefix: `AMUX_ISOLATED_NO_SANDBOX=1 ~/.local/bin/amux-isolated`) | Exit | Evidence |
+| --- | --- | --- |
+| `scripts/safe-cargo.sh check --workspace` | 75 | `round2-check.log` |
+| `scripts/safe-cargo.sh test -p amux-server --test secret_jobs_api --test vault_secrets_api` | 75 | `round2-tests.log` |
+| `scripts/safe-cargo.sh clippy --workspace --all-targets -- -D warnings` | 75 | `round2-clippy.log` |
+| `scripts/safe-cargo.sh test -p amux-server api::request_log::tests` | 75 | `round2-request-log.log` |
+| `scripts/test-contended.sh -p amux-server` | 75 | `round2-suite.log` |
+| `rustfmt --edition 2021 --check crates/amux-server/tests/secret_jobs_api.rs` (no prefix) | 0 | Format/parse only |
+| `git diff --check` (no prefix) | 0 | Whitespace clean |
+
+Caller next step: rerun the Rust checks outside this sandbox and verify the allowed-job assertion flips to 200, sibling route stays 403, and real CLI/log-canary cases pass. Commit only; no push performed. Existing lead evidence and `.codex-build.log` preserved.
