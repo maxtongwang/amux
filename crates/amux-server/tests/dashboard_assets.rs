@@ -2401,7 +2401,6 @@ fn every_notification_emitter_goes_through_the_shared_gate() {
     assert!(feedback.contains("amuxNotifyAllowed?.('toast')"), "the press layer's success toast must ask the gate");
 }
 
-<<<<<<< HEAD
 /// The dashboard files a needs-input send-back as Harness text by matching its
 /// opening words. The server owns that wording (needs_input_auto::send_back_text)
 /// and the client copies it into a regex, so a reword on one side alone would turn
@@ -2415,7 +2414,9 @@ fn the_dashboard_classifies_the_servers_send_back_wording() {
     assert!(
         app.contains("/This is yours to do; (?:Ethan's|the owner's) needs-input policy returns/"),
         "app.js no longer matches the server's send-back wording ({phrase})"
-=======
+    );
+}
+
 /// A server with no model must lead to "Sign in with Claude", not only to an API
 /// key. On an amux Cloud server the first-run window opened only for the old
 /// shared gateway (`is_cloud`), and the banner pointed at the Vault's API keys,
@@ -2436,6 +2437,5 @@ fn no_model_leads_to_the_window_with_the_subscription_sign_in() {
     assert!(
         app.contains("if (d.is_cloud || d.account_url) {"),
         "a Cloud server's owner (account_url) gets the first-run window on load"
->>>>>>> upstream/main
     );
 }

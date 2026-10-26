@@ -249,21 +249,12 @@ pub fn routes() -> Router<AppState> {
         .route("/request", post(request))
 }
 async fn config() -> Response {
-<<<<<<< HEAD
     let result = crate::integrations::browser::discover_chrome_profiles();
+    let (methods, methods_errors) = methods();
     Json(json!({"config":load(),"chrome_profiles":result.profiles,
         "measured":result.discovery.measured,"n_considered":result.discovery.n_considered,
-        "discovery":result.discovery,"ladder":["amux","cdp","cua"],
+        "discovery":result.discovery,"ladder":methods["ladder"],"methods":methods,"methods_errors":methods_errors,
         "note":"CDP uses a persistent isolated copy of the selected Chrome profile. CUA uses the selected saved Amux profile; sandbox transfer currently covers cookies only."})).into_response()
-=======
-    let chrome_root = crate::integrations::browser::chrome_user_data_dir();
-    let v: Value = std::fs::read(chrome_root.join("Local State"))
-        .ok()
-        .and_then(|s| serde_json::from_slice(&s).ok())
-        .unwrap_or(Value::Null);
-    let profiles:Vec<Value>=v.pointer("/profile/info_cache").and_then(Value::as_object).map(|cache|cache.iter().map(|(name,m)|json!({"name":name,"label":m.get("name"),"identity":m.get("user_name"),"on_disk":chrome_root.join(name).is_dir()})).collect()).unwrap_or_default();
-    Json(json!({"config":load(),"chrome_profiles":profiles,"measured":true,"n_considered":profiles.len(),"ladder":methods().0["ladder"],"methods":methods().0,"methods_errors":methods().1,"note":"CDP uses a persistent isolated copy of the selected Chrome profile. CUA uses the selected saved Amux profile; sandbox transfer currently covers cookies only."})).into_response()
->>>>>>> upstream/main
 }
 async fn save(headers: HeaderMap, Json(mut c): Json<Config>) -> Response {
     // The fallback identity is an owner choice, never a worker's silent edit.
@@ -544,23 +535,10 @@ async fn request(
         .find(|p| p.name == c.cua_profile)
         .map(|p| p.identity.as_str())
         .unwrap_or(""));
-<<<<<<< HEAD
     let chrome = crate::integrations::browser::discover_chrome_profiles();
     context["chrome_identity"] = json!(chrome.profiles.iter()
         .find(|p| p.name == c.chrome_profile).and_then(|p| p.identity.as_deref()).unwrap_or(""));
     context["chrome_discovery"] = json!(chrome.discovery);
-=======
-    let chrome_state: Value =
-        std::fs::read(crate::integrations::browser::chrome_user_data_dir().join("Local State"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or(Value::Null);
-    context["chrome_identity"] = chrome_state
-        .pointer("/profile/info_cache")
-        .and_then(|v| v.get(&c.chrome_profile))
-        .and_then(|v| v.get("user_name"))
-        .cloned()
-        .unwrap_or(json!(""));
     let (methods, method_errors) = methods();
     for e in &method_errors {
         tracing::warn!(error = %e, measured = true, n_considered = 1, verdict = "browser_methods_unloadable", "a browser-methods layer did not parse; using the rest");
@@ -572,7 +550,6 @@ async fn request(
             Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("could not write the browser agent adapters: {e}")),
         }
     }
->>>>>>> upstream/main
     let input = json!({"context":context,"verb":r.verb,"body":r.body});
     let mut child = match tokio::process::Command::new("node")
         .arg(script)

@@ -1,4 +1,4 @@
--- 0123_cmd_history_msg_id.sql: the send's message ID on its history row.
+-- 0135_cmd_history_msg_id.sql (was 0123 before the 2026-10-26 upstream merge): the send's message ID on its history row.
 --
 -- A send's receipt is decided ONLY by its unique message ID (dev-lead
 -- 2026-10-17, after three review rounds of PR #9 each found a receipt hole in

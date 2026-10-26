@@ -68129,7 +68129,6 @@ async function _drawLoadRecents() {
 async function _drawRememberRecent(force) {
   const d = _draw;
   if (!d || !d.path || !d.api) return;
-<<<<<<< HEAD
   // Counted until the save is scheduled: the thumbnail below is awaited before
   // recentsTimer is set, so "no timer, no save" alone read as settled while a
   // remember was still on its way to one.
@@ -68157,7 +68156,7 @@ async function _drawRememberRecent(force) {
         else {
           d.thumbAt = now;
           const blob = await d.lib.X.exportToBlob({ elements: els, files: d.api.getFiles(), mimeType: 'image/png',
-            appState: { exportBackground: true, viewBackgroundColor: '#ffffff', exportWithDarkMode: false },
+            appState: { exportBackground: true, viewBackgroundColor: '#ffffff', exportWithDarkMode: false },   // design-tokens: allow (an exported drawing's paper)
             exportPadding: 8, maxWidthOrHeight: 240 });
           entry.thumb = await new Promise(res => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => res(''); fr.readAsDataURL(blob); });
         }
@@ -68175,47 +68174,6 @@ async function _drawRememberRecent(force) {
     if (d.recentsTimer) clearTimeout(d.recentsTimer);
     d.recentsTimer = setTimeout(_drawSaveRecents, 1500);
   } finally { d.recentsRemembering--; }
-=======
-  const now = Date.now();
-  let entry = d.recents.find(x => x.path === d.path);
-  // Already first in the list: a save only changes its picture and time, so
-  // the row is patched in place below. A full re-render on every autosave
-  // replaced the library under a pointer about to click a row (and reset its
-  // scroll), so a click on "In this folder" during autosave did nothing.
-  const wasFirst = !!entry && d.recents[0] === entry && entry.title === _drawTitleOf(d.path);
-  if (!entry) { entry = { path: d.path }; d.recents.unshift(entry); }
-  entry.title = _drawTitleOf(d.path);
-  entry.ts = now;
-  d.recents = [entry].concat(d.recents.filter(x => x !== entry)).slice(0, _DRAW_RECENTS_MAX);
-  // A thumbnail at most every 10s while drawing; always on open/rename and
-  // whenever the entry has none yet.
-  if (force || !entry.thumb || now - d.thumbAt > 10000) {
-    try {
-      const els = d.api.getSceneElements();
-      // An empty drawing gets no picture: a thumbnail kept from earlier
-      // content showed strokes on a file that had none (Ethan, 2026-10-13).
-      if (!els.length) entry.thumb = '';
-      else {
-        d.thumbAt = now;
-        const blob = await d.lib.X.exportToBlob({ elements: els, files: d.api.getFiles(), mimeType: 'image/png',
-          appState: { exportBackground: true, viewBackgroundColor: '#ffffff', exportWithDarkMode: false },   // design-tokens: allow (an exported drawing's paper)
-          exportPadding: 8, maxWidthOrHeight: 240 });
-        entry.thumb = await new Promise(res => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => res(''); fr.readAsDataURL(blob); });
-      }
-    } catch (e) {}
-  }
-  if (d.libTab === 'drawings') {
-    const row = wasFirst && document.querySelector('#draw-lib-body .draw-recent[data-path="' + CSS.escape(entry.path) + '"]');
-    if (row) {
-      const thumb = row.querySelector('.draw-recent-thumb');
-      if (thumb) thumb.innerHTML = entry.thumb ? '<img alt="" src="' + esc(entry.thumb) + '">' : '';
-      const when = row.querySelector('.draw-recent-when');
-      if (when) when.textContent = timeAgo(entry.ts / 1000);
-    } else _drawLibRender();
-  }
-  if (d.recentsTimer) clearTimeout(d.recentsTimer);
-  d.recentsTimer = setTimeout(_drawSaveRecents, 1500);
->>>>>>> upstream/main
 }
 // One save at a time per tab, and `recentsSaving` stays set until the write
 // has landed, so "no timer" never reads as "saved". A save asked for while one
@@ -68265,7 +68223,7 @@ async function _drawWriteRecents(d) {
       const body = { path: _drawRecentsPath(), content: JSON.stringify({ recents: d.recents }) };
       if (etag) body.expected_etag = etag;
       const r = await fetch(API + '/api/file', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body), _skipOutbox: true });
+        body: JSON.stringify(body), _skipOutbox: true, _background: true });
       if (r.status === 409 && attempt < _DRAW_RECENTS_TRIES) {
         _drawBeacon('recents-save-conflict', { measured: true, n_considered: disk.length, attempt });
         continue;
@@ -68277,7 +68235,6 @@ async function _drawWriteRecents(d) {
       if (d.recentsUnsaved) { d.recentsUnsaved = false; _drawRecentsNote(); }
       return;
     }
-<<<<<<< HEAD
   } catch (e) {
     // The list stays in memory and the next change saves it again; until then
     // the library says so instead of reading as saved.
@@ -68289,18 +68246,6 @@ async function _drawWriteRecents(d) {
 function _drawRecentsNote() {
   const el = document.getElementById('draw-recents-unsaved');
   if (el) el.textContent = _draw && _draw.recentsUnsaved ? _DRAW_RECENTS_UNSAVED : '';
-=======
-    const merged = [...byPath.values()].sort((p, q) => (q.ts || 0) - (p.ts || 0)).slice(0, _DRAW_RECENTS_MAX);
-    if (merged.length > d.recents.length) _drawBeacon('recents-merged', { measured: true, n_considered: disk.length, added: merged.length - d.recents.length });
-    d.recents = merged;
-    const r = await fetch(API + '/api/file', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: _drawRecentsPath(), content: JSON.stringify({ recents: d.recents }) }), _skipOutbox: true, _background: true });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    // No re-render here: entries merged in from another tab would shift the
-    // list under a pointer that is about to click. They show on the next
-    // render the user causes.
-  } catch (e) { _drawBeacon('recents-save-failed', { error: String(e && e.message || e) }); }
->>>>>>> upstream/main
 }
 async function _drawRenderDrawings(body, q) {
   const d = _draw;
@@ -68319,15 +68264,11 @@ async function _drawRenderDrawings(body, q) {
   // straddled that swap fired no click (draw-tab.spec.ts:356 on iOS).
   const keep = d.folderHtml || '<div class="draw-empty">Loading…</div>';
   const top = body.scrollTop;
-<<<<<<< HEAD
-  if (_drawSetBody(body, '<div class="draw-lib-sub">Recent drawings<span id="draw-recents-unsaved" class="draw-recents-unsaved">'
-    + (d.recentsUnsaved ? _DRAW_RECENTS_UNSAVED : '') + '</span></div>'
-=======
   if (_drawSetBody(body, '<div class="draw-default-dir"><span class="draw-default-lbl">New drawings go to</span>'
       + '<button class="draw-link-btn" data-path="' + esc(defDir) + '" onclick="_drawOpenDirInFiles(this.dataset.path)" title="Open ' + esc(defDir) + ' in Files">' + esc(_drawShortPath(defDir)) + '</button>'
       + '<button class="draw-link-btn" id="draw-default-dir-btn" onclick="_drawChangeDefaultDir(this)" title="Choose the folder new drawings are created in">Change</button></div>'
-    + '<div class="draw-lib-sub">Recent drawings</div>'
->>>>>>> upstream/main
+    + '<div class="draw-lib-sub">Recent drawings<span id="draw-recents-unsaved" class="draw-recents-unsaved">'
+    + (d.recentsUnsaved ? _DRAW_RECENTS_UNSAVED : '') + '</span></div>'
     + (rec.length ? rec.map(row).join('') : '<div class="draw-empty">' + (q ? 'No drawings match.' : 'Drawings you open show up here.') + '</div>')
     + '<div class="draw-lib-subrow"><span class="draw-lib-sub">In this folder</span>'
     + '<button class="draw-link-btn" id="draw-folder-files" data-path="' + esc(dir) + '" onclick="_drawOpenDirInFiles(this.dataset.path)" title="Open ' + esc(dir) + ' in Files">Open in Files</button></div>'

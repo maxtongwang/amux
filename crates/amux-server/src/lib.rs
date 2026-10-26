@@ -1267,20 +1267,14 @@ async fn async_main() {
     }
     // Inherited from the previous image on a self-adoption, so the port never
     // closes across a rebuild; bound fresh on a cold start.
-<<<<<<< HEAD
     let (listener, listener_source) = listener_handoff::adopt_or_bind(addr).unwrap_or_else(|error| {
         tracing::error!(%addr, %error, measured = true, n_considered = 1,
             verdict = "listener_bind_failed", "cannot bind server listener; check AMUX_BIND and AMUX_RS_PORT");
         std::process::exit(1);
     });
+    boot_watch::bound();
     tracing::info!(addr = %listener.local_addr().expect("bound listener address"),
         measured = true, n_considered = 1, listener_source, verdict = if listener_source == "inherited" {
-=======
-    let (listener, listener_source) =
-        listener_handoff::adopt_or_bind(addr).expect("bind listener");
-    boot_watch::bound();
-    tracing::info!(%addr, listener_source, verdict = if listener_source == "inherited" {
->>>>>>> upstream/main
         "listener_inherited"
     } else {
         "listener_bound"

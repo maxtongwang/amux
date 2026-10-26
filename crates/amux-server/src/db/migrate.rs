@@ -39,7 +39,43 @@ const MIGRATION_NAME_ALIASES: &[(i64, &str, &str)] = &[
     (35, "0029_regenerable_samples", "0035_regenerable_samples"),
     (82, "0082_project_execution", "0082_nudge_budget"),
     (83, "0083_project_attempts", "0083_project_execution"),
+    // 2026-10-26 upstream merge: the fork's 0123-0125 moved to 0135-0137
+    // (MIGRATION_RELOCATIONS) and 0138 is the idempotent union of upstream's
+    // 0123-0125, so a database that recorded the fork's names converges.
+    (123, "0123_cmd_history_msg_id", "0123_file_opens"),
+    (124, "0124_native_delivery", "0124_pinned_notes_groups"),
+    (125, "0125_native_uncertainty", "0125_schedule_lifecycle"),
 ];
+
+/// Migrations that moved to a new version, as `(new_version, old_version,
+/// old_name)`. A database that recorded `old_name` at `old_version` already
+/// holds that schema, so the migration is applied and is not run again under
+/// its new number. Needed when the SQL is not safe to repeat: 0137 rebuilds a
+/// table. History rows are never rewritten.
+const MIGRATION_RELOCATIONS: &[(i64, i64, &str)] = &[
+    (135, 123, "0123_cmd_history_msg_id"),
+    (136, 124, "0124_native_delivery"),
+    (137, 125, "0125_native_uncertainty"),
+];
+
+/// True when `m` is recorded, at its own version or (for a relocated
+/// migration) under its old version and name. `apply_all` and `pending` share
+/// this so the two cannot disagree. A missing `_amux_migrations` reads as
+/// nothing applied, the truth for a fresh database.
+fn applied(conn: &Connection, m: &Migration) -> bool {
+    let at = |version: i64, name: Option<&str>| {
+        conn.query_row(
+            "SELECT 1 FROM _amux_migrations WHERE version = ?1 AND (?2 IS NULL OR name = ?2)",
+            rusqlite::params![version, name],
+            |_| Ok(true),
+        )
+        .unwrap_or(false)
+    };
+    at(m.version, None)
+        || MIGRATION_RELOCATIONS
+            .iter()
+            .any(|(new, old, name)| *new == m.version && at(*old, Some(name)))
+}
 
 fn known_name_alias(version: i64, recorded: &str, registered: &str) -> bool {
     MIGRATION_NAME_ALIASES
@@ -676,21 +712,6 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 123,
-<<<<<<< HEAD
-        name: "0123_cmd_history_msg_id",
-        sql: include_str!("../../migrations/0123_cmd_history_msg_id.sql"),
-    },
-    Migration {
-        version: 124,
-        name: "0124_native_delivery",
-        sql: include_str!("../../migrations/0124_native_delivery.sql"),
-    },
-    Migration {
-        version: 125,
-        name: "0125_native_uncertainty",
-        sql: include_str!("../../migrations/0125_native_uncertainty.sql"),
-    },];
-=======
         name: "0123_file_opens",
         sql: include_str!("../../migrations/0123_file_opens.sql"),
     },
@@ -749,8 +770,27 @@ const MIGRATIONS: &[Migration] = &[
         name: "0134_social_posts",
         sql: include_str!("../../migrations/0134_social_posts.sql"),
     },
+    Migration {
+        version: 135,
+        name: "0135_cmd_history_msg_id",
+        sql: include_str!("../../migrations/0135_cmd_history_msg_id.sql"),
+    },
+    Migration {
+        version: 136,
+        name: "0136_native_delivery",
+        sql: include_str!("../../migrations/0136_native_delivery.sql"),
+    },
+    Migration {
+        version: 137,
+        name: "0137_native_uncertainty",
+        sql: include_str!("../../migrations/0137_native_uncertainty.sql"),
+    },
+    Migration {
+        version: 138,
+        name: "0138_upstream_0123_0125_union",
+        sql: include_str!("../../migrations/0138_upstream_0123_0125_union.sql"),
+    },
 ];
->>>>>>> upstream/main
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
 ///
@@ -761,15 +801,7 @@ const MIGRATIONS: &[Migration] = &[
 pub fn pending(conn: &Connection) -> Vec<&'static str> {
     MIGRATIONS
         .iter()
-        .filter(|m| {
-            !conn
-                .query_row(
-                    "SELECT 1 FROM _amux_migrations WHERE version = ?1",
-                    [m.version],
-                    |_| Ok(true),
-                )
-                .unwrap_or(false)
-        })
+        .filter(|m| !applied(conn, m))
         .map(|m| m.name)
         .collect()
 }
@@ -1024,6 +1056,13 @@ pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {
                 // missing schema is actually touched.
                 tracing::error!("{msg}");
             }
+            continue;
+        }
+        if applied(conn, m) {
+            tracing::info!(
+                migration = m.name,
+                "migration already applied under its pre-renumber version; not run again"
+            );
             continue;
         }
         // TIME EVERY MIGRATION. This function used to log nothing, so 0031
@@ -1407,6 +1446,80 @@ mod tests {
             recorded, "0082_project_execution",
             "deployed history remains immutable"
         );
+    }
+
+    /// 2026-10-26 upstream merge. A database that recorded the fork's
+    /// 0123-0125 must end with BOTH sides' schema: upstream's 0123-0125 through
+    /// the 0138 union, and the fork's tables without 0136/0137 running again
+    /// (0137 rebuilds a table and would fail). No collision is reported, and
+    /// nothing reads as pending afterwards.
+    #[test]
+    fn fork_history_at_123_125_converges_with_upstream_schema() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_history_through(&conn, 122);
+        for (version, name, sql) in [
+            (123, "0123_cmd_history_msg_id", include_str!("../../migrations/0135_cmd_history_msg_id.sql")),
+            (124, "0124_native_delivery", include_str!("../../migrations/0136_native_delivery.sql")),
+            (125, "0125_native_uncertainty", include_str!("../../migrations/0137_native_uncertainty.sql")),
+        ] {
+            apply_one(&conn, sql).unwrap();
+            conn.execute(
+                "INSERT INTO _amux_migrations(version,name,applied_at,duration_ms) VALUES(?1,?2,'test',0)",
+                rusqlite::params![version, name],
+            )
+            .unwrap();
+        }
+        assert!(pending(&conn).contains(&"0138_upstream_0123_0125_union"));
+        assert!(!pending(&conn).contains(&"0137_native_uncertainty"));
+
+        apply_all(&mut conn).unwrap();
+
+        for (table, column) in [
+            ("file_opens", "opened_at"),
+            ("pinned_notes", "group_id"),
+            ("schedules", "cron_runs"),
+            ("schedules", "disabled_reason"),
+            ("cmd_history", "msg_id"),
+            ("native_delivery_attempts", "unknown_since"),
+        ] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+                    [table, column],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(present, "missing {table}.{column}");
+        }
+        assert!(renumbered_migrations(&conn).is_empty());
+        assert!(pending(&conn).is_empty(), "pending: {:?}", pending(&conn));
+        let relocated: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _amux_migrations WHERE version BETWEEN 135 AND 137",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(relocated, 0, "the fork's migrations must not run again under 135-137");
+        let recorded: String = conn
+            .query_row("SELECT name FROM _amux_migrations WHERE version=124", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(recorded, "0124_native_delivery", "deployed history remains immutable");
+    }
+
+    #[test]
+    fn fresh_db_runs_both_sides_in_order_and_leaves_nothing_pending() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_all(&mut conn).unwrap();
+        assert!(pending(&conn).is_empty(), "pending: {:?}", pending(&conn));
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _amux_migrations WHERE version BETWEEN 123 AND 138",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 16);
     }
 
     /// AF-353: a version whose recorded name is no longer the registered one

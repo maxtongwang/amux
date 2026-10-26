@@ -1632,13 +1632,14 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-<<<<<<< HEAD
-    "_drawWriteRecents": {
-      "kind": "command._drawWriteRecents",
-=======
     "_drawWriteDraft": {
       "kind": "command._drawWriteDraft",
->>>>>>> upstream/main
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawWriteRecents": {
+      "kind": "command._drawWriteRecents",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
