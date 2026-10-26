@@ -6290,7 +6290,7 @@ SEVERITY: degrades
 STATUS: fixed
 DATE: 2026-10-18
 SESSION: PR-3-round-6
-CARD: maxtongwang/amux#3
+CARD: DEF-1 maxtongwang/amux#3
 SYMPTOM: A scheduled run's guard removed its old pathname after rename moved the
   directory, leaving the credential valid after completion. A retry after moving
   the env also adopted an unrelated previous destination holder's token.
@@ -6307,7 +6307,7 @@ SEVERITY: degrades
 STATUS: fixed
 DATE: 2026-10-18
 SESSION: PR-3-round-7
-CARD: maxtongwang/amux#3
+CARD: DEF-1 maxtongwang/amux#3
 SYMPTOM: First launch and schedule mints read an absent incarnation concurrently,
   persist different IDs, and invalidate issued credentials. Assignment failures
   became None and the scheduler still launched a shell without its requested token.
@@ -6323,7 +6323,7 @@ SEVERITY: degrades
 STATUS: fixed
 DATE: 2026-10-18
 SESSION: PR-3-round-9
-CARD: maxtongwang/amux#3
+CARD: DEF-1 maxtongwang/amux#3
 SYMPTOM: A transient token or rename-history I/O failure writes the completion
   marker anyway; repaired legacy credentials remain unreadable indefinitely.
 COST: Round-8 Codex B1; permission and malformed-target reproductions require
