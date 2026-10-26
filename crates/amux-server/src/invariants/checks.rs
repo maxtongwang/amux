@@ -1106,6 +1106,8 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // off the migrations. 44 numeric timestamp columns; 5 are milliseconds and
     // they are the whole trap.
     ("_amux_invariant_incident", "resolved_at", false),
+    ("vault_write_grants", "created_at", false),
+    ("vault_write_grants", "revoked_at", false),
     ("_amux_invariant_result", "ts", false),
     ("card_contracts", "deploy_at", false),
     ("land_queue", "done_at", false), // land_queue.rs: now_f64(); live 1791295108.5

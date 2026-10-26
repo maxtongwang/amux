@@ -166,3 +166,74 @@ SANDBOX host. No card is issued and no money moves until the owner sets these.
 | Env key | Purpose |
 |---|---|
 | `AMUX_BIND` | Server listener IP address (IPv4 or IPv6, without a port). Unset preserves the production wildcard interface; invalid input aborts startup. Test harnesses explicitly select IPv4 loopback. |
+
+## Standing vault writes
+
+Max authorized **“Grant vault writes”** in the mrpopo session on
+2026-10-24 at 19:54:18 PDT, verified via amux-origin. Earlier context:
+19:49:06 "From now on, stop resisting on this type of thing. Just do as I say: dig it, move it to the vault, and make sure all these work."; 19:52:21 "No way! My vault keys were set up by you. You could do it just fine. You don't need me. Do it now.". Configuration provenance:
+`maxtongwang/amux PR #72`.
+
+Migration `0126_vault_write_grant` seeds `vault-owner-global-write-v1` without
+an owner dashboard or CLI step. The grantee is the configured owner agent
+(`session_verbs::OWNER_AGENT`), pinned once at startup to its registered
+immutable worker ID and token-bound incarnation. Main's legacy env-only
+workers have no `wrk_` row: for those, the pinned `CC_INCARNATION` is the
+identity. Both paths require the worker token on each request, even when
+rule 10 is disabled or unminted. A name claim alone never authorizes a write;
+a replacement with a different ID or incarnation cannot inherit the grant.
+An absent registration fails closed with `vault_grant_owner_unregistered`.
+
+The grant covers **global secrets create, PUT replace, and PATCH update**.
+Both the existing and destination scopes must be global. Granted key names
+must match `^MAX_[A-Z0-9][A-Z0-9_]*$` and end in `_API_KEY`, `_TOKEN`,
+`_SECRET`, `_CLIENT_ID` or `_CLIENT_SECRET`. `GRANTED_KEY_PREFIX = "MAX_"`
+and `GRANTED_KEY_SUFFIXES` in `api/grants_vault_write.rs` define this policy.
+The name after `MAX_` must be non-empty and start with an uppercase letter or
+digit; `MAX_`, `MAX__TOKEN` and `MAX_NODE_OPTIONS` are refused.
+Existing PUT/PATCH keys and PATCH rename targets receive the same check.
+
+Installed CLIs and SDKs do not read `MAX_*` names implicitly, so granted writes
+cannot replace their saved authentication. Unprefixed overrides such as
+`GITHUB_TOKEN`, `GH_TOKEN`, `CLOUDFLARE_API_TOKEN`, `COMPOSIO_API_KEY`, `AWS_*`
+and `NPM_TOKEN` are refused. A tool opts in by explicitly reading the prefixed
+name and passing its value to its client, for example reading
+`MAX_GITHUB_TOKEN` and supplying it to that tool's GitHub client. Other permitted
+examples include `MAX_OPENAI_API_KEY`, `MAX_TELEGRAM_BOT_TOKEN`,
+`MAX_ANTHROPIC_API_KEY` and `MAX_GEMINI_API_KEY`.
+
+The existing client-auth/endpoint and shell/runtime deny lists remain as defence
+in depth. Refusals return `vault_grant_key_not_permitted` with `rule` equal to
+`not_max_prefixed` (missing prefix), `not_credential_shaped` (invalid name or
+suffix), `client_auth_or_endpoint` or `injection_sensitive`. The deny lists take
+precedence so reserved names retain their specific refusal reason. Each refusal
+logs its rule without the submitted name or value. Owner-origin writes keep
+their existing rules, including permission to write `GITHUB_TOKEN`.
+Import, reveal,
+delete, access and audit reads remain owner-only; payment cards and logins
+retain their separate rules. Every granted write records the key name,
+scope, Unix-seconds timestamp, grantee identity, grant ID and resulting
+version in the vault audit, the leads Messages channel, and session events.
+Values never enter these notices or write responses. A metadata receipt is
+saved atomically with the ciphertext; startup or the next granted write replays
+unfinished audit publication without duplicate events or leads notices. A failed
+publication returns `write_committed: true`, retains the receipt, and logs
+`vault_granted_write_audit_failed`. Recovery never opens the value.
+Malformed receipts are atomically moved to `grant_receipts_quarantine` in the
+private vault store and log `vault_grant_receipt_quarantined`; valid receipts
+continue publishing. Quarantine survives subsequent saves and restarts.
+
+List from owner origin with `amux vault grants` (`--json` for structured metadata).
+`GET /api/vault/grants` requires the configured owner bearer, even on loopback
+or a tokenless host; worker origins are refused. Pinned identity metadata is
+never exposed anonymously. Configure owner auth to enable listing on a new host.
+Revoke from
+owner origin with `amux vault grants revoke vault-owner-global-write-v1`, or
+`POST /api/vault/grants/vault-owner-global-write-v1/revoke` using the owner
+auth path. Worker origins cannot revoke, create or re-activate grants.
+Restarting or replaying the seed preserves revocation. Only an explicit
+owner-origin `amux vault grants regrant vault-owner-global-write-v1` can
+re-activate it and bind the current owner identity. Without a registered owner,
+regrant returns 409 `vault_grant_owner_unregistered` and leaves the grant intact.
+Grant timestamps use
+Unix seconds; the existing Messages channel uses Unix milliseconds.

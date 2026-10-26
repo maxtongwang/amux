@@ -217,6 +217,17 @@ pub fn check(home: &Path, lane: &str, presented: Option<&str>) -> Check {
     }
 }
 
+/// Strict credential proof for standing permissions. Unlike rule 10's rollout,
+/// disabled enforcement and unminted lanes NEVER authorize a standing grant.
+pub(crate) fn authenticated_incarnation(home: &Path, headers: &axum::http::HeaderMap, lane: &str) -> Option<String> {
+    let token = headers.get(TOKEN_HEADER)?.to_str().ok()?.trim();
+    if token.is_empty() { return None; }
+    let incarnation = super::rename_identity::incarnation(home, lane)?;
+    let launch_valid = std::fs::read_to_string(hash_path(home, &incarnation)).ok()
+        .is_some_and(|want| super::auth::constant_time_eq(digest(token).as_bytes(), want.trim().as_bytes()));
+    (launch_valid || run_token_valid(home, &incarnation, token)).then_some(incarnation)
+}
+
 fn header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
     req.headers().get(name).and_then(|v| v.to_str().ok()).map(str::trim).filter(|s| !s.is_empty())
 }

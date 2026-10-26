@@ -185,6 +185,14 @@ pub fn router_with_connector_transport(
     state: AppState,
     http: Arc<dyn crate::integrations::email::HttpTransport>,
 ) -> Router {
+    if let Err(error) = grants::vault_write::bind_seed(&state.store, &crate::config::amux_home()) {
+        tracing::warn!(%error, verdict = "vault_grant_binding_failed", measured = false, n_considered = 0,
+            "standing vault grant remains unavailable; startup will retry without changing revocation");
+    }
+    if let Err(error) = vault_secrets::recover_granted_writes(&state, &crate::config::amux_home()) {
+        tracing::error!(%error, verdict = "vault_grant_audit_recovery_failed", measured = false, n_considered = 0,
+            "pending vault receipts retained for the next startup or granted write");
+    }
     let connector_ctx = Arc::new(connectors::ConnectorsCtx {
         http: http.clone(), home: crate::config::amux_home(),
     });

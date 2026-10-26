@@ -43,7 +43,9 @@
 //!
 //! # Who can write, and the one read
 //!
-//! Only the owner: no worker origin, not an invited member, and on a host
+//! The owner, plus the seeded standing grant for global create/update only.
+//! Reveal, delete and import remain owner-only. Owner: no worker origin, not
+//! an invited member, and on a host
 //! with an auth token the owner bearer itself (the dashboard sends it). A
 //! worker origin is refused on every write and sees only the metadata of
 //! items that apply to it. Exactly one endpoint returns a value: `reveal`,
@@ -312,17 +314,61 @@ fn load(home: &Path) -> Result<Vec<Value>, String> {
     }
 }
 
+fn pending_grant_receipts(home: &Path) -> Result<Vec<Value>, String> {
+    let raw = match std::fs::read_to_string(store_path(home)) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e.to_string()),
+    };
+    let doc: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    match doc.get("grant_receipts") {
+        None => Ok(vec![]),
+        Some(Value::Array(a)) => Ok(a.clone()),
+        // Preserve a malformed queue as one invalid receipt for quarantine.
+        Some(other) => Ok(vec![other.clone()]),
+    }
+}
+
 fn save(home: &Path, items: &[Value]) -> Result<(), String> {
+    save_with_receipt(home, items, None)
+}
+
+fn save_with_receipt(home: &Path, items: &[Value], receipt: Option<Value>) -> Result<(), String> {
+    let mut pending = pending_grant_receipts(home)?;
+    if let Some(r) = receipt { pending.push(r); }
+    save_state(home, items, &pending)
+}
+
+fn save_state(home: &Path, items: &[Value], pending: &[Value]) -> Result<(), String> {
+    save_state_with_quarantine(home, items, pending, &[])
+}
+
+fn save_state_with_quarantine(home: &Path, items: &[Value], pending: &[Value], invalid: &[Value]) -> Result<(), String> {
+    let mut quarantined = match std::fs::read(store_path(home)) {
+        Ok(raw) => {
+            let doc: Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+            match doc.get("grant_receipts_quarantine") {
+                None => vec![],
+                Some(Value::Array(entries)) => entries.clone(),
+                Some(other) => vec![other.clone()],
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+        Err(e) => return Err(e.to_string()),
+    };
+    quarantined.extend_from_slice(invalid);
     let dir = super::vault::vault_dir(home);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let tmp = dir.join(format!(".secrets.json.{}", std::process::id()));
-    let body = serde_json::to_vec_pretty(&json!({"version": STORE_VERSION, "items": items})).map_err(|e| e.to_string())?;
+    let body = serde_json::to_vec_pretty(&json!({"version": STORE_VERSION, "items": items,
+        "grant_receipts": pending, "grant_receipts_quarantine": quarantined})).map_err(|e| e.to_string())?;
     std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
     }
+    std::fs::OpenOptions::new().write(true).open(&tmp).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, store_path(home)).map_err(|e| e.to_string())
 }
 
@@ -388,7 +434,7 @@ fn public_view(item: &Value) -> Value {
 
 /// One writer at a time for the store and the delivery ledger. The temp file
 /// name is per process, so two writes from this process must not interleave.
-fn store_lock() -> &'static std::sync::Mutex<()> {
+pub(crate) fn store_lock() -> &'static std::sync::Mutex<()> {
     static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     L.get_or_init(Default::default)
 }
@@ -752,7 +798,7 @@ fn refuse_worker(home: &Path, who: &str, action: &str) -> Response {
 /// merely OMITS the worker headers is not the owner, because a worker shell
 /// can do that (the same rule as `worker_identity::owner_allowed`). The
 /// dashboard sends the bearer on every call (`_authHeaders`).
-fn owner_only(state: &super::AppState, headers: &HeaderMap, uri: &Uri, home: &Path, action: &str) -> Result<(), Box<Response>> {
+pub(crate) fn owner_only(state: &super::AppState, headers: &HeaderMap, uri: &Uri, home: &Path, action: &str) -> Result<(), Box<Response>> {
     if let Some(w) = worker_origin(headers) {
         return Err(Box::new(refuse_worker(home, &w, action)));
     }
@@ -774,6 +820,70 @@ fn owner_only(state: &super::AppState, headers: &HeaderMap, uri: &Uri, home: &Pa
         tracing::info!(action, measured = true, n_considered = 1, verdict = "vault_owner_by_absence",
             "vault: this host has no auth token, so any non-worker, non-member request is the owner");
     }
+    Ok(())
+}
+
+/// Grant checks do not use rule 10's rollout exceptions: a worker must prove
+/// its pinned identity, even on in-process calls or when enforcement is off.
+fn write_authority(state: &super::AppState, headers: &HeaderMap, uri: &Uri, home: &Path, action: &str)
+    -> Result<Option<super::grants::vault_write::GrantUse>, Box<Response>> {
+    if worker_origin(headers).is_some() {
+        return super::grants::vault_write::check(state, home, headers).map(Some)
+            .map_err(|(c, v)| Box::new(err(c, v)));
+    }
+    owner_only(state, headers, uri, home, action)?;
+    Ok(None)
+}
+
+/// Called INSIDE store_lock, also held by revoke/regrant. A revoke that wins
+/// the lock prevents the write, including one whose earlier check succeeded.
+fn check_write_scope(state: &super::AppState, home: &Path, headers: &HeaderMap,
+    grant: Option<&super::grants::vault_write::GrantUse>, scopes: &[&Scope]) -> Result<(), (StatusCode, Value)> {
+    if let Some(g) = grant { super::grants::vault_write::recheck(state, home, headers, g)?; }
+    super::grants::vault_write::global_only(home, grant, scopes)
+}
+
+fn record_granted_write(state: &super::AppState, home: &Path,
+    grant: Option<&super::grants::vault_write::GrantUse>, item: &Value) -> Result<(), (StatusCode, Value)> {
+    if grant.is_some() {
+        publish_pending_grants(state, home).map_err(|error| {
+            tracing::error!(%error, grant_id = super::grants::vault_write::ID, item = %item["id"],
+                verdict = "vault_granted_write_audit_failed", measured = true, n_considered = 1,
+                "vault write committed but an audit surface failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({"code": "vault_grant_audit_failed",
+                "error": "write committed but audit publication failed", "write_committed": true,
+                "item": public_view(item)}))
+        })?;
+    }
+    Ok(())
+}
+
+/// Replays receipts without opening any secret or asking the Keychain. Owner
+/// writes preserve this queue too, including deletion of the secret itself.
+pub(crate) fn recover_granted_writes(state: &super::AppState, home: &Path) -> Result<(), String> {
+    let _guard = store_lock().lock().unwrap_or_else(|p| p.into_inner());
+    publish_pending_grants(state, home)
+}
+
+fn publish_pending_grants(state: &super::AppState, home: &Path) -> Result<(), String> {
+    let pending = pending_grant_receipts(home)?;
+    if pending.is_empty() { return Ok(()); }
+    let (valid, invalid): (Vec<_>, Vec<_>) = pending.into_iter().partition(|receipt|
+        super::grants::vault_write::validated_receipt(receipt).is_ok());
+    if !invalid.is_empty() {
+        // One atomic save moves bad receipts out of the active queue. Crashing
+        // before it retains the originals; after it retains the quarantine.
+        save_state_with_quarantine(home, &load(home)?, &valid, &invalid)?;
+        tracing::warn!(verdict = "vault_grant_receipt_quarantined", measured = true,
+            n_considered = invalid.len(), "invalid vault grant receipts preserved outside the replay queue");
+    }
+    for receipt in &valid {
+        super::grants::vault_write::publish_receipt(state, home, receipt).map_err(|e| e.to_string())?;
+    }
+    let items = load(home)?;
+    save_state(home, &items, &[])?;
+    tracing::info!(verdict = "vault_grant_audit_recovered", measured = true, n_considered = valid.len(),
+        "pending vault grant receipts published without duplicate notices");
     Ok(())
 }
 
@@ -890,6 +1000,22 @@ fn key_unavailable(e: &str) -> (StatusCode, Value) {
 
 fn create_item(home: &Path, key: &str, scope: &Scope, value: &str, by: &str, note: &str, source: Option<&str>) -> Result<Value, (StatusCode, Value)> {
     let _g = store_lock().lock().unwrap_or_else(|p| p.into_inner());
+    create_item_locked(NewSecret { home, key, scope, value, by, note, source, grant: None })
+}
+
+struct NewSecret<'a> {
+    home: &'a Path,
+    key: &'a str,
+    scope: &'a Scope,
+    value: &'a str,
+    by: &'a str,
+    note: &'a str,
+    source: Option<&'a str>,
+    grant: Option<&'a super::grants::vault_write::GrantUse>,
+}
+
+fn create_item_locked(input: NewSecret<'_>) -> Result<Value, (StatusCode, Value)> {
+    let NewSecret { home, key, scope, value, by, note, source, grant } = input;
     let mut items = load(home).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})))?;
     if let Some(dup) = items.iter().find(|i| i["key"] == key && item_scope(i).as_ref() == Some(scope)) {
         return Err((StatusCode::CONFLICT, json!({"error": "this key already has a value at this scope; edit or rotate it instead",
@@ -905,7 +1031,7 @@ fn create_item(home: &Path, key: &str, scope: &Scope, value: &str, by: &str, not
         "nonce": nonce, "ct": ct, "key_fp": fingerprint(&master), "created": now, "updated": now,
         "version": 1, "by": by, "note": note, "source": source});
     items.push(item.clone());
-    save(home, &items).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})))?;
+    save_with_receipt(home, &items, grant.map(|g| super::grants::vault_write::receipt(g, &item))).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})))?;
     Ok(item)
 }
 
@@ -925,10 +1051,15 @@ fn parse_body_scope(home: &Path, body: &Value, default_kind: &str, default_targe
 
 async fn create(State(state): State<super::AppState>, uri: Uri, headers: HeaderMap, Json(body): Json<Value>) -> Response {
     let home = amux_home();
-    if let Err(r) = owner_only(&state, &headers, &uri, &home, "create") {
-        return *r;
-    }
+    let grant = match write_authority(&state, &headers, &uri, &home, "create") {
+        Ok(g) => g,
+        Err(r) => return *r,
+    };
+    let by = grant.as_ref().map(|g| g.name.as_str()).unwrap_or("owner");
     let key = body.get("key").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if let Err((c, v)) = super::grants::vault_write::permitted_keys(&home, grant.as_ref(), &[&key]) {
+        return err(c, v);
+    }
     if let Err(e) = valid_key(&key) {
         return err(StatusCode::BAD_REQUEST, json!({"error": e, "field": "key"}));
     }
@@ -944,10 +1075,19 @@ async fn create(State(state): State<super::AppState>, uri: Uri, headers: HeaderM
         Ok(n) => n,
         Err(e) => return err(StatusCode::BAD_REQUEST, json!({"error": e, "field": "description"})),
     };
-    match create_item(&home, &key, &scope, &value, "owner", &note, None) {
+    let result = {
+        let _g = store_lock().lock().unwrap_or_else(|p| p.into_inner());
+        (|| {
+            check_write_scope(&state, &home, &headers, grant.as_ref(), &[&scope])?;
+            let item = create_item_locked(NewSecret { home: &home, key: &key, scope: &scope, value: &value, by, note: &note, source: None, grant: grant.as_ref() })?;
+            record_granted_write(&state, &home, grant.as_ref(), &item)?;
+            Ok(item)
+        })()
+    };
+    match result {
         Ok(item) => {
             audit(&home, json!({"ts": now_f64(), "event": "secret_added", "item": item["id"], "key": key,
-                "scope": scope.kind(), "target": scope.target(), "version": 1, "by": "owner"}));
+                "scope": scope.kind(), "target": scope.target(), "version": 1, "by": by}));
             tracing::info!(key = %key, scope = scope.kind(), measured = true, n_considered = 1,
                 verdict = "vault_secret_added", "vault: a secret was added (no value logged)");
             (StatusCode::CREATED, Json(json!({"ok": true, "item": public_view(&item),
@@ -975,9 +1115,11 @@ fn reseal(items: &mut [Value], pos: usize, master: &[u8; 32], key: &str, scope: 
 /// worker still holding the old one is visible as stale until it restarts.
 async fn replace(State(state): State<super::AppState>, uri: Uri, headers: HeaderMap, AxPath(id): AxPath<String>, Json(body): Json<Value>) -> Response {
     let home = amux_home();
-    if let Err(r) = owner_only(&state, &headers, &uri, &home, "replace") {
-        return *r;
-    }
+    let grant = match write_authority(&state, &headers, &uri, &home, "replace") {
+        Ok(g) => g,
+        Err(r) => return *r,
+    };
+    let by = grant.as_ref().map(|g| g.name.as_str()).unwrap_or("owner");
     let value = match body_value(&body) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, json!({"error": e, "field": "value"})),
@@ -992,8 +1134,15 @@ async fn replace(State(state): State<super::AppState>, uri: Uri, headers: Header
             let mut items = load(&home).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})))?;
             let pos = items.iter().position(|i| i["id"] == id.as_str())
                 .ok_or((StatusCode::NOT_FOUND, json!({"error": "no such secret"})))?;
+            let (key, scope) = (items[pos]["key"].as_str().unwrap_or("").to_string(), item_scope(&items[pos]).ok_or((StatusCode::CONFLICT, json!({"error": "item has no valid scope"})))?);
+            super::grants::vault_write::permitted_keys(&home, grant.as_ref(), &[&key])?;
+            check_write_scope(&state, &home, &headers, grant.as_ref(), &[&scope])?;
+            // PUT cannot request a scope change either.
+            if body.get("scope").is_some() {
+                let requested = parse_body_scope(&home, &body, "global", "")?;
+                check_write_scope(&state, &home, &headers, grant.as_ref(), &[&requested])?;
+            }
             let master = master_key(&home, true).map_err(|e| key_unavailable(&e))?.ok_or_else(|| key_unavailable("missing"))?;
-            let (key, scope) = (items[pos]["key"].as_str().unwrap_or("").to_string(), item_scope(&items[pos]).unwrap_or(Scope::Global));
             reseal(&mut items, pos, &master, &key, &scope, &value).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})))?;
             let version = item_version(&items[pos]) + 1;
             let now = now_f64();
@@ -1001,12 +1150,13 @@ async fn replace(State(state): State<super::AppState>, uri: Uri, headers: Header
             it["version"] = json!(version);
             it["updated"] = json!(now);
             it["rotated"] = json!(now);
-            it["by"] = json!("owner");
+            it["by"] = json!(by);
             if let Some(n) = &note {
                 it["note"] = json!(n);
             }
             let view = public_view(it);
-            save(&home, &items).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})))?;
+            save_with_receipt(&home, &items, grant.as_ref().map(|g| super::grants::vault_write::receipt(g, &view))).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})))?;
+            record_granted_write(&state, &home, grant.as_ref(), &view)?;
             Ok((view, key, scope, version))
         })()
     };
@@ -1017,7 +1167,7 @@ async fn replace(State(state): State<super::AppState>, uri: Uri, headers: Header
     let running = super::session_verbs::running_workers().await;
     let stale = holders(&load_ledger(&home), &running, &id, Some(version));
     audit(&home, json!({"ts": now_f64(), "event": "secret_replaced", "item": id, "key": key,
-        "scope": scope.kind(), "target": scope.target(), "version": version, "by": "owner",
+        "scope": scope.kind(), "target": scope.target(), "version": version, "by": by,
         "running_stale": stale.len()}));
     tracing::info!(key = %key, version, running_stale = stale.len(), measured = true, n_considered = running.len(),
         verdict = "vault_secret_rotated", "vault: a secret was rotated; running workers keep the old value until restarted");
@@ -1030,9 +1180,11 @@ async fn replace(State(state): State<super::AppState>, uri: Uri, headers: Header
 /// the ciphertext can never be moved without the key.
 async fn update(State(state): State<super::AppState>, uri: Uri, headers: HeaderMap, AxPath(id): AxPath<String>, Json(body): Json<Value>) -> Response {
     let home = amux_home();
-    if let Err(r) = owner_only(&state, &headers, &uri, &home, "update") {
-        return *r;
-    }
+    let grant = match write_authority(&state, &headers, &uri, &home, "update") {
+        Ok(g) => g,
+        Err(r) => return *r,
+    };
+    let by = grant.as_ref().map(|g| g.name.as_str()).unwrap_or("owner");
     let new_value = match body.get("value").and_then(Value::as_str) {
         Some("") | None => None,
         Some(_) => match body_value(&body) {
@@ -1046,6 +1198,9 @@ async fn update(State(state): State<super::AppState>, uri: Uri, headers: HeaderM
     };
     let new_key = body.get("key").and_then(Value::as_str).map(|k| k.trim().to_string());
     if let Some(k) = &new_key {
+        if let Err((c, v)) = super::grants::vault_write::permitted_keys(&home, grant.as_ref(), &[k]) {
+            return err(c, v);
+        }
         if let Err(e) = valid_key(k) {
             return err(StatusCode::BAD_REQUEST, json!({"error": e, "field": "key"}));
         }
@@ -1057,12 +1212,14 @@ async fn update(State(state): State<super::AppState>, uri: Uri, headers: HeaderM
             let pos = items.iter().position(|i| i["id"] == id.as_str())
                 .ok_or((StatusCode::NOT_FOUND, json!({"error": "no such secret"})))?;
             let old_key = items[pos]["key"].as_str().unwrap_or("").to_string();
-            let old_scope = item_scope(&items[pos]).unwrap_or(Scope::Global);
+            super::grants::vault_write::permitted_keys(&home, grant.as_ref(), &[&old_key])?;
+            let old_scope = item_scope(&items[pos]).ok_or((StatusCode::CONFLICT, json!({"error": "item has no valid scope"})))?;
             let scope = if body.get("scope").is_some() {
                 parse_body_scope(&home, &body, "global", "")?
             } else {
                 old_scope.clone()
             };
+            check_write_scope(&state, &home, &headers, grant.as_ref(), &[&old_scope, &scope])?;
             let key = new_key.clone().unwrap_or_else(|| old_key.clone());
             let moved = key != old_key || scope != old_scope;
             if moved {
@@ -1098,9 +1255,10 @@ async fn update(State(state): State<super::AppState>, uri: Uri, headers: HeaderM
                 return Ok((public_view(&items[pos]), changes, Value::Null));
             }
             items[pos]["updated"] = json!(now);
-            items[pos]["by"] = json!("owner");
+            items[pos]["by"] = json!(by);
             let view = public_view(&items[pos]);
-            save(&home, &items).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})))?;
+            save_with_receipt(&home, &items, grant.as_ref().map(|g| super::grants::vault_write::receipt(g, &view))).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})))?;
+            record_granted_write(&state, &home, grant.as_ref(), &view)?;
             Ok((view, changes, json!({"key": old_key, "scope": old_scope.kind(), "target": old_scope.target()})))
         })()
     };
@@ -1116,7 +1274,7 @@ async fn update(State(state): State<super::AppState>, uri: Uri, headers: HeaderM
     let stale = if affects_process { holders(&load_ledger(&home), &running, &id, None) } else { Vec::new() };
     audit(&home, json!({"ts": now_f64(), "event": "secret_updated", "item": id, "key": view["key"],
         "scope": view["scope"], "target": view["target"], "version": view["version"], "changes": changes,
-        "from": from, "by": "owner", "running_stale": stale.len()}));
+        "from": from, "by": by, "running_stale": stale.len()}));
     tracing::info!(key = %view["key"], changes = ?changes, measured = true, n_considered = 1,
         verdict = "vault_secret_updated", "vault: a secret's metadata or value changed (no value logged)");
     Json(json!({"ok": true, "item": view, "changes": changes, "running_stale": stale})).into_response()
@@ -1246,9 +1404,9 @@ async fn access(State(state): State<super::AppState>, uri: Uri, headers: HeaderM
 
 /// Fields an audit line may carry out of this endpoint. The writer never puts
 /// a value in the file; this is the second wall.
-const AUDIT_FIELDS: [&str; 16] = [
+const AUDIT_FIELDS: [&str; 20] = [
     "ts", "event", "item", "key", "scope", "target", "by", "version", "path", "session", "action",
-    "changes", "from", "running_stale", "still_held_by", "error",
+    "changes", "from", "running_stale", "still_held_by", "error", "grantee", "grantee_id", "grant_id", "receipt_id",
 ];
 
 fn audit_view(line: &Value) -> Value {
