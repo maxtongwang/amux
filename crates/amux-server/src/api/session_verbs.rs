@@ -21647,8 +21647,9 @@ fn render_fleet_roster(
         return String::new();
     }
     // Bilateral only: one side naming the other opens nothing (bilateral_peers).
+    // Listed only while the BILATERAL_PEERS_GATE fork gate is on.
     let mut pairs: Vec<String> = Vec::new();
-    for (i, (a, ea)) in live.iter().enumerate() {
+    for (i, (a, ea)) in live.iter().enumerate().filter(|_| fork_gate_on(BILATERAL_PEERS_GATE)) {
         let ap: Vec<String> = list(ea, "CC_PEERS").iter().map(|x| x.to_lowercase()).collect();
         for (b, eb) in live.iter().skip(i + 1) {
             let bp: Vec<String> = list(eb, "CC_PEERS").iter().map(|x| x.to_lowercase()).collect();
@@ -40059,7 +40060,8 @@ mod tests {
         );
         // The refusal names the owner's real paths in, so a relay does not
         // fall back to fake schedules (gs12 review, finding 6).
-        assert_eq!(body["owner_paths"], json!(["raw@chat", "group:admin", "dashboard"]), "{body}");
+        // Fork gate off (default): no admin path is named (security rule 1).
+        assert_eq!(body["owner_paths"], json!(["raw@chat", "dashboard"]), "{body}");
         assert!(body["what_to_do"].as_str().unwrap_or("").contains("raw@chat"), "{body}");
         // And each named path does pass the isolation gate.
         for origin in ["raw@chat"] {
@@ -40070,7 +40072,9 @@ mod tests {
         std::fs::write(sessions.join("boss.env"), "CC_TAGS=admin\n").unwrap();
         let mut h = axum::http::HeaderMap::new();
         h.insert("x-amux-session", "boss".parse().unwrap());
-        assert!(isolated_peer_refusal(&state, "raw", &h).await.is_none(), "an admin-group worker speaks for the owner");
+        assert!(isolated_peer_refusal(&state, "raw", &h).await.is_some(), "gate off: an admin-group worker is not the owner");
+        let _gate = fork_gate_test::set(ADMIN_AS_OWNER_GATE, true);
+        assert!(isolated_peer_refusal(&state, "raw", &h).await.is_none(), "gate on: an admin-group worker speaks for the owner");
     }
 
     /// AMUX-4566 through the shipped handler: a send between a paused lane and an
@@ -40175,7 +40179,8 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(rows.len(), 1, "an unidentified send must leave exactly one row: {rows:?} (send answered {status} {body})");
-        assert_eq!(rows[0], ("user".to_string(), UNIDENTIFIED_SEND_ORIGIN.to_string()));
+        // Fork gate off (default): only typed text is the owner (security rule 3).
+        assert_eq!(rows[0], ("session".to_string(), UNIDENTIFIED_SEND_ORIGIN.to_string()));
     }
 
     /// AMUX-4661: STOPPED is a third state AMUX-4566's own check cannot see —
@@ -40664,13 +40669,18 @@ mod tests {
         std::fs::create_dir_all(&sessions).unwrap();
         std::fs::write(sessions.join("boss.env"), "CC_TAGS=amux,admin\n").unwrap();
         std::fs::write(sessions.join("peer.env"), "CC_TAGS=amux\n").unwrap();
-        for (who, admin) in [("boss", true), ("peer", false)] {
-            let mut h = HeaderMap::new();
-            h.insert("x-amux-session", who.parse().unwrap());
-            assert_eq!(admin_origin(&h, "test").is_some(), admin, "{who}");
-            assert_eq!(membership_patch_refusal(&h, true).is_none(), admin, "group membership: {who}");
-            assert_eq!(crate::api::standing_approvals::is_owner_request(&h), admin, "owner request: {who}");
-            assert_eq!(crate::api::needs_input::refuse_worker(&h, "snooze").is_none(), admin, "triage: {who}");
+        // Fork gate (security rule 1): off by default, so no worker passes.
+        for gate in [false, true] {
+            let _gate = fork_gate_test::set(ADMIN_AS_OWNER_GATE, gate);
+            for (who, admin) in [("boss", gate), ("peer", false)] {
+                let mut h = HeaderMap::new();
+                h.insert("x-amux-session", who.parse().unwrap());
+                assert_eq!(admin_origin(&h, "test").is_some(), admin, "{who} gate={gate}");
+                // Our group boundary (#8/#17): no worker edits membership, admin or not.
+                assert!(membership_patch_refusal(&h, true).is_some(), "group membership: {who} gate={gate}");
+                assert_eq!(crate::api::standing_approvals::is_owner_request(&h), admin, "owner request: {who} gate={gate}");
+                assert_eq!(crate::api::needs_input::refuse_worker(&h, "snooze").is_none(), admin, "triage: {who} gate={gate}");
+            }
         }
         assert!(admin_origin(&HeaderMap::new(), "test").is_none(), "the owner is not an admin worker");
     }
@@ -40690,6 +40700,10 @@ mod tests {
         std::fs::write(sessions.join("onesided.env"), "CC_TAGS=gs12\nCC_PEERS=parity\n").unwrap();
         std::fs::write(sessions.join("stranger.env"), "CC_TAGS=gs12\n").unwrap();
         std::fs::write(sessions.join("open.env"), "CC_TAGS=gs12\nCC_PEERS=gs12\n").unwrap();
+        // Fork gate off (default, security rule 2): a pair bypasses nothing.
+        assert_eq!(send_origin_for("gs12", "parity"), SendOrigin::Automation, "gate off: no bypass");
+        assert!(peer_input_refusal("gs12", "parity").is_some(), "gate off: the group boundary holds");
+        let _gate = fork_gate_test::set(BILATERAL_PEERS_GATE, true);
         assert_eq!(send_origin_for("gs12", "parity"), SendOrigin::Owner, "paired, isolated target");
         assert_eq!(send_origin_for("parity", "gs12"), SendOrigin::Owner, "and the other direction");
         assert_eq!(send_origin_for("onesided", "parity"), SendOrigin::Automation, "parity does not name onesided");
@@ -40718,6 +40732,10 @@ mod tests {
         // Isolation does not take admin reach away.
         std::fs::write(sessions.join("boss.env"), "CC_TAGS=beta, Admin\nCC_ISOLATED=1\n").unwrap();
         std::fs::write(sessions.join("peer.env"), "CC_TAGS=beta\n").unwrap();
+        // Fork gate off (default, security rule 1): admin membership grants nothing.
+        assert!(!is_admin_worker("boss"), "gate off");
+        assert!(peer_input_refusal("boss", "raw").is_some(), "gate off: the boundary holds for admin");
+        let _gate = fork_gate_test::set(ADMIN_AS_OWNER_GATE, true);
         for (sender, allowed) in [("boss", true), ("peer", false)] {
             assert_eq!(is_admin_worker(sender), allowed, "{sender}");
             for target in ["raw", "closed"] {
@@ -47241,7 +47259,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         let n = state.store.write(move |c| {
             ensure_fleet_tables(c)?;
             c.execute("INSERT INTO cmd_history(text,type,session,ts,delivery) VALUES(?1,'user','w',1,'queued')", [&stored])?;
-            let n = stamp_queued_delivery(c, "w", &raw, 5000)?;
+            let n = stamp_queued_delivery(c, "w", "Q-UNLINKED", &raw, 5000)?;
             Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
         }).unwrap();
         assert!(n.applied, "the raw queue text must find the row that stores its redacted form");
@@ -49728,6 +49746,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             std::fs::write(home.path().join(format!("sessions/{n}.env")), format!("CC_DIR=\"/tmp\"\n{extra}")).unwrap();
         }
         let _home = crate::api::settings::test_env::set_home(home.path());
+        let _gate = fork_gate_test::set(BILATERAL_PEERS_GATE, true);
         let (state, _dir) = state();
         let app: Router = routes().with_state(state);
         let peers = |n: &str| lane_peers(n).into_iter().collect::<Vec<_>>();
@@ -57560,6 +57579,9 @@ mod roster_tests {
             ("parity".to_string(), lane(&[("CC_TAGS", "ts"), ("CC_PEERS", "helper"),
                 ("CC_DESC", "x".repeat(400).as_str())])),
         ];
+        let off = super::render_fleet_roster(&lanes, &["amux".to_string()]);
+        assert!(!off.contains("↔"), "fork gate off: no pairing is listed: {off}");
+        let _gate = super::fork_gate_test::set(super::BILATERAL_PEERS_GATE, true);
         let r = super::render_fleet_roster(&lanes, &["amux".to_string()]);
         assert!(r.contains(long), "a one-sentence description prints whole: {r}");
         assert!(r.contains("| amux (open) |"), "an open-inbound group is marked: {r}");

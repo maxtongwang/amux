@@ -189,7 +189,7 @@ pub(crate) fn worker_declaration_refusal(headers: &HeaderMap, doc: &Value) -> Op
         }
         let tags = match super::session_verbs::tags_of(w.get("tags")) {
             Ok(t) => t,
-            Err(e) => return Some((StatusCode::BAD_REQUEST, Json(json!({"error": format!("worker '{name}': {e}")}))),
+            Err(e) => return Some((StatusCode::BAD_REQUEST, Json(json!({"error": format!("worker '{name}': {e}")})))),
         };
         for key in ["dir", "flags", "creator"] {
             if let Some(why) = w.get(key).and_then(Value::as_str).and_then(|v| super::session_verbs::EnvFile::value_error(key, v)) {

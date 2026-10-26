@@ -486,6 +486,12 @@ pub async fn import(
         }
     };
     let config = bundle.get("config").filter(|c| c.is_object());
+    // Worker declarations in the config hold the same create and membership
+    // rules as /api/config/apply, even under AMUX_SCOPE_WRITE_AGENTS=1.
+    if let Some(refusal) = config.filter(|_| !dry_run).and_then(|c| super::config_iac::worker_declaration_refusal(&headers, c)) {
+        tracing::warn!(verdict = "move_import_refused", reason = "worker_declaration", "move import refused");
+        return refusal;
+    }
     let new_total: usize = plans.iter().map(|p| p.new_rows.len()).sum();
     let existing_total: usize = plans.iter().map(|p| p.existing).sum();
 

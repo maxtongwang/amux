@@ -1,6 +1,7 @@
 //! `CC_PEERS`: bilateral peer-to-peer channels that bypass both isolation and
 //! group boundaries. Both sides must name each other; a unilateral listing is
-//! not enough.
+//! not enough. In this fork the bypass is behind AMUX_BILATERAL_PEERS_BYPASS=1
+//! (default off); the default-off refusal is tested in api::session_verbs.
 
 use amux_server::api::{router, AppState};
 use amux_server::db::Store;
@@ -57,6 +58,9 @@ fn fleet_home() -> &'static std::path::Path {
         .expect("stranger");
 
         std::env::set_var("AMUX_HOME", dir.path());
+        // Fork gate (security rule 2, maxtongwang/amux): the bypass is off by
+        // default; this file tests upstream's behaviour with it on.
+        std::env::set_var("AMUX_BILATERAL_PEERS_BYPASS", "1");
         dir.path().to_path_buf()
     })
     .as_path()
