@@ -1,5 +1,7 @@
+// Working now fixtures — keep the routed runtime projection free of provider startup (refs ai-config #344).
 import { test, expect } from './fixtures';
-import { getSessionsResilient } from './lifecycle/evidence';
+import { cleanup } from './teardown';
+import { createMockWorker, getSessionsResilient, deleteWorkerApi, deleteBoardCardApi } from './lifecycle/evidence';
 
 test('one active worker marks exactly its claimed card as Working now', async ({ page, request }, testInfo) => {
   await page.goto('/');
@@ -9,10 +11,7 @@ test('one active worker marks exactly its claimed card as Working now', async ({
   const cards: string[] = [];
 
   try {
-    expect((await request.post('/api/sessions', {
-      headers: auth,
-      data: { name: worker, dir: '/tmp', tags: ['e2e-working-now'] },
-    })).status()).toBe(201);
+    await createMockWorker(request, auth, worker, { tags: ['e2e-working-now'] });
 
     for (let i = 1; i <= 4; i += 1) {
       const made = await request.post('/api/board', {
@@ -91,7 +90,9 @@ test('one active worker marks exactly its claimed card as Working now', async ({
     }
     await expect(page.getByText('no board task claimed', { exact: false })).toHaveCount(0);
   } finally {
-    for (const id of cards) await request.delete(`/api/board/${id}`, { headers: auth }).catch(() => {});
-    await request.delete(`/api/sessions/${worker}`, { headers: auth }).catch(() => {});
+    for (const id of cards) {
+      await cleanup(`delete card ${id} for ${worker}`, () => deleteBoardCardApi(request, auth, id), testInfo);
+    }
+    await cleanup(`delete worker for ${worker}`, () => deleteWorkerApi(page, request, auth, worker), testInfo);
   }
 });

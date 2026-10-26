@@ -1,6 +1,8 @@
 // Opt-in fault proof against a disposable local server. Never damage live prefs.
+// Connector scope fixtures — avoid provider startup and report cleanup failures (refs ai-config #344).
 import { test, expect } from './fixtures';
 import { cleanup } from './teardown';
+import { createMockWorker, deleteWorkerApi } from './lifecycle/evidence';
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 
@@ -22,9 +24,8 @@ test('damaged local or inherited connector scope is visible and explicitly repai
     'import sqlite3,json,sys; c=sqlite3.connect(sys.argv[1]); q=c.execute(sys.argv[2],json.loads(sys.argv[3])); print(json.dumps(q.fetchall())); c.commit()',
     home + '/amux.db', statement, JSON.stringify(args)], { encoding: 'utf8' });
   const original = layers.map(l => JSON.parse(sql('SELECT value FROM prefs WHERE key=?', [l.pref])));
-  const created = await request.post('/api/sessions', { headers: auth, data: { name: worker, dir: '/tmp', tags: [group] } });
-  expect(created.status()).toBe(201);
   try {
+    await createMockWorker(request, auth, worker, { tags: [group] });
     for (const layer of layers) {
       for (const l of layers) sql('DELETE FROM prefs WHERE key=?', [l.pref]);
       sql('INSERT INTO prefs(key,value) VALUES(?,?)', [layer.pref, '{damaged-ui-scope']);
@@ -66,10 +67,10 @@ test('damaged local or inherited connector scope is visible and explicitly repai
       await page.screenshot({ path: info.outputPath(layer.level + '-repair.png'), fullPage: true });
     }
   } finally {
-    await cleanup('restore scope prefs', () => layers.forEach((l, i) => {
+    await cleanup(`restore scope prefs for ${worker}`, () => layers.forEach((l, i) => {
       sql('DELETE FROM prefs WHERE key=?', [l.pref]);
       if (original[i].length) sql('INSERT INTO prefs(key,value) VALUES(?,?)', [l.pref, original[i][0][0]]);
     }), info);
-    await cleanup('delete fixture worker', () => request.delete('/api/sessions/' + worker, { headers: auth }), info);
+    await cleanup(`delete worker for ${worker}`, () => deleteWorkerApi(page, request, auth, worker), info);
   }
 });

@@ -139,6 +139,7 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
           provider: 'codex',
           creator: 'spoofed-owner',
           tags: ['e2e-multiplayer'],
+          start: false,
         }),
       });
       const createBody = await create.json();
@@ -180,7 +181,7 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
     if (workerAccess.createStatus === 201) createdWorkers.push(memberWorker);
     expect(workerAccess, JSON.stringify(workerAccess)).toMatchObject({
       createStatus: 201,
-      createBody: { creator: 'member:guest@example.com' },
+      createBody: { creator: 'member:guest@example.com', starting: false },
       fleetStatus: 200,
       listed: true,
       fleetCreator: 'member:guest@example.com',
@@ -198,13 +199,14 @@ test('local invitee joins, shares work, uses worker APIs, appears in logs, and c
       [groupPeer, ['e2e-multiplayer']],
       [outsider, ['e2e-outsider']],
     ] as Array<[string, string[]]>) {
-      const status = await guest.evaluate(async ({ name, tags }) => (
-        await fetch('/api/sessions', {
+      const peer = await guest.evaluate(async ({ name, tags }) => {
+        const r = await fetch('/api/sessions', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, dir: '/tmp', provider: 'codex', tags }),
-        })
-      ).status, { name, tags });
-      expect(status).toBe(201);
+          body: JSON.stringify({ name, dir: '/tmp', provider: 'codex', tags, start: false }),
+        });
+        return { status: r.status, starting: (await r.json().catch(() => ({}))).starting };
+      }, { name, tags });
+      expect(peer, `${name} must be created without autostart`).toEqual({ status: 201, starting: false });
       createdWorkers.push(name);
     }
 

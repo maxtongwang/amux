@@ -45,6 +45,25 @@ export async function createMockWorker(
   expect(body.starting, `mock worker ${name} must not autostart: body=${text}`).toBe(false);
 }
 
+// Deleting a worker is human-only: a bearer token alone gets 403 unless the
+// request carries the dashboard's UI token. Cleanups that sent only the bearer
+// were refused, the refusal was swallowed, and the worker leaked (ai-config #344).
+export async function deleteWorkerApi(
+  page: Page, request: APIRequestContext, headers: Record<string, string>, name: string,
+) {
+  const uiToken = await page.evaluate(() => (window as any)._AMUX_UI_TOKEN as string);
+  expect(uiToken, 'served bootstrap must provide the human-only destructive guard').toBeTruthy();
+  const response = await request.delete(`/api/sessions/${encodeURIComponent(name)}`, {
+    headers: { ...headers, 'X-Amux-UI-Token': uiToken },
+  });
+  expect(response.ok(), `delete worker ${name}: status=${response.status()} body=${await response.text()}`).toBeTruthy();
+}
+
+export async function deleteBoardCardApi(request: APIRequestContext, headers: Record<string, string>, id: string) {
+  const response = await request.delete(`/api/board/${encodeURIComponent(id)}`, { headers });
+  expect(response.ok(), `delete card ${id}: status=${response.status()} body=${await response.text()}`).toBeTruthy();
+}
+
 // GET /api/sessions can legitimately 503 once when a concurrent session
 // create/delete races the single-flight list build — the server fails
 // closed rather than serve a stale snapshot and says so in its own error

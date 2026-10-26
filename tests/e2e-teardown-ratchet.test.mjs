@@ -18,7 +18,7 @@ const E2E = fileURLToPath(new URL('../e2e', import.meta.url));
  * were produced before a teardown was made non-throwing, and the real error
  * appeared immediately.
  *
- * THIS IS A RATCHET, NOT A GATE, and the distinction is the honest part. 47
+ * THIS IS A RATCHET, NOT A GATE, and the distinction is the honest part. 43
  * unguarded blocks remain. Converting them all at once is a large mechanical
  * change across the whole e2e suite with real regression risk and no way to
  * verify each one except by breaking it. So the number is recorded and may only
@@ -44,7 +44,7 @@ const E2E = fileURLToPath(new URL('../e2e', import.meta.url));
  * `e2e/teardown.ts`'s `cleanup()` is the per-spec form for the blocks no
  * fixture owns.
  */
-const BASELINE = 47;
+const BASELINE = 43;
 
 function walk(dir) {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap(e => {
