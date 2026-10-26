@@ -1,5 +1,6 @@
+// Send latency coverage — measure mocked transport without provider startup (refs ai-config #339).
 import { test, expect } from '../fixtures';
-import { boot, auth, checkpoint, deleteOwnedWorkers } from './evidence';
+import { boot, auth, checkpoint, deleteOwnedWorkers, createMockWorker } from './evidence';
 
 test('LC-LATENCY: rapid sends skip retry backoff and render through lightweight terminal polls', async ({page,request}, info) => {
   test.setTimeout(60_000);
@@ -8,7 +9,7 @@ test('LC-LATENCY: rapid sends skip retry backoff and render through lightweight 
   const pressSend=()=>info.project.use.hasTouch
     ? page.locator('#peek-overlay .send-split-main').tap()
     : page.locator('#peek-overlay .send-split-main').click();
-  expect((await request.post('/api/sessions',{headers,data:{name,dir:'/tmp'}})).status()).toBe(201);
+  await createMockWorker(request, headers, name);
   let release!:()=>void;const held=new Promise<void>(resolve=>release=resolve);
   const posts:{id:string,at:number}[]=[];const peeks:{live:boolean,at:number}[]=[];
   let frame='Terminal transport fixture ready';

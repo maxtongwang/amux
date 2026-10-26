@@ -1,3 +1,4 @@
+// Lifecycle evidence and mock workers — avoid provider startup in UI fixtures (refs ai-config #339).
 import { expect, Page, TestInfo, APIRequestContext, Response } from '@playwright/test';
 import { captureState } from '../ux-discovery/crawler';
 
@@ -28,6 +29,20 @@ export async function auth(page: Page) {
   const token = await page.evaluate(() => (window as any)._AMUX_AUTH_TOKEN as string);
   expect(token).toBeTruthy();
   return { Authorization: `Bearer ${token}` };
+}
+
+export async function createMockWorker(
+  request: APIRequestContext, headers: Record<string, string>, name: string,
+  extra: { dir?: string; tags?: readonly string[]; isolated?: boolean } = {},
+) {
+  const response = await request.post('/api/sessions', {
+    headers, data: { dir: '/tmp', ...extra, name, start: false },
+  });
+  const text = await response.text();
+  expect(response.status(), `create ${name}: status=${response.status()} body=${text}`).toBe(201);
+  const body = await response.json();
+  console.log(`[e2e] verdict=mock_worker_created measured=true starting=${body.starting} name=${name}`);
+  expect(body.starting, `mock worker ${name} must not autostart: body=${text}`).toBe(false);
 }
 
 // GET /api/sessions can legitimately 503 once when a concurrent session
@@ -79,7 +94,15 @@ export async function deleteOwnedWorkers(page: Page, request: APIRequestContext,
     await card.locator('.card-menu-btn').click();
     await page.locator('.card-menu.open [data-worker-action="delete"]').click();
     await expect(page.locator('#modal-msg')).toHaveText(`Delete worker "${name}"?`);
+    const deletion = page.waitForResponse(response =>
+      response.request().method() === 'POST' &&
+      new URL(response.url()).pathname === `/api/sessions/${encodeURIComponent(name)}/delete`);
     await page.locator('#modal-btns').getByRole('button', { name: 'Delete', exact: true }).click();
+    const deleted = await deletion;
+    const body = await deleted.text();
+    const message = `UI deletion of ${name}: status=${deleted.status()} body=${body}`;
+    expect(deleted.status(), message).toBe(200);
+    expect(await deleted.json().catch(() => null), message).toMatchObject({ ok: true });
     await expect.poll(async () => {
       const rows = await getSessionsResilient(request, headers);
       // A transient race here is "unknown", not "still present" — report not-yet-

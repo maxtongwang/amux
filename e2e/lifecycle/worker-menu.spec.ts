@@ -1,10 +1,11 @@
+// Worker menu coverage — exercise actions without provider startup (refs ai-config #339).
 import {test,expect} from '../fixtures';
-import {boot,auth,deleteOwnedWorkers} from './evidence';
+import {boot,auth,deleteOwnedWorkers,createMockWorker} from './evidence';
 
 test('LC-WORKER-MENU: unrelated panel scrolling preserves actions; anchor scrolling dismisses them',async({page,request},info)=>{
   await boot(page);const headers=await auth(page);
   const name=`lc-menu-${info.project.name}-${Date.now()}`;
-  expect((await request.post('/api/sessions',{headers,data:{name,dir:'/tmp'}})).status()).toBe(201);
+  await createMockWorker(request, headers, name);
   try {
     await page.goto('/#view=sessions');
     await page.reload();
