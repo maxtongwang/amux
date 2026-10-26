@@ -95,6 +95,8 @@ test('a RELATIVE file path in session output opens the file, not its folder', as
   await expect.poll(async () => {
     const { subpath, subClickable } = await overlayState(page);
     return { subpath, subClickable };
+  }, {
+    message: 'the file overlay must show the resolved folder as a clickable link once /api/fs/resolve answers',
   }).toEqual({ subpath: DIR_PATH, subClickable: true });
   const s = await overlayState(page);
   console.log('[e2e] verdict=peek_folder_ready measured=true subpath=' + JSON.stringify(s.subpath)
