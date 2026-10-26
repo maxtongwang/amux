@@ -27,8 +27,14 @@ const ALLOW: &[(&str, &str, &str)] = &[
      "four zero counters, not an address"),
     ("crates/amux-server/src/integrations/computer.rs", "x.starts_with(\"0.0.0.0\")",
      "reads a Docker port mapping; binds nothing"),
-    ("crates/amux-server/src/api/proxies.rs", "validate(\"\", 8080)",
-     "a proxy-config validation case with an empty host; binds nothing"),
+    // Upstream (merged 2026-10-26): host strings matched against a request or
+    // a redirect Location, never an address any socket binds.
+    ("crates/amux-server/src/api/static_files/app_relay.rs", "for host in [\"localhost\", \"127.0.0.1\", \"0.0.0.0\", \"[::1]\"]",
+     "rewrites a relayed app's loopback redirect; binds nothing"),
+    ("crates/amux-server/src/api/static_files/public_links.rs", "h.eq_ignore_ascii_case(\"localhost\") || h == \"0.0.0.0\"",
+     "classifies a request Host as loopback; binds nothing"),
+    ("crates/amux-server/src/api/static_files/public_links.rs", "for lo in [\"localhost:8824\", \"127.0.0.1:8824\", \"[::1]:8824\", \"0.0.0.0\"]",
+     "test Host headers that must not yield a public origin; binds nothing"),
     ("scripts/amux-playwright-mcp.sh", "--host 0.0.0.0",
      "Linux systemd Playwright MCP wrapper; localhost resolves IPv6-only there (see CLAUDE.md); never runs on macOS"),
     ("scripts/rebuild-rust-base.sh", "never 0.0.0.0",
