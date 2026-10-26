@@ -208,8 +208,12 @@ wrapper preserves stdin, argument bytes, and the child's exit status. It never
 prints values; the child must also avoid printing its environment. The normal
 CLI endpoint discovery applies; `AMUX_API` overrides it. Delivery accepts HTTP or
 HTTPS at `localhost`, `127.0.0.1`, or `::1`, with no proxy or redirects. HTTPS
-verifies the server certificate using the active local `tls/connection.pem`
-bundle, or `tls/cert.pem` when no bundle exists; verification is never disabled. A stopped server fails closed.
+pins the peer's exact leaf certificate to the first certificate in the active
+local `tls/connection.pem` bundle, or `tls/cert.pem` when no bundle exists.
+This pin replaces CA/hostname verification, supporting both public DNS-only
+certificates and self-signed dev certificates over loopback. The TLS connection
+is opened and checked before sending the token header; a different certificate
+fails with `server_certificate_mismatch`. A stopped server fails closed.
 
 An owner registers each label in `$AMUX_HOME/secret-jobs.json` (default
 `~/.amux/secret-jobs.json`), a user-owned regular file with mode 0600:

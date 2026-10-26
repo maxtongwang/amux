@@ -6588,9 +6588,22 @@ try:
         cert = os.path.join(home, "tls", "connection.pem")
         if not os.path.exists(cert):
             cert = os.path.join(home, "tls", "cert.pem")
-        context = ssl.create_default_context(cafile=cert)
+        with open(cert) as stream:
+            first_cert = re.search(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+                                   stream.read(), re.DOTALL)
+        if first_cert is None:
+            fail("server_certificate_invalid")
+        pinned_der = ssl.PEM_cert_to_DER_cert(first_cert.group())
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        # Exact leaf-DER pinning below replaces CA and hostname verification.
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
         conn = http.client.HTTPSConnection(url.hostname, url.port,
                                           timeout=REQUEST_TIMEOUT_SECONDS, context=context)
+        conn.connect()
+        if conn.sock.getpeercert(binary_form=True) != pinned_der:
+            conn.close()
+            fail("server_certificate_mismatch")
     else:
         conn = http.client.HTTPConnection(url.hostname, url.port, timeout=REQUEST_TIMEOUT_SECONDS)
     conn.request("POST", "/api/vault/job-secrets", json.dumps({"job": args.job, "names": names}),

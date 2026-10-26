@@ -30,6 +30,13 @@ class SecretExecTests(unittest.TestCase):
         test = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            def handle(self):
+                try:
+                    super().handle()
+                except ConnectionResetError:
+                    # Pin refusal closes TLS before sending an HTTP request.
+                    pass
+
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 test.requests.append((self.path, body, self.headers["X-Amux-Worker-Token"]))
@@ -50,6 +57,11 @@ class SecretExecTests(unittest.TestCase):
         self.addCleanup(self.server.shutdown)
         self.env = dict(os.environ, HOME=str(home), CC_HOME=str(home), AMUX_HOME=str(home),
                         AMUX_ISOLATED_RUN="1", AMUX_API=f"http://127.0.0.1:{self.server.server_port}")
+        # Exercise the verb with the same Python interpreter as this test run.
+        bin_dir = home / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "python3").symlink_to(sys.executable)
+        self.env["PATH"] = str(bin_dir) + os.pathsep + self.env["PATH"]
         self.env.pop("AMUX_SESSION", None)
         self.env.pop("TMUX_PANE", None)
 
@@ -60,12 +72,12 @@ class SecretExecTests(unittest.TestCase):
         self.assertNotIn(SENTINEL, out.stdout + out.stderr)
         return out
 
-    def enable_tls(self):
+    def enable_tls(self, san="DNS:localhost,IP:127.0.0.1"):
         tls = Path(self.env["AMUX_HOME"]) / "tls"
         tls.mkdir()
         config = tls / "openssl.cnf"
         config.write_text("[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n"
-                          "[dn]\nCN=localhost\n[ext]\nsubjectAltName=DNS:localhost,IP:127.0.0.1\n")
+                          f"[dn]\nCN=amux.example.test\n[ext]\nsubjectAltName={san}\n")
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                         "-days", "1", "-config", str(config), "-keyout", str(tls / "key.pem"),
                         "-out", str(tls / "cert.pem")], check=True, capture_output=True)
@@ -75,7 +87,7 @@ class SecretExecTests(unittest.TestCase):
         return tls
 
     def test_discovered_https_without_amux_api(self):
-        self.enable_tls()
+        self.enable_tls(san="DNS:amux.example.test")
         # A scratch endpoint exercises production discovery; isolation deliberately
         # ignores endpoint.json, so disable that guard only in this scratch child.
         self.env["AMUX_ISOLATED_RUN"] = "0"
@@ -97,19 +109,29 @@ class SecretExecTests(unittest.TestCase):
     def test_https_verifies_certificate_and_active_bundle(self):
         tls = self.enable_tls()
         self.env["AMUX_API"] = f"https://localhost:{self.server.server_port}"
-        (tls / "connection.pem").write_bytes((tls / "cert.pem").read_bytes() + (tls / "key.pem").read_bytes())
+        leaf = (tls / "cert.pem").read_bytes()
+        (tls / "connection.pem").write_bytes(leaf + (tls / "key.pem").read_bytes())
         (tls / "cert.pem").unlink()
         out = self.run_cli(sys.executable, "-c", "print('trusted')")
         self.assertEqual(out.returncode, 0, out.stderr)
-        # A readable but unrelated trust anchor must also refuse the server.
+        self.requests.clear()
+        # A readable but unrelated trust anchor must refuse before any HTTP request.
         other_key = tls / "other-key.pem"
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                         "-days", "1", "-config", str(tls / "openssl.cnf"),
                         "-keyout", str(other_key), "-out", str(tls / "connection.pem")],
                        check=True, capture_output=True)
+        other = (tls / "connection.pem").read_bytes()
+        # A bundle pins its FIRST certificate, not any certificate in its chain.
+        (tls / "connection.pem").write_bytes(other + leaf)
         out = self.run_cli("unused-command")
         self.assertEqual(out.returncode, 1)
-        self.assertIn("server_unavailable", out.stderr)
+        self.assertIn("server_certificate_mismatch", out.stderr)
+        self.assertEqual(self.requests, [])
+        (tls / "connection.pem").write_bytes(leaf + other + (tls / "key.pem").read_bytes())
+        out = self.run_cli(sys.executable, "-c", "print('chain trusted')")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "chain trusted\n")
         self.assertEqual(len(self.requests), 1)
 
     def test_environment_argv_stdin_and_exit(self):

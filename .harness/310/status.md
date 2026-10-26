@@ -93,3 +93,25 @@ Starting head: `e6f63f1e3d092f826143eff9ab2b632fe31c3a2a`. Read both exact-head 
 Python discovery test disables only the CLI endpoint guard in its scratch child, because that guard deliberately ignores endpoint.json. HOME, CC_HOME, AMUX_HOME, endpoint and trust material all point to the temporary fixture; the outer test remains under amux-isolated. Rust TLS test uses the same scratch-only discovery pattern. No live endpoint or native configuration was touched.
 
 Rust commands are intentionally not attempted this round per brief. Caller must run workspace check/clippy, secret_jobs_api + vault_secrets_api and request-log tests before publishing/reviewing this new head. Prior-head passes do not verify these changes. Failure-history lookup again failed (exit 1, denied .lock); GitNexus index is unavailable. Raw new logs remain local and are not committed; existing evidence and lead directories are preserved. Commit only, no push.
+
+## Round 4 exact leaf pin
+
+Starting head: `57f1b62986de4e2fb91824328b98a8f5bb126d22`. Read the round-3 Sonnet report at the supplied absolute path. Its PASS did not cover the lead's subsequently reproduced production DNS-only certificate failure.
+
+Replaced hostname/CA trust with exact leaf-DER pinning using public Python ssl APIs. Read the FIRST PEM certificate from connection.pem (preferred) or cert.pem, explicitly connect TLS, compare the peer DER, and only then send the HTTP request and credential header. A mismatch closes the connection and emits the value-free `server_certificate_mismatch` diagnostic on stderr. Missing PEM certificate emits `server_certificate_invalid`. Self-signed certs and bundles with trailing certs/private keys work. No live cert, job token, config, installation, dependency, or Rust file changed.
+
+Class sweep: reviewed the complete PR diff for TLS clients, hostname verification and certificate use. secret-exec is the only added HTTPS client; the Rust integration fixture is a TLS server that executes that same CLI. Existing generic CLI clients are outside this change. Updated the vault docs; this section supersedes round 3's hostname-verification description.
+
+Regression evidence: current tests run against a temporary extraction of `57f1b6298:amux` fail both the DNS-only discovered HTTPS assertion and the named mismatch assertion (exit 1). The fixture uses SAN DNS:amux.example.test, scratch HOME/endpoint.json and no AMUX_API. Wrong-pin coverage puts the correct cert SECOND to prove only the first pins, and asserts zero HTTP requests. Reversing the bundle succeeds. Each test run now binds the verb's python3 to its test interpreter through a scratch-bin symlink, so testing Apple Python actually tests that CLI interpreter too.
+
+| Round 4 command | Exit | Result |
+| --- | --- | --- |
+| Isolated Python baseline extraction probe (two TLS tests) | 1 | Both assertions fail; `round4-before.log` |
+| `AMUX_ISOLATED_NO_SANDBOX=1 ~/.local/bin/amux-isolated python3 scripts/test-secret-exec.py` | 0 | Homebrew Python: 9 tests OK; `round4-python.log` |
+| `AMUX_ISOLATED_NO_SANDBOX=1 ~/.local/bin/amux-isolated /usr/bin/python3 scripts/test-secret-exec.py` | 0 | Apple Python: 9 tests OK; `round4-apple-python.log` |
+| `AMUX_ISOLATED_NO_SANDBOX=1 ~/.local/bin/amux-isolated bash -n amux` | 0 | Syntax valid |
+| `AMUX_ISOLATED_NO_SANDBOX=1 ~/.local/bin/amux-isolated scripts/test-cli-offset-safe.sh` | 0 | PASS |
+| `AMUX_ISOLATED_NO_SANDBOX=1 ~/.local/bin/amux-isolated scripts/test-cli-sourceable.sh` | 0 | PASS including negative control |
+| `git diff --check` | 0 | Clean |
+
+Rust checks intentionally left to the lead per brief; no Rust execution or new Rust green claimed. Failure-history search still exits 1 on denied .lock. GitNexus index remains unavailable. Existing unrelated evidence preserved. Commit-only handoff; caller owns publishing.
