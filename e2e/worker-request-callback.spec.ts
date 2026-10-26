@@ -1,7 +1,11 @@
+// Worker ownership fixtures — exercise API authorization without provider startup (refs ai-config #344).
+
 // Worker board ownership is an authorization boundary. Peer collaboration is
 // represented by reviewer/shepherd and evidence references. Another worker's
 // board cannot become an execution prerequisite or receive this worker's tasks.
 import { test, expect } from './fixtures';
+import { createMockWorker, deleteWorkerApi } from './lifecycle/evidence';
+import { cleanup } from './teardown';
 
 test('a worker creates only on its own board and links peers explicitly', async ({ page, request }, testInfo) => {
   await page.goto('/');
@@ -17,11 +21,7 @@ test('a worker creates only on its own board and links peers explicitly', async 
 
   try {
     for (const name of [owner, reviewer, shepherd]) {
-      const made = await request.post('/api/sessions', {
-        headers: auth,
-        data: { name, dir: '/tmp', tags: ['e2e-board-ownership'] },
-      });
-      expect(made.status(), `create ${name}`).toBe(201);
+      await createMockWorker(request, auth, name, { tags: ['e2e-board-ownership'] });
     }
 
     // Administrative setup creates a real task on the reviewer's board. The
@@ -107,10 +107,22 @@ test('a worker creates only on its own board and links peers explicitly', async 
     await expect(page.locator('#bd-key')).toHaveText(owned);
     await expect(page.locator('#bd-meta')).toContainText(reviewer);
   } finally {
-    if (owned) await request.delete(`/api/board/${encodeURIComponent(owned)}`, { headers: auth }).catch(() => {});
-    if (dependency) await request.delete(`/api/board/${encodeURIComponent(dependency)}`, { headers: auth }).catch(() => {});
+    if (owned) {
+      await cleanup(`delete card ${owned} for ${owner}`, async () => {
+        const response = await request.delete(`/api/board/${encodeURIComponent(owned)}`, { headers: auth });
+        expect(response.ok(), `delete card ${owned} for ${owner}: status=${response.status()} body=${await response.text()}`).toBeTruthy();
+      }, testInfo);
+    }
+    if (dependency) {
+      await cleanup(`delete card ${dependency} for ${reviewer}`, async () => {
+        const response = await request.delete(`/api/board/${encodeURIComponent(dependency)}`, { headers: auth });
+        expect(response.ok(), `delete card ${dependency} for ${reviewer}: status=${response.status()} body=${await response.text()}`).toBeTruthy();
+      }, testInfo);
+    }
     for (const name of [owner, reviewer, shepherd]) {
-      await request.delete(`/api/sessions/${name}`, { headers: auth }).catch(() => {});
+      await cleanup(`delete worker for ${name}`, async () => {
+        await deleteWorkerApi(page, request, auth, name);
+      }, testInfo);
     }
   }
 });
@@ -122,9 +134,7 @@ test('a worker cannot create an unassigned card to escape board ownership', asyn
   const owner = `board-owner-null-${testInfo.project.name}-${Date.now()}`;
 
   try {
-    expect((await request.post('/api/sessions', {
-      headers: auth, data: { name: owner, dir: '/tmp', tags: ['e2e-board-ownership'] },
-    })).status()).toBe(201);
+    await createMockWorker(request, auth, owner, { tags: ['e2e-board-ownership'] });
     const refused = await request.post('/api/board', {
       headers: { ...auth, 'X-Amux-Worker': owner },
       data: { title: 'Unassigned escape must fail', session: null, status: 'backlog' },
@@ -134,6 +144,8 @@ test('a worker cannot create an unassigned card to escape board ownership', asyn
       code: 'cross_board_create_forbidden', caller: owner, requested_owner: null,
     });
   } finally {
-    await request.delete(`/api/sessions/${owner}`, { headers: auth }).catch(() => {});
+    await cleanup(`delete worker for ${owner}`, async () => {
+      await deleteWorkerApi(page, request, auth, owner);
+    }, testInfo);
   }
 });

@@ -1,9 +1,12 @@
+// Worker configuration fixtures — test durable settings without provider startup (refs ai-config #344).
+
 // Worker Configurations is the one place an operator should be able to change
 // every durable worker setting, board automation, gates, terminal-state
 // availability, memory, rules, environment, skin, and connectors. This drives
 // the real dashboard and real Rust API against each project's throwaway home.
 import { test, expect } from './fixtures';
-import { getSessionsResilient } from './lifecycle/evidence';
+import { createMockWorker, getSessionsResilient, deleteWorkerApi } from './lifecycle/evidence';
+import { cleanup } from './teardown';
 
 test.setTimeout(60_000);
 
@@ -21,11 +24,7 @@ test('worker Configurations edits the full board lifecycle and every scoped capa
 
   const name = `config-${testInfo.project.name}-${Date.now()}`;
   try {
-    const created = await request.post('/api/sessions', {
-      headers: auth,
-      data: { name, dir: '/tmp', tags: ['e2e-configurations'] },
-    });
-    expect(created.status()).toBe(201);
+    await createMockWorker(request, auth, name, { tags: ['e2e-configurations'] });
 
     await page.reload();
     // CHAOS CELL: another worker can create pending permission grants while
@@ -176,6 +175,8 @@ test('worker Configurations edits the full board lifecycle and every scoped capa
     );
     expect(overflow).toBe(false);
   } finally {
-    await request.delete(`/api/sessions/${name}`, { headers: auth }).catch(() => {});
+    await cleanup(`delete worker for ${name}`, async () => {
+      await deleteWorkerApi(page, request, auth, name);
+    }, testInfo);
   }
 });
