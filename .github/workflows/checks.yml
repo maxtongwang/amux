@@ -61,15 +61,11 @@ jobs:
       - name: Browser evidence and lifecycle cleanup controls (AF-768, AF-773)
         run: |
           npm ci --ignore-scripts
-<<<<<<< HEAD
-          node --test tests/ci-e2e-evidence.test.mjs tests/worker-lifecycle-cleanup.test.mjs tests/e2e-teardown-ratchet.test.mjs tests/e2e-plan.test.mjs tests/e2e-worker-control.test.mjs
-=======
           # worker-lifecycle-cleanup.test.mjs launches a real Playwright run, so
           # the headless shell must be on the runner (it failed 2026-10-23:
           # "Executable doesn't exist ... chrome-headless-shell").
           npx playwright install --only-shell chromium
-          node --test tests/ci-e2e-evidence.test.mjs tests/worker-lifecycle-cleanup.test.mjs tests/e2e-teardown-ratchet.test.mjs tests/e2e-plan.test.mjs
->>>>>>> upstream/main
+          node --test tests/ci-e2e-evidence.test.mjs tests/worker-lifecycle-cleanup.test.mjs tests/e2e-teardown-ratchet.test.mjs tests/e2e-plan.test.mjs tests/e2e-worker-control.test.mjs
           npm run test:project-setup
           npm run test:outbox
           npm run test:offline
@@ -690,11 +686,7 @@ jobs:
       - name: land precheck verdict and attributed cancel
         run: |
           set -uo pipefail
-<<<<<<< HEAD
-          bash scripts/test-land-precheck-verdict.sh && bash scripts/test-land-cancel-for.sh && bash scripts/test-land-blame.sh && bash scripts/test-land-cancel-holder.sh && bash scripts/test-land-cancel-shared-checkout.sh && bash scripts/test-land-refusal-spares.sh && bash scripts/test-land-demote-sticks.sh && bash scripts/test-land-to-head.sh && bash scripts/test-land-resume-place.sh && bash scripts/test-land-shared-config-guard.sh && bash scripts/test-land-heal-core-worktree.sh && bash scripts/test-land-already-landed.sh && bash scripts/test-land-fast-gate.sh && bash scripts/test-land-fix-forward.sh && bash scripts/test-land-net-retry.sh && bash scripts/test-land-regenerate-scoped.sh && bash scripts/test-land-regenerate-reuse.sh && bash scripts/test-land-leg-summary.sh && bash scripts/test-land-window.sh && bash scripts/test-land-inflight-fixes.sh && bash scripts/test-lane-efficiency.sh && bash scripts/test-land-precheck-base.sh && bash scripts/test-board-close-tracking.sh && bash scripts/test-cli-stale-url.sh && bash scripts/test-cli-isolated-endpoint.sh && python3 scripts/test-endpoint-clients-isolated.py && bash scripts/test-pipeline-bottlenecks-throughput.sh && bash scripts/test-pipeline-bottlenecks-constraints.sh && python3 scripts/test-pipeline-bottlenecks-host.py
-=======
-          bash scripts/test-land-precheck-verdict.sh && bash scripts/test-land-cancel-for.sh && bash scripts/test-land-blame.sh && bash scripts/test-land-cancel-holder.sh && bash scripts/test-land-cancel-shared-checkout.sh && bash scripts/test-land-refusal-spares.sh && bash scripts/test-land-demote-sticks.sh && bash scripts/test-land-to-head.sh && bash scripts/test-land-resume-place.sh && bash scripts/test-land-shared-config-guard.sh && bash scripts/test-land-heal-core-worktree.sh && bash scripts/test-land-already-landed.sh && bash scripts/test-land-fast-gate.sh && bash scripts/test-land-fix-forward.sh && bash scripts/test-land-net-retry.sh && bash scripts/test-land-regenerate-scoped.sh && bash scripts/test-land-regenerate-reuse.sh && bash scripts/test-land-leg-summary.sh && bash scripts/test-land-window.sh && bash scripts/test-land-inflight-fixes.sh && bash scripts/test-lane-efficiency.sh && bash scripts/test-land-precheck-base.sh && bash scripts/test-land-guards.sh && bash scripts/test-ci-wait.sh && bash scripts/test-board-close-tracking.sh && bash scripts/test-cli-stale-url.sh && bash scripts/test-pipeline-bottlenecks-throughput.sh && bash scripts/test-pipeline-bottlenecks-constraints.sh && python3 scripts/test-pipeline-bottlenecks-host.py
->>>>>>> upstream/main
+          bash scripts/test-land-precheck-verdict.sh && bash scripts/test-land-cancel-for.sh && bash scripts/test-land-blame.sh && bash scripts/test-land-cancel-holder.sh && bash scripts/test-land-cancel-shared-checkout.sh && bash scripts/test-land-refusal-spares.sh && bash scripts/test-land-demote-sticks.sh && bash scripts/test-land-to-head.sh && bash scripts/test-land-resume-place.sh && bash scripts/test-land-shared-config-guard.sh && bash scripts/test-land-heal-core-worktree.sh && bash scripts/test-land-already-landed.sh && bash scripts/test-land-fast-gate.sh && bash scripts/test-land-fix-forward.sh && bash scripts/test-land-net-retry.sh && bash scripts/test-land-regenerate-scoped.sh && bash scripts/test-land-regenerate-reuse.sh && bash scripts/test-land-leg-summary.sh && bash scripts/test-land-window.sh && bash scripts/test-land-inflight-fixes.sh && bash scripts/test-lane-efficiency.sh && bash scripts/test-land-precheck-base.sh && bash scripts/test-land-guards.sh && bash scripts/test-ci-wait.sh && bash scripts/test-board-close-tracking.sh && bash scripts/test-cli-stale-url.sh && bash scripts/test-cli-isolated-endpoint.sh && python3 scripts/test-endpoint-clients-isolated.py && bash scripts/test-pipeline-bottlenecks-throughput.sh && bash scripts/test-pipeline-bottlenecks-constraints.sh && python3 scripts/test-pipeline-bottlenecks-host.py
       - name: a lane resumes its own conversation, never whichever peer ran here last
         run: |
           set -uo pipefail

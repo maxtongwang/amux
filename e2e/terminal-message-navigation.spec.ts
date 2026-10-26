@@ -1,8 +1,6 @@
-<<<<<<< HEAD
+// Terminal message navigation — peek filters and jumps between messages in a worker terminal, end to end.
 import { test, expect, Page, peekFilterProbe } from './operands';
-=======
-import { test, expect, Page, allowUnusedRoute } from './fixtures';
->>>>>>> upstream/main
+import { allowUnusedRoute } from './fixtures';
 
 async function sourceFilter(page: Page, kind: string) {
   await page.getByRole('button', {name:'Filter messages', exact:true}).click();

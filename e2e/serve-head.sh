@@ -52,11 +52,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}"
 _scrubbed=""
 for _k in ${!AMUX_@}; do
   case "$_k" in
-<<<<<<< HEAD
-    AMUX_HOME|AMUX_BIND|AMUX_RS_PORT|AMUX_RS_NO_LOOPBACK_BYPASS|AMUX_NO_SELF_ADOPT|AMUX_VAULT_KEYSTORE|AMUX_DASHBOARD_DIR|AMUX_E2E_*) ;;
-=======
-    AMUX_HOME|AMUX_RS_PORT|AMUX_RS_NO_LOOPBACK_BYPASS|AMUX_NO_SELF_ADOPT|AMUX_VAULT_KEYSTORE|AMUX_DASHBOARD_DIR|AMUX_GEMINI_BASE|AMUX_E2E_*) ;;
->>>>>>> upstream/main
+    AMUX_HOME|AMUX_BIND|AMUX_RS_PORT|AMUX_RS_NO_LOOPBACK_BYPASS|AMUX_NO_SELF_ADOPT|AMUX_VAULT_KEYSTORE|AMUX_DASHBOARD_DIR|AMUX_GEMINI_BASE|AMUX_E2E_*) ;;
     *) unset "$_k"; _scrubbed="$_scrubbed $_k" ;;
   esac
 done
@@ -124,7 +120,17 @@ export AMUX_NO_SELF_ADOPT=1
 # not turn monitoring into a silent absence.
 export AMUX_ISOLATED=1
 
-<<<<<<< HEAD
+# AMUX_ISOLATED stops the loops, not the fleet reads. Started from a worker's
+# pane, this server inherited $TMUX and the fleet shim on PATH, so it listed
+# and captured every real worker's pane (about 15 wrapper processes a sweep,
+# 274% CPU averaged over 30s on 2026-10-26, cpu RCA 20261026-100223) and made
+# any session a test created in the fleet's own tmux server. It gets a private
+# tmux server in its throwaway home instead.
+unset TMUX TMUX_PANE
+export TMUX_TMPDIR="$AMUX_HOME/tmux"
+mkdir -p "$TMUX_TMPDIR"
+echo "[e2e] tmux: a private server under $TMUX_TMPDIR, so the fleet's panes are not read or written (verdict=e2e_tmux_private)."
+
 # BUILT THROUGH safe-cargo, then exec'd (DMIW-7). This was `exec cargo run`, the
 # one build path in the repo that skipped the wrapper: no budget, no reclaim on an
 # over-cap target, no concurrency slot. The target dir is unchanged (AMUX-2961
@@ -139,18 +145,6 @@ serve_built() {
   fi
   exec "$CARGO_TARGET_DIR/debug/amux-server"
 }
-=======
-# AMUX_ISOLATED stops the loops, not the fleet reads. Started from a worker's
-# pane, this server inherited $TMUX and the fleet shim on PATH, so it listed
-# and captured every real worker's pane (about 15 wrapper processes a sweep,
-# 274% CPU averaged over 30s on 2026-10-26, cpu RCA 20261026-100223) and made
-# any session a test created in the fleet's own tmux server. It gets a private
-# tmux server in its throwaway home instead.
-unset TMUX TMUX_PANE
-export TMUX_TMPDIR="$AMUX_HOME/tmux"
-mkdir -p "$TMUX_TMPDIR"
-echo "[e2e] tmux: a private server under $TMUX_TMPDIR, so the fleet's panes are not read or written (verdict=e2e_tmux_private)."
->>>>>>> upstream/main
 
 dirty="$(git -C "$REPO" status --porcelain -- crates/ Cargo.toml Cargo.lock 2>/dev/null || true)"
 

@@ -852,7 +852,6 @@ test('Draw: saving recents keeps entries another tab wrote', async ({ page, requ
   });
 });
 
-<<<<<<< HEAD
 // The lost update itself, made deterministic: this tab's save has read the
 // file and its PUT is held while another tab writes. The held write must not
 // erase that entry (the server refuses it on the changed ETag and the merge
@@ -965,7 +964,9 @@ test('Draw: recents that cannot be saved stay pending and say so, then save on t
     expect(disk.find((x: any) => x.path === mine)?.ts, 'the next change saved the pending entry').toBe(want);
     await expect(note).toHaveText('');
     expect(await page.evaluate(() => (window as unknown as Win)._draw.recentsUnsaved)).toBe(false);
-=======
+  });
+});
+
 // Library management (Ethan, 2026-10-18): rename and delete drawings and
 // components from the library, open the folder in Files, and pick the folder
 // new drawings go to. Every check reads the disk or the stored pref.
@@ -1151,6 +1152,5 @@ test('Draw: a failed save retries, and unsaved edits survive a reload', async ({
     await page.locator('#draw-conflict').getByRole('button', { name: 'Keep mine' }).click();
     await expect.poll(() => diskIds(p), { timeout: 15_000 }).toEqual(['base', 'one', 'stale-edit', 'two']);
     await expect.poll(draft).toBeNull();
->>>>>>> upstream/main
   });
 });

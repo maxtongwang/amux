@@ -14,13 +14,8 @@ import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { mkdtemp, readFile, rm, writeFile, mkdir, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-<<<<<<< HEAD
-import type { Page } from '@playwright/test';
-import { test, expect } from './operands';
-=======
 import type { APIRequestContext, Page } from '@playwright/test';
-import { test, expect } from './fixtures';
->>>>>>> upstream/main
+import { test, expect } from './operands';
 import { cleanup } from './teardown';
 
 // `hold`, when set, keeps this spec's node answers waiting until released: a
@@ -33,10 +28,8 @@ type Mode = { delayMs: number; fail?: string; hold?: Promise<void> };
 async function fakeMessagesApi() {
   const mode: Mode = { delayMs: 0 };
   const prompts: string[] = [];
-<<<<<<< HEAD
   let heldNow = 0;
   let releaseHeld: (() => void) | null = null;
-=======
   // `mdai_api_base` is a server-wide pref, and other model helpers share the
   // server's ApiModel: a skills spec running beside this one on the same
   // project server saved a skill, and its example-inference calls landed here
@@ -47,31 +40,21 @@ async function fakeMessagesApi() {
   // recorded apart and refused the way the real provider refuses the e2e
   // home's non-secret key.
   const foreign: string[] = [];
->>>>>>> upstream/main
   const server: Server = createServer(async (req: IncomingMessage, res) => {
     let body = '';
     for await (const chunk of req) body += chunk;
     if (req.method !== 'POST' || !req.url?.endsWith('/v1/messages')) { res.writeHead(404).end(); return; }
     const prompt = JSON.parse(body).messages?.[0]?.content || '';
-<<<<<<< HEAD
-    // `mdai_api_base` is a server-wide pref, so other model callers in a spec
-    // running alongside this one (skill example inference on a skill save)
-    // reach this stand-in too. Count only this spec's node: every node prompt
-    // carries its instruction. Others get an answer and are not counted.
-    const node = String(prompt).includes('"Where I Left Off" dashboard');
-    if (node) prompts.push(prompt);
-    if (node && mode.hold) {
-      heldNow++;
-      try { await mode.hold; } finally { heldNow--; }
-    }
-=======
     if (!String(prompt).includes(NODE_MARK)) {
       foreign.push(String(prompt).slice(0, 200));
       res.writeHead(401, { 'content-type': 'application/json' }).end(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key (stand-in: not an MDAI node prompt)' } }));
       return;
     }
     prompts.push(prompt);
->>>>>>> upstream/main
+    if (mode.hold) {
+      heldNow++;
+      try { await mode.hold; } finally { heldNow--; }
+    }
     const { delayMs, fail } = mode;
     setTimeout(() => {
       if (res.destroyed) return;
@@ -87,7 +70,6 @@ async function fakeMessagesApi() {
   });
   await new Promise<void>(r => server.listen(0, '127.0.0.1', () => r()));
   const port = (server.address() as { port: number }).port;
-<<<<<<< HEAD
   // Hold this spec's node answers until the returned release() runs.
   const hold = () => {
     let open!: () => void;
@@ -96,13 +78,10 @@ async function fakeMessagesApi() {
     return releaseHeld;
   };
   return {
-    url: `http://127.0.0.1:${port}`, mode, prompts, hold, held: () => heldNow,
+    url: `http://127.0.0.1:${port}`, mode, prompts, foreign, hold, held: () => heldNow,
     // A held answer is released before the server goes, so no handler outlives the spec.
     close: () => new Promise<void>(r => { releaseHeld?.(); server.closeAllConnections(); server.close(() => r()); }),
   };
-=======
-  return { url: `http://127.0.0.1:${port}`, mode, prompts, foreign, close: () => new Promise<void>(r => { server.closeAllConnections(); server.close(() => r()); }) };
->>>>>>> upstream/main
 }
 
 // Every node prompt carries the instruction (the run assertions below check
@@ -348,9 +327,10 @@ test('MDAI: create and configure a node entirely in the UI, every field round-tr
     await page.screenshot({ path: info.outputPath('mdai-preview.png') });
 
     // ---- Reload mid-run: the run is found again, then finishes ------------------
-<<<<<<< HEAD
     // The model answer is HELD until the reopened page has shown the run, so
-    // "found again" is asserted while the run is provably still in flight.
+    // "found again" is asserted while the run is provably still in flight
+    // (a fixed delay did not outlast reload plus reopen on a slow iOS runner:
+    // 4 s on 941fd8044, 2026-10-16).
     api.mode.delayMs = 0;
     const releaseRun = api.hold();
     try {
@@ -366,19 +346,6 @@ test('MDAI: create and configure a node entirely in the UI, every field round-tr
     } finally {
       releaseRun();
     }
-=======
-    // Long enough to outlast a reload plus reopening the node on a slow iOS
-    // runner (4 s did not, 2026-10-16 run on 941fd8044); completion is awaited
-    // with a 20 s budget below.
-    api.mode.delayMs = 9000;
-    await editInstruction(page);
-    await page.locator('#mdai-run-btn').click();
-    await expect(page.locator('#mdai-runbanner.mdai-runbanner')).toBeVisible();
-    await page.reload();
-    await page.evaluate(() => (window as any).switchView('mdai'));
-    await openNodeFromList(page);
-    await expect(page.locator('#mdai-runbanner.mdai-runbanner')).toBeVisible();
->>>>>>> upstream/main
     await expect(page.locator('#mdai-runbanner.mdai-runbanner')).toHaveCount(0, { timeout: 20_000 });
     expect(api.held()).toBe(0);
     await tab(page, 'runs');
@@ -423,14 +390,11 @@ test('MDAI: create and configure a node entirely in the UI, every field round-tr
     await expect(page.locator('#mdai-list')).toContainText('No MDAI nodes yet');
     await expect(access(join(dir, 'team', 'Resume.mdai'))).rejects.toThrow();
   } finally {
-<<<<<<< HEAD
-    await cleanup('capture F01 operands', () => ops.capture('finally')); // before the prefs and folder below are restored
-=======
     if (api.foreign.length) {
       console.log(`[mdai-pages] ${api.foreign.length} non-node model call(s) reached the stand-in and were not counted: ${JSON.stringify(api.foreign.map(p => p.slice(0, 80)))}`);
       info.annotations.push({ type: 'foreign-model-calls', description: String(api.foreign.length) });
     }
->>>>>>> upstream/main
+    await cleanup('capture F01 operands', () => ops.capture('finally')); // before the prefs and folder below are restored
     await cleanup('restore MDAI prefs', () => Promise.all([pref('mdai_root', prior[0]), pref('mdai_api_base', prior[1])]));
     await cleanup('stop the stand-in Messages API', () => api.close());
     await cleanup('remove temp folder', () => rm(dir, { recursive: true, force: true }));

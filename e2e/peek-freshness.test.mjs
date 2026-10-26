@@ -1,3 +1,4 @@
+// Peek freshness — runs the real app.js peek code in a VM to prove late or stale frames cannot rewind the view.
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -43,12 +44,9 @@ function fixture() {
   });
   // Exercise the real cache painter newly called by refreshPeek, too.
   vm.runInContext(source.slice(source.indexOf('function _paintCachedPeek('), source.indexOf('// ── Worker types')),ctx);
-<<<<<<< HEAD
   vm.runInContext(source.slice(source.indexOf('function _peekFrameApplied('), source.indexOf('function _checkViewFreshness(')),ctx);
-=======
   // The scrollback window that history paints through (b920ec409), also real.
   vm.runInContext(source.slice(source.indexOf('const _PEEK_HIST_DRAWN_LINES'), source.indexOf('function _peekEarlierHTML(')),ctx);
->>>>>>> upstream/main
   vm.runInContext(code,ctx);
   ctx._resetPeekRequests();
   return {ctx,calls,beacons,body,status,timers,advance(ms){clock+=ms;},switchWorker(name){generation++;ctx.peekSession=name;ctx._resetPeekRequests();}};

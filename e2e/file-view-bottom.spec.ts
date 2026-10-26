@@ -386,53 +386,22 @@ test('a late directory response cannot replace the folder a split pane moved to'
     await writeFile(join(oldDir,'OLD_DIR_MUST_NOT_REPLACE_CURRENT.md'),'x');await writeFile(join(curDir,'current-folder.md'),'y');
     await page.setViewportSize(sizes[0]);await openSplitWorker(page,root);
     await page.evaluate(()=>(window as any)._peekSplitOpen('files'));
-<<<<<<< HEAD
-    for(const [matcher,start] of [
-      [/\/api\/ls\?path=/,() => page.evaluate(p=>{void (window as any)._psfLoad(p);},dir)],
-      [/\/api\/file\?path=.*old\.md/,() => page.evaluate(p=>{void (window as any)._psfViewFile(p);},oldFile)],
-    ] as const){
-      let release!:()=>void, arrived!:()=>void, completed!:()=>void;
-      const held=new Promise<void>(r=>release=r), seen=new Promise<void>(r=>arrived=r), done=new Promise<void>(r=>completed=r);
-      // EVERY request this route matched is owned by this test, not just the
-      // first: the view can issue a second matching /api/ls, and its handler
-      // was still inside route.fetch() when the old unroute returned, so it
-      // threw "Test ended" into the NEXT test (F10: stack at this test, failure
-      // reported at the next). Each handler is tracked, its error kept here, and
-      // all of them are drained before this iteration ends.
-      const handlers:Promise<void>[]=[], handlerErrors:string[]=[];
-      await page.route(matcher,route=>{
-        const handled=(async()=>{
-          const response=await route.fetch();arrived();await held;
-          await route.fulfill({response});completed();
-        })().catch(e=>{handlerErrors.push(String(e?.message??e).split('\n')[0]);});
-        handlers.push(handled);
-        return handled;
-      });
-      const drain=async()=>{await page.unroute(matcher);await Promise.all(handlers);};
-      try{
-        await start();await seen;
-        await page.evaluate(p=>(window as any)._psfViewFile(p),currentFile);
-        await expect(page.locator('#psf-body')).toContainText(end);
-        const beacon=page.waitForRequest(r=>r.url().endsWith('/api/client-debug')&&r.postDataJSON()?.kind==='file-split-stale-response',{timeout:5000});
-        release();await done;expect((await beacon).postDataJSON().verdict).toBe('discarded');
-        await expect(page.locator('#psf-body')).toContainText(end);
-        await expect(page.locator('#psf-body')).not.toContainText('OLD_FILE_MUST_NOT_REPLACE_CURRENT');
-        await finalLine(page,'#psf-body .file-overlay-body');
-        // Drained inside the test body, so a handler failure fails THIS test.
-        await drain();
-        expect(handlerErrors,`held ${String(matcher)} handlers (${handlers.length}) all completed`).toEqual([]);
-      }finally{release();await cleanup('drain held route handlers', drain);}
-    }
-  }finally { await cleanup('remove temp folder', () => rm(dir,{recursive:true,force:true})); }
-=======
     const pane=page.frameLocator('#psp-frame');await pane.locator('#files-body').waitFor();
     const key='/api/ls?path='+encodeURIComponent(oldDir);
     let release!:()=>void, arrived!:()=>void, completed!:()=>void, taken=false;
     const held=new Promise<void>(r=>release=r), seen=new Promise<void>(r=>arrived=r), done=new Promise<void>(r=>completed=r);
-    await page.route(/\/api\/ls\?path=/,async route=>{
+    // The held handler is owned by this test: a handler still inside
+    // route.fetch() when unroute returns throws "Test ended" into the NEXT test
+    // (F10). Its error is kept here and it is drained before the test ends.
+    let handled:Promise<void>=Promise.resolve();const handlerErrors:string[]=[];
+    await page.route(/\/api\/ls\?path=/,route=>{
       if(taken||!route.request().url().includes(key)) return route.fallback();
-      taken=true;const response=await route.fetch();arrived();await held;await route.fulfill({response});completed();
+      taken=true;
+      handled=(async()=>{const response=await route.fetch();arrived();await held;await route.fulfill({response});completed();})()
+        .catch(e=>{handlerErrors.push(String(e?.message??e).split('\n')[0]);});
+      return handled;
     });
+    const drain=async()=>{await page.unroute(/\/api\/ls\?path=/);await handled;};
     try{
       await pane.locator('html').evaluate((el,p)=>{void (el.ownerDocument.defaultView as any).loadFiles(p);},oldDir);await seen;
       await pane.locator('html').evaluate((el,p)=>(el.ownerDocument.defaultView as any).loadFiles(p),curDir);
@@ -440,9 +409,11 @@ test('a late directory response cannot replace the folder a split pane moved to'
       release();await done;
       await expect(pane.locator('#files-body')).toContainText('current-folder.md');
       await expect(pane.locator('#files-body')).not.toContainText('OLD_DIR_MUST_NOT_REPLACE_CURRENT');
-    }finally{release();await cleanup('unroute held response', () => page.unroute(/\/api\/ls\?path=/));}
+      // Drained inside the test body, so a handler failure fails THIS test.
+      await drain();
+      expect(handlerErrors,'the held /api/ls handler completed').toEqual([]);
+    }finally{release();await cleanup('drain held route handler', drain);}
   }finally { await cleanup('remove temp folder', () => rm(root,{recursive:true,force:true})); }
->>>>>>> upstream/main
 });
 
 test('capped PDF and large text disclose their limits and download the complete original',async({page})=>{
