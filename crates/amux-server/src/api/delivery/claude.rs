@@ -443,6 +443,19 @@ async fn prepare(
                     continue;
                 }
             };
+            let connection = match CallbackConnection::new(stream) {
+                Ok(connection) => connection,
+                Err(reason) => {
+                    tracing::warn!(
+                        reason,
+                        measured = true,
+                        n_considered = 1,
+                        verdict = "native_reply_credentials_unavailable",
+                        "callback connection refused; receipts stay unconfirmed"
+                    );
+                    continue;
+                }
+            };
             let Ok(permit) = slots.clone().try_acquire_owned() else {
                 tracing::warn!(
                     measured = true,
@@ -455,7 +468,7 @@ async fn prepare(
             let (host, store) = (host.clone(), store.clone());
             tokio::spawn(async move {
                 let _permit = permit;
-                receive_callback(stream, host, store).await;
+                receive_callback(connection, host, store).await;
             });
         }
     });
@@ -478,13 +491,29 @@ impl Drop for ConsumerGuard {
     }
 }
 
-async fn receive_callback(
-    mut stream: UnixStream,
+/// Snapshot kernel credentials at accept: macOS can lose LOCAL_PEERPID once
+/// the peer fully closes, even while its callback bytes remain buffered.
+pub(super) struct CallbackConnection {
+    stream: UnixStream,
+    peer: (u32, u32),
+}
+impl CallbackConnection {
+    pub fn new(stream: UnixStream) -> Result<Self, &'static str> {
+        let peer = system::peer(&stream)?;
+        Ok(Self { stream, peer })
+    }
+}
+
+pub(super) async fn receive_callback(
+    connection: CallbackConnection,
     host: Arc<dyn Host>,
     store: crate::db::SharedStore,
 ) {
+    let CallbackConnection {
+        mut stream,
+        peer: (pid, uid),
+    } = connection;
     let result = async {
-        let (pid, uid) = system::peer(&stream)?;
         if uid != host.uid() {
             return Err("callback_uid");
         }
@@ -539,11 +568,9 @@ async fn receive_callback(
         Ok(Err(r)) => r,
         Err(_) => "callback_timeout",
     };
-    if let Ok((pid, uid)) = system::peer(&stream) {
-        if uid == host.uid() {
-            if let Ok(peer) = host.process(pid) {
-                ledger::quarantine_peer(&store, peer, reason).await;
-            }
+    if uid == host.uid() {
+        if let Ok(peer) = host.process(pid) {
+            ledger::quarantine_peer(&store, peer, reason).await;
         }
     }
     tracing::warn!(

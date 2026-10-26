@@ -784,6 +784,85 @@ async fn socket_fixture() -> (
     (dir, store, host, target, listener)
 }
 
+async fn fully_closed_callback(
+    listener: &UnixListener,
+    bytes: &[u8],
+) -> claude::CallbackConnection {
+    let path = listener.local_addr().unwrap();
+    let (mut peer, (stream, _)) = tokio::try_join!(
+        UnixStream::connect(path.as_pathname().unwrap()),
+        listener.accept()
+    )
+    .unwrap();
+    let connection = claude::CallbackConnection::new(stream).unwrap();
+    peer.write_all(bytes).await.unwrap();
+    // This is the ordering barrier: fully close, not just shutdown(Write),
+    // before the caller can start receive_callback. No sleeps or polling.
+    drop(peer);
+    connection
+}
+
+#[tokio::test]
+async fn fully_closed_callback_confirms_a_valid_receipt() {
+    let (_dir, store, host, target, listener) = socket_fixture().await;
+    let mut a = attempt(None);
+    a.endpoint = target.socket.to_string_lossy().into();
+    let row = a.clone();
+    fixture_write(&store, move |c| fixture_row(c, &row));
+    assert!(ledger::mark_write(&store, &a.id).await.unwrap());
+    let bytes = format!("{}\n{}\n", status(&a, "held"), status(&a, "delivered"));
+    let connection = fully_closed_callback(&listener, bytes.as_bytes()).await;
+    claude::receive_callback(connection, host, store.clone()).await;
+    let c = store.read().unwrap();
+    assert_eq!(
+        ledger::find(&c, &a.session, &a.source_key)
+            .unwrap()
+            .unwrap()
+            .state,
+        ReceiptState::Admitted,
+        "buffered receipts must use credentials captured before the peer closed"
+    );
+    assert_eq!(
+        c.query_row("SELECT count(*) FROM native_delivery_quarantine", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn fully_closed_callback_quarantines_an_uncorrelated_receipt() {
+    let (_dir, store, host, target, listener) = socket_fixture().await;
+    let mut a = attempt(None);
+    a.endpoint = target.socket.to_string_lossy().into();
+    let row = a.clone();
+    fixture_write(&store, move |c| fixture_row(c, &row));
+    assert!(ledger::mark_write(&store, &a.id).await.unwrap());
+    let mut frame = status(&a, "held");
+    frame["orig_msg_id"] = json!(uuid());
+    let connection = fully_closed_callback(&listener, frame.to_string().as_bytes()).await;
+    claude::receive_callback(connection, host.clone(), store.clone()).await;
+    let c = store.read().unwrap();
+    assert_eq!(
+        ledger::find(&c, &a.session, &a.source_key)
+            .unwrap()
+            .unwrap()
+            .state,
+        ReceiptState::WrittenUnconfirmed
+    );
+    assert_eq!(
+        c.query_row(
+            "SELECT reason FROM native_delivery_quarantine WHERE endpoint_key=?1",
+            [system::profile_key(&host.0)],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "callback_identity_or_correlation",
+        "quarantine must use the same accept-time credentials after EOF"
+    );
+}
+
 #[tokio::test]
 async fn fake_uds_eof_is_written_unconfirmed_and_reverse_hold_release_is_correlated() {
     let (_dir, store, host, target, listener) = socket_fixture().await;
