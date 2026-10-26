@@ -1946,6 +1946,18 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET"],
     },
     RouteEntry {
+        path: "/api/vault/grants",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/vault/grants/{id}/revoke",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/vault/grants/{id}/regrant",
+        methods: &["POST"],
+    },
+    RouteEntry {
         path: "/api/chat-delegate",
         methods: &["GET", "POST"],
     },
