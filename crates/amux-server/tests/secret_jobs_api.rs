@@ -216,6 +216,8 @@ async fn registered_jobs_are_scoped_authenticated_and_never_logged_as_values() {
     let credential = home.join("job-tokens/com.test.allowed.token");
     std::fs::write(&credential, JOB_TOKEN).unwrap();
     std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // The server installs this provider at startup (lib.rs); this test builds its own listener.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let material = amux_server::tls::load_or_generate(&home.join("tls")).unwrap();
     let config = axum_server::tls_rustls::RustlsConfig::from_pem(
         material.cert_pem.into_bytes(),
