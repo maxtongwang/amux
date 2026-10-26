@@ -999,6 +999,21 @@ async fn finish_turn(
 /// not summarised by a model: status, the card it is on, what waits on the
 /// owner, board counts and trend, git state and its last reply. The companion
 /// reaches deeper with the amux CLI and directs the worker with `amux send`.
+/// Marks a Chat tab turn for ai-config's `amux send` guard (Max, 2026-10-26:
+/// "we should ban amux send"). The companion relays the owner's instruction,
+/// has no SendMessage tool, and is a server-side sender, so the guard lets it
+/// through (dev-lead decision, ai-config #394).
+pub(crate) const CHAT_COMPANION_ENV: &str = "AMUX_CHAT_COMPANION";
+
+/// The shell prelude of a Chat tab turn: its worker's prelude, then its own
+/// identity and the companion marker.
+fn companion_prelude(worker_prelude: &str, name: &str) -> String {
+    format!(
+        "{worker_prelude}export AMUX_SESSION={key}; export AMUX_WORKER={key}; export {CHAT_COMPANION_ENV}=1; ",
+        key = sh_quote(name)
+    )
+}
+
 pub(crate) async fn companion_prompt(state: &AppState, worker: &str, fresh: bool, text: &str) -> String {
     let wenv = parse_env(worker);
     let dir = wenv.get_or("CC_DIR", "").to_string();
@@ -1484,10 +1499,9 @@ async fn execute(
         // The Chat tab runs with its worker's scope settings (credentials,
         // env) but under its own identity, so an `amux send` it makes is
         // stamped as the worker's Chat tab (see owner_relay_quote).
-        Some(worker) => format!(
-            "{}export AMUX_SESSION={key}; export AMUX_WORKER={key}; ",
-            super::session_verbs::headless_turn_prelude(worker, provider, &work_dir),
-            key = sh_quote(name)
+        Some(worker) => companion_prelude(
+            &super::session_verbs::headless_turn_prelude(worker, provider, &work_dir),
+            name,
         ),
         None => super::session_verbs::headless_turn_prelude(name, provider, &work_dir),
     };
@@ -2336,6 +2350,16 @@ fn interrupt_turn(name: &str) -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chat_tab_turn_carries_the_companion_marker_for_the_send_guard() {
+        // ai-config's amux-send guard exempts only a process with this marker.
+        let p = companion_prelude("cd /w; ", "w@chat");
+        assert!(p.starts_with("cd /w; "), "{p}");
+        assert!(p.contains("export AMUX_SESSION='w@chat'") || p.contains("export AMUX_SESSION=w@chat"), "{p}");
+        assert!(p.ends_with("export AMUX_CHAT_COMPANION=1; "), "{p}");
+        assert_eq!(CHAT_COMPANION_ENV, "AMUX_CHAT_COMPANION");
+    }
 
     #[test]
     fn chat_tab_key_belongs_to_its_worker_and_no_worker_can_own_it() {
