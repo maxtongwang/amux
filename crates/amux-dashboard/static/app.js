@@ -27753,6 +27753,14 @@ async function _filesTargetDir(action) {
   } catch(e) {}
 })();
 function setFilesCwd() {
+  // Before the saved home loads and with no explicit navigation, _filesPath is
+  // only the "/" placeholder; saving it would overwrite the real home with "/".
+  // Stays synchronous so the request keeps its pressed feedback.
+  if (!_filesCwdSettled && !_filesLoadGeneration) {
+    _filesClientDiagnostic({kind:'files_target_dir',action:'set_home',waited:false,refused:true,measured:true,n_considered:1,ver:APP_VER});
+    showToast('Home folder is still loading');
+    return;
+  }
   _filesCwd = _filesPath;
   fetch(API + '/api/prefs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({key:'files_cwd', value:_filesCwd})}).catch(()=>{});
   _updateFilesCwdBtn();
@@ -30205,7 +30213,7 @@ async function _mdaiNewFile(dirOrOpts) {
   let dir = null, silent = false, noOpen = false;
   if (typeof dirOrOpts === 'string') dir = dirOrOpts;
   else if (dirOrOpts) { dir = dirOrOpts.dir || null; silent = !!dirOrOpts.silent; noOpen = !!dirOrOpts.noOpen; }
-  if (!noOpen) { _mdaiCreatePage({ dir: dir || ((activeView === 'files' && _filesPath && !_exploreSession) ? _filesPath : null) }); return null; }
+  if (!noOpen) { _mdaiCreatePage({ dir: dir || ((activeView === 'files' && !_exploreSession) ? await _filesTargetDir('mdai_new_page') : null) }); return null; }
   if (!dir) dir = _mdaiRoot();
   const raw = prompt('New .mdai node name (e.g. weekly-brief.mdai):', 'node.mdai');
   if (!raw || !raw.trim()) return null;
