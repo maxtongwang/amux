@@ -44,7 +44,7 @@ holds no values.
 
 ## API
 
-All under `/api/vault/secrets`. No response but `reveal` carries a value.
+All under `/api/vault/secrets`. Only `reveal` and the separately authenticated job delivery route below carry values.
 
 | Method and path | Who | What |
 | --- | --- | --- |
@@ -198,3 +198,111 @@ a value: `vault_secret_added`, `vault_secret_updated`, `vault_secret_rotated`,
   plaintext; import is opt-in per key.
 - herdr-backed workers: `running` is read from tmux, so a herdr worker reads as
   not running (`next_launch`) in the access view.
+
+## Launchd job secrets
+
+`amux secret-exec --job <label> --names A,B -- <command> [args...]` fetches only
+those names, then replaces itself with the command using an argument vector and
+child environment. Requires Python 3 (the existing Bash CLI dependency). The
+wrapper preserves stdin, argument bytes, and the child's exit status. It never
+prints values; the child must also avoid printing its environment. The normal
+CLI endpoint discovery applies, but delivery accepts only an HTTP literal
+loopback address, with no proxy or redirects. A stopped server fails closed.
+
+An owner registers each label in `$AMUX_HOME/secret-jobs.json` (default
+`~/.amux/secret-jobs.json`), a user-owned regular file with mode 0600:
+
+```json
+{
+  "jobs": [
+    {
+      "label": "com.example.buyer-match",
+      "groups": ["business"],
+      "allowed_names": ["MAX_APILLOW_API_KEY"],
+      "token_sha256": "<64 lowercase hex characters: SHA-256 of the token>"
+    }
+  ]
+}
+```
+
+The server only reads this registry. There is no registration, self-approval, or
+scope-override API. Groups are lowercase; labels and allowed names must be unique
+within their respective lists. Existing one-shot `grants.rs` permissions do not
+widen a job's standing allowlist or group scope. Registry removal revokes the
+next request immediately. Rotation replaces the token and hash; it does not
+change a running child's environment.
+
+Registration is an owner operation on disk, outside workers' writable sandbox.
+Generate a fresh 32-byte random token as 64 lowercase hex characters, save it
+without a newline to `job-tokens/<label>.token` (0600), and store its SHA-256 in
+the registry. This example prepares a **new** credential and approval entry in
+an existing amux home; the owner chooses the label, groups and names first:
+
+```python
+import hashlib, json, os, pathlib, secrets, tempfile
+home = pathlib.Path(os.environ.get("AMUX_HOME", pathlib.Path.home() / ".amux"))
+label = "com.example.buyer-match"
+groups = ["business"]
+names = ["MAX_APILLOW_API_KEY"]
+registry = home / "secret-jobs.json"
+entries = json.loads(registry.read_text()) if registry.exists() else {"jobs": []}
+assert not any(j["label"] == label for j in entries["jobs"]), "already registered"
+tokens = home / "job-tokens"
+tokens.mkdir(mode=0o700, exist_ok=True)
+token = secrets.token_hex(32)
+fd = os.open(tokens / (label + ".token"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as stream:
+    stream.write(token)
+entries["jobs"].append(dict(label=label, groups=groups, allowed_names=names,
+                          token_sha256=hashlib.sha256(token.encode()).hexdigest()))
+fd, pending = tempfile.mkstemp(dir=home, prefix=".secret-jobs-")
+with os.fdopen(fd, "w") as stream:
+    json.dump(entries, stream)
+os.replace(pending, registry)
+```
+
+Serialize owner registry edits. If registration stops after writing the token,
+there is no approval yet: finish the registry entry using that token's hash or
+remove that unregistered token before retrying. No API will adopt it implicitly.
+Keep the registry, token directory and vault outside agent-writable sandboxes.
+
+The credential uses worker identity's SHA-256 and constant-time comparison,
+unconditionally (no worker rule-10 rollout bypass). The client presents it in
+`X-Amux-Worker-Token`; a label alone, the owner bearer, or another job's token
+cannot authorize delivery. This proves possession of the registered credential,
+**not launchd process ancestry**. As with existing worker tokens and grants,
+processes with unrestricted access as the same OS user can read each other's
+credentials. File permissions protect against other OS users; OS sandboxing is
+needed to distinguish agents under the same user. Do not describe this as a
+security boundary against an unsandboxed same-user process.
+
+A plist's `ProgramArguments` uses absolute executable paths and separate array
+entries (no shell, no secret in the plist):
+
+```xml
+<key>ProgramArguments</key>
+<array>
+  <string>/absolute/path/to/amux</string>
+  <string>secret-exec</string>
+  <string>--job</string><string>com.example.buyer-match</string>
+  <string>--names</string><string>MAX_APILLOW_API_KEY</string>
+  <string>--</string>
+  <string>/absolute/path/to/real-command</string>
+  <string>argument with spaces</string>
+</array>
+```
+
+The agent surface is `POST /api/vault/job-secrets`, JSON
+`{"job":"com.example.buyer-match","names":["MAX_APILLOW_API_KEY"]}` and the token
+header above. Real socket loopback metadata is mandatory. Success is 200 with
+`{"values":{"MAX_APILLOW_API_KEY":"..."}}` and `Cache-Control: no-store`.
+Resolution uses vault global/group precedence, including the last sorted group
+winning; worker-specific secrets never apply to jobs, even for an equal label.
+Every requested name must be both allowed and resolvable before any is returned.
+Failure JSON is `{"error":"<code>","names":["<affected name>"]}`; codes include
+`unknown_job`, `job_identity_refused`, `name_not_allowed`,
+`missing_or_wrong_group`, registry errors and vault errors. No error includes
+values. The CLI exits nonzero and reports a fixed code and requested names;
+`server_unavailable` means no usable server response. It refuses unexpected or
+missing response names. Successful delivery is audited by label and names;
+refusals emit `verdict=secret_job_refused` and a fixed reason for log sweeps.

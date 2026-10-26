@@ -59,6 +59,7 @@ pub mod google_sa;
 pub mod grants;
 pub mod vault;
 pub mod vault_secrets;
+pub mod secret_jobs;
 pub mod chatgpt_app;
 pub mod graph;
 pub mod groups;
@@ -368,6 +369,7 @@ pub fn router_with_connector_transport(
         .merge(land_queue::routes())
         .merge(vault::routes())
         .merge(vault_secrets::routes())
+        .merge(secret_jobs::routes())
         .merge(chatgpt_app::routes())
         .merge(chat_delegate::routes())
         .merge(self_update::routes())

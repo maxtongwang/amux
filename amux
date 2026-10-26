@@ -6520,6 +6520,97 @@ EOF
   esac
 }
 
+# Job credentials travel in a header; values travel only in exec's environment.
+cmd_secret_exec() {
+  exec 3<&0
+  exec python3 - "$@" 3<&3 <<'PY_SECRET_EXEC'
+import argparse
+import http.client
+import ipaddress
+import json
+import os
+import re
+import stat
+import sys
+import urllib.parse
+
+os.dup2(3, 0)
+os.close(3)
+parser = argparse.ArgumentParser(prog="amux secret-exec", description="Execute a command with owner-approved job vault secrets")
+parser.add_argument("--job", required=True)
+parser.add_argument("--names", required=True, help="Comma-separated environment names")
+if sys.argv[1:] in (["--help"], ["-h"]):
+    parser.print_help()
+    sys.exit(0)
+try:
+    split = sys.argv.index("--")
+except ValueError:
+    parser.error("expected -- followed by a command and its arguments")
+args = parser.parse_args(sys.argv[1:split])
+command = sys.argv[split + 1:]
+if not command:
+    parser.error("a command is required after --")
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", args.job):
+    parser.error("invalid job label")
+names = args.names.split(",")
+if any(not re.fullmatch(r"[A-Z_][A-Z0-9_]{0,127}", n) for n in names) or len(set(names)) != len(names):
+    parser.error("names must be distinct environment variable names")
+
+def fail(reason):
+    print("secret-exec: " + reason + "; names: " + ",".join(names), file=sys.stderr)
+    sys.exit(1)
+
+home = os.environ.get("AMUX_HOME") or os.environ.get("CC_HOME") or os.path.expanduser("~/.amux")
+try:
+    fd = os.open(os.path.join(home, "job-tokens", args.job + ".token"), os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd) as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.geteuid():
+            fail("job_credential_permissions")
+        token = stream.read(65).strip()
+    if not re.fullmatch(r"[a-f0-9]{64}", token):
+        fail("job_credential_invalid")
+except OSError:
+    fail("job_credential_missing_or_unregistered")
+try:
+    url = urllib.parse.urlsplit(os.environ["AMUX_API"])
+    # Literal loopback avoids DNS changes; no proxies, redirects, or URL credentials.
+    if url.scheme != "http" or not ipaddress.ip_address(url.hostname).is_loopback or url.username or url.password or url.path not in ("", "/") or url.query or url.fragment:
+        fail("local_server_url_required")
+    conn = http.client.HTTPConnection(url.hostname, url.port, timeout=10)
+    conn.request("POST", "/api/vault/job-secrets", json.dumps({"job": args.job, "names": names}),
+                 {"Content-Type": "application/json", "X-Amux-Worker-Token": token})
+    response = conn.getresponse()
+    payload = response.read(8 * 1024 * 1024)
+    status = response.status
+    conn.close()
+except (OSError, ValueError, http.client.HTTPException):
+    fail("server_unavailable")
+try:
+    data = json.loads(payload)
+except (ValueError, UnicodeError):
+    fail("invalid_server_response")
+# Never echo arbitrary server output, even on error: it could contain a value.
+reasons = {"unknown_job", "job_identity_refused", "name_not_allowed", "missing_or_wrong_group",
+           "job_registry_unavailable", "job_registry_permissions", "job_registry_invalid",
+           "vault_unavailable", "vault_key_unavailable", "vault_decrypt_failed", "invalid_secret_value",
+           "loopback_required", "invalid_names", "invalid_request"}
+if status != 200:
+    reason = data.get("error") if isinstance(data, dict) else None
+    fail(reason if isinstance(reason, str) and reason in reasons else "server_refused")
+values = data.get("values") if isinstance(data, dict) else None
+if not isinstance(values, dict) or set(values) != set(names) or any(not isinstance(v, str) or "\0" in v for v in values.values()):
+    fail("invalid_server_response")
+env = dict(os.environ)
+env.pop("AMUX_WORKER_TOKEN", None)
+env.update(values)
+try:
+    os.execvpe(command[0], command, env)
+except (OSError, ValueError):
+    fail("command_exec_failed")
+PY_SECRET_EXEC
+}
+
 cmd_help() {
   cat <<EOF
 ${BOLD}amux${RESET} — phone-friendly Claude Code worker manager ${DIM}v${CC_VERSION}${RESET}
@@ -6541,6 +6632,8 @@ ${BOLD}Worker management:${RESET}
                                  ${DIM}compaction backlog. See /api/debug/context-health${RESET}
   amux start-all                 Start all registered workers
   amux stop-all                  Stop all running workers
+  amux secret-exec --job <label> --names A,B -- <cmd> [args...]
+                                 Run with owner-registered job vault secrets
 
 ${BOLD}Interaction:${RESET}
   amux attach <name>             Attach to a running worker (detach: Ctrl-b d)
@@ -9739,6 +9832,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
   _flush_transport_breadcrumbs
 
   case "${1:-}" in
+    secret-exec)      shift; cmd_secret_exec "$@" ;;
     register|reg)     shift; cmd_register "$@" ;;
     worktree|wt)      shift; cmd_worktree "$@" ;;
     model)            shift; cmd_model "$@" ;;

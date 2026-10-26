@@ -57,6 +57,11 @@ fn digest(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
+/// Shared credential proof for workers and owner-registered jobs.
+pub(crate) fn token_matches(presented: &str, expected_sha256: &str) -> bool {
+    super::auth::constant_time_eq(digest(presented).as_bytes(), expected_sha256.as_bytes())
+}
+
 fn random_token() -> std::io::Result<String> {
     use std::io::Read;
     let mut b = [0u8; 32];
@@ -212,7 +217,7 @@ pub fn check(home: &Path, lane: &str, presented: Option<&str>) -> Check {
         return if presented.is_some() { Check::Invalid } else { Check::Unminted };
     };
     match presented {
-        Some(t) if super::auth::constant_time_eq(digest(t).as_bytes(), want.trim().as_bytes()) => Check::Valid,
+        Some(t) if token_matches(t, want.trim()) => Check::Valid,
         _ => Check::Invalid,
     }
 }

@@ -1,0 +1,7 @@
+  ok: A: code after 'source amux' actually runs
+  ok: B: _warn_stale_amux_url (defined right before the guard) is callable post-source
+  ok: C: cmd_start (defined far above the guard) is callable post-source
+  ok: D: direct execution ('amux version') still dispatches normally
+  ok: D: the unknown-command error path still exits 1
+  ok: E: pre-fix file (guard removed) kills the sourcing shell before 'REACHED_AFTER_SOURCE' -- confirms the fix is load-bearing
+cli-sourceable suite: PASS
