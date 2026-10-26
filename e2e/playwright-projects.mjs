@@ -1,11 +1,11 @@
 // Playwright project settings — pure construction keeps config contracts free of server setup.
 
-export function buildTargets(devices) {
+export function buildTargets(devices, portOffset = 0) {
   return [
-    { name: 'desktop', port: 18823, use: { viewport: { width: 1280, height: 800 } } },
+    { name: 'desktop', port: 18823 + portOffset, use: { viewport: { width: 1280, height: 800 } } },
     // Mobile is a first-class target (amux is mobile-first): 375px must
     // render without overflow.
-    { name: 'mobile', port: 18833, use: { viewport: { width: 375, height: 667 } } },
+    { name: 'mobile', port: 18833 + portOffset, use: { viewport: { width: 375, height: 667 } } },
     // iOS SAFARI IS ITS OWN TARGET, not a viewport (AMUX tab-customizer, 2026-08-13).
     // A bottom-sheet fix passed desktop+mobile Chromium at 375px while Ethan still
     // could not see the menu on his phone — Chromium at a phone WIDTH is not Safari
@@ -18,7 +18,7 @@ export function buildTargets(devices) {
     // wrong in effect — a new mobile spec would silently never reach iOS, which
     // is the one target that motivated the project. Isolation removed the reason
     // for it, so the list is gone; do not reintroduce one to quiet a red.
-    { name: 'ios-safari', port: 18843, use: { ...devices['iPhone 15'] } },
+    { name: 'ios-safari', port: 18843 + portOffset, use: { ...devices['iPhone 15'] } },
   ];
 }
 
@@ -40,7 +40,12 @@ export function buildProject(t) {
         cookies: [],
         origins: [{
           origin: `https://127.0.0.1:${t.port}`,
-          localStorage: [{ name: 'amux_walkthrough_done', value: '1' }],
+          // amux_cloud_offer: the self-hosted Cloud offer stays off too (fixtures.ts).
+          // WebKit (ios-safari) ignores this localStorage (measured 2026-10-23: a raw
+          // @playwright/test page there started empty and wrote the cloud_offer
+          // pref). The fixtures.ts init script is what covers WebKit, so a spec
+          // that renders at phone width imports test from ./fixtures.
+          localStorage: [{ name: 'amux_walkthrough_done', value: '1' }, { name: 'amux_cloud_offer', value: '{"dismissed":1}' }],
         }],
       },
     },

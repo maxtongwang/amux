@@ -128,15 +128,18 @@ pub mod ids {
     pub const MAC_HEALTH: &str = "mac-health";
     pub const ACCOUNTABILITY_NUDGE: &str = "accountability-nudge";
     pub const CONTEXT_HEALTH: &str = "context-health";
+    pub const SUBSCRIPTION_RELAUNCH: &str = "subscription-relaunch";
     pub const DISK_WATCH: &str = "disk-watch";
     pub const STATUS_HISTORY: &str = "status-history";
     pub const BROWSER_LOGIN_SYNC: &str = "browser-login-sync";
     pub const CONNECTOR_MAINTENANCE: &str = "connector-maintenance";
+    pub const SOCIAL_METRICS: &str = "social-metrics";
     pub const EPISODES: &str = "episodes";
     pub const TOKEN_LEDGER: &str = "token-ledger";
     pub const BOARD_HYGIENE: &str = "board-hygiene";
     pub const RECORDINGS_TRANSCRIBE: &str = "recordings-transcribe";
     pub const MODEL_CATALOG_REFRESH: &str = "model-catalog-refresh";
+    pub const WORKER_RESOURCES: &str = "worker-resources";
     pub const CAPTURE_RECONCILE: &str = "capture-reconcile";
     pub const EMAIL_APPROVAL_DIGEST: &str = "email-approval-digest";
     pub const NEEDS_INPUT_AUTO: &str = "needs-input-auto";
@@ -184,6 +187,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::MAC_HEALTH,
     ids::ACCOUNTABILITY_NUDGE,
     ids::CONTEXT_HEALTH,
+    ids::SUBSCRIPTION_RELAUNCH,
     ids::DISK_WATCH,
     ids::HOST_METRICS,
     ids::TRACE_ARCHIVE,
@@ -193,6 +197,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::STATUS_HISTORY,
     ids::BROWSER_LOGIN_SYNC,
     ids::CONNECTOR_MAINTENANCE,
+    ids::SOCIAL_METRICS,
     ids::EPISODES,
     ids::TOKEN_LEDGER,
     ids::BOARD_HYGIENE,
@@ -204,6 +209,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::CONTRACT_WATCH,
     ids::LAND_QUEUE,
     ids::CONVERSE_RETENTION,
+    ids::WORKER_RESOURCES,
 ];
 
 /// An env var this job reads at startup. It is a READOUT, never a switch: a
@@ -258,14 +264,21 @@ pub const CATALOG: &[Doc] = &[
     Doc {
         id: ids::SCHEDULER,
         name: "Schedule firing",
-        purpose: "Fires every due user schedule and delivers its command to the worker; in shadow mode it only journals what it would have fired.",
+        purpose: "Fires every due user schedule and delivers its command to the worker; in shadow mode it only journals what it would have fired. A goal-continuation tmux schedule (names /goal and keep going) is skipped while the goal is met, the worker is mid-turn, or another continuation woke it within AMUX_GOAL_CONTINUE_INTERVAL_S. A long brief is sent in full once per version and as a pointer to its saved file while unchanged. Held receipts ride along on each delivered fire.",
         // NOT an off switch: shadow mode still runs the loop. Claiming `off`
         // here would grey out a loop that is very much ticking.
-        env: &[EnvControl {
-            var: "AMUX_RS_SCHEDULER",
-            effect: "1 = fire for real; anything else = shadow mode (journals what it would fire)",
-            off: None,
-        }],
+        env: &[
+            EnvControl {
+                var: "AMUX_RS_SCHEDULER",
+                effect: "unset or 1 = fire for real (default); 0/false/off/no = shadow mode (journals what it would fire)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_SCHEDULE_BRIEF_MIN_CHARS",
+                effect: "a tmux command at least this long is versioned under ~/.amux/schedules/briefs and sent as a pointer while unchanged; default 800, 0 always sends the full text",
+                off: None,
+            },
+        ],
         pref: None,
         detail: None,
     },
@@ -562,8 +575,8 @@ pub const CATALOG: &[Doc] = &[
     },
     Doc {
         id: ids::TUNNEL,
-        name: "Tunnel relay",
-        purpose: "Long-polls the amux cloud gateway and serves each public request from a local port, so a localhost app is reachable without an inbound port. Registered only while a tunnel is running — absent here means no tunnel is up, which is also the default.",
+        name: "ChatGPT app relay",
+        purpose: "Long-polls the amux cloud gateway and serves the ChatGPT app's OAuth and /mcp requests from amux, refusing every other path. Registered only while the connector is published; absent here means it is not, which is also the default.",
         env: &[
             EnvControl {
                 var: "AMUX_TUNNEL_TOKEN",
@@ -571,8 +584,8 @@ pub const CATALOG: &[Doc] = &[
                 off: Some(OFF_WHEN_UNSET),
             },
             EnvControl {
-                var: "AMUX_TUNNEL_PORT",
-                effect: "the local port to auto-target at boot. UNSET means no auto-start: defaulting to amux's own port would publish an unauthenticated control plane",
+                var: "AMUX_TUNNEL_MCP",
+                effect: "1 starts the relay at boot even without the dashboard's Publish marker",
                 off: Some(OFF_WHEN_UNSET),
             },
             EnvControl {
@@ -588,11 +601,6 @@ pub const CATALOG: &[Doc] = &[
             EnvControl {
                 var: "AMUX_TUNNEL_MAX_CONCURRENT",
                 effect: "simultaneous local fetches; excess waits 8s then gets a 503 (default 8)",
-                off: None,
-            },
-            EnvControl {
-                var: "AMUX_TUNNEL_ALLOW_SELF",
-                effect: "1 = permit tunnelling amux's OWN port. Refused by default: this port has no request auth and /api/sessions/<n>/send is ungated",
                 off: None,
             },
         ],
@@ -708,6 +716,14 @@ pub const CATALOG: &[Doc] = &[
         detail: Some("/api/debug/context-health"),
     },
     Doc {
+        id: ids::SUBSCRIPTION_RELAUNCH,
+        name: "Subscription relaunch",
+        purpose: "Relaunches, at an idle boundary and on the same conversation, Claude workers that started before the host's Claude sign-in and still run on ANTHROPIC_API_KEY.",
+        env: NO_ENV,
+        pref: None,
+        detail: None,
+    },
+    Doc {
         id: ids::DISK_WATCH,
         name: "Disk watch",
         purpose: "Measures disk pressure and regenerable cache growth, starts bounded scans when due, and reports findings without deleting user data.",
@@ -751,14 +767,30 @@ pub const CATALOG: &[Doc] = &[
         detail: Some("/api/metrics/host/history"),
     },
     Doc {
+        id: ids::WORKER_RESOURCES,
+        name: "Worker resource samples",
+        purpose: "Samples each worker's RSS, CPU, process and thread counts into worker_resource_samples every 30s, so which worker was using the machine at a past moment is answerable, and logs a WARN when a worker's RSS passes AMUX_WORKER_MAX_RSS_MB.",
+        env: &[
+            EnvControl { var: "AMUX_WORKER_RESOURCES_EVERY_SECS", effect: "seconds between samples (default 30, floored at 10)", off: None },
+            EnvControl { var: "AMUX_WORKER_METRICS_RETAIN_DAYS", effect: "days of samples kept (default 7, floored at 1)", off: None },
+            EnvControl { var: "AMUX_WORKER_MAX_RSS_MB", effect: "per-worker RSS above which a WARN is logged (default 0, no cap)", off: None },
+        ],
+        pref: None,
+        detail: Some("/api/metrics/workers"),
+    },
+    Doc {
         id: ids::GOAL_KEEPER,
         name: "Goal keeper",
-        purpose: "Continues a Claude worker whose owner-set /goal is not met (latest transcript goal_status met:false and the footer shows /goal active) once it has been idle 2 minutes, because Claude Code's own goal loop does not survive a resume. At most one continue per 10 minutes; two continues with no tool call stop it for that goal until the goal changes or the owner writes. Reaches isolated workers as owner configuration (goal: guard). Each tick also runs the goal-loop guard's restore (AMUX-5277): a lane parked on a needsyou card gets `/goal <condition>` back once when the card leaves needsyou, and is never continued while parked.",
+        purpose: "Continues a Claude worker whose owner-set /goal is not met (latest transcript goal_status met:false and the footer shows /goal active, or the goal was cleared by an error, or the worker's AMUX_GOAL_CHECK checker says not met) once it has been idle 2 minutes, because Claude Code's own goal loop does not survive a resume. At most one continue per 10 minutes; two continues with no tool call stop it for that goal until the goal changes or the owner writes. Reaches isolated workers as owner configuration (goal: guard). Each tick also runs the goal-loop guard's restore (AMUX-5277): a lane parked on a needsyou card gets `/goal <condition>` back once when the card leaves needsyou, and is never continued while parked.",
         env: &[
             EnvControl { var: "AMUX_GOAL_KEEPER_SECS", effect: "0 disables the keeper", off: Some("0") },
             EnvControl { var: "AMUX_GOAL_CONTINUE", effect: "0 opts a worker, group or the fleet out (scoped)", off: None },
             EnvControl { var: "AMUX_GOAL_CONTINUE_IDLE_S", effect: "idle seconds before a continue, default 120", off: None },
-            EnvControl { var: "AMUX_GOAL_CONTINUE_INTERVAL_S", effect: "minimum seconds between continues, default 600", off: None },
+            EnvControl { var: "AMUX_GOAL_CONTINUE_INTERVAL_S", effect: "minimum seconds between continues by the keeper or a goal-continuation schedule, default 600", off: None },
+            EnvControl { var: "AMUX_GOAL_CHECK", effect: "the worker's goal checker, a shell command (exit 0 met, 1 not met, else unknown; prints N/M or {\"done\",\"total\",\"summary\"}); it decides met (scoped)", off: None },
+            EnvControl { var: "AMUX_GOAL_CHECK_INTERVAL_S", effect: "seconds between checker runs, default 600 (scoped)", off: None },
+            EnvControl { var: "AMUX_GOAL_CHECK_TIMEOUT_S", effect: "checker time limit, default 120 (scoped)", off: None },
+            EnvControl { var: "AMUX_GOAL_STALL_H", effect: "hours without checker movement before one owner alert, default 6 (scoped)", off: Some("0") },
             EnvControl { var: "AMUX_GOAL_LOOP_GUARD", effect: "0 turns off goal-loop detection, park and restore (scoped)", off: None },
         ],
         pref: None,
@@ -800,6 +832,14 @@ pub const CATALOG: &[Doc] = &[
         env: &[EnvControl { var: "AMUX_CONNECTOR_MAINTENANCE_SECS", effect: "pass interval in seconds (default 300, 0 disables)", off: Some("0") }],
         pref: None,
         detail: Some("/api/connectors/maintenance"),
+    },
+    Doc {
+        id: ids::SOCIAL_METRICS,
+        name: "Social metrics",
+        purpose: "Reads each social post's views and engagement once its 24h, 72h and 7d windows pass, and stores one snapshot per window. A failed read is stored unmeasured with its error and retried.",
+        env: &[EnvControl { var: "AMUX_SOCIAL_METRICS_SECS", effect: "pass interval in seconds (default 600, 0 disables)", off: Some("0") }],
+        pref: None,
+        detail: Some("/api/social/posts"),
     },
     Doc {
         id: ids::BROWSER_LOGIN_SYNC,

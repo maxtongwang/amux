@@ -10,6 +10,8 @@ pub mod backend;
 mod cargo_target_guard;
 pub mod config;
 mod fanout_retirement;
+mod boot_watch;
+mod parent_watch;
 pub mod fanout_workspace;
 pub mod legacy_port;
 pub mod listener_handoff;
@@ -394,6 +396,8 @@ async fn async_main() {
     // The outage length needs no new state: the request log's newest row is
     // when the fleet last got an answer. `env::var` is read BEFORE the runtime
     // starts so nothing can have cleared it.
+    boot_watch::start();
+    boot_watch::step("store_open");
     let self_adopted = std::env::var("AMUX_SELF_ADOPTED").is_ok();
     // Read before Store::open creates the database. An absent store means
     // there cannot have been a predecessor to die; filesystem uncertainty
@@ -494,6 +498,7 @@ async fn async_main() {
         tracing::info!(dir = %dir.display(), locks = ?removed, "cleaned stale Chrome profile locks");
     }
 
+    boot_watch::step("app_state");
     let reconciled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = api::AppState {
         store: store.clone(),
@@ -512,6 +517,7 @@ async fn async_main() {
     // fails if a bare `tokio::spawn` of a background loop reappears in this
     // file. The whole set is readable at `GET /api/system-jobs` and in the
     // dashboard's Scheduler tab under "System".
+    boot_watch::step("spawn_jobs");
     use runtime_jobs::registry as jobs;
     let secs = std::time::Duration::from_secs;
 
@@ -651,7 +657,9 @@ async fn async_main() {
     // and wait. Noticing is infrastructure; fixing is work.
     drop(runtime_jobs::autofix::spawn(state.clone()));
     // MDAI runs cut off by the restart that started this process resume here.
+    boot_watch::step("mdai_resume");
     crate::api::mdai::resume_interrupted(state.store.clone());
+    boot_watch::step("spawn_jobs_2");
     // AMUX-3579: enrol /api/board/commit-mentions, which had zero consumers.
     drop(runtime_jobs::commit_mention_notes::spawn(state.clone()));
     // AMUX-5238: close auto-captured intake cards on cited evidence and tag
@@ -678,6 +686,7 @@ async fn async_main() {
     drop(runtime_jobs::host_metrics::spawn(state.clone()));
     drop(runtime_jobs::trace_archive::spawn(state.clone()));
     drop(runtime_jobs::host_guard::spawn());
+    drop(runtime_jobs::worker_resources::spawn(state.clone()));
     drop(runtime_jobs::goal_keeper::spawn(state.clone()));
     drop(runtime_jobs::task_titles::spawn(state.clone()));
     // Record tab transcripts (AMUX-4624): the folder is the work list, so a
@@ -695,6 +704,7 @@ async fn async_main() {
     // worse than raw claude" was invisible for months is that nothing counted
     // how many times a lane's conversation had been summarized away.
     drop(runtime_jobs::context_health::spawn());
+    drop(runtime_jobs::subscription_relaunch::spawn(state.clone()));
     // Example invocations for every skill, ready before the first `/`.
     crate::api::skill_examples::spawn_warmer(state.clone());
     // Recompose every lane's MEMORY.md once per boot (contract rule 13). A new
@@ -709,12 +719,16 @@ async fn async_main() {
     });
     // AA-40: skills saved in the Skills tab before their command file was
     // written on save exist only in the table, where Claude Code cannot run
-    // them. Give each one a file once per boot (create only).
+    // them. Give each one a file once per boot (create only). The skills amux
+    // itself ships (skills/amux-contribute.md) are installed first.
     {
         let st = state.clone();
         tokio::task::spawn_blocking(move || {
-            let Ok(conn) = st.store.read() else { return };
             let dir = crate::api::skills::user_commands_dir();
+            let (written, n) = crate::api::skills::install_shipped(&dir, crate::api::skills::SHIPPED_COMMANDS);
+            tracing::info!(written, measured = true, n_considered = n, verdict = "shipped_skills_installed",
+                "installed or refreshed the skills amux ships (e.g. /amux-contribute)");
+            let Ok(conn) = st.store.read() else { return };
             let (created, n) = crate::api::skills::materialize_missing(&conn, &dir);
             tracing::info!(created, measured = true, n_considered = n, verdict = "skill_command_files_reconciled",
                 "gave every Skills-tab skill a command file Claude Code can run");
@@ -724,11 +738,31 @@ async fn async_main() {
     drop(runtime_jobs::contract_watch::spawn(state.clone()));
     // Contract rule 5 (AH-380): the server-owned land queue.
     drop(runtime_jobs::land_queue::spawn(state.clone()));
+    // Install the passive status observer BEFORE the listener binds, so a
+    // healthy /health implies the hook script is on disk. It used to arrive
+    // only on status_history's first tick (a spawn_blocking task), which can
+    // lose the race to /health: a server killed right after turning healthy
+    // left no native-status.py, and a provider hook firing while it was down
+    // had nothing to run (restart_persistence CI runs 38917609108,
+    // 38845948860: "python3: can't open file .../native-status.py"). The tick
+    // still repairs drift later; this makes the first install unconditional,
+    // including on servers where that job is disabled.
+    // A test harness killed before its teardown leaves this server orphaned
+    // under a temp AMUX_HOME, running every loop for nobody (CPU RCA
+    // 20261018-015302). It exits with its parent instead.
+    parent_watch::start(&config::amux_home());
+
+    if let Err(error) = api::native_status::ensure_observer(&config::amux_home()) {
+        tracing::warn!(%error, measured = false, n_considered = 1, verdict = "native_status_observer_startup_install_failed",
+            "passive observer could not be installed at startup; status_history's tick will retry");
+    }
+    api::native_status::ensure_claude_hooks_here();
     // AMUX-3761: a durable record of WHICH RULE decided each lane's status,
     // so "was that badge accurate?" is answerable after the screenshot arrives.
     drop(runtime_jobs::status_history::spawn(state.clone()));
     drop(runtime_jobs::browser_login_sync::spawn());
     drop(runtime_jobs::connector_maintenance::spawn());
+    drop(runtime_jobs::social_metrics::spawn(state.clone()));
     drop(runtime_jobs::episodes::spawn(state.clone()));
     // CDC poller (migration 0061): tails board_change_log so the catch-up
     // endpoint (/api/board/changes) stays current.
@@ -762,6 +796,17 @@ async fn async_main() {
     {
         let store = store.clone();
         let firing = runtime_jobs::firing_enabled();
+        // Say the mode once at boot. Shadow mode looks exactly like a working
+        // scheduler in the UI (schedules save, next_run advances on screen)
+        // while nothing ever runs, so the log is where a sweep can see it.
+        if firing {
+            tracing::info!(verdict = "scheduler_firing", "schedule firing is on");
+        } else {
+            tracing::warn!(
+                verdict = "scheduler_shadow_mode",
+                "AMUX_RS_SCHEDULER disables schedule firing; schedules are journaled, never run"
+            );
+        }
         let deliverer: std::sync::Arc<dyn runtime_jobs::scheduler::Deliverer> =
             std::sync::Arc::new(runtime_jobs::scheduler::LiveDeliverer::new(state.clone()));
         jobs::spawn_loop(
@@ -775,13 +820,17 @@ async fn async_main() {
     // spawned further down (after the listener is up) and now needs the store to
     // tell a lane its browser was released (AF-497).
     let reaper_store = state.store.clone();
+    // Read once at boot for the retired-Proxies note (MSG-95893).
+    let proxies_store = state.store.clone();
     api::board_intake::initialize();
     api::history_ask::initialize();
+    boot_watch::step("router");
     let app = api::router(state);
 
     // SNI dual-cert: Tailscale LE cert for the tailnet hostname, self-signed
     // for localhost/IPs — Python-server parity (its _sni_cb), so the PWA's
     // service worker registers over https://<host>.ts.net:<port>.
+    boot_watch::step("tls");
     let server_config = tls::build_server_config(&cfg.tls_dir()).expect("tls material");
     let rustls_cfg =
         axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(server_config));
@@ -790,6 +839,7 @@ async fn async_main() {
     // AMUX_HERDR_SESSION names the herdr session hosting amux workspaces
     // (backend::backends_from_env — constructing it against a missing herdr
     // server would make every probe a failure report).
+    boot_watch::step("backends");
     let backends = backend::backends_from_env(&cfg.env);
     // Publish the backend set for API handlers (worker peek, AMUX-2613
     // gap 4): AppState is constructed at 40+ sites, so the accessor is a
@@ -831,6 +881,7 @@ async fn async_main() {
         })
         .unwrap_or(amux_core::circuit::FleetState::Normal)
     };
+    boot_watch::step("orchestrator_runtime");
     let runtime = Arc::new(orchestrator::runtime::Runtime {
         store: store.clone(),
         backends: backends.clone(),
@@ -1037,11 +1088,36 @@ async fn async_main() {
             };
             let mut observed = meta.modified().ok();
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            // An in-flight shell schedule run holds adoption, for at most
+            // AMUX_ADOPT_SHELL_DEFER_MAX_S (default 900, like the builder's).
+            let defer_max = std::time::Duration::from_secs(
+                std::env::var("AMUX_ADOPT_SHELL_DEFER_MAX_S").ok().and_then(|v| v.parse().ok()).unwrap_or(900));
+            let mut defer_since: Option<std::time::Instant> = None;
+            let mut defer_logged: Option<std::time::Instant> = None;
             loop {
                 interval.tick().await;
                 jobs::tick(jobs::ids::SELF_ADOPT);
                 let current = std::fs::metadata(&exe).ok().and_then(|m| m.modified().ok());
                 if current.is_some() && current != observed {
+                    let busy = runtime_jobs::scheduler::shell_runs_in_flight(defer_max);
+                    if !busy.is_empty() {
+                        let since = *defer_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() < defer_max {
+                            if defer_logged.is_none_or(|t| t.elapsed().as_secs() >= 60) {
+                                defer_logged = Some(std::time::Instant::now());
+                                tracing::info!(verdict = "adoption_deferred_shell_run", runs = ?busy,
+                                    held_s = since.elapsed().as_secs(), max_s = defer_max.as_secs(),
+                                    measured = true, n_considered = busy.len(),
+                                    "self-adoption held: a shell schedule run is in flight and an exec would kill it");
+                            }
+                            continue;
+                        }
+                        tracing::warn!(verdict = "adoption_shell_defer_expired", runs = ?busy,
+                            held_s = since.elapsed().as_secs(), measured = true, n_considered = busy.len(),
+                            "self-adoption proceeding: shell schedule runs still in flight after the hold cap");
+                    }
+                    defer_since = None;
+                    defer_logged = None;
                     let path = exe.clone();
                     let candidate = match tokio::task::spawn_blocking(move || {
                         activation::Candidate::read(&path)
@@ -1098,6 +1174,7 @@ async fn async_main() {
     // RELEASE IDLE BROWSERS (AMUX-3829, Ethan: "it should clean up
     // automatically after idle use"). Nothing reaped one before, which is how a
     // browser sat 18.1h with zero tabs and blocked him.
+    boot_watch::step("reapers");
     runtime_jobs::browser_reaper::spawn(reaper_store);
 
     // STOP IDLE COMPUTER-USE SANDBOXES (AMUX-5300). Each is a 4 GB Docker
@@ -1117,19 +1194,29 @@ async fn async_main() {
     // reaper nor disk_watch covers these.
     drop(runtime_jobs::mac_health::spawn());
 
-    // AUTO-START THE TUNNEL RELAY, and only with an explicit target port
-    // (AMUX-2888, py:78089). Both halves are required: a token alone would
-    // default the target to amux's OWN port, and this port has no request auth
-    // — publishing it is unauthenticated RCE on a YOLO lane. `maybe_boot_start`
-    // owns that decision and returns what it did, so the log records a fact
-    // rather than an intention.
+    // AUTO-START THE CHATGPT APP RELAY when the owner published the connector
+    // (AMUX-5396). `maybe_boot_start` owns that decision and returns what it
+    // did, so the log records a fact rather than an intention.
     //
     // Not a `spawn_loop`: it is a one-shot that ADOPTS the relay's own task
     // under `ids::TUNNEL` if it manages to start one.
-    tokio::spawn(async {
+    //
+    // The same shot notes saved Proxies-tab rows. That tab is retired
+    // (MSG-95893) and nothing reads the table any more; the rows are the
+    // owner's data, so they stay on disk and get one line saying so.
+    tokio::spawn(async move {
         let outcome = runtime_jobs::tunnel::maybe_boot_start().await;
-        if outcome != "no token" && outcome != "no AMUX_TUNNEL_PORT" {
+        if outcome != "no token" && outcome != "not published" {
             tracing::info!(outcome, "tunnel: boot autostart");
+        }
+        let saved = proxies_store
+            .read()
+            .ok()
+            .and_then(|c| c.query_row("SELECT COUNT(*) FROM proxies", [], |r| r.get::<_, i64>(0)).ok())
+            .unwrap_or(0);
+        if saved > 0 {
+            tracing::info!(saved, verdict = "retired_proxies_data_present",
+                "proxies: the Proxies tab is retired; its saved rows are kept on disk and no longer read (use Pages)");
         }
     });
 
@@ -1152,6 +1239,7 @@ async fn async_main() {
     //
     // tests/legacy_port_guard.rs fails the build if the retired address
     // reappears in code, scripts or e2e.
+    boot_watch::step("publish_endpoint");
     legacy_port::publish_endpoint(&cfg.amux_home, cfg.port, None);
 
     let addr = std::net::SocketAddr::new(bind_ip, cfg.port);
@@ -1184,12 +1272,31 @@ async fn async_main() {
             verdict = "listener_bind_failed", "cannot bind server listener; check AMUX_BIND and AMUX_RS_PORT");
         std::process::exit(1);
     });
+    boot_watch::bound();
     tracing::info!(addr = %listener.local_addr().expect("bound listener address"),
         measured = true, n_considered = 1, listener_source, verdict = if listener_source == "inherited" {
         "listener_inherited"
     } else {
         "listener_bound"
     }, "listening (https, plain-http redirected)");
+    // The apps origin (api/static_files/apps_origin.rs): a second listener that
+    // serves only /app/<id>/, so an app inside amux never shares the dashboard's
+    // origin. A failure to bind is logged and leaves the dashboard serving.
+    if let Some(apps_port) = api::static_files::apps_origin::apps_port(cfg.port) {
+        let apps_addr = std::net::SocketAddr::new(addr.ip(), apps_port);
+        let apps_tls = rustls_cfg.clone();
+        tokio::spawn(async move {
+            tracing::info!(%apps_addr, measured = true, n_considered = 1, verdict = "apps_origin_listening",
+                "apps origin listening: /app/<id>/ only");
+            if let Err(error) = axum_server::bind_rustls(apps_addr, apps_tls)
+                .serve(api::apps_router().into_make_service())
+                .await
+            {
+                tracing::warn!(%apps_addr, %error, measured = true, n_considered = 1, verdict = "apps_origin_bind_failed",
+                    "the apps origin could not listen; apps inside amux will not open");
+            }
+        });
+    }
     let acceptor = tls::RedirectingAcceptor::new(
         axum_server::tls_rustls::RustlsAcceptor::new(rustls_cfg),
         if bind_ip.is_unspecified() {

@@ -21,6 +21,9 @@ test('Messages tab opens with the human pill selected', async ({ page, request }
     const slot = seen.push(null) - 1;
     r.json().then(b => { seen[slot] = b; }, e => { badBodies.push(`${r.status()} ${String(e).slice(0, 80)}`); });
   });
+  // CI's empty fleet opens the walkthrough (#wt-tooltip) over #cv-all-item, and on ios-safari the
+  // click retried until the 90s timeout (main, 2026-10-19). Same suppression as tab-customizer.
+  await page.addInitScript(() => localStorage.setItem('amux_walkthrough_done', '1'));
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any).switchView === 'function', { timeout: 20000 });
   // Ground truth the chips cannot supply about themselves: one owner message in
@@ -80,6 +83,12 @@ test('Messages tab opens with the human pill selected', async ({ page, request }
     expect(sel.join(','), 'exactly one chip selected, and it is Human').toMatch(/Human/i);
     expect(urls.some(u => u.includes('counts=1'))).toBe(true);
     expect(urls.filter(u => u.includes('counts=1')).every(u => !u.includes('kind='))).toBe(true);
+    // Every chip is present and shows the rendered response's total.
+    for (const [label, key] of Object.entries(CHIP_KEYS)) {
+      const chip = chips.find(c => c.label.startsWith(label + ' '));
+      expect(chip, label).toBeTruthy();
+      expect(Number(chip!.label.split(' ').pop()), label).toBe(rendered![key] || 0);
+    }
     // Signal only: a concurrent history write since the page's fetch shows here,
     // so a future chip mismatch can be told apart from shared-server drift.
     const live = await page.evaluate(async () => (await fetch('/api/history?counts=1')).json());

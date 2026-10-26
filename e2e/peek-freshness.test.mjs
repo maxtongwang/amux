@@ -1,3 +1,4 @@
+// Peek freshness — runs the real app.js peek code in a VM to prove late or stale frames cannot rewind the view.
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -22,7 +23,7 @@ function fixture() {
     _PEEK_CACHE_KEY:name=>'peek_'+name, _peekVisibleCols:()=>120,   // helpers defined outside the extracted slice
     _peekThin:false, _peekModePainted:null, _peekGeoHold:0, _peekLastFullMs:0, _peekLastFullAttemptMs:0, _peekEtag:null, _peekLiveEtag:null,
     _peekHistoryRaw:'', _peekHistoryHTML:'', _lastPeekRaw:'', _lastLiveHTML:'', lastPeekHTML:'',
-    _peekEarlier:{}, _peekEarlierHTML:()=>'', _trimPeekLiveOverlap:(_history,live)=>live,
+    _peekEarlier:{chunks:[]}, _peekEarlierHTML:()=>'', _peekUnechoedHtml:()=>'', _trimPeekLiveOverlap:(_history,live)=>live,
     _peekLiveHtml:value=>value, _peekHtml:value=>value, hidePeekLoading(){}, _stopPeekPoll(){},
     _peekLastAppliedAt:null, _peekFreshnessEpisode:'',   // freshness state the real _peekFrameApplied writes
     _peekPollActive:true, _peekPollInFlight:false, _peekPollAgain:false, _peekFullPending:false,
@@ -44,6 +45,8 @@ function fixture() {
   // Exercise the real cache painter newly called by refreshPeek, too.
   vm.runInContext(source.slice(source.indexOf('function _paintCachedPeek('), source.indexOf('// ── Worker types')),ctx);
   vm.runInContext(source.slice(source.indexOf('function _peekFrameApplied('), source.indexOf('function _checkViewFreshness(')),ctx);
+  // The scrollback window that history paints through (b920ec409), also real.
+  vm.runInContext(source.slice(source.indexOf('const _PEEK_HIST_DRAWN_LINES'), source.indexOf('function _peekEarlierHTML(')),ctx);
   vm.runInContext(code,ctx);
   ctx._resetPeekRequests();
   return {ctx,calls,beacons,body,status,timers,advance(ms){clock+=ms;},switchWorker(name){generation++;ctx.peekSession=name;ctx._resetPeekRequests();}};

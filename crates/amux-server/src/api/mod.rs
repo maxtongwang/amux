@@ -4,10 +4,12 @@
 //! in the OpenAPI spec (RR checklist) and — for legacy-compat paths — in the
 //! alias registry (RR-0018a).
 
+pub mod agent_limit_resume;
 pub mod alerts;
 pub mod aliases;
 pub mod auth;
 pub mod board;
+pub mod boundaries;
 pub mod contract;
 pub mod scratchpad;
 pub mod prompt_block;
@@ -36,6 +38,7 @@ pub mod chat_worker;
 pub mod commit_mentions;
 pub mod computer;
 pub mod config_iac;
+pub mod move_bundle;
 pub mod connection;
 pub mod gcal;
 pub mod connectors;
@@ -59,6 +62,7 @@ pub mod google_sa;
 pub mod grants;
 pub mod vault;
 pub mod vault_secrets;
+pub mod vault_spend;
 pub mod chatgpt_app;
 pub mod graph;
 pub mod groups;
@@ -67,14 +71,18 @@ pub mod harness;
 pub mod health;
 pub mod history;
 pub mod history_ask;
+pub mod history_backfill;
 pub mod interactions;
 pub mod invariants_api;
 pub mod journal;
+pub mod launch_context;
 pub mod layout_presets;
+pub mod social;
 pub mod log_search;
 pub mod lookup;
 pub mod location;
 pub mod map;
+pub mod map_store;
 pub mod mcp;
 pub mod mdai;
 pub mod measured;
@@ -84,6 +92,7 @@ pub mod memories;
 pub mod messages;
 pub(crate) mod delivery;
 pub(crate) mod native_status;
+pub(crate) mod cross_site;
 pub mod metrics;
 pub mod traces;
 pub mod observability;
@@ -92,17 +101,20 @@ pub mod orchestrate;
 pub mod orchestrations;
 pub mod org;
 pub(crate) mod pane_prompts;
+pub mod pages;
+pub mod palette;
 pub mod pinned;
 pub mod planning;
 pub mod policy;
 pub mod process_identity;
 pub mod prefs;
 pub mod projects;
-pub mod proxies;
 pub mod py_proxy;
 pub mod reclaim;
+pub(crate) mod reclaim_owner;
 pub mod reconciliation;
 pub mod recordings;
+pub(crate) mod transcription;
 pub mod reports;
 pub mod request_log;
 pub mod review;
@@ -135,6 +147,7 @@ pub mod static_files;
 pub mod stats;
 pub mod sync;
 pub mod telegram;
+pub mod tailnet_join;
 pub mod terminal;
 pub mod torrents;
 pub mod tts;
@@ -144,6 +157,7 @@ pub(crate) mod promise_nudge;
 pub(crate) mod turn_end;
 pub mod upload;
 pub mod usage;
+pub mod usage_accounts;
 pub mod verify;
 pub mod why;
 pub mod worker_create;
@@ -173,6 +187,12 @@ pub struct AppState {
     /// BEFORE reconciliation so the fleet gets 503s instead of connection-
     /// refused during the startup window (AMUX-3969b: 88s blackout).
     pub reconciled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The apps origin's router: `/app/<id>/` and nothing else
+/// (static_files/apps_origin.rs). Served on its own listener.
+pub fn apps_router() -> Router {
+    static_files::apps_origin::router()
 }
 
 pub fn router(state: AppState) -> Router {
@@ -209,6 +229,11 @@ pub fn router_with_connector_transport(
         )
         .route("/api/models", axum::routing::get(workers::model_catalog))
         .route("/api/peek/steps", axum::routing::get(session_verbs::peek_steps))
+        .route("/api/sessions/{name}/task-history", axum::routing::get(sessions_legacy::task_history))
+        .route("/api/sessions/{name}/quota", axum::routing::get(agent_limit_resume::worker_quota))
+        .route("/api/task-history", axum::routing::get(sessions_legacy::task_list))
+        .route("/api/task-history/at", axum::routing::get(sessions_legacy::task_at_batch))
+        .route("/api/task-history/links", axum::routing::get(sessions_legacy::task_links))
         .route("/api/scratchpad/config", axum::routing::get(scratchpad::get_config).put(scratchpad::put_config))
         .nest("/api/memories", memories::routes())
         .nest("/api/traces", traces::routes())
@@ -218,6 +243,7 @@ pub fn router_with_connector_transport(
         // blocked_on="signal:<name>"; POST /api/signals/<name> raises it,
         // clears those waits and wakes their lanes.
         .nest("/api/signals", signals::routes())
+        .nest("/api/subscriptions", signals::subscription_routes())
         // RR-0110: universal FTS5 search across cards (incl. their log lines),
         // messages, memories, workers, journal and schedules. Net-new — there
         // was never a /api/search in the Python server or the SPA.
@@ -277,8 +303,10 @@ pub fn router_with_connector_transport(
         // fleet substrate (env files + tmux + shared DB), api/session_verbs.rs.
         // Was PROXIED_FAMILIES' SessionVerbs row; the rust-worker 501 pointer
         // guard moved into the module's dispatch.
+        .merge(palette::routes())
         .merge(session_verbs::routes())
         .merge(typing::routes())
+        .merge(boundaries::routes())
         // Realtime rooms (api/rt.rs): one WebSocket per tab multiplexing
         // ephemeral per-resource rooms, with an SSE + POST fallback.
         .merge(rt::routes())
@@ -349,6 +377,8 @@ pub fn router_with_connector_transport(
         .nest("/api/crm", crm::routes())
         .nest("/api/speedtest", speedtest::routes())
         .nest("/api/layout-presets", layout_presets::routes())
+        // Social posting and results (AA-42): YouTube first, the rest report their gate.
+        .nest("/api/social", social::routes())
         .nest("/api/pinned", pinned::routes())
         // The New Worker / Connect modals' supporting reads (AMUX-2871).
         .merge(worker_create::routes())
@@ -371,7 +401,6 @@ pub fn router_with_connector_transport(
         .merge(chatgpt_app::routes())
         .merge(chat_delegate::routes())
         .merge(self_update::routes())
-        .nest("/api/proxies", proxies::routes())
         // AMUX-2888: the client controls the SPA and CLI already call. Status
         // answers 200 with ported:false; start/stop answer an honest 501.
         .nest("/api/tunnel", tunnel::routes())
@@ -379,14 +408,18 @@ pub fn router_with_connector_transport(
         .nest("/api/skills", skills::routes())
         .nest("/api/mcp", mcp::routes())
         .nest("/api/sql", sql::routes())
+        .nest("/api/pages", pages::api_routes())
         .nest("/api/slash-commands", skills::slash_routes())
         .nest("/api/map", map::routes())
+        // Read-only shared map lists (/s/map/{token}, /api/share/map/{token}).
+        .merge(map::public_routes())
         // Map tab's graph mode: mind-map store + Obsidian import + the fleet
         // org-chart projection (AMUX-2886 — tables existed, routes did not).
         .nest("/api/graph", graph::routes())
         // Workspace tab web-terminal panes: local-shell PTY over base64 I/O +
         // long-poll output (AMUX-2885 — every keystroke 404'd since cutover).
         .nest("/api/terminal", terminal::routes())
+        .nest("/api/tailnet", tailnet_join::routes())
         // Metrics tab report cards: CRUD + registry + ops-server refresh
         // (AMUX-2884 — the table kept its rows, the routes never mounted).
         .nest("/api/reports", reports::routes())
@@ -407,6 +440,7 @@ pub fn router_with_connector_transport(
         // worker, replay and expiry. The folder is the store (api/converse.rs).
         .merge(converse::routes())
         .nest("/api/dictation", dictation::routes())
+        .merge(transcription::routes())
         // Transcription lives at the TOP-LEVEL /api/dictate (python parity);
         // the dictation module owns it and answers NATIVELY (AMUX-2598:
         // whisper worker + gemini fallback in this process). Body limit off:
@@ -454,6 +488,18 @@ pub fn router_with_connector_transport(
         .route("/api/skin", axum::routing::get(skin::get_skin))
         .route("/api/config/export", axum::routing::get(config_iac::export))
         .route("/api/config/apply", axum::routing::put(config_iac::apply))
+        // The move bundle (cloud-self-service.md 7.1): config plus allowlisted
+        // data, one document. A real board with years of card history exported
+        // at 239 MB and the old 100 MB ceiling answered 413 (amux Cloud e2e,
+        // 2026-10-18; customer hosts are not behind Cloudflare's proxy, so its
+        // cap never applied). `amux import` sends it gzipped (about 4x
+        // smaller), and the handler caps the decompressed JSON too.
+        .route("/api/move/export", axum::routing::get(move_bundle::export))
+        .route(
+            "/api/move/import",
+            axum::routing::post(move_bundle::import)
+                .layer(axum::extract::DefaultBodyLimit::max(move_bundle::MAX_IMPORT_BYTES)),
+        )
         .route(
             "/api/board/commit-mentions",
             axum::routing::get(commit_mentions::commit_mentions),
@@ -533,6 +579,25 @@ pub fn router_with_connector_transport(
         .route(
             "/api/offline-origin",
             axum::routing::get(offline_origin::offline_origin),
+        )
+        // Public links to an app's port (static_files/public_links.rs). The
+        // list and its changes are the owner's; only /pub/<id>/ is public.
+        .route(
+            "/api/page-links",
+            axum::routing::get(static_files::public_links::list).post(static_files::public_links::create),
+        )
+        .route(
+            "/api/page-links/{id}",
+            axum::routing::delete(static_files::public_links::revoke),
+        )
+        .route(
+            "/api/page-links/{id}/approve",
+            axum::routing::post(static_files::public_links::approve),
+        )
+        // A one-time link that opens an app inside amux on the apps origin.
+        .route(
+            "/api/page-links/{id}/open",
+            axum::routing::post(static_files::apps_origin::open),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -650,6 +715,9 @@ pub fn router_with_connector_transport(
             "/api/_clear_sw",
             axum::routing::get(static_files::clear_sw_landing),
         )
+        // Standalone pages (/pages/<name>) check owner access in the handler,
+        // the same check the dashboard shell's bootstrap uses.
+        .merge(pages::view_routes())
         .merge(static_files::routes())
         .merge(protected)
         .with_state(state);
@@ -679,6 +747,10 @@ pub fn router_with_connector_transport(
     // Synthesizes ONLY into an empty body: a handler that returned its own 405
     // with prose knows more than this layer does and must not be overwritten.
     let app = app.layer(axum::middleware::from_fn(explain_method_not_allowed));
+    // A browser acting for another site may not change anything (cross_site.rs):
+    // on amux Cloud every server is under amux.io, so the door cookie alone
+    // would let one customer's page act on another's server.
+    let app = app.layer(axum::middleware::from_fn(cross_site::guard));
     // A chat delegate may only read (AMUX-5432): refused before any handler.
     let app = app.layer(axum::middleware::from_fn(chat_delegate::delegate_read_only));
     let app = app.layer(axum::middleware::from_fn_with_state(
@@ -1116,6 +1188,9 @@ async fn identity(headers: axum::http::HeaderMap) -> axum::Json<serde_json::Valu
     let mut has_key_in_env = false;
     let mut base = String::new();
     let mut tok = String::new();
+    let env_text_all = std::fs::read_to_string(home.join("server.env")).unwrap_or_default();
+    let user_home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let model_auth = model_auth_status(&env_text_all, &user_home);
     if let Ok(env_text) = std::fs::read_to_string(home.join("server.env")) {
         for l in env_text.lines() {
             let l = l.trim();
@@ -1160,12 +1235,161 @@ async fn identity(headers: axum::http::HeaderMap) -> axum::Json<serde_json::Valu
         "is_local_member": is_local_member,
         "access_scope": access_scope,
         "team": team,
-        "has_api_key": has_key_in_env || has_oauth || has_proxy,
+        "has_api_key": has_key_in_env || has_oauth || has_proxy
+            || model_auth["claude"]["subscription_token"].as_bool().unwrap_or(false),
         "has_oauth": has_oauth,
+        // Any provider at all: an OpenAI key or a Codex sign-in runs Codex workers, so a server
+        // with one must not be told "no key" (amux Cloud e2e, 2026-10-18).
+        "has_any_model": has_key_in_env || has_oauth || has_proxy || any_model_auth(&model_auth),
+        "model_auth": model_auth,
+        // Kept out of model_auth: a GitHub sign-in runs no worker. It is what
+        // `amux contribute` (Pull from remote on a cloud server) needs.
+        "github": {"signed_in": github_signed_in(&user_home)},
         "managed_upstream": has_proxy,
         "key_valid": serde_json::Value::Null,
         "key_error": "",
+        "account_url": account_url(&env_text_all, is_local_member),
     }))
+}
+
+/// Where the server's owner manages billing and deletes the account. An amux
+/// Cloud server gets AMUX_ACCOUNT_URL from its signup (cloud/desktop/bootstrap.sh);
+/// a self-hosted one has none. Invited members never see it: the account and its
+/// server belong to the person paying.
+fn account_url(env_text: &str, is_local_member: bool) -> Option<String> {
+    if is_local_member {
+        return None;
+    }
+    env_text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("AMUX_ACCOUNT_URL="))
+        .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string())
+        .rfind(|v| v.starts_with("https://"))
+}
+
+/// Which model sign-ins this server holds, for the first-run "Connect a model"
+/// screen (docs/design/cloud-self-service.md 8.4). Each CLI keeps its own
+/// credential in its own store; this only reports presence, never a value.
+/// `claude.subscription_token` is `claude setup-token`'s one-year token saved
+/// as CLAUDE_CODE_OAUTH_TOKEN; `claude.oauth` is an interactive /login.
+pub(crate) fn model_auth_status(env_text: &str, user_home: &std::path::Path) -> serde_json::Value {
+    let set = |key: &str| {
+        env_text.lines().any(|l| {
+            l.trim()
+                .strip_prefix(key)
+                .and_then(|r| r.strip_prefix('='))
+                .map(|v| {
+                    let v = v.trim().trim_matches('"').trim_matches('\'').to_lowercase();
+                    !v.is_empty() && !PLACEHOLDER_API_KEYS.contains(&v.as_str())
+                })
+                .unwrap_or(false)
+        })
+    };
+    let nonempty = |p: std::path::PathBuf| std::fs::metadata(p).map(|m| m.len() > 2).unwrap_or(false);
+    let claude_oauth = std::fs::read_to_string(user_home.join(".claude.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .map(|v| py_truthy(&v["oauthAccount"]))
+        .unwrap_or(false)
+        || nonempty(user_home.join(".claude").join(".credentials.json"));
+    serde_json::json!({
+        "claude": {
+            "api_key": set("ANTHROPIC_API_KEY"),
+            "subscription_token": set("CLAUDE_CODE_OAUTH_TOKEN"),
+            "oauth": claude_oauth,
+        },
+        "codex": {
+            "api_key": set("OPENAI_API_KEY"),
+            "signed_in": nonempty(user_home.join(".codex").join("auth.json")),
+        },
+        "gemini": {
+            "api_key": set("GEMINI_API_KEY") || set("GOOGLE_API_KEY"),
+            "signed_in": nonempty(user_home.join(".gemini").join("oauth_creds.json")),
+        },
+    })
+}
+
+/// True when `gh` holds a github.com sign-in: its hosts.yml names the host with
+/// a user or a token (the token sits in a keyring on a desktop, in the file on
+/// a server). Presence only; nothing is read out.
+pub(crate) fn github_signed_in(user_home: &std::path::Path) -> bool {
+    let dir = std::env::var_os("GH_CONFIG_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| user_home.join(".config"))
+            .join("gh")
+    });
+    github_hosts_signed_in(&std::fs::read_to_string(dir.join("hosts.yml")).unwrap_or_default())
+}
+
+fn github_hosts_signed_in(hosts: &str) -> bool {
+    let mut in_github = false;
+    for line in hosts.lines() {
+        if !line.starts_with(' ') && !line.trim().is_empty() {
+            in_github = line.trim_end() == "github.com:";
+        } else if in_github {
+            let t = line.trim();
+            if (t.starts_with("user:") || t.starts_with("oauth_token:")) && t.split_once(':').is_some_and(|(_, v)| !v.trim().is_empty()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True when any provider in a [`model_auth_status`] answer has a credential.
+pub(crate) fn any_model_auth(v: &serde_json::Value) -> bool {
+    v.as_object().is_some_and(|providers| {
+        providers.values().any(|p| p.as_object().is_some_and(|f| f.values().any(|b| b.as_bool() == Some(true))))
+    })
+}
+
+#[cfg(test)]
+mod model_auth_tests {
+    use super::{account_url, any_model_auth, model_auth_status};
+
+    #[test]
+    fn the_owner_of_a_cloud_server_gets_its_account_page_and_a_member_does_not() {
+        let env = "AMUX_AUTH_TOKEN=none\nAMUX_ACCOUNT_URL='https://amux.io/start/billing/?email=a%40b.co'\n";
+        assert_eq!(account_url(env, false).as_deref(), Some("https://amux.io/start/billing/?email=a%40b.co"));
+        assert_eq!(account_url(env, true), None, "an invited member cannot delete the owner's account");
+        assert_eq!(account_url("AMUX_AUTH_TOKEN=none\n", false), None, "self-hosted: no account page");
+        assert_eq!(account_url("AMUX_ACCOUNT_URL=javascript:alert(1)\n", false), None, "only an https link");
+    }
+
+    #[test]
+    fn github_sign_in_is_read_from_gh_hosts_file() {
+        use super::github_hosts_signed_in as s;
+        assert!(s("github.com:\n    users:\n        tester:\n    git_protocol: https\n    user: tester\n"));
+        assert!(s("github.com:\n    oauth_token: gho_fake\n"));
+        assert!(!s(""), "no file");
+        assert!(!s("github.com:\n    git_protocol: https\n"), "host listed, nobody signed in");
+        assert!(!s("ghe.example.com:\n    user: tester\n"), "another host");
+    }
+
+    #[test]
+    fn an_openai_key_alone_is_a_connected_model() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!any_model_auth(&model_auth_status("", home.path())), "nothing set");
+        assert!(any_model_auth(&model_auth_status("OPENAI_API_KEY=sk-proj-abc123\n", home.path())));
+        assert!(!any_model_auth(&model_auth_status("OPENAI_API_KEY=changeme\n", home.path())), "placeholder");
+    }
+
+    #[test]
+    fn reports_presence_per_provider_and_ignores_placeholders() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(home.path().join(".codex/auth.json"), r#"{"tokens":{"x":1}}"#).unwrap();
+        let env = "ANTHROPIC_API_KEY=changeme\nCLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-abc\nGEMINI_API_KEY=\n";
+        let v = model_auth_status(env, home.path());
+        assert_eq!(v["claude"]["api_key"], false, "placeholder key is not a key");
+        assert_eq!(v["claude"]["subscription_token"], true);
+        assert_eq!(v["claude"]["oauth"], false);
+        assert_eq!(v["codex"]["signed_in"], true);
+        assert_eq!(v["codex"]["api_key"], false);
+        assert_eq!(v["gemini"]["api_key"], false, "empty value is not a key");
+        assert_eq!(v["gemini"]["signed_in"], false);
+    }
 }
 
 // ---- /api/memory/global ----

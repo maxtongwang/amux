@@ -8,7 +8,7 @@ import { defineConfig, devices } from '@playwright/test';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import { E2E_ANTHROPIC_KEY } from './test-env';
+import { E2E_ANTHROPIC_KEY, geminiStubPort } from './test-env';
 import { reapStaleTmp } from './tmp-reap';
 import { buildTargets, buildProject } from './playwright-projects.mjs';
 
@@ -51,7 +51,12 @@ const fileMatchers = (files: string[]): RegExp[] =>
 // would have come back the moment anyone added a fourth project or a fourth
 // state-mutating spec. A port and a home each is the boundary; adding a target
 // below now costs nothing and races nothing.
-const TARGETS = buildTargets(devices);
+// The ports are fixed, and every lane on one machine runs this suite against
+// the same three. A second concurrent run fails "is already used", or worse,
+// a test reaches the other lane's server. AMUX_E2E_PORT_OFFSET moves all
+// three (e.g. 1000 -> 19823/19833/19843).
+const PORT_OFFSET = Number(process.env.AMUX_E2E_PORT_OFFSET || 0) || 0;
+const TARGETS = buildTargets(devices, PORT_OFFSET);
 const PROJECTS = TARGETS.map(buildProject);
 
 // The broad suite exercises dashboard/runtime behaviour, not a real Anthropic
@@ -87,6 +92,12 @@ for (const home of Object.values(homes)) {
     `ANTHROPIC_API_KEY=${E2E_ANTHROPIC_KEY}\n`,
     { mode: 0o600 },
   );
+  // Each server's scratchpad lives in its own temp home. The default,
+  // ~/Vault/Scratchpad under the REAL $HOME, collected 150 test notes in the
+  // owner's folder before this (2026-10-18). e2e/scratchpad-dir.ts refuses
+  // to run a scratchpad test against the real folder.
+  fs.mkdirSync(path.join(home, 'scratchpad'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'scratchpad.json'), JSON.stringify({ retain_days: 0, dir: path.join(home, 'scratchpad') }));
 }
 console.log(
   '[e2e] provider prerequisite: seeded each isolated server.env with a non-secret test key; ' +
@@ -274,6 +285,10 @@ export default defineConfig({
       // The vault's master key goes to a 0600 file in the throwaway home, never
       // into the developer's login Keychain (vault_secrets.rs keystore_is_file).
       AMUX_VAULT_KEYSTORE: 'file',
+      // Every Gemini call (Dictate, Recordings) goes to a local stub port, never
+      // the real billed API; a spec that needs an answer listens there
+      // (e2e/transcription-settings.spec.ts). Nothing listening is a failure.
+      AMUX_GEMINI_BASE: `http://127.0.0.1:${geminiStubPort(t.port)}`,
     },
   })),
 });

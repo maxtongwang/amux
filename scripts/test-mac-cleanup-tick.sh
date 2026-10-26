@@ -6,6 +6,7 @@
 # not: the thresholds, the label guard, and dry run. Each cell fails if its
 # guard is removed — the point is that it CAN go red (ethos rule 7).
 set -euo pipefail
+export AMUX_CLEANUP_OPEN_WRITERS_CMD=false   # a disk bundle must not read the live lsof
 HERE=$(cd "$(dirname "$0")" && pwd)
 TICK="$HERE/mac-cleanup-tick.sh"
 FIX=$(mktemp -d)                      # never a fixed name: /tmp is shared
@@ -25,7 +26,7 @@ check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; else echo "  FAIL $1: expec
 export AMUX_CLEANUP_TARGET_ROOTS="$FIX/no-such-root"
 # Same reason for the assess stage (DESKT-57): its end-to-end runs must neither
 # message a real lane nor move the real burn-rate state file.
-export AMUX_CLEANUP_STATE_DIR="$FIX/assess-state" AMUX_CLEANUP_ESCALATE_CMD="true" AMUX_CLEANUP_HISTORY_CMD="true" AMUX_CLEANUP_CARD_CMD="true" AMUX_CLEANUP_VM_LIST_CMD="true"
+export AMUX_CLEANUP_STATE_DIR="$FIX/assess-state" AMUX_CLEANUP_RECLAIM_TRIGGER_CMD="${RECLAIM_TRIGGER_STUB:-echo 204}" AMUX_CLEANUP_DEMOTE_PS_CMD=true AMUX_CLEANUP_ESCALATE_CMD="true" AMUX_CLEANUP_HISTORY_CMD="true" AMUX_CLEANUP_CARD_CMD="true" AMUX_CLEANUP_VM_LIST_CMD="true"
 
 # Library mode must define the decisions without running a single probe.
 export AMUX_CLEANUP_SCOPE_FILE=/dev/null   # the live global scope must not configure a test (DESKT-72)

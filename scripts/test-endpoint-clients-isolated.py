@@ -376,6 +376,9 @@ ALLOWLIST = [  # (file, substring of the line, reason): a literal that is not a 
     ("Makefile", "PORT      ?= 8824", "`make` run configuration, not a client request"),
     ("install.sh", 'PORT="${AMUX_RS_PORT:-8824}"', "the port the installer configures the server with"),
     ("amux-remote", "e.g. https://100.108.219.90:8824", "--help example of a REMOTE server address"),
+    ("skills/muse/install-paired-mac.sh", "usage: install-paired-mac.sh https://<amux server>:8824", "usage text naming a REMOTE server; the given URL is stored, not requested here"),
+    ("skills/muse/scripts/muse-sync.py", '{"url": "https://<server>:8824", "token"', "module docstring: the config file's shape, naming a REMOTE server"),
+    ("scripts/amux-menubar.swift", '?? "https://localhost:8824"', "the owner's menu-bar GUI app; no test or isolated run launches it and Swift has no guard copy"),
 ]
 GUARDED = re.compile(r"_endpoint_guard\(|amux_endpoint_guard |amuxEndpointGuard\(")
 LITERAL = re.compile(r"(?<![0-9])0*88(24|22)(?![0-9])")

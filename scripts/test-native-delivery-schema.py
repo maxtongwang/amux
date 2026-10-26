@@ -12,7 +12,7 @@ def fixture():
     conn = sqlite3.connect(':memory:')
     conn.row_factory = sqlite3.Row
     conn.execute('CREATE TABLE steering_queue(id TEXT PRIMARY KEY, session TEXT, text TEXT, queued_at REAL)')
-    conn.executescript((MIGRATIONS / '0124_native_delivery.sql').read_text())
+    conn.executescript((MIGRATIONS / '0136_native_delivery.sql').read_text())
     conn.execute("INSERT INTO steering_queue(id,session,text,queued_at) VALUES('old','receiver','body',1)")
     conn.execute("INSERT INTO steering_queue(id,session,text,queued_at) VALUES('later','receiver','later',2)")
     fields = {
@@ -27,7 +27,7 @@ def fixture():
     }
     conn.execute(f"INSERT INTO native_delivery_attempts({','.join(fields)}) VALUES({','.join('?' for _ in fields)})",
                  tuple(fields.values()))
-    conn.executescript((MIGRATIONS / '0125_native_uncertainty.sql').read_text())
+    conn.executescript((MIGRATIONS / '0137_native_uncertainty.sql').read_text())
     return conn, fields
 
 

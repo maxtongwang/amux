@@ -42,6 +42,186 @@ pub(crate) fn ensure_observer(home: &Path) -> std::io::Result<bool> {
         "installed passive observer now matches this server's bundled bytes");
     Ok(true)
 }
+/// The Claude events the observer listens on, as scripts/hooks/
+/// install-native-status-hooks.py registers them (keep the two in step).
+const CLAUDE_HOOK_EVENTS: &[&str] = &[
+    "SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PermissionRequest",
+    "PostToolUse", "PreCompact", "PostCompact", "Stop", "Notification", "PostToolUseFailure",
+    "StopFailure",
+];
+
+/// `shlex.quote`, so the command is byte-identical to what install.sh writes.
+fn sh_word(s: &str) -> String {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"@%+=:,./-_".contains(&b)) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\"'\"'"))
+    }
+}
+
+/// Register the observer in Claude's settings when it is missing there, the
+/// same entries the installer writes. Returns whether the file was written.
+///
+/// Only install.sh and the cloud bootstrap/update scripts used to register it,
+/// so a host that missed them had no hooks: on the sandbox (2026-10-25) every
+/// worker read "unknown" with "hooks are not reaching amux", mtp-demo included
+/// while five of its subagents were running. Settings that already carry every
+/// entry are left byte-for-byte alone; otherwise only amux's own entries are
+/// replaced, never another hook.
+pub(crate) fn ensure_claude_hooks(settings: &Path, script: &Path) -> std::io::Result<bool> {
+    let command = format!("python3 {} claude", sh_word(&script.to_string_lossy()));
+    let mut data: Value = match std::fs::read_to_string(settings) {
+        Ok(t) => serde_json::from_str(&t)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: {e}", settings.display())))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(e),
+    };
+    let ours = |h: &Value| h["command"].as_str().is_some_and(|c| c.contains("native-status.py"));
+    let present = |data: &Value, ev: &str| {
+        data["hooks"][ev].as_array().is_some_and(|gs| gs.iter().any(|g| {
+            g["hooks"].as_array().is_some_and(|hs| hs.iter().any(|h| h["command"] == json!(command)))
+        }))
+    };
+    let total = data["hooks"].as_object().map_or(0, |o| {
+        o.values().filter_map(Value::as_array).flatten()
+            .filter_map(|g| g["hooks"].as_array()).flatten().filter(|h| ours(h)).count()
+    });
+    if CLAUDE_HOOK_EVENTS.iter().all(|ev| present(&data, ev)) && total == CLAUDE_HOOK_EVENTS.len() {
+        return Ok(false);
+    }
+    if !data.is_object() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "settings is not a JSON object"));
+    }
+    if !data["hooks"].is_object() {
+        data["hooks"] = json!({});
+    }
+    let hooks = data["hooks"].as_object_mut().expect("hooks is an object");
+    for groups in hooks.values_mut() {
+        if let Some(gs) = groups.as_array_mut() {
+            for g in gs.iter_mut() {
+                if let Some(hs) = g.get_mut("hooks").and_then(Value::as_array_mut) {
+                    hs.retain(|h| !ours(h));
+                }
+            }
+            gs.retain(|g| g["hooks"].as_array().is_none_or(|hs| !hs.is_empty()));
+        }
+    }
+    for ev in CLAUDE_HOOK_EVENTS {
+        let mut group = json!({"hooks": [{"type": "command", "command": command, "timeout": 3}]});
+        if matches!(*ev, "PreToolUse" | "PermissionRequest" | "PostToolUse" | "PostToolUseFailure") {
+            group["matcher"] = json!(".*");
+        }
+        let slot = hooks.entry(ev.to_string()).or_insert_with(|| json!([]));
+        if !slot.is_array() {
+            *slot = json!([]);
+        }
+        slot.as_array_mut().expect("array").push(group);
+    }
+    if let Some(dir) = settings.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = settings.with_extension(format!("status-hook-{}.tmp", ulid::Ulid::new()));
+    let result = (|| {
+        std::fs::write(&tmp, serde_json::to_string_pretty(&data).unwrap_or_default() + "\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(settings).map(|m| m.permissions().mode() & 0o777).unwrap_or(0o600);
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        }
+        std::fs::rename(&tmp, settings)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result?;
+    Ok(true)
+}
+
+/// The tools amux denies every Claude on the host. The Artifact tool publishes to
+/// claude.ai, outside amux, where the owner cannot list, serve or turn the page
+/// off: on sandbox.amux.io (2026-10-25) PPD-payroll-demo answered with
+/// claude.ai/artifact/... and left nothing in its workspace, because that host's
+/// settings carried no deny (the owner's Mac denies it by hand).
+const CLAUDE_DENIED_TOOLS: &[&str] = &["Artifact", "Artifact(*)"];
+
+/// Add [`CLAUDE_DENIED_TOOLS`] to `permissions.deny` when any is missing; every
+/// other key and entry is kept. Returns whether the file was written.
+pub(crate) fn ensure_claude_denies(settings: &Path) -> std::io::Result<bool> {
+    let mut data: Value = match std::fs::read_to_string(settings) {
+        Ok(t) => serde_json::from_str(&t)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: {e}", settings.display())))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(e),
+    };
+    let has = |data: &Value, t: &str| data["permissions"]["deny"].as_array().is_some_and(|a| a.iter().any(|v| v == t));
+    if CLAUDE_DENIED_TOOLS.iter().all(|t| has(&data, t)) {
+        return Ok(false);
+    }
+    if !data.is_object() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "settings is not a JSON object"));
+    }
+    if !data["permissions"].is_object() {
+        data["permissions"] = json!({});
+    }
+    if !data["permissions"]["deny"].is_array() {
+        data["permissions"]["deny"] = json!([]);
+    }
+    for t in CLAUDE_DENIED_TOOLS {
+        if !has(&data, t) {
+            data["permissions"]["deny"].as_array_mut().expect("array").push(json!(t));
+        }
+    }
+    if let Some(dir) = settings.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = settings.with_extension(format!("deny-{}.tmp", ulid::Ulid::new()));
+    let result = (|| {
+        std::fs::write(&tmp, serde_json::to_string_pretty(&data).unwrap_or_default() + "\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(settings).map(|m| m.permissions().mode() & 0o777).unwrap_or(0o600);
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        }
+        std::fs::rename(&tmp, settings)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result?;
+    Ok(true)
+}
+
+/// [`ensure_claude_hooks`] for this server's own Claude, logged. Only when the
+/// server uses the default home (`~/.amux`): a test server runs under a
+/// throwaway AMUX_HOME with the real HOME, and must not point the user's
+/// Claude at a temporary observer.
+pub(crate) fn ensure_claude_hooks_here() {
+    let home = crate::config::amux_home();
+    let default_home = std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".amux"));
+    if default_home.as_deref() != Some(home.as_path()) {
+        return;
+    }
+    let settings = super::session_verbs::claude_home().join("settings.json");
+    match ensure_claude_hooks(&settings, &home.join("native-status.py")) {
+        Ok(true) => tracing::warn!(measured = true, n_considered = 1, verdict = "claude_status_hooks_installed",
+            settings = %settings.display(),
+            "Claude settings did not register the status observer; registered it so workers report their state"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, measured = false, n_considered = 1, verdict = "claude_status_hooks_install_failed",
+            settings = %settings.display(), "could not register the status observer; Claude workers will read unknown"),
+    }
+    match ensure_claude_denies(&settings) {
+        Ok(true) => tracing::warn!(measured = true, n_considered = 1, verdict = "claude_tool_denies_installed",
+            settings = %settings.display(), denied = ?CLAUDE_DENIED_TOOLS,
+            "Claude settings allowed tools amux denies (claude.ai Artifacts); denied them"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, measured = false, n_considered = 1, verdict = "claude_tool_denies_install_failed",
+            settings = %settings.display(), "could not deny the claude.ai Artifact tool in Claude settings"),
+    }
+}
+
 fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
@@ -375,6 +555,8 @@ pub(crate) fn replay(state: &AppState) {
         tracing::warn!(%error, measured = false, n_considered = 1, verdict = "native_status_observer_adoption_failed",
             "observer installation drift could not be repaired; retained status spool still replays");
     }
+    observer_error_census(&crate::config::amux_home());
+    ensure_claude_hooks_here();
     let Ok(workers) = std::fs::read_dir(root()) else {
         return;
     };
@@ -393,6 +575,77 @@ pub(crate) fn replay(state: &AppState) {
         replay_run(state, &name, &worker.path().join(run));
     }
 }
+
+/// Byte offset already counted in `status-observer-errors.jsonl`, per file.
+static OBSERVER_ERRORS_SEEN: std::sync::Mutex<Option<(PathBuf, u64)>> = std::sync::Mutex::new(None);
+
+/// Count what the passive observer wrote to `status-observer-errors.jsonl`
+/// since the last pass, by `error_type` and worker, and WARN when it is not
+/// zero.
+///
+/// The hook appended 16,081 lines there (9,065 TimeoutError, 5,131 HTTPError
+/// on 2026-10-18) and nothing read the file, so ~690 hook timeouts in one lane
+/// surfaced only in a transcript review. The hook now also writes
+/// `lock_budget_exceeded` (it gave up waiting for the spool lock rather than
+/// hold the provider's turn) and `slow_hook`. The first pass of a process
+/// reports the backlog once, then only new lines are counted.
+pub(crate) fn observer_error_census(home: &Path) -> Option<Value> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = home.join("status-observer-errors.jsonl");
+    let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let mut seen = OBSERVER_ERRORS_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (backlog, from) = match seen.as_ref() {
+        Some((p, off)) if *p == path && *off <= len => (false, *off),
+        _ => (true, 0),
+    };
+    if len == from {
+        *seen = Some((path, len));
+        return None;
+    }
+    // A backlog read is bounded to the newest 4 MiB; its first, cut line is
+    // skipped below.
+    const BACKLOG_CAP: u64 = 4 << 20;
+    let cut = backlog && len > BACKLOG_CAP;
+    let from = if cut { len - BACKLOG_CAP } else { from };
+    let mut buf = String::new();
+    let read = std::fs::File::open(&path).and_then(|mut f| {
+        f.seek(SeekFrom::Start(from))?;
+        // A partial trailing line is left for the next pass.
+        f.take(len - from).read_to_string(&mut buf)
+    });
+    if let Err(error) = read {
+        tracing::warn!(%error, measured = false, n_considered = 0, verdict = "native_status_observer_errors_unreadable",
+            "could not read the passive observer's error log");
+        return None;
+    }
+    let complete = buf.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let mut by_type: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut by_worker: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut n = 0u64;
+    for line in buf[..complete].lines().skip(usize::from(cut)) {
+        let v: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+        n += 1;
+        *by_type.entry(v["error_type"].as_str().unwrap_or("unparsed").to_string()).or_default() += 1;
+        *by_worker.entry(v["worker"].as_str().unwrap_or("").to_string()).or_default() += 1;
+    }
+    *seen = Some((path, from + complete as u64));
+    if n == 0 {
+        return None;
+    }
+    let mut workers: Vec<(String, u64)> = by_worker.into_iter().collect();
+    workers.sort_by_key(|w| std::cmp::Reverse(w.1));
+    workers.truncate(8);
+    let summary = json!({"errors": n, "by_type": by_type, "top_workers": workers, "backlog": backlog});
+    if backlog {
+        tracing::info!(measured = true, n_considered = n, verdict = "native_status_observer_errors_backlog",
+            summary = %summary, "passive observer error log on disk at startup, counted once");
+    } else {
+        tracing::warn!(measured = true, n_considered = n, verdict = "native_status_observer_errors",
+            summary = %summary, "passive status hook recorded errors since the last pass (timeouts, lock budget overruns, slow hooks)");
+    }
+    Some(summary)
+}
+
 fn replay_run(state: &AppState, name: &str, dir: &Path) {
     let Ok(files) = std::fs::read_dir(dir) else {
         return;
@@ -441,6 +694,30 @@ fn replay_run(state: &AppState, name: &str, dir: &Path) {
 
 #[cfg(test)]
 mod tests {
+    /// gs12 review: the hook's error log had 16K lines and no reader.
+    #[test]
+    fn observer_errors_are_counted_once_by_type_then_only_new_lines() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status-observer-errors.jsonl");
+        let line = |t: &str, w: &str| format!("{}\n", serde_json::json!({"at":1.0,"worker":w,"error_type":t}));
+        std::fs::write(&path, line("TimeoutError", "a") + &line("TimeoutError", "b")).unwrap();
+        let first = super::observer_error_census(dir.path()).expect("backlog counted");
+        assert_eq!(first["backlog"], true);
+        assert_eq!(first["errors"], 2);
+        assert_eq!(first["by_type"]["TimeoutError"], 2);
+        assert!(super::observer_error_census(dir.path()).is_none(), "nothing new, nothing reported");
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(line("lock_budget_exceeded", "a").as_bytes()).unwrap();
+        f.write_all(b"{\"error_type\":\"partial").unwrap();
+        let next = super::observer_error_census(dir.path()).expect("new line counted");
+        assert_eq!(next["backlog"], false);
+        assert_eq!(next["errors"], 1, "a partial trailing line waits for the next pass");
+        assert_eq!(next["by_type"]["lock_budget_exceeded"], 1);
+        f.write_all(b"\"}\n").unwrap();
+        assert_eq!(super::observer_error_census(dir.path()).unwrap()["by_type"]["partial"], 1);
+    }
+
     /// An unchanged state is recorded as a bare update; only a real transition
     /// carries the report.
     #[test]
@@ -455,6 +732,47 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_artifact_tool_is_denied_once_and_other_permissions_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        std::fs::write(&settings, r#"{"model":"opus","permissions":{"allow":["Bash"],"deny":["WebFetch"]}}"#).unwrap();
+        assert!(ensure_claude_denies(&settings).unwrap());
+        let d: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(d["model"], "opus");
+        assert_eq!(d["permissions"]["allow"], json!(["Bash"]));
+        assert_eq!(d["permissions"]["deny"], json!(["WebFetch", "Artifact", "Artifact(*)"]));
+        let written = std::fs::read(&settings).unwrap();
+        assert!(!ensure_claude_denies(&settings).unwrap(), "already denied: not rewritten");
+        assert_eq!(std::fs::read(&settings).unwrap(), written);
+        let fresh = dir.path().join("none").join("settings.json");
+        assert!(ensure_claude_denies(&fresh).unwrap());
+        assert!(std::fs::read_to_string(&fresh).unwrap().contains("Artifact(*)"));
+    }
+
+    #[test]
+    fn claude_hooks_are_registered_once_and_other_hooks_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        let script = Path::new("/home/amux/.amux/native-status.py");
+        std::fs::write(&settings, r#"{"model":"opus","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"python3 guard.py"}]},{"hooks":[{"type":"command","command":"python3 /old/native-status.py claude"}]}]}}"#).unwrap();
+        assert!(ensure_claude_hooks(&settings, script).unwrap());
+        let d: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(d["model"], "opus");
+        let pre = d["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre[0]["hooks"][0]["command"], "python3 guard.py", "another hook is kept");
+        assert!(!d.to_string().contains("/old/"), "a stale observer path is replaced");
+        for ev in CLAUDE_HOOK_EVENTS {
+            assert!(d["hooks"][ev].to_string().contains("python3 /home/amux/.amux/native-status.py claude"), "{ev}");
+        }
+        let written = std::fs::read(&settings).unwrap();
+        assert!(!ensure_claude_hooks(&settings, script).unwrap(), "complete settings are not rewritten");
+        assert_eq!(std::fs::read(&settings).unwrap(), written);
+        let fresh = dir.path().join("none").join("settings.json");
+        assert!(ensure_claude_hooks(&fresh, Path::new("/a path/native-status.py")).unwrap());
+        assert!(std::fs::read_to_string(&fresh).unwrap().contains("python3 '/a path/native-status.py' claude"));
+    }
 
     #[test]
     fn bundled_observer_repairs_drift_atomically_without_rewriting_current_bytes() {

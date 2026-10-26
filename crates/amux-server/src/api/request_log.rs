@@ -1317,7 +1317,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/connection/session",
-        methods: &["POST"],
+        methods: &["POST", "DELETE"],
     },
     RouteEntry {
         path: "/api/connection/certificate",
@@ -1343,6 +1343,18 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry {
         path: "/api/health",
         methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/pub/{id}",
+        methods: &["*"],
+    },
+    RouteEntry {
+        path: "/pub/{id}/",
+        methods: &["*"],
+    },
+    RouteEntry {
+        path: "/pub/{id}/{*rest}",
+        methods: &["*"],
     },
     RouteEntry {
         path: "/api/_clear_sw",
@@ -1759,6 +1771,23 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         path: "/api/signals/{name}",
         methods: &["GET", "POST"],
     },
+    // Event subscriptions (api/signals.rs `subscription_routes`, migration 0130).
+    RouteEntry {
+        path: "/api/subscriptions",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/subscriptions/emit",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/subscriptions/fires",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/subscriptions/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
     RouteEntry {
         path: "/api/verify/{id}",
         methods: &["GET", "POST"],
@@ -1885,7 +1914,24 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET"],
     },
     RouteEntry {
+        path: "/api/metrics/workers",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/metrics/workers/live",
+        methods: &["GET"],
+    },
+    RouteEntry {
         path: "/api/metrics/telemetry",
+        methods: &["GET"],
+    },
+    // Worker boundaries (boundaries.toml) and resource awareness.
+    RouteEntry {
+        path: "/api/boundaries",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/resources",
         methods: &["GET"],
     },
     // Agent trace archive (370787b2), pinned launchers and the credential vault.
@@ -1895,6 +1941,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/traces/file",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/palette",
         methods: &["GET"],
     },
     RouteEntry {
@@ -2126,6 +2176,14 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET"],
     },
     RouteEntry {
+        path: "/api/usage/accounts",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/usage/accounts/readings",
+        methods: &["POST"],
+    },
+    RouteEntry {
         path: "/api/alert/config",
         methods: &["GET", "PATCH"],
     },
@@ -2270,6 +2328,22 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry {
         path: "/api/offline-origin",
         methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/page-links",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/page-links/{id}",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/page-links/{id}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/page-links/{id}/open",
+        methods: &["POST"],
     },
     RouteEntry {
         path: "/api/scope",
@@ -2602,6 +2676,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET"],
     },
     RouteEntry {
+        path: "/api/files/mdai/chat",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
         path: "/api/files/mdai/connect",
         methods: &["POST"],
     },
@@ -2618,6 +2696,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET", "PUT"],
     },
     RouteEntry {
+        path: "/api/files/mdai/chat",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
         path: "/api/fs/mkdir",
         methods: ANY,
     },
@@ -2631,6 +2713,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/fs/rename",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/fs/move",
         methods: ANY,
     },
     RouteEntry {
@@ -2651,6 +2737,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/fs/resolve",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/fs/opened",
         methods: ANY,
     },
     RouteEntry {
@@ -2691,6 +2781,19 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         path: "/api/tags",
         methods: ANY,
     },
+    // -- tailnet join (api/tailnet_join.rs)
+    RouteEntry {
+        path: "/api/tailnet/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/tailnet/join",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/tailnet/leave",
+        methods: &["POST"],
+    },
     // -- journal / layout presets
     RouteEntry {
         path: "/api/journal",
@@ -2727,6 +2830,27 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry {
         path: "/api/layout-presets/{name}",
         methods: &["DELETE"],
+    },
+    // -- Social posting (api/social.rs, AA-42)
+    RouteEntry {
+        path: "/api/social",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/social/posts",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/social/posts/track",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/social/posts/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/social/posts/{id}/metrics",
+        methods: &["GET"],
     },
     // -- New Worker / Connect modals (api/worker_create.rs, AMUX-2871)
     RouteEntry {
@@ -2784,6 +2908,25 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         path: "/api/sessions/{name}/typing",
         methods: &["GET", "POST"],
     },
+    // -- a worker's task-name changes, newest first (sessions_legacy::task_history)
+    RouteEntry {
+        path: "/api/sessions/{name}/task-history",
+        methods: &["GET"],
+    },
+    // -- a worker's plan window and limit-killed agents (agent_limit_resume::worker_quota)
+    RouteEntry {
+        path: "/api/sessions/{name}/quota",
+        methods: &["GET"],
+    },
+    // -- every worker's tasks, oldest first (sessions_legacy::task_list, the Tasks tab)
+    RouteEntry {
+        path: "/api/task-history",
+        methods: &["GET"],
+    },
+    // -- the task each worker was on at given times (sessions_legacy::task_at_batch)
+    RouteEntry { path: "/api/task-history/at", methods: &["GET"] },
+    // -- one task's commits, closed requests and handoff (sessions_legacy::task_links)
+    RouteEntry { path: "/api/task-history/links", methods: &["GET"] },
     // -- Converse tab: voice conversations with a worker (api/converse.rs)
     RouteEntry { path: "/api/converse/config", methods: &["GET"] },
     RouteEntry { path: "/api/converse/sweep", methods: &["POST"] },
@@ -3065,23 +3208,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/pull",
-        methods: &["POST"],
-    },
-    RouteEntry {
-        path: "/api/proxies",
         methods: &["GET", "POST"],
-    },
-    RouteEntry {
-        path: "/api/proxies/{id}",
-        methods: &["PATCH", "DELETE"],
-    },
-    RouteEntry {
-        path: "/api/proxies/{id}/start",
-        methods: &["POST"],
-    },
-    RouteEntry {
-        path: "/api/proxies/{id}/stop",
-        methods: &["POST"],
     },
     // AMUX-2888: mounted ahead of the tunnel client port so the SPA panel and
     // `amux tunnel` stop getting a 404 (status) and a 405 (the POSTs, from the
@@ -3193,11 +3320,59 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["POST"],
     },
     RouteEntry {
+        path: "/api/sql/ask",
+        methods: &["POST"],
+    },
+    RouteEntry {
         path: "/api/sql/schema",
         methods: &["GET"],
     },
     RouteEntry {
         path: "/api/sql/rows",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/pages",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}",
+        methods: &["GET", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}/html",
+        methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}/sql",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}/ask",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}/version",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}/file",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}/snapshots",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}/restore",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/pages/{name}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/pages/{name}/",
         methods: &["GET"],
     },
     RouteEntry {
@@ -3234,6 +3409,54 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/map/search",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/map/meta",
+        methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/map/pins/bulk",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/map/pins/merge",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/map/pins/{id}",
+        methods: &["PUT", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/map/pins/{id}/history",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/map/duplicates",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/map/visits/match",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/map/places/link",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/map/places/refresh",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/map/lists/{id}/share",
+        methods: &["GET", "POST", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/share/map/{token}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/s/map/{token}",
         methods: &["GET"],
     },
     RouteEntry {
@@ -3321,6 +3544,18 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["DELETE"],
     },
     RouteEntry {
+        path: "/api/tailnet/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/tailnet/join",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/tailnet/leave",
+        methods: &["POST"],
+    },
+    RouteEntry {
         path: "/api/reports/types",
         methods: &["GET"],
     },
@@ -3354,6 +3589,16 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/history/import",
+        methods: &["POST"],
+    },
+    // gs12 review finding 9: dry-run count, owner-only apply.
+    RouteEntry {
+        path: "/api/history/redact-stored",
+        methods: &["POST"],
+    },
+    // Rebuild cmd_history rows from session_events: dry run, owner-only apply.
+    RouteEntry {
+        path: "/api/history/backfill",
         methods: &["POST"],
     },
     // AMUX-4664: ask a question of the messages.
@@ -3406,6 +3651,14 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry {
         path: "/api/config/apply",
         methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/move/export",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/move/import",
+        methods: &["POST"],
     },
     RouteEntry {
         path: "/api/board/themes",
@@ -3499,6 +3752,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry {
         path: "/api/dictate",
         methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/transcription",
+        methods: &["GET", "POST"],
     },
     RouteEntry {
         path: "/api/recordings",

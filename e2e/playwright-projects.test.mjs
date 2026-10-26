@@ -26,9 +26,15 @@ for (const target of TARGETS) {
       cookies: [],
       origins: [{
         origin,
-        localStorage: [{ name: 'amux_walkthrough_done', value: '1' }],
+        localStorage: [{ name: 'amux_walkthrough_done', value: '1' }, { name: 'amux_cloud_offer', value: '{"dismissed":1}' }],
       }],
-    }, `${target.name}: walkthrough suppression must survive project overrides`);
+    }, `${target.name}: walkthrough and Cloud offer suppression must survive project overrides`);
     assert.equal(project.use.trace ?? 'off', target.name === 'ios-safari' ? 'retain-on-failure' : 'off');
   });
 }
+
+test('AMUX_E2E_PORT_OFFSET moves every target port together', () => {
+  const moved = buildTargets({ 'iPhone 15': {} }, 1000);
+  assert.deepEqual(moved.map(t => t.port), TARGETS.map(t => t.port + 1000));
+  assert.deepEqual(TARGETS.map(t => t.port), [18823, 18833, 18843]);
+});
