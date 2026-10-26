@@ -10331,96 +10331,6 @@ fn stranded_expire_secs() -> i64 {
         .unwrap_or(86_400)
 }
 
-<<<<<<< HEAD
-=======
-/// Whether a Claude transcript holds a user prompt that is exactly `text` (or
-/// `text` after an amux origin stamp), dated at or after `since` (unix seconds,
-/// the requested clock skew). `None` when the answer cannot be trusted: the file is
-/// unreadable, or the part read starts after `since`, which covers both a file
-/// too large for the tail read and a conversation that began after the
-/// reservation (the prompt could be in an older transcript).
-/// Whether the lane's pane shows a turn in progress right now.
-async fn lane_generating_now(name: &str) -> bool {
-    #[cfg(test)]
-    if let Some(g) = test_generating::get(name) {
-        return g;
-    }
-    detect_claude_status(&tmux_capture(name, 0).await) == "active"
-}
-
-#[cfg(test)]
-pub(crate) mod test_generating {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    static LANES: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
-    pub(crate) fn set(name: &str, generating: bool) {
-        LANES.lock().unwrap().get_or_insert_with(HashMap::new).insert(name.to_string(), generating);
-    }
-    pub(crate) fn get(name: &str) -> Option<bool> {
-        LANES.lock().unwrap().as_ref().and_then(|m| m.get(name).copied())
-    }
-}
-
-/// Whether a message missing from the transcript may be released for a resend.
-/// Never while the lane is generating: a message delivered mid-turn reaches the
-/// transcript only when the turn ends, so its absence proves nothing yet.
-fn stranded_release_allowed(generating: bool) -> bool {
-    !generating
-}
-
-fn transcript_has_prompt_since(path: &std::path::Path, text: &str, since: i64, clock_skew_s: i64) -> Option<bool> {
-    use std::io::{Read, Seek, SeekFrom};
-    const TAIL: u64 = 16 * 1024 * 1024;
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let start = len.saturating_sub(TAIL);
-    f.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let hay = String::from_utf8_lossy(&buf);
-    let needle = serde_json::to_string(text).ok()?;
-    let needle = needle.trim_matches('"');
-    let stamped = format!("\n\n{text}");
-    let mut earliest: Option<i64> = None;
-    let mut found = false;
-    // A tail read can begin mid-line; the first partial line is skipped.
-    for line in hay.lines().skip(usize::from(start > 0)) {
-        let at_of = |v: &Value| {
-            v["timestamp"]
-                .as_str()
-                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                .map(|t| t.timestamp())
-        };
-        if earliest.is_none() && line.contains("\"timestamp\"") {
-            if let Ok(v) = serde_json::from_str::<Value>(line) {
-                earliest = at_of(&v);
-            }
-        }
-        if found || !line.contains(needle) || !line.contains("\"type\":\"user\"") {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(content) = v["message"]["content"].as_str() else {
-            continue;
-        };
-        if v["type"] == "user"
-            && (content == text || content.ends_with(&stamped))
-            && at_of(&v).map_or(clock_skew_s > 0, |t| t >= since - clock_skew_s)
-        {
-            found = true;
-        }
-    }
-    if found {
-        return Some(true);
-    }
-    match earliest {
-        Some(t) if t <= since => Some(false),
-        _ => None,
-    }
-}
->>>>>>> upstream/main
 
 // Codex rollout recovery is positive-only: absence in a bounded/rotated log
 // cannot authorize a second delivery. Ignore assistant/tool text and require a
@@ -10513,97 +10423,10 @@ async fn send_receipt_resolving(
             rusqlite::params![name, msg_id],
             |r| r.get::<_, i64>(0),
         )
-<<<<<<< HEAD
         .ok()
     });
     match reserved_ts {
         Some(ts) if !send_is_in_flight(name, msg_id) && now_i64().saturating_sub(ts) > stranded_expire_secs() => {
-=======
-    })();
-    // No row (an ID never reserved) or a schema without text_sha yet: the plain
-    // receipt answer is already the truth.
-    let Ok((ts, text_sha)) = row else { return base };
-    if send_is_in_flight(name, msg_id) {
-        return base;
-    }
-    let aged = now_i64().saturating_sub(ts) > 120;
-    // A restarted process has no live owner. Exact positive evidence is safe
-    // now; lack of evidence must not authorize a replay sooner than before.
-    if !aged && text_sha.as_deref() != Some(text_sha256(text).as_str()) {
-        return base;
-    }
-    let judgeable = !text.is_empty()
-        && text.len() <= STRANDED_TEXT_MAX
-        && !text.contains('\n')
-        && text_sha
-            .as_deref()
-            .is_none_or(|sha| sha == text_sha256(text));
-    // Rollout discovery and bounded transcript reads are filesystem work;
-    // keep receipt recovery off the async executor during reconnect bursts.
-    let (worker, prompt) = (name.to_owned(), text.to_owned());
-    let evidence = tokio::task::spawn_blocking(move || {
-        let codex = matches!(
-            provider_of(&parse_env(&worker)).as_str(),
-            "codex" | "ollama"
-        );
-        if codex
-            && !prompt.is_empty()
-            && prompt.len() <= 2000
-            && text_sha.as_deref() == Some(text_sha256(&prompt).as_str())
-        {
-            codex_rollout_path(&worker)
-                .map(|path| (codex_receipt_evidence(&path, &prompt, ts), path))
-        } else if !codex && judgeable {
-            session_jsonl_path(&worker)
-                .map(|path| (transcript_has_prompt_since(&path, &prompt, ts, if aged { 60 } else { 0 }), path))
-        } else {
-            None
-        }
-    })
-    .await
-    .unwrap_or(None);
-    match evidence {
-        Some((Some(true), path)) => {
-            let id = format!("reconciled-{msg_id}");
-            send_dedup_accept(state, name, msg_id, &id).await;
-            tracing::warn!(
-                target: "amux::message_acceptance", session = name, verdict = "stranded_reservation_reconciled",
-                measured = true, n_considered = 1, transcript = %path.display(), early_recovery = !aged,
-                "a stranded reservation's text is in the lane transcript; recorded its receipt (AMUX-4594)"
-            );
-            stranded_answer(
-                json!({"ok": true, "accepted": true, "reconciled": true, "id": id, "msg_id": msg_id}),
-            )
-        }
-        Some((Some(false), path)) if aged && {
-            // ABSENCE IS NOT EVIDENCE WHILE THE LANE IS MID-TURN. Claude Code holds a
-            // message typed during a turn and writes it to the transcript only when
-            // the turn ends: on sandbox.amux.io (2026-10-26) "password protect it" was
-            // released at 15:56:18.098, the transcript recorded it at 15:56:18.577, and
-            // the owner was shown "may already be with the worker" with a resend
-            // invitation that would have delivered it twice.
-            let generating = lane_generating_now(name).await;
-            if generating {
-                tracing::info!(target: "amux::message_acceptance", session = name, measured = true, n_considered = 1,
-                    verdict = "stranded_reservation_deferred_mid_turn",
-                    "a reservation's text is not in the transcript yet, but the lane is mid-turn; not released");
-            }
-            stranded_release_allowed(generating)
-        } => {
-            send_dedup_forget(state, name, msg_id).await;
-            tracing::warn!(
-                target: "amux::message_acceptance", session = name, verdict = "stranded_reservation_released",
-                measured = true, n_considered = 1, transcript = %path.display(),
-                "a stranded reservation's text never reached the lane transcript; released it so the sender can send once (AMUX-4594)"
-            );
-            stranded_answer(json!({
-                "ok": true, "accepted": false, "released": true, "delivered": false, "msg_id": msg_id,
-                "evidence": format!("no prompt matching the text after the reservation in {}", path.display()),
-            }))
-        }
-        _ if !aged => base,
-        _ if now_i64().saturating_sub(ts) > stranded_expire_secs() => {
->>>>>>> upstream/main
             tracing::warn!(
                 target: "amux::message_acceptance", session = name, verdict = "stranded_reservation_expired",
                 measured = false, n_considered = 1, age_s = now_i64().saturating_sub(ts),
@@ -21888,10 +21711,12 @@ fn roster_footer(n: usize) -> String {
         format!(" Open groups take messages from any worker: {}. Their members still message only \
             workers they share a group with.", open.join(", "))
     };
+    let admin_line = if fork_gate_on(ADMIN_AS_OWNER_GATE) {
+        format!(" Members of the `{ADMIN_GROUP}` group act with the owner's reach and may message any \
+            worker, isolated ones included.")
+    } else { String::new() };
     format!(
-        "\n{n} discoverable peer worker(s). {WORKER_MESSAGING_POLICY}{open_line} Members of the \
-         `{ADMIN_GROUP}` group act with the owner's reach and may message any worker, isolated ones \
-         included. To reach a worker outside \
+        "\n{n} discoverable peer worker(s). {WORKER_MESSAGING_POLICY}{open_line}{admin_line} To reach a worker outside \
          your groups, ask the owner (the owner can put you in a shared group); a \
          refused send is not retried or rerouted.\n"
     )
@@ -29767,6 +29592,11 @@ async fn post_dispatch(
             )
         }
         "stop" => {
+            // The CLI stops through here from guarded worker panes too, with no
+            // local kill fallback. Authorize before spawning shutdown.
+            if let Some(refusal) = peer_input_gate(headers, name, "stop") {
+                return refusal;
+            }
             let st2 = state.clone();
             let n = name.to_string();
             crate::db::interactions::spawn(async move {
@@ -30338,6 +30168,9 @@ pub(crate) fn lane_peers(lane: &str) -> std::collections::BTreeSet<String> {
 /// True if both lanes name each other in `CC_PEERS` (bilateral).
 /// Neither side can unilaterally open a channel to the other.
 pub(crate) fn bilateral_peers(a: &str, b: &str) -> bool {
+    if !fork_gate_on(BILATERAL_PEERS_GATE) {
+        return false;
+    }
     let ap = lane_peers(a);
     if !ap.contains(&b.to_lowercase()) {
         return false;
@@ -30991,7 +30824,50 @@ pub(crate) fn chat_speaks_for_owner(origin: &str) -> bool {
 pub(crate) const ADMIN_GROUP: &str = "admin";
 
 pub(crate) fn is_admin_worker(origin: &str) -> bool {
-    !origin.is_empty() && lane_groups(origin).contains(ADMIN_GROUP)
+    fork_gate_on(ADMIN_AS_OWNER_GATE) && !origin.is_empty() && lane_groups(origin).contains(ADMIN_GROUP)
+}
+
+/// FORK GATES (maxtongwang/amux, upstream merge 2026-10-26). Three upstream
+/// changes widen owner input; this fork's rules hold instead: only the owner's
+/// own typing is owner input (#9/#10) and the group boundary holds (#8/#17).
+/// Each upstream behaviour stays in the code behind its env switch, default
+/// off, so later merges stay small. `=1` turns one back on.
+/// 11e6bea91: an `admin`-group worker acts as the owner.
+pub(crate) const ADMIN_AS_OWNER_GATE: &str = "AMUX_ADMIN_WORKERS_AS_OWNER";
+/// 09baa60a2: a bilateral `CC_PEERS` pair bypasses isolation and group checks.
+pub(crate) const BILATERAL_PEERS_GATE: &str = "AMUX_BILATERAL_PEERS_BYPASS";
+/// fb9e44cb3: a send with no worker identity is recorded as owner input.
+pub(crate) const UNIDENTIFIED_SEND_AS_OWNER_GATE: &str = "AMUX_UNIDENTIFIED_SEND_AS_OWNER";
+
+pub(crate) fn fork_gate_on(gate: &str) -> bool {
+    #[cfg(test)]
+    if let Some(on) = fork_gate_test::get(gate) {
+        return on;
+    }
+    std::env::var(gate).ok().as_deref() == Some("1")
+}
+
+/// Per-thread gate override for unit tests (a `#[tokio::test]` runs on one
+/// thread), so a test that turns a gate on cannot leak it into another test.
+#[cfg(test)]
+pub(crate) mod fork_gate_test {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! { static GATES: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new()); }
+    pub(crate) fn get(gate: &str) -> Option<bool> {
+        GATES.with(|g| g.borrow().get(gate).copied())
+    }
+    /// Sets `gate` for this thread until the guard drops.
+    pub(crate) fn set(gate: &str, on: bool) -> Guard {
+        GATES.with(|g| g.borrow_mut().insert(gate.to_string(), on));
+        Guard(gate.to_string())
+    }
+    pub(crate) struct Guard(String);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            GATES.with(|g| g.borrow_mut().remove(&self.0));
+        }
+    }
 }
 
 /// The admin-group worker behind a request, if any. Every owner-only gate (group
@@ -31082,6 +30958,13 @@ async fn isolated_peer_refusal(
         "isolation",
     )
     .await;
+    let admin = fork_gate_on(ADMIN_AS_OWNER_GATE);
+    let admin_path = if admin { format!(", or a worker in the `{ADMIN_GROUP}` group") } else { String::new() };
+    let mut owner_paths = vec![format!("{name}@chat")];
+    if admin {
+        owner_paths.push(format!("group:{ADMIN_GROUP}"));
+    }
+    owner_paths.push("dashboard".to_string());
     Some(jresp(
         StatusCode::FORBIDDEN,
         json!({
@@ -31093,10 +30976,10 @@ async fn isolated_peer_refusal(
             // any admin-group worker (`speaks_for_owner`).
             "what_to_do": format!(
                 "An isolated worker takes input only from its owner: the dashboard, its own Chat tab \
-                 ({name}@chat), or a worker in the `{ADMIN_GROUP}` group. To relay an owner directive, send it \
+                 ({name}@chat){admin_path}. To relay an owner directive, send it \
                  from one of those; a schedule is not a message channel. No approval can authorize peer delivery."
             ),
-            "owner_paths": [format!("{name}@chat"), format!("group:{ADMIN_GROUP}"), "dashboard"],
+            "owner_paths": owner_paths,
         }),
     ))
 }
@@ -31834,13 +31717,18 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                 .chars()
                 .take(40)
                 .collect::<String>();
+            // FORK GATE (fb9e44cb3): only typed text is the owner. Without
+            // UNIDENTIFIED_SEND_AS_OWNER_GATE the row is a `session` row from
+            // the API, never a `user` (owner) row.
+            let kind = if fork_gate_on(UNIDENTIFIED_SEND_AS_OWNER_GATE) { "user" } else { "session" };
             tracing::warn!(session = name, user_agent = %agent, measured = true, n_considered = 1,
-                verdict = "send_unidentified_recorded",
-                "a send with no worker identity and no record_history was delivered; recorded as owner input via the API");
+                verdict = "send_unidentified_recorded", kind,
+                "a send with no worker identity and no record_history was delivered; recorded via the API");
             let row_id = cmd_hist_record_with_id(
-                state, name, &orig_text, "user", UNIDENTIFIED_SEND_ORIGIN, skip_board, meta,
+                state, name, &orig_text, kind, UNIDENTIFIED_SEND_ORIGIN, skip_board, meta,
             )
             .await;
+            note_history_msg_id(state, row_id, &msg_id).await;
             if let Some(id) = queue_id.as_deref() {
                 link_queued_message(state, name, row_id, id).await;
             }
@@ -36953,18 +36841,6 @@ fn config_body_env_error(body: &Value) -> Option<String> {
 /// several branches write one field and then reject a second. Clearing a cache
 /// that did not need clearing costs one rebuild; NOT clearing one that did is
 /// the bug this fixes.
-<<<<<<< HEAD
-=======
-pub(crate) fn membership_patch_refusal(headers: &HeaderMap, membership_named: bool) -> Option<Response> {
-    if !membership_named || hdr_worker(headers).is_empty() || super::org::local_member_actor(headers).is_some()
-        || admin_origin(headers, "group_membership").is_some() { return None; }
-    tracing::warn!(verdict="worker_group_membership_refused", measured=true, n_considered=1,
-        "worker cannot widen messaging authority by editing group membership");
-    Some(jresp(StatusCode::FORBIDDEN,json!({"ok":false,"code":"worker_group_membership_refused",
-        "error":"Group membership changes require direct owner input."})))
-}
-
->>>>>>> upstream/main
 pub(crate) async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
     // Every config field lands in the worker's env file, so a value the env
     // serializer would refuse is a 400 here, before any field is written
@@ -42708,17 +42584,14 @@ mod tests {
         // test it was written to satisfy went red on main and stayed red.
         // Counted again here rather than adjusted by hand: both new sites pass
         // the computed `skip_board`, which is the property below.
-<<<<<<< HEAD
         // 11 -> 12 for send_post's native_history_id reservation before native
         // I/O (PR #67); it also passes the computed `skip_board`.
-=======
-        // 11 -> 12 at fb9e44cb3: a send with no worker identity is recorded
+        // 12 -> 13 at fb9e44cb3: a send with no worker identity is recorded
         // under UNIDENTIFIED_SEND_ORIGIN, also passing the computed `skip_board`.
->>>>>>> upstream/main
         assert_eq!(
             sites.len(),
-            12,
-            "the scan must see all 12 production call sites. A LOWER number means the detector \
+            13,
+            "the scan must see all 13 production call sites. A LOWER number means the detector \
              stopped matching rather than that the call sites went away, which is exactly how \
              the first two versions of this test passed a broken tree: one scanned a window \
              that excluded the send handlers, the other missed the multi-line spelling and left \
@@ -44467,25 +44340,15 @@ mod tests {
         let sessions = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         std::fs::write(sessions.join("seo.env"), "AMUX_COMMAND_LIFECYCLE=0\nAMUX_BOARD_FORCE_ADHERENCE=1\n").unwrap();
-<<<<<<< HEAD
         let spawned = capture_gate::hold("seo", "spawned");
         let before_release = capture_gate::hold("seo", "before_release");
         let id = cmd_hist_record_with_id(&st, "seo", "build the video understanding extension", "user", "", false,
             DeliveryMeta::board(now_i64() * 1000)).await;
         assert!(id > 0);
-=======
-        // The held row exactly as the send path stores it. Inserted directly:
-        // cmd_hist_record_with_id also SPAWNS a capture for a 'board' row, and
-        // that task racing this call made the assertion timing-dependent (it
-        // failed on CI's runners, passed 15/15 here; rust run 38926900646).
-        let now_ms = now_i64() * 1000;
->>>>>>> upstream/main
         st.store.write_async(move |c| {
-            c.execute("INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, submit_verdict, capture_pending) \
-                       VALUES ('build the video understanding extension','user','seo',?1,'','board',?1,'accepted',1)", [now_ms])?;
+            c.execute("UPDATE cmd_history SET capture_pending=1 WHERE id=?1", [id])?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         }).await.unwrap();
-<<<<<<< HEAD
         // The spawned capture claims the row and stops just before releasing it.
         spawned.open();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -44494,11 +44357,6 @@ mod tests {
         }
         assert_eq!(before_release.reached(), 1, "the spawned capture claimed the row");
         // This second capture finds nothing pending: the spawned one owns the row.
-=======
-        let id = st.store.read().unwrap()
-            .query_row("SELECT MAX(id) FROM cmd_history WHERE session='seo'", [], |r| r.get::<_, i64>(0)).unwrap();
-        assert!(id > 0);
->>>>>>> upstream/main
         capture_recorded_message(&st, id).await;
         let delivery = |st: &AppState| -> String {
             st.store.read().unwrap().query_row("SELECT delivery FROM cmd_history WHERE id=?1", [id], |r| r.get(0)).unwrap()
@@ -47639,7 +47497,6 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             let status = r.status();
             (status, serde_json::from_slice(&axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap()).unwrap())
         }
-<<<<<<< HEAD
         let row = |state: &AppState, msg_id: &'static str, kind: &'static str, delivery: &'static str,
                    verdict: Option<&'static str>, delivered: bool| {
             let st = state.store.clone();
@@ -47682,38 +47539,6 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         let (status, v) = read(send_receipt_resolving(&state, name, "live", "the same text").await).await;
         assert_eq!((status, v["accepted"].clone()), (StatusCode::ACCEPTED, json!(false)), "{v}");
         assert!(send_dedup_gate(&state, name, "ancient").await.is_none());
-=======
-        let (_, v) =
-            read(send_receipt_resolving(&state, name, "landed-id", "[03:17 PM] landed").await)
-                .await;
-        assert_eq!(
-            (v["accepted"].clone(), v["reconciled"].clone()),
-            (json!(true), json!(true)),
-            "{v}"
-        );
-        // Mid-turn, a missing message is not yet evidence: Claude Code writes a
-        // message typed during a turn to the transcript when the turn ends.
-        test_generating::set(name, true);
-        let (_, v) =
-            read(send_receipt_resolving(&state, name, "lost-id", "[03:17 PM] never typed").await)
-                .await;
-        assert!(v.get("released").is_none(), "released while the lane was mid-turn: {v}");
-        assert!(send_dedup_gate(&state, name, "lost-id").await.is_some(), "still reserved: no resend while mid-turn");
-        test_generating::set(name, false);
-        let (_, v) =
-            read(send_receipt_resolving(&state, name, "lost-id", "[03:17 PM] never typed").await)
-                .await;
-        assert_eq!(v["released"], true, "{v}");
-        assert!(
-            send_dedup_gate(&state, name, "lost-id").await.is_none(),
-            "released: the same ID can be sent once"
-        );
-        let (_, v) = read(send_receipt_resolving(&state, name, "unchecked-id", "").await).await;
-        assert_eq!(v["delivered"], "unknown", "no text, no verdict: {v}");
-        assert!(v.get("expired").is_none(), "an hour is not expired: {v}");
-        // A reservation older than any evidence ends: expired, never released.
-        assert!(send_dedup_gate(&state, name, "ancient-id").await.is_none());
->>>>>>> upstream/main
         let ancient = now_i64() - 2 * 86_400;
         state.store.write_async(move |c| {
             c.execute("UPDATE send_dedup SET ts=?1 WHERE msg_id='ancient'", [ancient])?;
@@ -61185,7 +61010,6 @@ mod session_limit_banner_tests {
 }
 
 #[cfg(test)]
-<<<<<<< HEAD
 mod codex_launch_model_tests {
     use super::*;
 
@@ -61512,7 +61336,8 @@ mod composer_guard_tests {
         }
     }
 }
-=======
+
+#[cfg(test)]
 mod codex_saved_key_login_tests {
     use super::{codex_api_key_login, codex_os_sandbox_probe};
 
@@ -61662,4 +61487,3 @@ pub(crate) async fn relaunch_key_workers_onto_subscription(state: &AppState) -> 
     }
     (considered, relaunched)
 }
->>>>>>> upstream/main
