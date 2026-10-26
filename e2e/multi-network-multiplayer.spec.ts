@@ -150,11 +150,12 @@ test('multi-network: isolated guests share workspace, scoped by group, with conc
       const r = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, dir: '/tmp', provider: 'codex', tags: ['alpha'] }),
+        body: JSON.stringify({ name, dir: '/tmp', provider: 'codex', tags: ['alpha'], start: false }),
       });
       return { status: r.status, body: await r.json() };
     }, alphaWorker);
     expect(alphaCreate.status).toBe(201);
+    expect(alphaCreate.body.starting, 'member-created fixture must not autostart').toBe(false);
     expect(alphaCreate.body.creator).toBe('member:alpha@example.com');
     createdWorkers.push(alphaWorker);
 
@@ -162,11 +163,12 @@ test('multi-network: isolated guests share workspace, scoped by group, with conc
       const r = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, dir: '/tmp', provider: 'codex', tags: ['beta'] }),
+        body: JSON.stringify({ name, dir: '/tmp', provider: 'codex', tags: ['beta'], start: false }),
       });
       return { status: r.status, body: await r.json() };
     }, betaWorker);
     expect(betaCreate.status).toBe(201);
+    expect(betaCreate.body.starting, 'member-created fixture must not autostart').toBe(false);
     expect(betaCreate.body.creator).toBe('member:beta@example.com');
     createdWorkers.push(betaWorker);
 
@@ -186,11 +188,13 @@ test('multi-network: isolated guests share workspace, scoped by group, with conc
           provider: 'codex',
           creator: 'spoofed-owner',
           tags: ['alpha'],
+          start: false,
         }),
       });
       return { status: r.status, body: await r.json() };
     }, spoofName);
     expect(spoofResult.status).toBe(201);
+    expect(spoofResult.body.starting, 'member-created fixture must not autostart').toBe(false);
     expect(spoofResult.body.creator).toBe('member:alpha@example.com');
     createdWorkers.push(spoofName);
 
