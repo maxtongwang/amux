@@ -142,6 +142,7 @@ pub mod tunnel;
 pub(crate) mod goal_loop;
 pub(crate) mod promise_nudge;
 pub(crate) mod turn_end;
+pub(crate) mod ask_route;
 pub mod upload;
 pub mod usage;
 pub mod verify;

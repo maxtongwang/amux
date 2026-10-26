@@ -736,7 +736,7 @@ async fn claim_once(state: &AppState, session: &str, etype: &str, idem: String, 
 /// looping under a /goal ends a NEW turn every five seconds on the same ask, so
 /// a per-turn claim steered it "proceed" at 12:41:27Z and again at 12:42:22Z,
 /// and each steer fed the loop another turn.
-async fn claim_within(
+pub(crate) async fn claim_within(
     state: &AppState,
     session: &str,
     etype: &str,
@@ -799,7 +799,7 @@ pub(crate) async fn file_goal_loop_card(
     file_ask_card_via(state, lane, kind, question, context, GOAL_LOOP_ORIGIN, path, isolated).await
 }
 
-fn question_key(q: &str) -> String {
+pub(crate) fn question_key(q: &str) -> String {
     let norm: String = q
         .to_lowercase()
         .chars()
@@ -1095,14 +1095,19 @@ reads (email, DM, PR comment, post), deleting or migrating customer or productio
 pushing to main over someone else's commits, scope or priority changes, fleet control, \
 and reversing an owner stop or disabled automation";
 
-fn steer_text(sentence: &str) -> String {
+fn steer_text(sentence: &str, lead: Option<&str>) -> String {
+    // A worker with a lead sends new decisions there, not to an owner card
+    // (ask_route; Max, 2026-10-26).
+    let route = match lead {
+        Some(lead) => format!("send the question to your lead {lead} (`amux send {lead} --stdin`)"),
+        None => "file the question and what unblocks it on a card".to_string(),
+    };
     format!(
         "[amux owner-ask] Automated Amux reminder. Your last turn asked: \"{}\". \
          This reminder does not grant owner approval or new instructions. Continue only \
          work already authorized by the owner, within the existing scope and priorities. \
          Preserve owner stops and disabled automation. If the choice requires a new \
-         owner decision or touches {BOUNDARY_TEXT}, file the question and what unblocks \
-         it on a card, then continue other authorized work.",
+         owner decision or touches {BOUNDARY_TEXT}, {route}, then continue other authorized work.",
         clip(sentence, 240)
     )
 }
@@ -1232,7 +1237,8 @@ pub(crate) async fn on_turn_end(state: AppState, name: String, session_id: Strin
                 return;
             }
             let id = format!("owner-ask-{}", turn.uuid);
-            match sv::steer_enqueue_idempotent_report(&state, &name, &steer_text(sentence), OWNER_ASK_GUARD, "", &id).await {
+            let lead = super::ask_route::lead_for(&name);
+            match sv::steer_enqueue_idempotent_report(&state, &name, &steer_text(sentence, lead.as_deref()), OWNER_ASK_GUARD, "", &id).await {
                 Ok(r) => {
                     tracing::warn!(session = %name, verdict = "owner_ask_steered", steer_id = %r.id,
                         sentence = %clip(sentence, 160),
@@ -1257,6 +1263,12 @@ pub(crate) async fn on_turn_end(state: AppState, name: String, session_id: Strin
             }
             let question = as_question(sentence, &name);
             let context = tail_paragraphs(&turn.text, 2);
+            // Worker questions go to the worker's lead first (ask_route).
+            if let Some(lead) = super::ask_route::lead_for(&name) {
+                if super::ask_route::route_turn_end_ask(&state, &name, &lead, &question, kind.label(), &context, &turn.uuid).await {
+                    return;
+                }
+            }
             match file_ask_card(&state, &name, Some(kind), &question, &context, "turn-end owner-ask classifier").await {
                 Ok((id, true, path)) => tracing::warn!(session = %name, verdict = "owner_ask_card_filed", card = %id,
                     boundary = kind.label(), path = path.label(),
@@ -1318,6 +1330,16 @@ pub(crate) async fn ask_user_question_post(
     }
     if !enabled(name, OWNER_ASK_KEY) {
         return allow("ask_intercept_disabled");
+    }
+    // A worker's picker goes to its lead whether or not a /goal is active
+    // (ask_route; Max, 2026-10-26). A failed route falls through to the goal
+    // intercept below, as before.
+    if let Some(lead) = super::ask_route::lead_for(name) {
+        if let Some(denied) = super::ask_route::route_picker(state, name, &lead, &body["tool_input"]).await {
+            tracing::warn!(session = %name, lead = %lead, verdict = "ask_intercept_routed_to_lead",
+                "ask intercept: worker AskUserQuestion routed to its lead and denied");
+            return Json(denied).into_response();
+        }
     }
     let sid = body["session_id"].as_str().unwrap_or("");
     let Some(path) = transcript_for(name, sid) else {
@@ -1503,7 +1525,7 @@ mod tests {
 
     #[test]
     fn automated_reminders_do_not_assert_fresh_owner_consent() {
-        let text = steer_text("Want me to rerun the fixture?");
+        let text = steer_text("Want me to rerun the fixture?", None);
         assert!(text.contains("Automated") && text.contains("does not grant"), "{text}");
         assert!(!text.contains("authority covers this"), "{text}");
     }
@@ -1865,7 +1887,7 @@ mod tests {
     fn automated_owner_ask_text_reads_clean() {
         assert!(!sv::is_owner_configured_guard("owner-policy:auto-proceed"));
         assert!(!sv::is_owner_configured_guard("owner-ask"));
-        let t = steer_text("Want me to start on 1 and 2?");
+        let t = steer_text("Want me to start on 1 and 2?", None);
         assert!(t.contains("Want me to start on 1 and 2?") && !t.contains('\u{2014}'));
         // The live in-boundary specimens stay in-boundary, the boundary ones do not.
         assert!(matches!(classify_owner_ask("Done.\n\nWant me to start on 1 and 2?"), OwnerAsk::InBoundary { .. }));
@@ -1896,8 +1918,16 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_with_a_lead_is_reminded_to_ask_the_lead_not_a_card() {
+        let t = steer_text("Want me to pick the schema?", Some("dev-lead"));
+        assert!(t.contains("send the question to your lead dev-lead"), "{t}");
+        assert!(!t.contains("on a card"), "{t}");
+        assert!(steer_text("Want me to pick the schema?", None).contains("on a card"));
+    }
+
+    #[test]
     fn steer_text_carries_no_em_dash() {
-        assert!(!steer_text("Say go and I'll do it.").contains('\u{2014}'));
+        assert!(!steer_text("Say go and I'll do it.", None).contains('\u{2014}'));
     }
 
     #[test]
