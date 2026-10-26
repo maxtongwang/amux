@@ -1,0 +1,194 @@
+# fnmatch globs over repository-relative paths; * includes nested paths.
+# Derived from the entrypoints the diagrams show, following each to what it calls
+# (one level of imports). scripts/diagram-checks.py fails on any tracked file that is
+# neither listed here nor excluded below with a reason.
+#
+# Server, core and CLI crates: the HTTP API and authority (api/, including session_verbs.rs
+# and worker_messaging.rs on the send path), the SQLite store and its migrations, SSE and
+# delta sync, background jobs, the orchestrator and session backends; the dashboard SPA
+# embedded in the binary.
+crates/*/src/*
+crates/*/Cargo.toml
+crates/*/build.rs
+crates/amux-server/migrations/*
+crates/amux-dashboard/static/*
+Cargo.toml
+rust-toolchain.toml
+# CLIs and installer: the bash amux CLI and amux-remote, install.sh/uninstall.sh (they place
+# the hooks, worker shims and services), the server config template.
+amux
+amux-remote
+install.sh
+uninstall.sh
+server.env.example
+Makefile
+Dockerfile.rust-base
+Dockerfile.rust-build
+# Agent entrypoints and the worker skills.
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+skills/*
+templates/*
+# Health integration the mac_health and tmux_health jobs call.
+integrations/*
+# Every non-test script the server (include_str!, job commands), the CLI, install.sh and CI
+# reach: report and guard hooks, worker shims, endpoint helpers, service templates, CI gates.
+scripts/worker-bin/*
+scripts/gh-shim/*
+scripts/git-hooks/amux-staged-guard
+scripts/git-hooks/append-only-push-guard
+scripts/git-hooks/git-shared-guard.py
+scripts/git-hooks/lint-blame.py
+scripts/git-hooks/post-commit
+scripts/git-hooks/pre-commit
+scripts/git-hooks/pre-push
+scripts/git-hooks/prepare-commit-msg
+scripts/amux-builder.service.template
+scripts/amux-builder.timer.template
+scripts/amux-credential-backup.sh
+scripts/amux-grid.sh
+scripts/amux-playwright-mcp.sh
+scripts/amux-playwright-mcp@.service.template
+scripts/amux-server.service.template
+scripts/amux-start-worker.sh
+scripts/amux-worker-start.service.template
+scripts/amux-xvfb.service.template
+scripts/amuxhelper-poll.plist.template
+scripts/amuxhelper-poll.sh
+scripts/app-store-screenshots.mjs
+scripts/atomic-replace.sh
+scripts/autofix-recovery-sweep.py
+scripts/board-close-tracking.py
+scripts/browser-route-driver.mjs
+scripts/build-draw.mjs
+scripts/build-install-from-head.sh
+scripts/build-md.mjs
+scripts/build-state.mjs
+scripts/button-audit.mjs
+scripts/cargo-budget.py
+scripts/cargo-target-guard.py
+scripts/check-e2e-evidence.mjs
+scripts/ci-affected.mjs
+scripts/ci-rust-key.mjs
+scripts/claude-rotate-install.sh
+scripts/claude-rotate.py
+scripts/claude-scratch-deliver.sh
+scripts/claude-scratch-report.sh
+scripts/codesign-identity-setup.sh
+scripts/codesign-identity.sh
+scripts/codesign-keychain-guard.sh
+scripts/codesign-keychain-unlock.sh
+scripts/codesign-server.sh
+scripts/create-codesign-identity.sh
+scripts/daily-philosophy.sh
+scripts/disk-alarm.py
+scripts/e2e-durations.mjs
+scripts/e2e-plan.mjs
+scripts/e2e-worker-control.mjs
+scripts/e2e-worker-control.sh
+scripts/fleet-boot.sh
+scripts/friction_themes.py
+scripts/frustration_scan.py
+scripts/frustrations-archive.py
+scripts/frustrations_audit.py
+scripts/frustrations_retire.py
+scripts/gen-spa-globals.mjs
+scripts/generate-seo-pages.js
+scripts/git-credential-amux-github.sh
+scripts/harness-exempt-sweep.sh
+scripts/host-analysis.sh
+scripts/import-google-timeline.py
+scripts/install-artifact-manifest.py
+scripts/install-cli.sh
+scripts/install-gh-shim.sh
+scripts/install-hooks.sh
+scripts/ios-browser-driver.sh
+scripts/lane-efficiency.py
+scripts/lane-worktree-migrate.sh
+scripts/mac-agent-volume.sh
+scripts/mac-cleanup-fallback.sh
+scripts/mac-cleanup-tick.sh
+scripts/mac-pressure-tripwire.sh
+scripts/main-ci-watch.sh
+scripts/memory_index_audit.py
+scripts/mutate.sh
+scripts/orch-pace.py
+scripts/perf-baseline.sh
+scripts/perf-ci.sh
+scripts/perf-compare.py
+scripts/pinned-overlay.swift
+scripts/pipeline-bottlenecks.py
+scripts/provider-usage-gemini.mjs
+scripts/prune-superseded-incremental.sh
+scripts/push-consent.sh
+scripts/reap-amux-debris.sh
+scripts/reap-remotion-bundles.sh
+scripts/rebuild-rust-base.sh
+scripts/review-preflight.sh
+scripts/rust-auto-build-authority.sh
+scripts/rust-auto-build.sh
+scripts/rust-remote-build.sh
+scripts/safe-cargo.sh
+scripts/scratch-reaper.py
+scripts/select-checks-cells.sh
+scripts/seo-data.js
+scripts/shared-index-class-count.py
+scripts/soak-probe.sh
+scripts/soak.sh
+scripts/soak_slope.py
+scripts/spa-lint.sh
+scripts/tmux-watchdog.sh
+scripts/token-baseline.py
+scripts/transfer-completed-project.py
+scripts/unbuilt-commits.sh
+scripts/watchdog.py
+scripts/amuxhelper-runbooks/*
+scripts/claude-hooks/*
+scripts/git-hooks/git-shared-guard.py
+scripts/git-hooks/lint-blame.py
+scripts/hooks/*
+scripts/lib/*
+scripts/lifecycle/browser_job_env.py
+scripts/lifecycle/build_catalog.py
+scripts/lifecycle/check_assets.py
+scripts/lifecycle/run.py
+scripts/shims/*
+# CI and the diagram checks.
+scripts/check-diagrams.py
+scripts/diagram-checks.py
+.github/*
+.woodpecker.yml
+#
+# probe: crates/amux-server/src/api/session_verbs.rs — on the send path; the first draft left it out
+# probe: crates/amux-server/src/api/workers.rs — left out by the first draft
+# probe: scripts/hooks/hook-report.sh — the report hook in all three diagrams
+#
+# exclude: crates/*/tests/* — tests
+# exclude: crates/amux-server/examples/* — examples, not built into the server
+# exclude: scripts/*test* — tests and test runners
+# exclude: scripts/fixtures/* — test fixtures
+# exclude: scripts/tests/* — tests
+# exclude: tests/* — tests
+# exclude: e2e/* — end-to-end tests
+# exclude: docs/* — prose, evidence and design references
+# exclude: research/* — research notes
+# exclude: android/* — mobile client of the HTTP API; the diagrams group callers as dashboard and CLIs
+# exclude: ios/* — mobile client of the HTTP API; the diagrams group callers as dashboard and CLIs
+# exclude: desktop/* — desktop wrapper around the dashboard; same grouping
+# exclude: business-ui/* — separate business web app; the server does not serve or call it
+# exclude: cloud/* — hosted deployment kit, separate from the local server drawn
+# exclude: site/* — marketing site
+# exclude: examples/* — demo app
+# exclude: assets/* — icon sources
+# exclude: .claude/* — agent settings for developing this repo
+# exclude: mcp.json — MCP servers for agents developing this repo
+# exclude: Cargo.lock — lockfile
+# exclude: package.json — lint and e2e tooling
+# exclude: package-lock.json — lockfile
+# exclude: eslint.config.mjs — lint config
+# exclude: README.md — prose; the guard already requires its link to the set
+# exclude: *.md — prose (CONTRIBUTING, REMOTE, SECURITY, VERIFY, frustrations)
+# exclude: LICENSE — license text
+# exclude: .gitignore — Git housekeeping
+# exclude: .dockerignore — Docker housekeeping
