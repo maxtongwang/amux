@@ -120,9 +120,36 @@ echo "mac-tripwire: measured=$measured level=$level reclaimable=${reclaim_gb}GB 
 # hour for its slot. It is the same bounded pass that runs every hour, so an
 # early start costs one extra pass at most, and the cooldown keeps a level that
 # oscillates 1 <-> 2 from starting it more than once an hour.
+# >>> amux-endpoint-guard (rule: scripts/lib/amux-endpoint.sh; every copy identical, test-enforced)
+_ae_dir=$(dirname "$0")
+for _ae in "$_ae_dir/amux-endpoint.sh" "$_ae_dir/lib/amux-endpoint.sh" "$_ae_dir/../lib/amux-endpoint.sh" \
+           "$(eval echo "~$(id -un 2>/dev/null)" 2>/dev/null)/.amux/hooks/amux-endpoint.sh"; do
+  [ -r "$_ae" ] && . "$_ae" && break
+done
+command -v amux_endpoint_guard >/dev/null 2>&1 || amux_endpoint_guard() {  # stand-in: same shape, fixed live ports
+  _aeg_bad=""
+  if [ "${AMUX_ISOLATED_RUN:-}" = 1 ]; then
+    if [ "$(printf '%s' "$1" | wc -l | tr -d ' ')" != 0 ] || ! printf '%s\n' "$1" | LC_ALL=C grep -Eq \
+        '^(https?://(127\.0\.0\.1|localhost|\[::1\]):[1-9][0-9]{0,4}(/[^[:space:][:cntrl:]\\@]*)?|file:///[^[:space:][:cntrl:]\\@]*)$'; then
+      _aeg_bad=1
+    else
+      case "$1" in file:*) ;; *)
+        _aeg_p=${1#*://}; _aeg_p=${_aeg_p%%/*}; _aeg_p=${_aeg_p##*:}
+        if [ "$_aeg_p" -gt 65535 ] || [ "$_aeg_p" = 8824 ] || [ "$_aeg_p" = 8822 ]; then _aeg_bad=1; fi ;;
+      esac
+    fi
+  fi
+  if [ -n "$_aeg_bad" ]; then
+    printf '[amux] verdict=isolated_live_endpoint_refused client=%s from=%s reason=stand_in to=http://127.0.0.1:9 measured=true n_considered=1\n' "$2" "${1:-<unset>}" >&2
+    echo "http://127.0.0.1:9"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+# <<< amux-endpoint-guard
 act_trigger_default() { # prints the HTTP status of the run request
   curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -X POST -H "X-Amux-Session: desktop" \
-    "$(amux url 2>/dev/null || echo https://localhost:8824)/api/schedules/$CLEANUP_SCHEDULE/run"
+    "$(amux_endpoint_guard "$(amux url 2>/dev/null || echo https://localhost:8824)" mac-pressure-tripwire)/api/schedules/$CLEANUP_SCHEDULE/run"
 }
 if [ "$level" != "-1" ] && awk_ge "$level" "$ACT_PRESSURE" || [ -n "$reasons" ]; then
   act_last=0

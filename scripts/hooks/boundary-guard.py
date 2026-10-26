@@ -500,15 +500,39 @@ def _disk_after(b: dict, command: str, session: str) -> tuple[int, str]:
 # also allows. The max is AMUX_MAX_SUBAGENTS in the worker's env when set
 # (0 turns the cap off), else the registry's `max_running_default`.
 
+# >>> amux-endpoint-guard (rule: scripts/lib/amux_endpoint.py; every copy identical, test-enforced)
+import os, sys  # noqa: E401
+_AE_HERE = os.path.dirname(os.path.realpath(__file__))
+for _ae_dir in (_AE_HERE, os.path.join(_AE_HERE, "lib"), os.path.join(_AE_HERE, os.pardir, "lib"),
+                os.path.join(__import__("pwd").getpwuid(os.getuid()).pw_dir, ".amux", "hooks")):
+    if _ae_dir not in sys.path:
+        sys.path.append(_ae_dir)
+try:
+    from amux_endpoint import guard as _endpoint_guard
+except ImportError:  # no shared file anywhere: the same allowed shape, fixed live ports
+    def _endpoint_guard(url, client):
+        import re
+        m = re.fullmatch(r"(?:https?://(?:127\.0\.0\.1|localhost|\[::1\]):([1-9][0-9]{0,4})"
+                         r"(?:/[^\s\\@\x00-\x1f\x7f]*)?|file:///[^\s\\@\x00-\x1f\x7f]*)", url or "")
+        port = int(m.group(1)) if m and m.group(1) else 0
+        if os.environ.get("AMUX_ISOLATED_RUN") == "1" and (m is None or port > 65535 or port in (8824, 8822)):
+            print("[amux] verdict=isolated_live_endpoint_refused client=%s from=%r reason=stand_in "
+                  "to=http://127.0.0.1:9 measured=true n_considered=1" % (client, url or "<unset>"),
+                  file=sys.stderr)
+            return "http://127.0.0.1:9"
+        return url
+# <<< amux-endpoint-guard
+
+
 def endpoint_url() -> str:
     url = os.environ.get("AMUX_URL") or ""
-    if url:
-        return url.rstrip("/")
-    try:
-        with open(os.path.join(amux_home(), "endpoint.json")) as fh:
-            return str(json.load(fh).get("canonical_url") or "").rstrip("/")
-    except (OSError, ValueError):
-        return ""
+    if not url:
+        try:
+            with open(os.path.join(amux_home(), "endpoint.json")) as fh:
+                url = str(json.load(fh).get("canonical_url") or "")
+        except (OSError, ValueError):
+            return ""
+    return _endpoint_guard(url.rstrip("/"), "boundary-guard") if url else ""
 
 
 def host_process_start() -> float | None:
