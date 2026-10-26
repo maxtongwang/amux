@@ -2581,9 +2581,51 @@ cmd_server() {
   esac
 }
 
+# A worker's delete goes to the server, which decides (the lead of the
+# target's team, or mrpopo, on a stopped worker with a saved handoff;
+# ai-config #378/#387) and closes the tmux session on its own socket. The
+# worker-pane tmux guard refuses direct kills, so a refusal never falls back.
+_delete_via_api() {
+  local name="$1"
+  local AMUX_API="${AMUX_API:-https://localhost:8824}"
+  local resp status body
+  resp=$(_curl -sk -m 30 -w '\n%{http_code}' -X POST \
+    -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
+    "$AMUX_API/api/sessions/$name/delete") || {
+    echo "could not reach server to delete $name; no local delete attempted" >&2
+    return 1
+  }
+  status="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+  if ! RESP="$body" STATUS="$status" python3 - <<'PYEOF'
+import json, os, sys
+try:
+    d = json.loads(os.environ["RESP"])
+    status = int(os.environ["STATUS"])
+except (ValueError, TypeError):
+    print("delete failed: invalid server response", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(d, dict) or not 200 <= status < 300 or d.get("ok") is not True or d.get("error"):
+    reason = d.get("error", "server did not accept delete") if isinstance(d, dict) else "invalid response"
+    code = f" [{d['code']}]" if isinstance(d, dict) and d.get("code") else ""
+    print(f"delete refused (HTTP {status}){code}: {reason}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+  then
+    return 1
+  fi
+  echo "${RED}removed${RESET} $name (deleted by server; handoff kept)"
+}
+
 cmd_rm() {
   local name
-  name=$(resolve_session "${1:-}")
+  name=$(resolve_session "${1:-}") || return 1
+
+  # From a worker pane, the server decides and deletes; never tmux or rm here.
+  if [[ -n "${AMUX_WORKER:-${AMUX_SESSION:-}}" ]]; then
+    _delete_via_api "$name"
+    return
+  fi
 
   # Stop if running (also cleans up any worktree)
   if is_running "$name" 2>/dev/null; then
@@ -6535,7 +6577,8 @@ ${BOLD}Worker management:${RESET}
                                 (--dry-run: print the command without spawning)
   amux exec <name> [flags]       Register + start in one step
   amux stop <name>               Stop a running worker
-  amux rm <name>                 Remove a worker (stops if running)
+  amux rm <name>                 Remove a worker (stops if running; from a worker:
+                                 server-decided, team lead or mrpopo, stopped + handoff)
   amux fresh <name> [-y]         Restart the worker on a NEW conversation
                                  ${DIM}keeps env, cards, memory, groups — drops the${RESET}
                                  ${DIM}compaction backlog. See /api/debug/context-health${RESET}

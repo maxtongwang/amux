@@ -3367,6 +3367,75 @@ mod tests {
         }
     }
 
+    /// Lift 1 (Max, 2026-10-26; ai-config #378, #387): the lead of a worker's
+    /// team, or the owner agent, deletes it once it is stopped and its handoff
+    /// is saved. Nothing else an agent sends deletes a worker, and every
+    /// decision is one line in the delete log.
+    #[tokio::test]
+    async fn a_lead_deletes_a_stopped_team_worker_with_a_saved_handoff_and_nothing_else() {
+        use crate::api::agent_delete::{handoff_path, AUDIT_LOG};
+        let home = tempfile::tempdir().unwrap();
+        let _guard = isolated(home.path());
+        lead_rename_fleet(home.path());
+        let s = home.path().join("sessions");
+        // Stopped workers: no fake pane, and no tmux server on the isolated socket.
+        for n in ["review-dev-c", "review-dev-d", "review-dev-e", "review-ops-b"] {
+            let t = if n.starts_with("review-ops") { "ops" } else { "dev" };
+            std::fs::write(s.join(format!("{n}.env")), format!("CC_DIR=\"/tmp\"\nCC_TAGS=\"{t}\"\nCC_AUTO_START=0\n")).unwrap();
+        }
+        std::fs::create_dir_all(home.path().join("handoffs")).unwrap();
+        for n in ["review-dev-a", "review-dev-c", "review-dev-e", "review-ops-b"] {
+            std::fs::write(handoff_path(home.path(), n), "done\n").unwrap();
+        }
+        let (app, _db) = app();
+        crate::api::rename_identity::ensure_migrated(home.path()).unwrap();
+        let lead: &[(&str, &str)] = &[("X-Amux-Session", "review-dev-lead")];
+        let ops_lead: &[(&str, &str)] = &[("X-Amux-Session", "review-ops-lead")];
+        let worker: &[(&str, &str)] = &[("X-Amux-Session", "review-dev-b")];
+        let popo: &[(&str, &str)] = &[("X-Amux-Session", "mrpopo")];
+        type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str, StatusCode, &'a str);
+        let refused: Vec<Case> = vec![
+            ("wrong-team lead", ops_lead, "review-dev-c", StatusCode::FORBIDDEN, "agent_delete_not_authorized"),
+            ("non-lead worker", worker, "review-dev-c", StatusCode::FORBIDDEN, "agent_delete_not_authorized"),
+            ("another lead", lead, "review-dev-lead2", StatusCode::FORBIDDEN, "agent_delete_not_authorized"),
+            ("no worker identity", &[], "review-dev-c", StatusCode::FORBIDDEN, "agent_delete_not_authorized"),
+            ("still running", lead, "review-dev-a", StatusCode::CONFLICT, "agent_delete_running"),
+            ("no handoff", lead, "review-dev-d", StatusCode::CONFLICT, "agent_delete_no_handoff"),
+        ];
+        // POST .../delete is the CLI's spelling; DELETE /api/sessions/<n> calls the same delete_post.
+        for (label, headers, target, status, code) in &refused {
+            let path = format!("/api/sessions/{target}/delete");
+            let (st, _, v) = send_with(&app, "POST", &path, None, headers).await;
+            assert_eq!((st, v["code"].as_str()), (*status, Some(*code)), "{label}: {path}: {v}");
+            assert!(s.join(format!("{target}.env")).exists(), "{label}: refused delete removed {target}");
+        }
+        // An unverified lead claim (rule-10 lane, no token) never reaches the gate.
+        std::fs::write(s.join("review-dev-lead2.env"),
+            "CC_DIR=\"/tmp\"\nCC_TAGS=\"leads,dev\"\nCC_AUTO_START=0\nAMUX_CONTRACT_DONE=1\n").unwrap();
+        crate::api::worker_identity::mint(home.path(), "review-dev-lead2").unwrap().expect("rule 10 mints");
+        let (st, v) = status_and_body(&app, socket_request("POST", "/api/sessions/review-dev-c/delete", json!({}),
+            &[("X-Amux-Session", "review-dev-lead2")])).await;
+        assert_eq!((st, v["code"].clone()), (StatusCode::FORBIDDEN, json!("worker_identity_refused")), "unverified lead: {v}");
+        assert!(s.join("review-dev-c.env").exists());
+        // Allowed: the team lead, and the owner agent across teams.
+        for (who, headers, target) in [("lead", lead, "review-dev-c"), ("owner agent", popo, "review-ops-b")] {
+            let (st, _, v) = send_with(&app, "POST", &format!("/api/sessions/{target}/delete"), None, headers).await;
+            assert_eq!(st, StatusCode::OK, "{who} deletes {target}: {v}");
+            assert!(!s.join(format!("{target}.env")).exists(), "{who}: {target} is unregistered");
+            assert!(crate::api::agent_delete::handoff_saved(&handoff_path(home.path(), target)), "{who}: handoff kept");
+        }
+        let log = std::fs::read_to_string(home.path().join(AUDIT_LOG)).unwrap();
+        let lines: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), refused.len() + 2, "one line per decision: {log}");
+        let last = &lines[lines.len() - 2..];
+        assert_eq!((last[0]["caller"].as_str(), last[0]["worker"].as_str(), last[0]["verdict"].as_str()),
+            (Some("review-dev-lead"), Some("review-dev-c"), Some("agent_delete_allowed")), "{log}");
+        assert_eq!(last[0]["handoff"].as_str(), handoff_path(home.path(), "review-dev-c").to_str());
+        assert_eq!((last[1]["caller"].as_str(), last[1]["verdict"].as_str()), (Some("mrpopo"), Some("agent_delete_allowed")));
+        assert_eq!(lines[0]["verdict"].as_str(), Some("agent_delete_not_authorized"));
+        assert_eq!(lines[0]["caller"].as_str(), Some("review-ops-lead"));
+    }
+
     /// ai-config #203 with amux #3: a rule-10 worker renamed BY ITS LEAD keeps
     /// its identity. Its launch token still verifies, under its old name (the
     /// alias resolves) and its new one, and its incarnation is unchanged.
