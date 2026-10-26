@@ -333,6 +333,11 @@ pub(crate) fn read_pool_size() -> u32 {
 }
 
 impl Store {
+    /// Path of the SQLite file; keys per-database test fixtures.
+    #[cfg(test)]
+    pub(crate) fn db_path(&self) -> &std::path::Path {
+        &self.db_path
+    }
     /// Open the store: apply migrations, start the writer thread, build the
     /// read pool.
     pub fn open(db_path: &Path) -> anyhow::Result<Store> {
