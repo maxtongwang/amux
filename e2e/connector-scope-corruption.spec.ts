@@ -71,8 +71,6 @@ test('damaged local or inherited connector scope is visible and explicitly repai
       sql('DELETE FROM prefs WHERE key=?', [l.pref]);
       if (original[i].length) sql('INSERT INTO prefs(key,value) VALUES(?,?)', [l.pref, original[i][0][0]]);
     }), info);
-    await cleanup(`delete worker for ${worker}`, async () => {
-      await deleteWorkerApi(page, request, auth, worker);
-    }, info);
+    await cleanup(`delete worker for ${worker}`, () => deleteWorkerApi(page, request, auth, worker), info);
   }
 });

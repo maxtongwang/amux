@@ -46,9 +46,10 @@ test('multi-network: isolated guests share workspace, scoped by group, with conc
   for (const [name, tag] of [[seedAlpha, 'alpha'], [seedBeta, 'beta']] as const) {
     const resp = await request.post('/api/sessions', {
       headers: ownerHeaders,
-      data: { name, dir: '/tmp', provider: 'codex', tags: [tag] },
+      data: { name, dir: '/tmp', provider: 'codex', tags: [tag], start: false },
     });
     expect(resp.status()).toBe(201);
+    expect((await resp.json()).starting, `${name} must not autostart`).toBe(false);
     createdWorkers.push(name);
   }
 
@@ -326,9 +327,10 @@ test('multi-network: isolated guests share workspace, scoped by group, with conc
     const sharedWorker = `e2e-shared-worker-${ts}`;
     const sharedResp = await request.post('/api/sessions', {
       headers: ownerHeaders,
-      data: { name: sharedWorker, dir: '/tmp', provider: 'codex', tags: ['alpha', 'beta'] },
+      data: { name: sharedWorker, dir: '/tmp', provider: 'codex', tags: ['alpha', 'beta'], start: false },
     });
     expect(sharedResp.status()).toBe(201);
+    expect((await sharedResp.json()).starting, `${sharedWorker} must not autostart`).toBe(false);
     createdWorkers.push(sharedWorker);
 
     const sharedCardResp = await request.post('/api/board', {

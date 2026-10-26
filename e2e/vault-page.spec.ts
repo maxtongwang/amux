@@ -5,7 +5,7 @@
 // is a synthetic canary; the page must never show one it was not asked to.
 import { test, expect, Page } from './fixtures';
 import { cleanup } from './teardown';
-import { boot } from './lifecycle/evidence';
+import { boot, deleteWorkerApi } from './lifecycle/evidence';
 
 const VALUES = {
   global: 'vp-canary-global-4b7e21',
@@ -52,7 +52,7 @@ test('Vault page: the full secret lifecycle without leaking a value', async ({ p
   const removeFixtures = async () => {
     const list = await (await request.get('/api/vault/secrets', { headers: auth })).json();
     for (const i of list.items || []) if (/^VP_/.test(i.key)) await request.delete(`/api/vault/secrets/${i.id}`, { headers: auth });
-    for (const n of created) await request.delete(`/api/sessions/${n}`, { headers: auth });
+    for (const n of created) await deleteWorkerApi(page, request, auth, n);
   };
   try {
     for (const [name, tags] of [[wa, ['research']], [wb, ['devops']]] as const) {

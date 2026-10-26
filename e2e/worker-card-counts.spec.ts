@@ -67,8 +67,6 @@ test('worker card shows the truthful board status breakdown on the sched row', a
     await expect(card.locator('.mc-todo')).toHaveText('1');
     await expect(card.locator('.mc-backlog')).toHaveText('1');
   } finally {
-    await cleanup(`delete worker for ${worker}`, async () => {
-      await deleteWorkerApi(page, request, auth, worker);
-    }, testInfo);
+    await cleanup(`delete worker for ${worker}`, () => deleteWorkerApi(page, request, auth, worker), testInfo);
   }
 });

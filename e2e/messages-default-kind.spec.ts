@@ -3,6 +3,7 @@
 import { test, expect } from './fixtures';
 import { clickWhenActionable } from './helpers';
 import { cleanup } from './teardown';
+import { deleteWorkerApi } from './lifecycle/evidence';
 
 const CHIP_KEYS = { All: 'all', Human: 'human', Session: 'session', Scheduled: 'schedule', amux: 'amux', Unstamped: 'unstamped', Unclassified: 'unknown' };
 
@@ -87,6 +88,6 @@ test('Messages tab opens with the human pill selected', async ({ page, request }
       .map(k => `${k} ${rendered![k] || 0}->${live[k] || 0}`);
     if (drift.length) console.log('[COUNTS-DRIFT] history changed on the shared server during the test: ' + drift.join(', '));
   } finally {
-    await cleanup('delete seed worker', () => request.delete(`/api/sessions/${seed}`, { headers }), info);
+    await cleanup('delete seed worker', () => deleteWorkerApi(page, request, headers, seed), info);
   }
 });

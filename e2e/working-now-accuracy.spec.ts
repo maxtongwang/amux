@@ -1,7 +1,7 @@
 // Working now fixtures — keep the routed runtime projection free of provider startup (refs ai-config #344).
 import { test, expect } from './fixtures';
 import { cleanup } from './teardown';
-import { createMockWorker, getSessionsResilient, deleteWorkerApi } from './lifecycle/evidence';
+import { createMockWorker, getSessionsResilient, deleteWorkerApi, deleteBoardCardApi } from './lifecycle/evidence';
 
 test('one active worker marks exactly its claimed card as Working now', async ({ page, request }, testInfo) => {
   await page.goto('/');
@@ -91,13 +91,8 @@ test('one active worker marks exactly its claimed card as Working now', async ({
     await expect(page.getByText('no board task claimed', { exact: false })).toHaveCount(0);
   } finally {
     for (const id of cards) {
-      await cleanup(`delete card ${id} for ${worker}`, async () => {
-        const response = await request.delete(`/api/board/${id}`, { headers: auth });
-        expect(response.ok(), `delete card ${id} for ${worker}: status=${response.status()} body=${await response.text()}`).toBeTruthy();
-      }, testInfo);
+      await cleanup(`delete card ${id} for ${worker}`, () => deleteBoardCardApi(request, auth, id), testInfo);
     }
-    await cleanup(`delete worker for ${worker}`, async () => {
-      await deleteWorkerApi(page, request, auth, worker);
-    }, testInfo);
+    await cleanup(`delete worker for ${worker}`, () => deleteWorkerApi(page, request, auth, worker), testInfo);
   }
 });

@@ -59,6 +59,11 @@ export async function deleteWorkerApi(
   expect(response.ok(), `delete worker ${name}: status=${response.status()} body=${await response.text()}`).toBeTruthy();
 }
 
+export async function deleteBoardCardApi(request: APIRequestContext, headers: Record<string, string>, id: string) {
+  const response = await request.delete(`/api/board/${encodeURIComponent(id)}`, { headers });
+  expect(response.ok(), `delete card ${id}: status=${response.status()} body=${await response.text()}`).toBeTruthy();
+}
+
 // GET /api/sessions can legitimately 503 once when a concurrent session
 // create/delete races the single-flight list build — the server fails
 // closed rather than serve a stale snapshot and says so in its own error

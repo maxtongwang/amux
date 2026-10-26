@@ -4,7 +4,7 @@
 // represented by reviewer/shepherd and evidence references. Another worker's
 // board cannot become an execution prerequisite or receive this worker's tasks.
 import { test, expect } from './fixtures';
-import { createMockWorker, deleteWorkerApi } from './lifecycle/evidence';
+import { createMockWorker, deleteWorkerApi, deleteBoardCardApi } from './lifecycle/evidence';
 import { cleanup } from './teardown';
 
 test('a worker creates only on its own board and links peers explicitly', async ({ page, request }, testInfo) => {
@@ -108,21 +108,13 @@ test('a worker creates only on its own board and links peers explicitly', async 
     await expect(page.locator('#bd-meta')).toContainText(reviewer);
   } finally {
     if (owned) {
-      await cleanup(`delete card ${owned} for ${owner}`, async () => {
-        const response = await request.delete(`/api/board/${encodeURIComponent(owned)}`, { headers: auth });
-        expect(response.ok(), `delete card ${owned} for ${owner}: status=${response.status()} body=${await response.text()}`).toBeTruthy();
-      }, testInfo);
+      await cleanup(`delete card ${owned} for ${owner}`, () => deleteBoardCardApi(request, auth, owned), testInfo);
     }
     if (dependency) {
-      await cleanup(`delete card ${dependency} for ${reviewer}`, async () => {
-        const response = await request.delete(`/api/board/${encodeURIComponent(dependency)}`, { headers: auth });
-        expect(response.ok(), `delete card ${dependency} for ${reviewer}: status=${response.status()} body=${await response.text()}`).toBeTruthy();
-      }, testInfo);
+      await cleanup(`delete card ${dependency} for ${reviewer}`, () => deleteBoardCardApi(request, auth, dependency), testInfo);
     }
     for (const name of [owner, reviewer, shepherd]) {
-      await cleanup(`delete worker for ${name}`, async () => {
-        await deleteWorkerApi(page, request, auth, name);
-      }, testInfo);
+      await cleanup(`delete worker for ${name}`, () => deleteWorkerApi(page, request, auth, name), testInfo);
     }
   }
 });
@@ -144,8 +136,6 @@ test('a worker cannot create an unassigned card to escape board ownership', asyn
       code: 'cross_board_create_forbidden', caller: owner, requested_owner: null,
     });
   } finally {
-    await cleanup(`delete worker for ${owner}`, async () => {
-      await deleteWorkerApi(page, request, auth, owner);
-    }, testInfo);
+    await cleanup(`delete worker for ${owner}`, () => deleteWorkerApi(page, request, auth, owner), testInfo);
   }
 });

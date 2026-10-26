@@ -175,8 +175,6 @@ test('worker Configurations edits the full board lifecycle and every scoped capa
     );
     expect(overflow).toBe(false);
   } finally {
-    await cleanup(`delete worker for ${name}`, async () => {
-      await deleteWorkerApi(page, request, auth, name);
-    }, testInfo);
+    await cleanup(`delete worker for ${name}`, () => deleteWorkerApi(page, request, auth, name), testInfo);
   }
 });
