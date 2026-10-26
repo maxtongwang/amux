@@ -27702,6 +27702,14 @@ document.addEventListener('DOMContentLoaded', _filesRenderBookmarks);
 let _exploreSession = null;  // set when explore overlay is opened from a session
 // Default Files opens wait for cwd; explicit paths advance the load generation immediately.
 const _FILES_CWD_INIT_TIMEOUT_MS = 8000;   // Bound offline startup like a directory read.
+let _filesCwdSettled = false;
+function _filesClientDiagnostic(diagnostic) {
+  console.info(diagnostic.kind, diagnostic);
+  try {
+    fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(diagnostic)}).catch(() => {});
+  } catch(e) {}
+}
 const _filesCwdReady = (async () => {
   let outcome = 'failed';
   try {
@@ -27714,13 +27722,19 @@ const _filesCwdReady = (async () => {
       else outcome = 'superseded';
     } else outcome = 'empty';
   } catch(e) {}
-  const diagnostic = {kind:'files_cwd_init',outcome,measured:true,n_considered:1,ver:APP_VER};
-  console.info('files_cwd_init', diagnostic);
-  try {
-    fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(diagnostic)}).catch(() => {});
-  } catch(e) {}
+  _filesCwdSettled = true;
+  _filesClientDiagnostic({kind:'files_cwd_init',outcome,measured:true,n_considered:1,ver:APP_VER});
 })();
+// Actions that write into "this folder" resolve it here, so one started while
+// the saved cwd is still loading targets that cwd rather than "/". Explicit
+// navigation already set _filesPath and still wins. Bounded by the cwd timeout.
+async function _filesTargetDir(action) {
+  const waited = !_filesCwdSettled;
+  await _filesCwdReady;
+  const dir = _filesPath || '/';
+  if (waited) _filesClientDiagnostic({kind:'files_target_dir',action,waited,root:dir === '/',measured:true,n_considered:1,ver:APP_VER});
+  return dir;
+}
 // Load hidden files + shortcuts independently of the saved cwd.
 (async () => {
   try {
@@ -28406,7 +28420,7 @@ async function _filesNewFolder() {
   if (!name || !name.trim()) return;
   const fname = name.trim();
   if (/[\/\0]/.test(fname) || fname === '.' || fname === '..') { showToast('Invalid folder name'); return; }
-  const fpath = (_filesPath || '/').replace(/\/$/, '') + '/' + fname;
+  const fpath = (await _filesTargetDir('new_folder')).replace(/\/$/, '') + '/' + fname;
   try {
     const r = await fetch(API + '/api/fs/mkdir', {
       method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
@@ -28417,11 +28431,11 @@ async function _filesNewFolder() {
     else showToast(d.error || 'Could not create folder');
   } catch (e) { showToast('Could not create folder'); }
 }
-function _filesNewFile() {
+async function _filesNewFile() {
   const name = prompt('File name (e.g. notes.txt, script.py, data.json):');
   if (!name || !name.trim()) return;
   const fname = name.trim();
-  const fpath = (_filesPath || '/').replace(/\/$/, '') + '/' + fname;
+  const fpath = (await _filesTargetDir('new_file')).replace(/\/$/, '') + '/' + fname;
   // Open the file overlay in edit mode with empty content
   _fileData = { path: fpath, content: '', is_markdown: /\.md$/i.test(fname), _isNew: true };
   _fileViewMode = 'edit';
@@ -31090,7 +31104,7 @@ async function handleFilesUpload(files) {
   if (!files || !files.length) return;
   const statusEl = document.getElementById('files-cache-status');
   if (statusEl) statusEl.textContent = online ? 'Uploading\u2026' : 'Offline \u2014 queueing\u2026';
-  const { uploaded, queued } = await _uploadOrQueue(files, _filesPath, 'file');
+  const { uploaded, queued } = await _uploadOrQueue(files, await _filesTargetDir('upload'), 'file');
   if (statusEl) statusEl.textContent = '';
   const inp = document.getElementById('files-upload-input');
   if (inp) inp.value = '';
@@ -31224,7 +31238,7 @@ function _updateFilesSessionBtn() {
 }
 async function setFilesSessionDir() {
   if (!_exploreSession) return;
-  const dir = _filesPath;
+  const dir = await _filesTargetDir('session_dir');
   try {
     await fetch(API + '/api/sessions/' + encodeURIComponent(_exploreSession) + '/config', {
       method: 'PATCH', headers: {'Content-Type':'application/json'},
