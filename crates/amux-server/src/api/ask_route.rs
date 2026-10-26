@@ -7,8 +7,8 @@
 //! `AskUserQuestion` picker, filed an owner card or parked on the owner's
 //! keyboard. Now that question is queued to the worker's lead as a peer
 //! message stamped with the worker's name, and the worker is told to hold that
-//! step until the lead answers. The lead brings the owner only money,
-//! signatures, passwords, outside sends and directional bets. A lead's own
+//! step until the lead answers. The lead brings the owner only the Owner-only
+//! categories (OWNER_ONLY_ASKS). A lead's own
 //! asks, and the owner agent's, keep the owner-ask path unchanged.
 //!
 //! WHO IS A LEAD comes from groups, as for lead renames and lead-made workers
@@ -39,8 +39,10 @@ const LEAD_ASK_EVENT: &str = "turn_end.lead_ask";
 const LEAD_ASK_WINDOW_S: f64 = 6.0 * 3600.0;
 /// Context sent to the lead with a question, in characters.
 const LEAD_CONTEXT_CHARS: usize = 1500;
-/// What a lead may still bring to the owner (ai-config agents/owner.md).
-pub(crate) const OWNER_ONLY_ASKS: &str = "money, signatures, passwords, outside sends or a directional bet";
+/// What a lead may still bring to the owner: the Owner-only row of ai-config
+/// harness/ORCHESTRATOR.md, Lead Authority.
+pub(crate) const OWNER_ONLY_ASKS: &str = "outside sends, money, signatures, credentials, permanent deletes, \
+     access and permission changes, or a directional bet";
 
 /// One lane as lead resolution sees it.
 #[derive(Debug, Clone)]
