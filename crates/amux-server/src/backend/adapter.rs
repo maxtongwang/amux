@@ -1234,10 +1234,6 @@ fn codex_model_bar(line: &str) -> bool {
         && (location == "~" || location.starts_with("~/") || location.starts_with('/'))
 }
 
-<<<<<<< HEAD
-fn codex_shortcut_hint_row(line: &str) -> bool {
-    line.trim_start().starts_with("? for shortcuts")
-=======
 /// Codex's hint row under the model bar (0.163+): `? for shortcuts`,
 /// optionally followed by a warnings notice such as `⚠ 2 warnings · f2 to
 /// view`. Anchored at the start of the row so prose that merely mentions
@@ -1273,7 +1269,6 @@ fn now_secs() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
->>>>>>> upstream/main
 }
 
 fn codex_active_status_line(line: &str) -> bool {
@@ -1328,17 +1323,6 @@ fn codex_structured_active_line_clean(clean: &str) -> Option<Option<&str>> {
     // Provider identity must be the CURRENT footer, not a Codex-looking frame
     // pasted into another provider's prompt. The model/path bar is Codex's
     // final non-empty row and its prompt glyph is `›` (not Claude's `❯`).
-<<<<<<< HEAD
-    // Before its first turn Codex paints a `? for shortcuts` hint row below
-    // the model bar; it is chrome, not a different frame (DMIW-1).
-    let footer_end = match tail.last() {
-        Some(last) if codex_shortcut_hint_row(last) => tail.len() - 1,
-        _ => tail.len(),
-    };
-    let model_i = footer_end
-        .checked_sub(1)
-        .filter(|i| codex_model_bar(tail[*i]))?;
-=======
     //
     // Codex 0.163 paints one more row UNDER the model bar: `? for shortcuts`
     // and, when it has any, `⚠ 2 warnings · f2 to view`. Requiring the bar to
@@ -1359,7 +1343,6 @@ fn codex_structured_active_line_clean(clean: &str) -> Option<Option<&str>> {
     } else {
         return None;
     };
->>>>>>> upstream/main
     let prompt_i = tail[..model_i].iter().rposition(|s| s.starts_with('›'))?;
     // Current Codex paints the active row immediately before its disabled
     // prompt. Older builds painted it immediately after the submitted prompt,

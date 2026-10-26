@@ -202,17 +202,16 @@ def merge(
     hook_path: str,
     read_guard_path: str = "$HOME/.amux/hooks/large-read-guard.py",
     ask_guard_path: str | None = None,
-<<<<<<< HEAD
     provider: str = "claude",
     changes: list[int] | None = None,
-=======
     boundary_guard_path: str | None = None,
->>>>>>> upstream/main
 ) -> dict[str, Any]:
     if provider not in ("claude", "codex"):
         raise ValueError(f"unknown provider {provider!r}")
     if provider == "codex" and ask_guard_path is not None:
         raise ValueError("the ask guard has no Codex wiring: owner-ask goal detection reads Claude transcripts only")
+    if provider == "codex" and boundary_guard_path is not None:
+        raise ValueError("the boundary guard has no Codex wiring yet: wire it for Claude only")
     raw_hooks = data.setdefault("hooks", {})
     if not isinstance(raw_hooks, dict):
         raise ValueError("settings 'hooks' must be an object")
@@ -311,16 +310,15 @@ def main() -> int:
         help="wire the AskUserQuestion goal guard (AMUX-5234); omitted = leave any existing wiring alone",
     )
     parser.add_argument(
-<<<<<<< HEAD
         "--provider",
         choices=("claude", "codex"),
         default="claude",
         help="whose native events to write (codex: ~/.codex/hooks.json)",
-=======
+    )
+    parser.add_argument(
         "--boundary-guard-path",
         default=None,
         help="wire the boundaries.toml guard; omitted = leave any existing wiring alone",
->>>>>>> upstream/main
     )
     parser.add_argument(
         "--allow-unsupported-events",
@@ -368,11 +366,8 @@ def main() -> int:
     before = json.loads(json.dumps(data))
     changes: list[int] = []
     try:
-<<<<<<< HEAD
-        merged = merge(data, args.hook_path, args.read_guard_path, args.ask_guard_path, args.provider, changes)
-=======
-        merged = merge(data, args.hook_path, args.read_guard_path, args.ask_guard_path, args.boundary_guard_path)
->>>>>>> upstream/main
+        merged = merge(data, args.hook_path, args.read_guard_path, args.ask_guard_path, args.provider, changes,
+                       boundary_guard_path=args.boundary_guard_path)
     except ValueError as exc:
         raise SystemExit(f"refusing to rewrite {args.settings}: {exc}")
     if args.dry_run:
