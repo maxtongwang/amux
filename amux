@@ -6522,21 +6522,27 @@ EOF
 
 # Job credentials travel in a header; values travel only in exec's environment.
 cmd_secret_exec() {
+  local endpoint="${AMUX_API:-$(cmd_url)}"
   exec 3<&0
-  exec python3 - "$@" 3<&3 <<'PY_SECRET_EXEC'
+  AMUX_API="$endpoint" exec python3 - "$@" 3<&3 <<'PY_SECRET_EXEC'
 import argparse
 import http.client
-import ipaddress
 import json
 import os
 import re
 import stat
+import ssl
 import sys
 import urllib.parse
 
+# Bound a local delivery request and its in-memory response.
+REQUEST_TIMEOUT_SECONDS = 10
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
 os.dup2(3, 0)
 os.close(3)
-parser = argparse.ArgumentParser(prog="amux secret-exec", description="Execute a command with owner-approved job vault secrets")
+parser = argparse.ArgumentParser(prog="amux secret-exec", description="Execute a command with owner-approved job vault secrets",
+    epilog="The job token is the authorization control. A local proxy (including tailscale serve) can forward remote requests from loopback.")
 parser.add_argument("--job", required=True)
 parser.add_argument("--names", required=True, help="Comma-separated environment names")
 if sys.argv[1:] in (["--help"], ["-h"]):
@@ -6574,14 +6580,25 @@ except OSError:
     fail("job_credential_missing_or_unregistered")
 try:
     url = urllib.parse.urlsplit(os.environ["AMUX_API"])
-    # Literal loopback avoids DNS changes; no proxies, redirects, or URL credentials.
-    if url.scheme != "http" or not ipaddress.ip_address(url.hostname).is_loopback or url.username or url.password or url.path not in ("", "/") or url.query or url.fragment:
+    # Only local hosts; no proxies, redirects, or URL credentials.
+    if url.scheme not in ("http", "https") or url.hostname not in ("localhost", "127.0.0.1", "::1") or url.username or url.password or url.path not in ("", "/") or url.query or url.fragment:
         fail("local_server_url_required")
-    conn = http.client.HTTPConnection(url.hostname, url.port, timeout=10)
+    if url.scheme == "https":
+        # Match tls::load_or_generate: an adopted connection bundle wins.
+        cert = os.path.join(home, "tls", "connection.pem")
+        if not os.path.exists(cert):
+            cert = os.path.join(home, "tls", "cert.pem")
+        context = ssl.create_default_context(cafile=cert)
+        conn = http.client.HTTPSConnection(url.hostname, url.port,
+                                          timeout=REQUEST_TIMEOUT_SECONDS, context=context)
+    else:
+        conn = http.client.HTTPConnection(url.hostname, url.port, timeout=REQUEST_TIMEOUT_SECONDS)
     conn.request("POST", "/api/vault/job-secrets", json.dumps({"job": args.job, "names": names}),
                  {"Content-Type": "application/json", "X-Amux-Worker-Token": token})
     response = conn.getresponse()
-    payload = response.read(8 * 1024 * 1024)
+    payload = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(payload) > MAX_RESPONSE_BYTES:
+        fail("invalid_server_response")
     status = response.status
     conn.close()
 except (OSError, ValueError, http.client.HTTPException):

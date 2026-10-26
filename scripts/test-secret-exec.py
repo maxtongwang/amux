@@ -4,6 +4,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -59,6 +60,58 @@ class SecretExecTests(unittest.TestCase):
         self.assertNotIn(SENTINEL, out.stdout + out.stderr)
         return out
 
+    def enable_tls(self):
+        tls = Path(self.env["AMUX_HOME"]) / "tls"
+        tls.mkdir()
+        config = tls / "openssl.cnf"
+        config.write_text("[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n"
+                          "[dn]\nCN=localhost\n[ext]\nsubjectAltName=DNS:localhost,IP:127.0.0.1\n")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                        "-days", "1", "-config", str(config), "-keyout", str(tls / "key.pem"),
+                        "-out", str(tls / "cert.pem")], check=True, capture_output=True)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(tls / "cert.pem", tls / "key.pem")
+        self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
+        return tls
+
+    def test_discovered_https_without_amux_api(self):
+        self.enable_tls()
+        # A scratch endpoint exercises production discovery; isolation deliberately
+        # ignores endpoint.json, so disable that guard only in this scratch child.
+        self.env["AMUX_ISOLATED_RUN"] = "0"
+        self.env.pop("AMUX_API", None)
+        self.env.pop("AMUX_URL", None)
+        endpoint = Path(self.env["CC_HOME"]) / "endpoint.json"
+        endpoint.write_text(json.dumps({"canonical_url": f"https://localhost:{self.server.server_port}"}))
+        out = self.run_cli(sys.executable, "-c", "print('TLS child ok')")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "TLS child ok\n")
+        self.assertEqual(len(self.requests), 1)
+
+    def test_explicit_api_wins_over_discovery(self):
+        self.env["AMUX_URL"] = "http://127.0.0.1:1"
+        out = self.run_cli(sys.executable, "-c", "print('override ok')")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "override ok\n")
+
+    def test_https_verifies_certificate_and_active_bundle(self):
+        tls = self.enable_tls()
+        self.env["AMUX_API"] = f"https://localhost:{self.server.server_port}"
+        (tls / "connection.pem").write_bytes((tls / "cert.pem").read_bytes() + (tls / "key.pem").read_bytes())
+        (tls / "cert.pem").unlink()
+        out = self.run_cli(sys.executable, "-c", "print('trusted')")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        # A readable but unrelated trust anchor must also refuse the server.
+        other_key = tls / "other-key.pem"
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                        "-days", "1", "-config", str(tls / "openssl.cnf"),
+                        "-keyout", str(other_key), "-out", str(tls / "connection.pem")],
+                       check=True, capture_output=True)
+        out = self.run_cli("unused-command")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("server_unavailable", out.stderr)
+        self.assertEqual(len(self.requests), 1)
+
     def test_environment_argv_stdin_and_exit(self):
         code = ('import os,sys; assert os.environ["MAX_TEST_KEY"] == ' + repr(SENTINEL) + '; '
                 'assert "MAX_OTHER_KEY" not in os.environ; '
@@ -110,9 +163,11 @@ class SecretExecTests(unittest.TestCase):
         path.chmod(0o644)
         self.assertIn("job_credential_permissions", self.run_cli("unused").stderr)
         path.chmod(0o600)
-        # The isolated endpoint guard blocks a nonlocal endpoint before transport.
-        self.env["AMUX_API"] = "http://192.0.2.1:12345"
-        self.assertNotEqual(self.run_cli("unused").returncode, 0)
+        # Invoke the verb after sourcing so the isolation guard cannot mask its check.
+        out = subprocess.run(["bash", "-c", 'source "$1"; AMUX_API=http://192.0.2.1:12345; cmd_secret_exec --job com.test.allowed --names MAX_TEST_KEY -- unused',
+                              "test", str(CLI)], env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("local_server_url_required", out.stderr)
         self.assertEqual(self.requests, [])
 
 

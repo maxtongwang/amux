@@ -206,8 +206,10 @@ those names, then replaces itself with the command using an argument vector and
 child environment. Requires Python 3 (the existing Bash CLI dependency). The
 wrapper preserves stdin, argument bytes, and the child's exit status. It never
 prints values; the child must also avoid printing its environment. The normal
-CLI endpoint discovery applies, but delivery accepts only an HTTP literal
-loopback address, with no proxy or redirects. A stopped server fails closed.
+CLI endpoint discovery applies; `AMUX_API` overrides it. Delivery accepts HTTP or
+HTTPS at `localhost`, `127.0.0.1`, or `::1`, with no proxy or redirects. HTTPS
+verifies the server certificate using the active local `tls/connection.pem`
+bundle, or `tls/cert.pem` when no bundle exists; verification is never disabled. A stopped server fails closed.
 
 An owner registers each label in `$AMUX_HOME/secret-jobs.json` (default
 `~/.amux/secret-jobs.json`), a user-owned regular file with mode 0600:
@@ -294,15 +296,17 @@ entries (no shell, no secret in the plist):
 
 The agent surface is `POST /api/vault/job-secrets`, JSON
 `{"job":"com.example.buyer-match","names":["MAX_APILLOW_API_KEY"]}` and the token
-header above. Real socket loopback metadata is mandatory. Success is 200 with
+header above. Real socket loopback metadata is mandatory. A local proxy such as tailscale serve
+can forward remote clients from loopback; the job token is the authorization control. Success is 200 with
 `{"values":{"MAX_APILLOW_API_KEY":"..."}}` and `Cache-Control: no-store`.
 Resolution uses vault global/group precedence, including the last sorted group
 winning; worker-specific secrets never apply to jobs, even for an equal label.
 Every requested name must be both allowed and resolvable before any is returned.
 Failure JSON is `{"error":"<code>","names":["<affected name>"]}`; codes include
-`unknown_job`, `job_identity_refused`, `name_not_allowed`,
-`missing_or_wrong_group`, registry errors and vault errors. No error includes
+`job_identity_refused` (also for unknown labels or unavailable/invalid registry state), `name_not_allowed`,
+`missing_or_wrong_group` and vault errors. Registry error details are local audit/log signals only. No error includes
 values. The CLI exits nonzero and reports a fixed code and requested names;
 `server_unavailable` means no usable server response. It refuses unexpected or
 missing response names. Successful delivery is audited by label and names;
-refusals emit `verdict=secret_job_refused` and a fixed reason for log sweeps.
+refusals emit `verdict=secret_job_refused` and a value-free `secrets_job_refused`
+audit record with a fixed reason and requested-name count for sweeps.

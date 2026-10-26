@@ -93,7 +93,9 @@ async fn registered_jobs_are_scoped_authenticated_and_never_logged_as_values() {
     std::fs::write(&registry_path, registry.to_string()).unwrap();
     std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     for (name, scope, target) in [
+        ("MAX_TEST_KEY", "global", ""),
         ("MAX_TEST_KEY", "group", "ops"),
+        ("MAX_TEST_KEY", "worker", "com.test.allowed"),
         ("MAX_EXTRA", "global", ""),
         ("MAX_WRONG_GROUP", "group", "other"),
         ("MAX_WORKER_ONLY", "worker", "com.test.allowed"),
@@ -101,7 +103,7 @@ async fn registered_jobs_are_scoped_authenticated_and_never_logged_as_values() {
         let (status, response, _) = call(
             &app,
             "/api/vault/secrets",
-            json!({"key": name, "scope": scope, "target": target, "value": CANARY}),
+            json!({"key": name, "scope": scope, "target": target, "value": format!("{CANARY}:{name}:{scope}:{target}")}),
             "",
             None,
         )
@@ -132,7 +134,10 @@ async fn registered_jobs_are_scoped_authenticated_and_never_logged_as_values() {
     )
     .await;
     assert_eq!(status, 200, "{result}");
-    assert_eq!(result, json!({"values": {"MAX_TEST_KEY": CANARY}}));
+    assert_eq!(
+        result,
+        json!({"values": {"MAX_TEST_KEY": format!("{CANARY}:MAX_TEST_KEY:group:ops")}})
+    );
     assert_eq!(cache, "no-store");
     for (job, names, token, peer, reason) in [
         (
@@ -147,7 +152,7 @@ async fn registered_jobs_are_scoped_authenticated_and_never_logged_as_values() {
             vec!["MAX_TEST_KEY"],
             JOB_TOKEN,
             Some("127.0.0.1:1"),
-            "unknown_job",
+            "job_identity_refused",
         ),
         (
             "com.test.allowed",
@@ -206,26 +211,45 @@ async fn registered_jobs_are_scoped_authenticated_and_never_logged_as_values() {
         assert!(result.get("values").is_none());
         assert!(!result.to_string().contains(CANARY));
     }
-    // Exercise the shipped Bash verb through a real, ephemeral HTTP listener.
+    // Exercise endpoint discovery and verified TLS through the production router.
     std::fs::create_dir_all(home.join("job-tokens")).unwrap();
     let credential = home.join("job-tokens/com.test.allowed.token");
     std::fs::write(&credential, JOB_TOKEN).unwrap();
     std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let material = amux_server::tls::load_or_generate(&home.join("tls")).unwrap();
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem(
+        material.cert_pem.into_bytes(),
+        material.key_pem.into_bytes(),
+    )
+    .await
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let service = app
         .clone()
         .into_make_service_with_connect_info::<std::net::SocketAddr>();
     let server = tokio::spawn(async move {
-        axum::serve(listener, service).await.unwrap();
+        axum_server::from_tcp_rustls(listener, config)
+            .serve(service)
+            .await
+            .unwrap();
     });
+    std::fs::write(
+        home.join("endpoint.json"),
+        json!({
+            "canonical_url": format!("https://localhost:{}", address.port())
+        })
+        .to_string(),
+    )
+    .unwrap();
     let cli = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../amux");
     let output = tokio::process::Command::new("bash").arg(cli)
         .args(["secret-exec", "--job", "com.test.allowed", "--names", "MAX_TEST_KEY", "--", "python3", "-c"])
-        .arg(format!("import os,sys; assert os.environ['MAX_TEST_KEY'] == {CANARY:?}; assert 'MAX_EXTRA' not in os.environ; assert sys.argv[1:] == ['with spaces', 'a\\\"b']; print('child ok')"))
+        .arg(format!("import os,sys; assert os.environ['MAX_TEST_KEY'] == '{CANARY}:MAX_TEST_KEY:group:ops'; assert 'MAX_EXTRA' not in os.environ; assert sys.argv[1:] == ['with spaces', 'a\\\"b']; print('child ok')"))
         .args(["with spaces", "a\"b"])
         .env("HOME", home).env("CC_HOME", home).env("AMUX_HOME", home)
-        .env("AMUX_API", format!("http://{address}")).env("AMUX_ISOLATED_RUN", "1")
+        .env_remove("AMUX_API").env_remove("AMUX_URL").env("AMUX_ISOLATED_RUN", "0")
         .env_remove("TMUX_PANE").env_remove("AMUX_SESSION").output().await.unwrap();
     server.abort();
     assert!(
@@ -265,6 +289,7 @@ async fn registered_jobs_are_scoped_authenticated_and_never_logged_as_values() {
     assert!(!log.contains(CANARY) && !log.contains(JOB_TOKEN));
     let audit = std::fs::read_to_string(home.join("logs/vault-audit.jsonl")).unwrap();
     assert!(audit.contains("secrets_job_delivered"));
+    assert!(audit.contains("secrets_job_refused") && audit.contains("unknown_job"));
     assert!(!audit.contains(CANARY) && !audit.contains(JOB_TOKEN));
     // Unsafe or malformed registry state fails closed without echoing file contents.
     std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -276,8 +301,8 @@ async fn registered_jobs_are_scoped_authenticated_and_never_logged_as_values() {
         Some("127.0.0.1:1"),
     )
     .await;
-    assert_eq!(status, 503);
-    assert_eq!(response["error"], "job_registry_permissions");
+    assert_eq!(status, 403);
+    assert_eq!(response["error"], "job_identity_refused");
     std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::write(&registry_path, CANARY).unwrap();
     let (status, response, _) = call(
@@ -288,9 +313,36 @@ async fn registered_jobs_are_scoped_authenticated_and_never_logged_as_values() {
         Some("127.0.0.1:1"),
     )
     .await;
-    assert_eq!(status, 503);
-    assert_eq!(response["error"], "job_registry_invalid");
+    assert_eq!(status, 403);
+    assert_eq!(response["error"], "job_identity_refused");
     assert!(!response.to_string().contains(CANARY));
+    let (status, response, _) = call(
+        &app,
+        route,
+        payload("com.test.allowed", &["MAX_TEST_KEY"]),
+        "",
+        Some("127.0.0.1:1"),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert_eq!(response["error"], "job_identity_refused");
+    let mut malformed = registry.clone();
+    malformed["jobs"][0]["token_sha256"] = json!("A".repeat(64));
+    std::fs::write(&registry_path, malformed.to_string()).unwrap();
+    let (status, response, _) = call(
+        &app,
+        route,
+        payload("com.test.allowed", &["MAX_TEST_KEY"]),
+        JOB_TOKEN,
+        Some("127.0.0.1:1"),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert_eq!(response["error"], "job_identity_refused");
+    let audit = std::fs::read_to_string(home.join("logs/vault-audit.jsonl")).unwrap();
+    assert!(audit.contains("job_registry_token_hash_invalid"));
+    assert!(audit.contains("job_registry_invalid") && audit.contains("job_registry_permissions"));
+    assert!(!audit.contains(CANARY) && !audit.contains(JOB_TOKEN));
     // Registry revocation is immediate; no cached approval survives a restart.
     std::fs::write(&registry_path, "{\"jobs\":[]}").unwrap();
     let (status, response, _) = call(
@@ -302,5 +354,5 @@ async fn registered_jobs_are_scoped_authenticated_and_never_logged_as_values() {
     )
     .await;
     assert_eq!(status, 403);
-    assert_eq!(response["error"], "unknown_job");
+    assert_eq!(response["error"], "job_identity_refused");
 }

@@ -47,10 +47,16 @@ fn registry(home: &Path) -> Result<Registry, &'static str> {
     let registry: Registry = serde_json::from_reader(file).map_err(|_| "job_registry_invalid")?;
     let mut labels = BTreeSet::new();
     for j in &registry.jobs {
+        if j.token_sha256.len() != 64
+            || !j
+                .token_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("job_registry_token_hash_invalid");
+        }
         if !super::worker_identity::valid_identity(&j.label)
             || !labels.insert(&j.label)
-            || j.token_sha256.len() != 64
-            || !j.token_sha256.bytes().all(|b| b.is_ascii_hexdigit())
             || j.groups
                 .iter()
                 .any(|g| !super::worker_identity::valid_identity(g) || *g != g.to_lowercase())
@@ -74,7 +80,18 @@ fn refuse(code: StatusCode, reason: &str, names: &BTreeSet<String>) -> Response 
         measured = true,
         "job secret delivery refused"
     );
-    (code, Json(json!({"error": reason, "names": names}))).into_response()
+    super::vault::audit_line(
+        &crate::config::amux_home(),
+        json!({"ts": crate::config::now_f64(), "event": "secrets_job_refused",
+               "reason": reason, "n_considered": names.len()}),
+    );
+    // Registry state and label existence are private until authentication.
+    let public_reason = if reason.starts_with("job_registry_") || reason == "unknown_job" {
+        "job_identity_refused"
+    } else {
+        reason
+    };
+    (code, Json(json!({"error": public_reason, "names": names}))).into_response()
 }
 
 async fn deliver(
@@ -97,18 +114,26 @@ async fn deliver(
     {
         return refuse(StatusCode::BAD_REQUEST, "invalid_names", &BTreeSet::new());
     }
+    let token = headers
+        .get(super::worker_identity::TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|t| {
+            t.len() == 64
+                && t.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+    let Some(token) = token else {
+        return refuse(StatusCode::FORBIDDEN, "job_identity_refused", names);
+    };
     let home = crate::config::amux_home();
     let registry = match registry(&home) {
         Ok(r) => r,
-        Err(reason) => return refuse(StatusCode::SERVICE_UNAVAILABLE, reason, names),
+        Err(reason) => return refuse(StatusCode::FORBIDDEN, reason, names),
     };
     let Some(job) = registry.jobs.iter().find(|j| j.label == request.job) else {
         return refuse(StatusCode::FORBIDDEN, "unknown_job", names);
     };
-    let token = headers
-        .get(super::worker_identity::TOKEN_HEADER)
-        .and_then(|v| v.to_str().ok());
-    if !token.is_some_and(|t| super::worker_identity::token_matches(t, &job.token_sha256)) {
+    if !super::worker_identity::token_matches(token, &job.token_sha256) {
         return refuse(StatusCode::FORBIDDEN, "job_identity_refused", names);
     }
     let denied: BTreeSet<_> = names.difference(&job.allowed_names).cloned().collect();
