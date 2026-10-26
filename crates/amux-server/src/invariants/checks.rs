@@ -810,6 +810,31 @@ pub struct DeployLag {
     /// fallback reintroduces the bug above, and a reader must be able to see
     /// that it happened.
     pub age_source: String,
+    /// Why the builder is not moving, from the activation gate's state file
+    /// (`~/.amux/activation-gate.json`), when the gate is HOLDING: no recent
+    /// main commit passed CI, so there was nothing to deploy. None when the
+    /// gate is not holding or its file is unreadable.
+    ///
+    /// 2026-10-24: this check failed for 27 hours with the server 73 commits
+    /// behind, and its text sent the reader to the builder log. The builder
+    /// was fine. main was red, and the fix was in CI, not in the builder.
+    pub gate_hold: Option<String>,
+}
+
+/// The gate's own words for a hold, from `activation-gate.json`. Pure so the
+/// mapping is tested; the caller reads the file.
+pub fn gate_hold_reason(gate: &serde_json::Value) -> Option<String> {
+    if gate["verdict"].as_str() != Some("ci_gate_no_green") {
+        return None;
+    }
+    let tip = gate["tip"].as_str().unwrap_or("");
+    let state = gate["tip_state"].as_str().unwrap_or("unknown");
+    let held = gate["held"].as_i64().map(|n| format!(" in the last {n}")).unwrap_or_default();
+    Some(format!(
+        "the CI gate is holding: no main commit{held} passed both `rust` and `checks`, and \
+         main's tip {} is {state}",
+        short(tip)
+    ))
 }
 
 /// When did origin/main first move PAST `served`?
@@ -906,19 +931,27 @@ pub fn served_commit_is_current(
         "threshold_s": threshold_s,
         "measured": true,
         "age_source": lag.age_source,
+        "gate_hold": lag.gate_hold,
     });
     if lag.oldest_unserved_age_s <= threshold_s {
         // Behind, but not yet longer than a build plausibly takes.
         return vec![InvariantResult::pass(ID).evidence(evidence)];
     }
+    let why = match &lag.gate_hold {
+        Some(hold) => format!(
+            "The builder is not the fault: {hold}. Fix main's CI (scripts/main-ci-watch.sh \
+             keeps a card on the amux lane for it); the server follows once a commit is green."
+        ),
+        None => "The builder may be ticking and still shipping nothing; check \
+                 `cargo_build_backoff` and BUILD FAILED in the builder log (AMUX-4947/AMUX-4957)."
+            .to_string(),
+    };
     vec![InvariantResult::fail(
         ID,
         "the served commit advances when origin/main moves".to_string(),
         format!(
             "serving {} while origin/main is {} — {} commit(s) behind, and the oldest unserved \
-             commit has been waiting {}s (over the {}s a build is given). The builder may be \
-             ticking and still shipping nothing; check `cargo_build_backoff` and BUILD FAILED \
-             in the builder log (AMUX-4947/AMUX-4957).",
+             commit has been waiting {}s (over the {}s a build is given). {why}",
             short(&lag.served),
             short(&lag.origin_head),
             lag.behind,
@@ -1106,10 +1139,20 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // off the migrations. 44 numeric timestamp columns; 5 are milliseconds and
     // they are the whole trap.
     ("_amux_invariant_incident", "resolved_at", false),
+    // Social posts (0134): api/social.rs now() is chrono timestamp(), epoch seconds.
+    ("social_posts", "posted_at", false),
+    ("social_post_metrics", "fetched_at", false),
+    // Map store (0128): map_store::now() is epoch seconds as f64.
+    ("map_meta", "updated_at", false),
+    ("map_pins", "created_at", false),
+    ("map_pins", "updated_at", false),
+    ("map_shares", "created_at", false),
+    ("map_shares", "revoked_at", false),
     ("_amux_invariant_result", "ts", false),
     ("card_contracts", "deploy_at", false),
     ("land_queue", "done_at", false), // land_queue.rs: now_f64(); live 1791295108.5
     ("land_queue", "queued_at", false),
+    ("schedules", "locked_at", false), // api/schedules.rs: Utc::now().timestamp()
     ("land_queue", "started_at", false),
     ("card_contracts", "frozen_at", false), // measured: 1791242852.2 on 2026-10-06
     ("card_contracts", "review_at", false),
@@ -1183,6 +1226,11 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // SECONDS: api/signals.rs `raise_in_store` stamps chrono::Utc::now().timestamp()
     // (migration 0088, AMUX-5237).
     ("board_signals", "raised_at", false),
+    // SECONDS: api/signals.rs `create_subscription` and the fire path stamp
+    // chrono::Utc::now().timestamp() (migration 0130).
+    ("signal_fires", "fired_at", false),
+    ("signal_subscriptions", "created_at", false),
+    ("signal_subscriptions", "last_fired_at", false),
     // SECONDS: DEFAULT (unixepoch('subsec')) in migration 0061.
     ("board_change_log", "changed_at", false),
     ("chatgpt_oauth_requests", "decided_at", false), // chatgpt_app.rs, REAL epoch seconds
@@ -1234,6 +1282,7 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("issues", "lease_heartbeat_at", false),
     ("layout_presets", "created_at", false),
     ("logs", "ts", false),
+    ("file_opens", "opened_at", false), // epoch seconds, written by POST /api/fs/opened
     ("mdai_runs", "ts", false),
     // SECONDS: api/delivery::now() uses SystemTime::as_secs_f64(); ledger
     // writes and observation/finalization deadlines all use that same clock.
@@ -1259,6 +1308,7 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("standing_approvals", "expires_at", false),
     ("standing_approvals", "revoked_at", false),
     ("standing_approval_uses", "ts", false),
+    // The Proxies tab is retired (MSG-95893); its table stays as the owner's data.
     ("proxies", "created_at", false),
     ("reclaim_quarantine", "created_at", false),
     // SECONDS, and MEASURED rather than assumed from the sibling convention:
@@ -9513,6 +9563,389 @@ pub fn unrecorded_schedule_outcomes_are_visible(
     vec![out]
 }
 
+/// One enabled, recurring schedule as [`enabled_schedules_are_firing`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnabledScheduleClock {
+    pub schedule_id: String,
+    pub title: String,
+    pub expr: String,
+    /// The schedule's own period at the fire it owes: the gap from that fire
+    /// to the one after it, from `ScheduleExpr::parse` and `next_run_after`,
+    /// the same parser and stepper the scheduler fires on. `None` when the
+    /// expression does not parse or has no future fire: an unknown deadline is
+    /// never a missed one, and those rows are COUNTED in evidence rather than
+    /// dropped.
+    pub cadence_s: Option<i64>,
+    /// Seconds from the start of the silence to the first fire the schedule
+    /// then owed. Equal to the cadence for an interval; longer for a weekday
+    /// schedule over a weekend or a cron that only fires in some months, which
+    /// is why the deadline is measured from that fire rather than from a flat
+    /// multiple of the cadence. `None` falls back to one cadence.
+    pub first_due_s: Option<i64>,
+    /// Seconds since the newest of: the last fire (`last_run`), creation, the
+    /// last re-enable or expression change, and a passed `not_before`. A
+    /// schedule re-enabled this morning has not been silent since last month.
+    pub silent_s: i64,
+    /// True when `last_run` is empty, so `silent_s` counts from creation (or a
+    /// later re-enable) rather than from a fire.
+    pub never_ran: bool,
+    /// The stored `next_run`, carried for the reader: a past `next_run` says
+    /// the scheduler is not picking the row up, a future one says something
+    /// moved the fire out.
+    pub next_run: String,
+}
+
+/// How long after server start a schedule is excused from this check, capped
+/// by its own cadence. The scheduler fires every overdue row on its first tick
+/// (`SCHEDULER_TICK_SECS`, 30s; missed-run policy `skip` fires the latest
+/// missed occurrence), so a schedule missed during downtime is caught up within
+/// a tick or two of boot. Five minutes covers a slow first tick and a deferred
+/// dispatch queue without blinding a daily schedule for a whole day after each
+/// of the builder's restarts, which a full-cadence grace would do.
+pub const SCHEDULE_STARTUP_GRACE_S: i64 = 300;
+
+impl EnabledScheduleClock {
+    /// Silent past the first fire it owed plus half a cadence. For a regular
+    /// schedule that fire is one cadence out, so this is 3/2 of the cadence:
+    /// the same bound `scheduler.unrecorded_delivery_outcomes` uses
+    /// (AMUX-4805 measured that healthy fires land within a few seconds of one
+    /// cadence). Measuring from the owed fire keeps a weekday schedule from
+    /// going red over a weekend and a seasonal cron from going red before its
+    /// season starts.
+    pub fn is_past_deadline(&self) -> bool {
+        match self.cadence_s {
+            Some(c) if c > 0 => {
+                let owed = self.first_due_s.unwrap_or(c).max(0);
+                let slack = c.saturating_mul(OVERDUE_CADENCE_NUM - OVERDUE_CADENCE_DEN)
+                    / OVERDUE_CADENCE_DEN;
+                self.silent_s > owed.saturating_add(slack)
+            }
+            _ => false,
+        }
+    }
+
+    /// Is the server too freshly started to hold this schedule to its deadline?
+    pub fn in_startup_grace(&self, uptime_s: i64) -> bool {
+        match self.cadence_s {
+            Some(c) if c > 0 => uptime_s < c.min(SCHEDULE_STARTUP_GRACE_S),
+            _ => false,
+        }
+    }
+
+    pub fn is_silent(&self, uptime_s: i64) -> bool {
+        self.is_past_deadline() && !self.in_startup_grace(uptime_s)
+    }
+
+    /// Fires missed so far, the sort key: a daily schedule two days late and an
+    /// every-5m schedule two days late are not the same size of problem.
+    fn missed(&self) -> i64 {
+        match self.cadence_s {
+            Some(c) if c > 0 => {
+                let owed = self.first_due_s.unwrap_or(c).max(0);
+                if self.silent_s < owed {
+                    0
+                } else {
+                    (self.silent_s - owed) / c + 1
+                }
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// Rows the caller excluded before the predicate, counted so they stay visible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScheduleFiringScope {
+    /// Every enabled, non-deleted schedule, before any exclusion.
+    pub total_enabled: i64,
+    /// `sched_type='once'`: no cadence by design, nothing to be late against.
+    pub one_shot: i64,
+    /// `not_before` still in the future: not due to have fired yet.
+    pub not_started: i64,
+    /// Seconds since this server process started.
+    pub uptime_s: i64,
+}
+
+fn fmt_age(s: i64) -> String {
+    if s >= 86_400 {
+        format!("{}d{}h", s / 86_400, (s % 86_400) / 3600)
+    } else if s >= 3600 {
+        format!("{}h{}m", s / 3600, (s % 3600) / 60)
+    } else {
+        format!("{}m", s / 60)
+    }
+}
+
+/// `schedule.enabled_is_firing`: an ENABLED schedule claims it fires on its
+/// cadence. One that has gone silent for 3/2 of that cadence has stopped.
+///
+/// The other schedule checks all read RUN ROWS: `target_can_receive` reads
+/// refusals, `unrecorded_delivery_outcomes` reads `delivery='unknown'`,
+/// `shell_owner_can_read` reads failures. Every one of them needs the
+/// scheduler to have fired. If the scheduler loop stops, or a row stops being
+/// picked up, there are no new rows and all three stay green. This one reads
+/// the absence: `last_run` against the cadence.
+///
+/// The specimen that asked for it is amux-helper's stall watchdog (SCHED-812,
+/// shell, `every 5m`, scripts/worker-stall-watch.sh). It watches the fleet, and
+/// nothing watched it.
+///
+/// `last_run` is bumped for every outcome, refusals included (scheduler.rs
+/// `record_run` and the cron claim path), so a schedule that fires into a
+/// paused lane is not silent here; that is `target_can_receive`'s question. A
+/// manual run-now also bumps it, so a manual run resets the clock by one fire.
+pub fn enabled_schedules_are_firing(
+    rows: &[EnabledScheduleClock],
+    scope: ScheduleFiringScope,
+) -> Vec<InvariantResult> {
+    const ID: &str = "schedule.enabled_is_firing";
+    let uptime_s = scope.uptime_s;
+    let unparseable: Vec<&EnabledScheduleClock> = rows
+        .iter()
+        .filter(|r| !matches!(r.cadence_s, Some(c) if c > 0))
+        .collect();
+    let checked = rows.len() - unparseable.len();
+    let grace: Vec<&EnabledScheduleClock> = rows
+        .iter()
+        .filter(|r| r.is_past_deadline() && r.in_startup_grace(uptime_s))
+        .collect();
+    let mut silent: Vec<&EnabledScheduleClock> =
+        rows.iter().filter(|r| r.is_silent(uptime_s)).collect();
+    silent.sort_by(|a, b| {
+        b.missed()
+            .cmp(&a.missed())
+            .then_with(|| b.silent_s.cmp(&a.silent_s))
+            .then_with(|| a.schedule_id.cmp(&b.schedule_id))
+    });
+    let row = |r: &&EnabledScheduleClock| {
+        json!({
+            "schedule_id": r.schedule_id,
+            "title": r.title,
+            "expr": r.expr,
+            "cadence_s": r.cadence_s,
+            "first_due_s": r.first_due_s,
+            "silent_s": r.silent_s,
+            "never_ran": r.never_ran,
+            "missed_fires": r.missed(),
+            "next_run": r.next_run,
+        })
+    };
+    // Every bucket in both arms: "all of them fired on time" and "three of
+    // them have expressions nobody can parse" are different facts, and a bare
+    // pass would report the first while meaning the second.
+    let ev = json!({
+        "measured": true,
+        "n_considered": rows.len(),
+        "total_enabled": scope.total_enabled,
+        "checked": checked,
+        "unparseable": unparseable.len(),
+        "unparseable_ids": unparseable
+            .iter()
+            .map(|r| json!({"schedule_id": r.schedule_id, "expr": r.expr}))
+            .collect::<Vec<_>>(),
+        "one_shot": scope.one_shot,
+        "not_started": scope.not_started,
+        "within_startup_grace": grace.len(),
+        "uptime_s": uptime_s,
+        "silent": silent.len(),
+        "silent_schedules": silent.iter().map(row).collect::<Vec<_>>(),
+        "deadline": "silent past the first fire it owed plus half its cadence (3/2 of the \
+                     cadence for a regular schedule)",
+        "unparseable_note": "an expression ScheduleExpr::parse rejects, or one with no future \
+                             fire, has no derivable deadline, so it is never called late here. \
+                             The scheduler cannot fire it on a cadence either, which is its own \
+                             problem.",
+        "grace_note": "past their deadline, but the server started less than \
+                       min(cadence, 300s) ago. The scheduler fires missed rows on its first \
+                       tick, so these are expected to clear without anyone acting.",
+    });
+    if silent.is_empty() {
+        let mut ok = InvariantResult::pass(ID);
+        ok.evidence = ev;
+        return vec![ok];
+    }
+    let named: Vec<String> = silent
+        .iter()
+        .map(|r| {
+            let since = if r.never_ran {
+                format!("never ran, enabled {} ago", fmt_age(r.silent_s))
+            } else {
+                format!("last ran {} ago", fmt_age(r.silent_s))
+            };
+            format!(
+                "{} '{}' ({}, cadence {}): {}, ~{} fire(s) missed, next_run {}",
+                r.schedule_id,
+                r.title,
+                r.expr,
+                fmt_age(r.cadence_s.unwrap_or(0)),
+                since,
+                r.missed(),
+                if r.next_run.is_empty() {
+                    "unset"
+                } else {
+                    &r.next_run
+                },
+            )
+        })
+        .collect();
+    let mut out = InvariantResult::fail(
+        ID,
+        "every enabled recurring schedule has fired by its owed fire plus half a cadence \
+         (3/2 of the cadence for a regular schedule)",
+        format!(
+            "{} of {checked} enabled schedule(s) with a parseable cadence have gone silent: {}. \
+             An enabled schedule claims it fires; these have not. A next_run in the past means \
+             the scheduler is not picking the row up (loop stopped, shadow mode \
+             AMUX_RS_SCHEDULER=0, host guard or dispatch queue deferring); a next_run in the \
+             future means something moved the fire out. Check GET /api/schedules/runs and the \
+             scheduler lines in server-rs.log.",
+            silent.len(),
+            named.join("; "),
+        ),
+    );
+    out.evidence = ev;
+    vec![out]
+}
+
+#[cfg(test)]
+mod enabled_schedule_firing_tests {
+    use super::*;
+
+    fn clock(id: &str, cadence: Option<i64>, silent: i64, never_ran: bool) -> EnabledScheduleClock {
+        EnabledScheduleClock {
+            schedule_id: id.into(),
+            title: format!("title {id}"),
+            expr: "every 5m".into(),
+            cadence_s: cadence,
+            first_due_s: None,
+            silent_s: silent,
+            never_ran,
+            next_run: "2026-10-25T08:00".into(),
+        }
+    }
+    fn scope(total: i64, uptime_s: i64) -> ScheduleFiringScope {
+        ScheduleFiringScope {
+            total_enabled: total,
+            uptime_s,
+            ..Default::default()
+        }
+    }
+    const UP: i64 = 86_400;
+
+    #[test]
+    fn on_time_schedules_pass_with_counts() {
+        let rows = [
+            clock("S1", Some(300), 200, false),
+            clock("S2", Some(86_400), 80_000, false),
+        ];
+        let r = enabled_schedules_are_firing(&rows, scope(2, UP));
+        assert_eq!(r[0].status, Status::Pass, "{}", r[0].observed);
+        assert_eq!(r[0].evidence["checked"], 2);
+        assert_eq!(r[0].evidence["unparseable"], 0);
+        assert_eq!(r[0].evidence["total_enabled"], 2);
+    }
+
+    #[test]
+    fn a_schedule_silent_past_three_halves_of_its_cadence_fails_and_is_named() {
+        // 451s on an every-5m: one second past 3/2 x 300.
+        let rows = [
+            clock("S1", Some(300), 451, false),
+            clock("S2", Some(300), 100, false),
+        ];
+        let r = enabled_schedules_are_firing(&rows, scope(2, UP));
+        assert_eq!(r[0].status, Status::Fail);
+        assert!(r[0].observed.contains("S1 'title S1'"), "{}", r[0].observed);
+        assert!(r[0].observed.contains("last ran 7m ago"), "{}", r[0].observed);
+        assert!(!r[0].observed.contains("S2"), "{}", r[0].observed);
+        // Exactly at the bound is not late.
+        let at = [clock("S1", Some(300), 450, false)];
+        assert_eq!(
+            enabled_schedules_are_firing(&at, scope(1, UP))[0].status,
+            Status::Pass
+        );
+    }
+
+    #[test]
+    fn the_deadline_runs_from_the_fire_it_owed_not_a_flat_multiple() {
+        // A weekday schedule on Monday at 20:00: last ran Friday 9am (83h
+        // ago), owed Monday 9am (72h after), daily cadence. 83h < 72h + 12h.
+        let mut r = clock("WD", Some(86_400), 83 * 3600, false);
+        r.first_due_s = Some(72 * 3600);
+        assert_eq!(
+            enabled_schedules_are_firing(&[r.clone()], scope(1, UP))[0].status,
+            Status::Pass
+        );
+        // Monday 22:00: 85h, past 84h.
+        r.silent_s = 85 * 3600;
+        assert_eq!(
+            enabled_schedules_are_firing(&[r], scope(1, UP))[0].status,
+            Status::Fail
+        );
+    }
+
+    #[test]
+    fn worst_first_is_most_fires_missed() {
+        let rows = [
+            clock("DAILY", Some(86_400), 2 * 86_400, false), // 2 missed
+            clock("FIVE", Some(300), 3600, false),           // 12 missed
+        ];
+        let obs = enabled_schedules_are_firing(&rows, scope(2, UP))[0]
+            .observed
+            .clone();
+        assert!(obs.find("FIVE").unwrap() < obs.find("DAILY").unwrap(), "{obs}");
+    }
+
+    #[test]
+    fn a_schedule_that_never_ran_fails_from_its_creation() {
+        let rows = [clock("S1", Some(300), 3600, true)];
+        let r = enabled_schedules_are_firing(&rows, scope(1, UP));
+        assert_eq!(r[0].status, Status::Fail);
+        assert!(
+            r[0].observed.contains("never ran, enabled 1h0m ago"),
+            "{}",
+            r[0].observed
+        );
+    }
+
+    #[test]
+    fn an_unparseable_cadence_is_never_late_but_is_counted() {
+        let rows = [
+            clock("S1", None, 10 * 86_400, true),
+            clock("S2", Some(300), 10, false),
+        ];
+        let r = enabled_schedules_are_firing(&rows, scope(2, UP));
+        assert_eq!(r[0].status, Status::Pass, "{}", r[0].observed);
+        assert_eq!(r[0].evidence["unparseable"], 1);
+        assert_eq!(r[0].evidence["checked"], 1);
+        assert_eq!(r[0].evidence["unparseable_ids"][0]["schedule_id"], "S1");
+    }
+
+    #[test]
+    fn right_after_a_restart_a_late_schedule_is_in_grace_not_red() {
+        let rows = [clock("S1", Some(300), 3 * 3600, false)];
+        // 60s up: under min(300, 300). The scheduler has not had its catch-up tick.
+        let r = enabled_schedules_are_firing(&rows, scope(1, 60));
+        assert_eq!(r[0].status, Status::Pass, "{}", r[0].observed);
+        assert_eq!(r[0].evidence["within_startup_grace"], 1);
+        // Grace is capped at 300s even for a daily schedule.
+        let daily = [clock("D", Some(86_400), 3 * 86_400, false)];
+        assert_eq!(
+            enabled_schedules_are_firing(&daily, scope(1, 301))[0].status,
+            Status::Fail
+        );
+        // And an every-1m schedule only gets its own cadence.
+        let minute = [clock("M", Some(60), 600, false)];
+        assert_eq!(
+            enabled_schedules_are_firing(&minute, scope(1, 61))[0].status,
+            Status::Fail
+        );
+        assert_eq!(
+            enabled_schedules_are_firing(&minute, scope(1, 59))[0].status,
+            Status::Pass
+        );
+    }
+}
+
 #[cfg(test)]
 mod schedule_kind_tests {
     use super::*;
@@ -10664,6 +11097,33 @@ mod served_commit_tests {
             behind,
             oldest_unserved_age_s: age,
             age_source: "origin_reflog_arrival".into(),
+            gate_hold: None,
+        }
+    }
+
+    /// 2026-10-24: 27 hours failing, 73 behind, and the text pointed at the
+    /// builder log while the gate file said main was red. A hold names the
+    /// gate and CI; a lag with no hold keeps pointing at the builder.
+    #[test]
+    fn a_gate_hold_names_ci_and_not_the_builder() {
+        let gate = serde_json::json!({"verdict": "ci_gate_no_green", "tip": "210066e2d0a5bd6a",
+            "tip_state": "red", "target": "", "held": 40});
+        let mut l = lag(73, 97_067);
+        l.gate_hold = gate_hold_reason(&gate);
+        let held = served_commit_is_current(Some(&l), "", 1_800);
+        assert_eq!(held[0].status, Status::Fail);
+        let o = &held[0].observed;
+        assert!(o.contains("CI gate is holding") && o.contains("210066e2d0a5") && o.contains("red"), "{o}");
+        assert!(!o.contains("cargo_build_backoff"), "a hold is not a builder fault: {o}");
+
+        let plain = served_commit_is_current(Some(&lag(73, 97_067)), "", 1_800);
+        assert!(plain[0].observed.contains("cargo_build_backoff"), "{}", plain[0].observed);
+
+        for not_held in [
+            serde_json::json!({"verdict": "ci_gate_green", "target": "abc"}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(gate_hold_reason(&not_held), None, "{not_held}");
         }
     }
 

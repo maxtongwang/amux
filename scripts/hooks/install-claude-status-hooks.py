@@ -33,6 +33,9 @@ from hook_labels import reconcile  # noqa: E402
 REPORT_MARKERS = ("hook-report.sh", "amux-report.sh")
 READ_GUARD_MARKERS = ("large-read-guard.py",)
 ASK_GUARD_MARKERS = ("ask-guard.py",)
+# mail-app-guard.py was folded into boundary-guard.py; an old wiring of it is
+# removed as managed rather than left running beside its replacement.
+BOUNDARY_GUARD_MARKERS = ("boundary-guard.py", "mail-app-guard.py")
 
 
 def is_amux_report(command: Any) -> bool:
@@ -49,6 +52,10 @@ def is_amux_read_guard(command: Any) -> bool:
 
 def is_amux_ask_guard(command: Any) -> bool:
     return isinstance(command, str) and any(marker in command for marker in ASK_GUARD_MARKERS)
+
+
+def is_amux_boundary_guard(command: Any) -> bool:
+    return isinstance(command, str) and any(marker in command for marker in BOUNDARY_GUARD_MARKERS)
 
 
 def group(command: str, matcher: str | None = None) -> dict[str, Any]:
@@ -126,8 +133,29 @@ def canonical_ask_guard(hook_path: str) -> list[dict[str, Any]]:
     # AMUX-5234: AskUserQuestion under an active /goal becomes a needsyou card.
     # ANCHORED, for the reason the subagent matcher in hook-report.sh gives:
     # the matcher is an unanchored regex over the tool name.
+    # FAILS OPEN WHEN THE SCRIPT IS MISSING, as the script itself does on every
+    # other fault. `python3 <missing file>` exits 2, which Claude Code reads as
+    # a deliberate block, so a settings entry that outlived its script turned
+    # every AskUserQuestion into "can't open file" (2026-10-21: the entry was
+    # registered, ~/.amux/hooks/ask-guard.py was absent, and no ask-guard.jsonl
+    # line had ever been written). The missing case is logged with its own
+    # verdict so a sweep of ask-guard.jsonl finds it.
     quoted = '"' + hook_path.replace('"', '\\"') + '"'
-    return [group(f"python3 {quoted}", "^AskUserQuestion$")]
+    command = (
+        f"f={quoted}; if [ -f \"$f\" ]; then exec python3 \"$f\"; fi; "
+        'mkdir -p "$HOME/.amux/logs" && '
+        'printf \'{"ts":%s,"verdict":"script_missing","path":"%s"}\\n\' "$(date +%s)" "$f" '
+        '>> "$HOME/.amux/logs/ask-guard.jsonl"; exit 0'
+    )
+    return [group(command, "^AskUserQuestion$")]
+
+
+def canonical_boundary_guard(hook_path: str) -> list[dict[str, Any]]:
+    # boundaries.toml, enforced by one guard. Anchored for the reason
+    # canonical_ask_guard gives: the matcher is an unanchored regex. Agent and
+    # Task carry the `subagents` boundary (the running-subagent cap).
+    quoted = '"' + hook_path.replace('"', '\\"') + '"'
+    return [group(f"python3 {quoted}", "^(Bash|Read|Edit|Write|MultiEdit|NotebookEdit|Grep|Glob|Agent|Task)$")]
 
 
 # What an event's HANDLER must contain for the wiring to mean anything
@@ -174,8 +202,12 @@ def merge(
     hook_path: str,
     read_guard_path: str = "$HOME/.amux/hooks/large-read-guard.py",
     ask_guard_path: str | None = None,
+<<<<<<< HEAD
     provider: str = "claude",
     changes: list[int] | None = None,
+=======
+    boundary_guard_path: str | None = None,
+>>>>>>> upstream/main
 ) -> dict[str, Any]:
     if provider not in ("claude", "codex"):
         raise ValueError(f"unknown provider {provider!r}")
@@ -216,6 +248,7 @@ def merge(
                         is_amux_report(item.get("command"))
                         or is_amux_read_guard(item.get("command"))
                         or (ask_guard_path is not None and is_amux_ask_guard(item.get("command")))
+                        or (boundary_guard_path is not None and is_amux_boundary_guard(item.get("command")))
                     )
                 )
             ]
@@ -234,6 +267,8 @@ def merge(
     raw_hooks.setdefault("PreToolUse", []).extend(canonical_read_guard(read_guard_path, provider))
     if ask_guard_path is not None:
         raw_hooks["PreToolUse"].extend(canonical_ask_guard(ask_guard_path))
+    if boundary_guard_path is not None:
+        raw_hooks["PreToolUse"].extend(canonical_boundary_guard(boundary_guard_path))
     return data
 
 
@@ -276,10 +311,16 @@ def main() -> int:
         help="wire the AskUserQuestion goal guard (AMUX-5234); omitted = leave any existing wiring alone",
     )
     parser.add_argument(
+<<<<<<< HEAD
         "--provider",
         choices=("claude", "codex"),
         default="claude",
         help="whose native events to write (codex: ~/.codex/hooks.json)",
+=======
+        "--boundary-guard-path",
+        default=None,
+        help="wire the boundaries.toml guard; omitted = leave any existing wiring alone",
+>>>>>>> upstream/main
     )
     parser.add_argument(
         "--allow-unsupported-events",
@@ -327,7 +368,11 @@ def main() -> int:
     before = json.loads(json.dumps(data))
     changes: list[int] = []
     try:
+<<<<<<< HEAD
         merged = merge(data, args.hook_path, args.read_guard_path, args.ask_guard_path, args.provider, changes)
+=======
+        merged = merge(data, args.hook_path, args.read_guard_path, args.ask_guard_path, args.boundary_guard_path)
+>>>>>>> upstream/main
     except ValueError as exc:
         raise SystemExit(f"refusing to rewrite {args.settings}: {exc}")
     if args.dry_run:

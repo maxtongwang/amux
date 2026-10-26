@@ -186,7 +186,11 @@ impl Rig {
             // Bootstrap would try to give a created worker a real terminal.
             // Nothing here starts a worker; push it out of the way anyway.
             .env("AMUX_RS_BOOTSTRAP_SECS", "3600")
-            .env("RUST_LOG", "warn,amux_server::api::contract=info")
+            // Info, so the timeout dump in wait_healthy names the last startup
+            // milestone reached (store open, migrations, jobs, listener bound).
+            // At "warn" the nightly's three hung first boots (AMUX-6095,
+            // 2026-10-14..16) left one line each, which places nothing.
+            .env("RUST_LOG", "warn,amux_server=info")
             .stdout(out)
             .stderr(err)
             .spawn()
@@ -906,7 +910,7 @@ async fn recover_completed_review(exit: &str, verdict: &str, live: bool) {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     assert_eq!(rig.count("SELECT COUNT(*) FROM session_events WHERE type='session.native_status' AND json_extract(data,'$.run_id')='deadbeef'"), 2);
-    assert_eq!(rig.count("SELECT COUNT(*) FROM schedule_runs WHERE status='error'"), 2, "unknown execution and delivery must not become success");
+    assert_eq!(rig.count("SELECT COUNT(*) FROM schedule_runs WHERE status='interrupted'"), 2, "unknown execution and delivery must not become success, and read as interrupted rather than failed");
     assert_eq!(rig.count("SELECT COUNT(*) FROM steering_queue WHERE id='rr-waiting'"), 1, "unattempted owner input survives");
     assert_eq!(rig.count("SELECT COUNT(*) FROM steering_history WHERE id='rr-claimed' AND outcome LIKE 'interrupted%'"), 1, "uncertain delivery remains explicit");
     assert_eq!(rig.count("SELECT COUNT(*) FROM card_contracts WHERE card='RR-RECOVERY' AND review_state='failed'"), 1);
@@ -945,7 +949,7 @@ async fn recover_completed_review(exit: &str, verdict: &str, live: bool) {
     if live { assert!(prompt.contains("original criteria") && prompt.contains("card-source.md")); }
     else { assert_eq!(prompt, "original immutable review prompt"); }
     rig.restart().await;
-    assert_eq!(rig.count("SELECT COUNT(*) FROM schedule_runs WHERE status='error'"), 2);
+    assert_eq!(rig.count("SELECT COUNT(*) FROM schedule_runs WHERE status='interrupted'"), 2);
     assert_eq!(rig.count("SELECT COUNT(*) FROM session_events WHERE type='session.native_status' AND json_extract(data,'$.run_id')='deadbeef'"), 2);
     assert_eq!(std::fs::read_to_string(&forbidden).unwrap_or_default().lines().count(), usize::from(live));
 }

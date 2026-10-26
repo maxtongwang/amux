@@ -14,8 +14,13 @@ import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { mkdtemp, readFile, rm, writeFile, mkdir, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+<<<<<<< HEAD
 import type { Page } from '@playwright/test';
 import { test, expect } from './operands';
+=======
+import type { APIRequestContext, Page } from '@playwright/test';
+import { test, expect } from './fixtures';
+>>>>>>> upstream/main
 import { cleanup } from './teardown';
 
 // `hold`, when set, keeps this spec's node answers waiting until released: a
@@ -28,13 +33,27 @@ type Mode = { delayMs: number; fail?: string; hold?: Promise<void> };
 async function fakeMessagesApi() {
   const mode: Mode = { delayMs: 0 };
   const prompts: string[] = [];
+<<<<<<< HEAD
   let heldNow = 0;
   let releaseHeld: (() => void) | null = null;
+=======
+  // `mdai_api_base` is a server-wide pref, and other model helpers share the
+  // server's ApiModel: a skills spec running beside this one on the same
+  // project server saved a skill, and its example-inference calls landed here
+  // and were counted as node runs ("ran it once" read 5 in run 38947919221,
+  // "one model call" read 2 in run 38945632973; the server logged
+  // skill_examples_unavailable with this stand-in's 181-byte answer). Only a
+  // prompt carrying this spec's instruction is a node call. Anything else is
+  // recorded apart and refused the way the real provider refuses the e2e
+  // home's non-secret key.
+  const foreign: string[] = [];
+>>>>>>> upstream/main
   const server: Server = createServer(async (req: IncomingMessage, res) => {
     let body = '';
     for await (const chunk of req) body += chunk;
     if (req.method !== 'POST' || !req.url?.endsWith('/v1/messages')) { res.writeHead(404).end(); return; }
     const prompt = JSON.parse(body).messages?.[0]?.content || '';
+<<<<<<< HEAD
     // `mdai_api_base` is a server-wide pref, so other model callers in a spec
     // running alongside this one (skill example inference on a skill save)
     // reach this stand-in too. Count only this spec's node: every node prompt
@@ -45,6 +64,14 @@ async function fakeMessagesApi() {
       heldNow++;
       try { await mode.hold; } finally { heldNow--; }
     }
+=======
+    if (!String(prompt).includes(NODE_MARK)) {
+      foreign.push(String(prompt).slice(0, 200));
+      res.writeHead(401, { 'content-type': 'application/json' }).end(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key (stand-in: not an MDAI node prompt)' } }));
+      return;
+    }
+    prompts.push(prompt);
+>>>>>>> upstream/main
     const { delayMs, fail } = mode;
     setTimeout(() => {
       if (res.destroyed) return;
@@ -60,6 +87,7 @@ async function fakeMessagesApi() {
   });
   await new Promise<void>(r => server.listen(0, '127.0.0.1', () => r()));
   const port = (server.address() as { port: number }).port;
+<<<<<<< HEAD
   // Hold this spec's node answers until the returned release() runs.
   const hold = () => {
     let open!: () => void;
@@ -72,8 +100,14 @@ async function fakeMessagesApi() {
     // A held answer is released before the server goes, so no handler outlives the spec.
     close: () => new Promise<void>(r => { releaseHeld?.(); server.closeAllConnections(); server.close(() => r()); }),
   };
+=======
+  return { url: `http://127.0.0.1:${port}`, mode, prompts, foreign, close: () => new Promise<void>(r => { server.closeAllConnections(); server.close(() => r()); }) };
+>>>>>>> upstream/main
 }
 
+// Every node prompt carries the instruction (the run assertions below check
+// this phrase in it), so it marks a call as this spec's.
+const NODE_MARK = '"Where I Left Off" dashboard';
 const PROMPT = '# Amux Workstream Reconstruction & Resumption\n\nAnalyze my complete Amux message history and reconstruct all the workstreams.\n\n## Final instruction\n\nStart with a **"Where I Left Off" dashboard**.\n';
 
 // The MDAI list is a directory view like Files: open the node's folder, then
@@ -215,8 +249,27 @@ test('MDAI: create and configure a node entirely in the UI, every field round-tr
     await page.locator('#mdai-fetch-url').fill(api.url + '/data');
     await page.locator('#mdai-fetch-headers').fill('Accept: application/json');
     await page.locator('#mdai-fetch-select').fill('data.items');
+    // Hold this save's response so the next edit always lands while it is in
+    // flight: the file on disk changes first, and CI on ios-safari cleared the
+    // URL in that window and saw the save's render put it back (be658a119).
+    let srcHeld = 0;
+    let releaseSrc: () => void = () => {};
+    const srcGate = new Promise<void>((r) => { releaseSrc = r; });
+    await page.route('**/api/files/mdai/doc', async (route) => {
+      if (route.request().method() !== 'PUT' || srcHeld++) return route.continue();
+      const res = await route.fetch();
+      await srcGate;
+      await route.fulfill({ response: res });
+    });
     await page.locator('#mdai-src-save').click();
     await expect.poll(() => fileText(file)).toContain('select: data.items');
+    // Clearing the URL while the save is in flight survives its render.
+    await page.locator('#mdai-fetch-url').fill('');
+    releaseSrc();
+    await expect(page.getByText('Sources saved')).toBeVisible();
+    await expect(page.locator('#mdai-fetch-url')).toHaveValue('');
+    await page.unroute('**/api/files/mdai/doc');
+    await page.locator('#mdai-fetch-url').fill(api.url + '/data');
     text = await fileText(file);
     expect(text).toContain('amux:messages?days=30&limit=150&offset=10&kb=200');
     expect(text).not.toContain('notes.md');
@@ -227,6 +280,21 @@ test('MDAI: create and configure a node entirely in the UI, every field round-tr
     await expect(page.locator('#mdai-fetch-url')).toHaveValue(api.url + '/data');
     await page.locator('#mdai-fetch-url').fill('');
     await expect(page.locator('#mdai-fetch-url')).toHaveValue('');
+    // Any render (graph reload, run poll) can land here; force one so the
+    // race is checked every run instead of when the timing happens to hit.
+    await page.evaluate(() => (window as any)._mdaiRender());
+    await expect(page.locator('#mdai-fetch-url')).toHaveValue('');
+    // The file on disk changes before the save's response reaches the page,
+    // so the owner can type the next change while that save is in flight.
+    // Hold the response so this always happens: the late response must not
+    // wipe what was typed after it was sent.
+    let held = 0;
+    await page.route('**/api/files/mdai/doc', async (route) => {
+      if (route.request().method() !== 'PUT' || held++) return route.continue();
+      const res = await route.fetch();
+      await new Promise((r) => setTimeout(r, 1500));
+      await route.fulfill({ response: res });
+    });
     await page.locator('#mdai-src-save').click();
     await expect.poll(() => fileText(file)).not.toContain('fetch:');
     await tab(page, 'edit');
@@ -234,6 +302,7 @@ test('MDAI: create and configure a node entirely in the UI, every field round-tr
     await expect(page.locator('#mdai-save-btn')).toHaveText('Save');
     await page.locator('#mdai-save-btn').click();
     await expect.poll(() => fileText(file)).toContain('Keep it short.');
+    await page.unroute('**/api/files/mdai/doc');
     // Raw file mode edits the whole text; the server refuses a file that does not parse.
     await page.locator('#mdai-body .mdai-seg button[data-mode=raw]').click();
     await expect(page.locator('#mdai-body-ta')).toHaveValue(await fileText(file));
@@ -279,6 +348,7 @@ test('MDAI: create and configure a node entirely in the UI, every field round-tr
     await page.screenshot({ path: info.outputPath('mdai-preview.png') });
 
     // ---- Reload mid-run: the run is found again, then finishes ------------------
+<<<<<<< HEAD
     // The model answer is HELD until the reopened page has shown the run, so
     // "found again" is asserted while the run is provably still in flight.
     api.mode.delayMs = 0;
@@ -296,6 +366,19 @@ test('MDAI: create and configure a node entirely in the UI, every field round-tr
     } finally {
       releaseRun();
     }
+=======
+    // Long enough to outlast a reload plus reopening the node on a slow iOS
+    // runner (4 s did not, 2026-10-16 run on 941fd8044); completion is awaited
+    // with a 20 s budget below.
+    api.mode.delayMs = 9000;
+    await editInstruction(page);
+    await page.locator('#mdai-run-btn').click();
+    await expect(page.locator('#mdai-runbanner.mdai-runbanner')).toBeVisible();
+    await page.reload();
+    await page.evaluate(() => (window as any).switchView('mdai'));
+    await openNodeFromList(page);
+    await expect(page.locator('#mdai-runbanner.mdai-runbanner')).toBeVisible();
+>>>>>>> upstream/main
     await expect(page.locator('#mdai-runbanner.mdai-runbanner')).toHaveCount(0, { timeout: 20_000 });
     expect(api.held()).toBe(0);
     await tab(page, 'runs');
@@ -340,7 +423,14 @@ test('MDAI: create and configure a node entirely in the UI, every field round-tr
     await expect(page.locator('#mdai-list')).toContainText('No MDAI nodes yet');
     await expect(access(join(dir, 'team', 'Resume.mdai'))).rejects.toThrow();
   } finally {
+<<<<<<< HEAD
     await cleanup('capture F01 operands', () => ops.capture('finally')); // before the prefs and folder below are restored
+=======
+    if (api.foreign.length) {
+      console.log(`[mdai-pages] ${api.foreign.length} non-node model call(s) reached the stand-in and were not counted: ${JSON.stringify(api.foreign.map(p => p.slice(0, 80)))}`);
+      info.annotations.push({ type: 'foreign-model-calls', description: String(api.foreign.length) });
+    }
+>>>>>>> upstream/main
     await cleanup('restore MDAI prefs', () => Promise.all([pref('mdai_root', prior[0]), pref('mdai_api_base', prior[1])]));
     await cleanup('stop the stand-in Messages API', () => api.close());
     await cleanup('remove temp folder', () => rm(dir, { recursive: true, force: true }));
@@ -361,7 +451,7 @@ const rowShape = (page: Page, sel: string) => page.locator(sel).first().evaluate
   [row.className.split(' ').filter(c => c !== 'fe-selected').sort().join(' ')]
     .concat([...row.children].map(c => c.className)).join(' | '));
 
-test('MDAI: the folder list is the Files file view (same breadcrumb, rows, sort, parent row, status)', async ({ page, request }, info) => {
+test('MDAI: the folder list is the Files file view (same breadcrumb, rows, headers, parent row, status)', async ({ page, request }, info) => {
   test.setTimeout(120_000);
   const dir = await mkdtemp(join(tmpdir(), 'amux-mdai-fv-'));
   await mkdir(join(dir, 'team'), { recursive: true });
@@ -393,10 +483,12 @@ test('MDAI: the folder list is the Files file view (same breadcrumb, rows, sort,
     const mdaiFileShape = await rowShape(page, '#mdai-fe-body .fe-row:not(.fe-dir)');
     const mdaiHeaders = await page.locator('#mdai-view .fe-col-headers > div').evaluateAll(els => els.map(e => e.className.replace(/\s*sorted/, '') + ':' + (e as HTMLElement).dataset.sortCol));
 
-    // One sort: a header click here sorts this list and marks the same column in Files.
+    // Its own sort, most recently opened first by default (Ethan, 2026-10-16);
+    // a header click here sorts this list and leaves the Files tab's sort alone.
+    await expect(page.locator('#mdai-view [data-sort-col=opened]')).toHaveClass(/sorted/);
     await page.locator('#mdai-view [data-sort-col=name]').click();
     await expect(page.locator('#mdai-view [data-sort-col=name]')).toHaveClass(/sorted/);
-    await expect(page.locator('#fe-hdr-name')).toHaveClass(/sorted/);
+    await expect(page.locator('#fe-hdr-name')).not.toHaveClass(/sorted/);
 
     // Into the subfolder and back through the shared parent row.
     await page.locator(mdaiDir, { hasText: 'team' }).click();
@@ -426,5 +518,350 @@ test('MDAI: the folder list is the Files file view (same breadcrumb, rows, sort,
   } finally {
     await cleanup('restore the MDAI folder pref', () => pref('mdai_root', prior), info);
     await cleanup('remove temp folder', () => rm(dir, { recursive: true, force: true }), info);
+  }
+});
+
+// "Opened" column (Ethan, 2026-10-16): every file table shows when a file was
+// last opened, the MDAI list sorts by it by default, and Escape goes back from
+// an MDAI page the way it does from any file.
+test('MDAI: last opened sorts the list, shows in Files, and Escape goes back', async ({ page, request }, info) => {
+  test.setTimeout(120_000);
+  const dir = await mkdtemp(join(tmpdir(), 'amux-mdai-opened-'));
+  await writeFile(join(dir, 'Alpha.mdai'), '---\ntitle: Alpha\nrefresh: manual\n---\nSay hello.\n');
+  await writeFile(join(dir, 'Beta.mdai'), '---\ntitle: Beta\nrefresh: manual\n---\nSay hello.\n');
+  await page.goto('/');
+  const headers = await page.evaluate(() => ({ Authorization: 'Bearer ' + (window as any)._AMUX_AUTH_TOKEN }));
+  const pref = (key: string, value: string) => request.post('/api/prefs', { headers, data: { key, value } });
+  const prior = (await (await request.get('/api/prefs?key=mdai_root', { headers })).json()).value || '';
+  try {
+    expect((await pref('mdai_root', dir)).ok()).toBeTruthy();
+    // Beta was opened, Alpha never: Beta leads although Alpha sorts first by name.
+    const rec = await request.post('/api/fs/opened', { headers, data: { path: join(dir, 'Beta.mdai') } });
+    expect(rec.ok(), await rec.text()).toBeTruthy();
+    await page.reload();
+    await page.waitForFunction(() => typeof (window as any).openMdaiNode === 'function');
+    await page.evaluate(() => (window as any).switchView('mdai'));
+    const files = page.locator('#mdai-fe-body .fe-row:not(.fe-dir)');
+    await expect(files).toHaveCount(2);
+    await expect(files.nth(0)).toContainText('Beta.mdai');
+    await expect(files.nth(0).locator('.fe-cell-opened')).not.toHaveText('');
+    await expect(files.nth(1).locator('.fe-cell-opened')).toHaveText('');
+    await expect(page.locator('#mdai-view [data-sort-col=opened]')).toHaveClass(/sorted/);
+
+    // Opening Alpha records it; Escape closes the node page back to the list,
+    // which now leads with Alpha. The record is held 1.5s so Escape always
+    // lands first, as it did on CI (run 40214810594): the list must wait for it.
+    await page.route('**/api/fs/opened', async (route) => {
+      await new Promise((r) => setTimeout(r, 1500));
+      await route.continue();
+    });
+    await page.evaluate(p => (window as any).openMdaiNode(p, { autorun: false }), join(dir, 'Alpha.mdai'));
+    await expect(page.locator('#mdai-overlay')).toHaveClass(/active/);
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#mdai-overlay')).not.toHaveClass(/active/);
+    await expect(files.nth(0)).toContainText('Alpha.mdai');
+    await expect(files.nth(0).locator('.fe-cell-opened')).not.toHaveText('');
+    await page.unroute('**/api/fs/opened');
+
+    // Escape on the New MDAI page goes back to the list too.
+    await page.evaluate(() => (window as any)._mdaiCreatePage());
+    await expect(page.locator('#mdai-create-page')).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#mdai-create-page')).toBeHidden();
+    await expect(page.locator('#mdai-list-page')).toBeVisible();
+
+    // Files shows the same column and keeps its own default sort (Modified).
+    await page.evaluate(d => { (window as any).switchView('files'); (window as any).loadFiles(d); }, dir);
+    await expect(page.locator('#fe-hdr-opened')).toHaveText(/Opened/);
+    await expect(page.locator('#fe-hdr-modified')).toHaveClass(/sorted/);
+    const alpha = page.locator('#files-body .fe-row', { hasText: 'Alpha.mdai' });
+    await expect(alpha.locator('.fe-cell-opened')).not.toHaveText('');
+    // Header and row tracks agree, and nothing spills past the viewport sideways
+    // except the table's own scroller.
+    const fit = await page.evaluate(() => {
+      const h = document.querySelector('#fe-col-headers') as HTMLElement, r = document.querySelector('#files-body .fe-row') as HTMLElement;
+      return { cols: getComputedStyle(h).gridTemplateColumns === getComputedStyle(r).gridTemplateColumns,
+               cells: r.children.length, headers: h.children.length,
+               overflow: document.documentElement.scrollWidth - window.innerWidth };
+    });
+    expect(fit.cols, 'header and row columns match').toBeTruthy();
+    expect(fit.cells).toBe(fit.headers);
+    expect(fit.overflow, 'no page-level horizontal overflow').toBeLessThanOrEqual(1);
+    await page.screenshot({ path: info.outputPath('files-opened-column.png') });
+  } finally {
+    await cleanup('restore the MDAI folder pref', () => pref('mdai_root', prior), info);
+    await cleanup('remove temp folder', () => rm(dir, { recursive: true, force: true }), info);
+  }
+});
+
+// ---- MDAI chat ------------------------------------------------------------
+// In this file, not its own, for the reason above: these tests point the
+// server-wide mdai_root pref at their own folder too, and a separate file ran
+// beside the tests above in another worker and swapped the folder under them.
+// MDAI chat (Ethan, 2026-10-17: "in mdai full view add the ability to talk to it
+// and add to it via chat ... I want to be able to say 'look at the messages
+// responsible for lifecycle work, and include that in the table'").
+//
+// Two tests, and which parts are real is stated per test:
+//
+// 1. The page, against a stubbed chat endpoint: the composer, the exchange, the
+//    changed-lines view, the run that follows, undo, a refused edit, and the
+//    phone layout. Only /api/files/mdai/chat and /run are stubbed; the doc API
+//    is the real server's.
+// 2. The whole path on a real server: POST /chat calls the server's model
+//    client, which the `mdai_api_base` pref points at a loopback stand-in for
+//    the Messages API (as mdai-pages.spec.ts does), the server validates and
+//    writes the file, and the run that follows sends the NEW instruction and
+//    the NEW source to the model. This needs a server built with the chat
+//    route; on one without it the test is skipped and says why.
+
+const NODE = '---\ntitle: Workstream Resumption\nmodel: sonnet\nrefresh: manual\nsources:\n- path: amux:messages?days=all&limit=4000&kb=300\n  prompt: My Amux message history.\n---\n# Workstream Resumption\n\nBuild a table of my workstreams with their last known state.\n';
+const ASK = 'look at the messages responsible for lifecycle work, and include that in the table';
+const NEW_BODY = '# Workstream Resumption\n\nBuild a table of my workstreams with their last known state.\nAdd a Lifecycle column: for each workstream, summarize the lifecycle work found in the lifecycle messages.\n';
+const NEW_SOURCE = 'amux:messages?days=all&q=lifecycle';
+
+async function setup(page: Page, request: APIRequestContext, prefix: string) {
+  const dir = await mkdtemp(join(tmpdir(), prefix));
+  const file = join(dir, 'Workstream Resumption.mdai');
+  await writeFile(file, NODE);
+  await page.goto('/');
+  const headers = await page.evaluate(() => ({ Authorization: 'Bearer ' + (window as any)._AMUX_AUTH_TOKEN }));
+  const pref = (key: string, value: string) => request.post('/api/prefs', { headers, data: { key, value } });
+  const prior = await Promise.all(['mdai_root', 'mdai_api_base'].map(async k => (await (await request.get('/api/prefs?key=' + k, { headers })).json()).value || ''));
+  expect((await pref('mdai_root', dir)).ok()).toBeTruthy();
+  return { dir, file, headers, pref, prior };
+}
+
+async function openNode(page: Page, file: string) {
+  await page.reload();
+  await page.waitForFunction(() => typeof (window as any).openMdaiNode === 'function');
+  await page.evaluate(p => (window as any).openMdaiNode(p, { autorun: false }), file);
+  await expect(page.locator('#mdai-overlay')).toHaveClass(/active/);
+  await expect(page.locator('#mdai-chatbar')).toBeVisible();
+}
+
+test('MDAI chat: the page shows the exchange and the changed lines, runs again, undoes, and says why an edit was refused', async ({ page, request }, info) => {
+  test.setTimeout(120_000);
+  const narrow = page.viewportSize()!.width <= 600;
+  const s = await setup(page, request, 'amux-mdai-chat-ui-');
+  page.on('dialog', d => d.accept());
+  const posts: any[] = [];
+  let runs = 0;
+  let refuse = false;
+  try {
+    await page.route('**/api/files/mdai/chat?**', r => r.fulfill({ json: { path: 'Workstream Resumption.mdai', turns: [], unreadable: 0, measured: true, n_considered: 0 } }));
+    await page.route('**/api/files/mdai/run', r => { runs++; return r.fulfill({ status: 503, json: { error: 'no model in this test' } }); });
+    await page.route('**/api/files/mdai/chat', async r => {
+      const body = r.request().postDataJSON();
+      posts.push(body);
+      if (refuse) {
+        return r.fulfill({ status: 422, json: { error: 'The model proposed an edit the file cannot hold (sources: unknown amux source). Nothing was changed.', verdict: 'mdai_chat_edit_invalid',
+          turn: { ts: Date.now(), message: body.message, error: 'The model proposed an edit the file cannot hold (sources: unknown amux source). Nothing was changed.', changed: false } } });
+      }
+      // Write the file the way the server would, so the page reads a real doc back.
+      const after = NODE.replace('  prompt: My Amux message history.\n', '  prompt: My Amux message history.\n- path: ' + NEW_SOURCE + '\n  prompt: Messages about lifecycle work.\n')
+        .replace(/# Workstream Resumption\n\n[\s\S]*$/, NEW_BODY);
+      await writeFile(s.file, after);
+      const doc = await (await request.get('/api/files/mdai/doc?path=' + encodeURIComponent(s.file), { headers: s.headers })).json();
+      return r.fulfill({ json: { ok: true, changed: true, doc,
+        turn: { ts: Date.now(), message: body.message, reply: 'Added a Lifecycle column and a source for lifecycle messages.', changed: true, body_changed: true, sources_changed: true,
+          before: NODE, after, truncated: false, model: 'sonnet', dur_ms: 4200, error: null } } });
+    });
+    await openNode(page, s.file);
+
+    // The composer: 44px targets, no sideways overflow on a phone.
+    const ta = page.locator('#mdai-chat-input');
+    const send = page.locator('#mdai-chat-send');
+    expect((await send.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    expect((await ta.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBeLessThanOrEqual(1);
+    if (narrow) expect(await page.locator('#mdai-overlay .mdai-tabs').evaluate(e => e.scrollWidth - e.clientWidth), 'six tabs still fit').toBeLessThanOrEqual(1);
+
+    // Send the owner's exact request.
+    await ta.fill(ASK);
+    await send.click();
+    await expect(page.locator('#mdai-overlay .mdai-tab[data-tab=chat]')).toHaveClass(/active/);
+    await expect(page.locator('#mdai-chat-log .mdai-msg.me .mdai-bubble').first()).toHaveText(ASK);
+    await expect(page.locator('#mdai-chat-log .mdai-msg.ai .mdai-bubble').first()).toContainText('Added a Lifecycle column');
+    expect(posts[0].message).toBe(ASK);
+    expect(typeof posts[0].base_mtime_ms, 'the edit is pinned to the version on screen').toBe('number');
+    await expect(ta, 'the box clears after a send').toHaveValue('');
+    // The changed lines: the new source and the new instruction line are added.
+    const diff = page.locator('#mdai-chat-log .mdai-diff');
+    await expect(diff).toBeVisible();
+    await expect(diff.locator('.mdai-diff-l.add', { hasText: NEW_SOURCE })).toHaveCount(1);
+    await expect(diff.locator('.mdai-diff-l.add', { hasText: 'Add a Lifecycle column' })).toHaveCount(1);
+    await expect(page.locator('#mdai-chat-log .mdai-msg.ai').first()).toContainText('changed instruction and sources');
+    // The page holds the new file: the Sources tab count and the editor.
+    await expect(page.locator('#mdai-overlay .mdai-tab[data-tab=sources] .mdai-tab-n')).toHaveText('2');
+    await expect(page.locator('#mdai-overlay .mdai-tab[data-tab=chat] .mdai-tab-n')).toHaveText('1');
+    // A change starts a run through the ordinary run flow.
+    await expect.poll(() => runs, { message: 'the node runs after the edit' }).toBe(1);
+    await expect(page.locator('#mdai-body .mdai-err')).toContainText('no model in this test');
+    if (narrow) {
+      // The run re-renders the log and can leave the Chat tab, and Run again
+      // only appears once the run settles: measure after all three are shown.
+      await page.locator('#mdai-overlay .mdai-tab[data-tab=chat]').click();
+      const acts = page.locator('#mdai-chat-log .mdai-chat-acts .btn');
+      await expect(acts).toHaveText(['See output', 'Run again', 'Undo']);
+      for (const name of ['See output', 'Run again', 'Undo']) {
+        const b = acts.filter({ hasText: name });
+        await expect(b).toBeVisible();
+        expect((await b.boundingBox())?.height ?? 0, name).toBeGreaterThanOrEqual(44);
+      }
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBeLessThanOrEqual(1);
+    await page.screenshot({ path: info.outputPath('mdai-chat-applied.png') });
+
+    // Undo puts the file back through the doc API.
+    await page.locator('#mdai-chat-log .mdai-chat-acts .btn', { hasText: 'Undo' }).click();
+    await expect.poll(() => readFile(s.file, 'utf8')).toBe(NODE);
+    await expect(page.locator('#mdai-chat-log .mdai-pill.ok')).toHaveText('undone');
+    await expect(page.locator('#mdai-overlay .mdai-tab[data-tab=sources] .mdai-tab-n')).toHaveText('1');
+
+    // A refused edit is shown in the conversation, keeps the typed text, and does not run.
+    refuse = true;
+    await ta.fill('add the board as a source');
+    await ta.press('Enter');
+    await expect(page.locator('#mdai-chat-log .mdai-bubble.bad')).toContainText('cannot hold');
+    await expect(ta, 'a failed message can be sent again').toHaveValue('add the board as a source');
+    expect(runs, 'a refused edit does not start a run').toBe(1);
+    expect(await readFile(s.file, 'utf8')).toBe(NODE);
+    await page.screenshot({ path: info.outputPath('mdai-chat-refused.png') });
+  } finally {
+    await cleanup('restore MDAI prefs', () => Promise.all([s.pref('mdai_root', s.prior[0]), s.pref('mdai_api_base', s.prior[1])]), info);
+    await cleanup('remove temp folder', () => rm(s.dir, { recursive: true, force: true }), info);
+  }
+});
+
+// A chat edit is a model call, measured at 17-18s on the live server. The
+// dashboard bounds an ordinary write at 15s and queues it offline when the
+// bound trips, so a slow chat used to read "The server could not be reached"
+// while the server applied the edit, and the outbox then sent the same message
+// a second time (Ethan's screenshot, 2026-10-18).
+test('MDAI chat: a reply slower than the 15s write bound still lands, once, with no offline queue', async ({ page, request }, info) => {
+  test.setTimeout(90_000);
+  const s = await setup(page, request, 'amux-mdai-chat-slow-');
+  let posts = 0;
+  try {
+    await page.route('**/api/files/mdai/chat?**', r => r.fulfill({ json: { path: 'Workstream Resumption.mdai', turns: [], unreadable: 0, measured: true, n_considered: 0 } }));
+    await page.route('**/api/files/mdai/chat', async r => {
+      posts++;
+      const body = r.request().postDataJSON();
+      await new Promise(res => setTimeout(res, 17_000));
+      const doc = await (await request.get('/api/files/mdai/doc?path=' + encodeURIComponent(s.file), { headers: s.headers })).json();
+      return r.fulfill({ json: { ok: true, changed: false, doc,
+        turn: { ts: Date.now() - 7_200_000, message: body.message, reply: 'The table already covers lifecycle work.', changed: false, model: 'sonnet', dur_ms: 17000, error: null } } }).catch(() => {});
+    });
+    await openNode(page, s.file);
+    await page.locator('#mdai-chat-input').fill(ASK);
+    await page.locator('#mdai-chat-send').click();
+    await expect(page.locator('#mdai-chat-send')).toHaveText('Working…');
+    await expect(page.locator('#mdai-chat-log .mdai-msg.ai .mdai-bubble').first()).toContainText('already covers lifecycle work', { timeout: 30_000 });
+    await expect(page.locator('#mdai-overlay')).not.toContainText('could not be reached');
+    // Turn times are milliseconds; read as seconds every turn said "just now".
+    await expect(page.locator('#mdai-chat-log .mdai-msg.me .mdai-msg-meta').first()).toHaveText('2h ago');
+    const queued = await page.evaluate(() => JSON.parse(localStorage.getItem('amux_offline_queue') || '[]')
+      .filter((q: any) => String(q.url || '').includes('/api/files/mdai/chat')).length);
+    expect(queued, 'no chat left in the offline outbox').toBe(0);
+    expect(posts, 'the message went to the server once').toBe(1);
+    await page.screenshot({ path: info.outputPath('mdai-chat-slow.png') });
+  } finally {
+    await cleanup('restore MDAI prefs', () => Promise.all([s.pref('mdai_root', s.prior[0]), s.pref('mdai_api_base', s.prior[1])]), info);
+    await cleanup('remove temp folder', () => rm(s.dir, { recursive: true, force: true }), info);
+  }
+});
+
+// A chat queued before the fix stays in the outbox, and its replay is refused
+// 409 forever (Ethan's screenshot: "POST /api/files/mdai/chat 409: This node
+// changed on disk"). The page drops such entries at load and keeps the rest.
+test('MDAI chat: a stuck chat in the offline outbox is dropped at load, other pending work is kept', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => localStorage.setItem('amux_offline_queue', JSON.stringify([
+    { id: 'stuck-chat', url: '/api/files/mdai/chat', options: { method: 'POST', body: '{"path":"/x.mdai","message":"m"}' }, timestamp: Date.now() - 660_000,
+      state: 'pending', error: '409: This node changed on disk since you opened it. Reload, then send your message again.' },
+    { id: 'keep-closeout', url: '/api/projects/p1/closeout', options: { method: 'POST', body: '{}' }, timestamp: Date.now(), state: 'pending' },
+  ])));
+  await page.reload();
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('amux_offline_queue') || '[]').map((q: any) => q.id).join(','))).toBe('keep-closeout');
+});
+
+// A loopback stand-in for the Messages API. A chat-edit prompt gets a tagged
+// edit; a node run gets a report that echoes what it was asked, so the test can
+// see the run used the edited file.
+async function chatMessagesApi() {
+  const chatPrompts: string[] = [];
+  const runPrompts: string[] = [];
+  const server: Server = createServer(async (req: IncomingMessage, res) => {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    if (req.method !== 'POST' || !req.url?.endsWith('/v1/messages')) { res.writeHead(404).end(); return; }
+    const prompt = String(JSON.parse(body).messages?.[0]?.content || '');
+    let text: string;
+    if (prompt.includes('You edit an .mdai file') && prompt.includes('Workstream Resumption')) {
+      chatPrompts.push(prompt);
+      text = '<reply>Added a Lifecycle column and a source that selects the lifecycle messages.</reply>\n<body>\n' + NEW_BODY + '</body>\n<sources>'
+        + JSON.stringify([{ path: 'amux:messages?days=all&limit=4000&kb=300', prompt: 'My Amux message history.' }, { path: NEW_SOURCE, prompt: 'Messages about lifecycle work.' }]) + '</sources>';
+    } else if (prompt.includes('Build a table of my workstreams')) {
+      runPrompts.push(prompt);
+      text = prompt.includes('Lifecycle column') ? '| Workstream | State | Lifecycle |\n|---|---|---|\n| Workers | live | restart path fixed |' : '| Workstream | State |\n|---|---|\n| Workers | live |';
+    } else {
+      res.writeHead(401, { 'content-type': 'application/json' }).end(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'stand-in: not this spec\'s prompt' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ content: [{ type: 'text', text }], usage: { input_tokens: 100, output_tokens: 50 } }));
+  });
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', () => r()));
+  const port = (server.address() as { port: number }).port;
+  return { url: `http://127.0.0.1:${port}`, chatPrompts, runPrompts, close: () => new Promise<void>(r => { server.closeAllConnections(); server.close(() => r()); }) };
+}
+
+test('MDAI chat: a real server edits the file through the model and the next run uses it', async ({ page, request }, info) => {
+  test.setTimeout(180_000);
+  const s = await setup(page, request, 'amux-mdai-chat-real-');
+  const api = await chatMessagesApi();
+  try {
+    const probe = await request.get('/api/files/mdai/chat?path=' + encodeURIComponent(s.file), { headers: s.headers });
+    test.skip(probe.status() === 404 || probe.status() === 405, 'this server was built without POST /api/files/mdai/chat (run with AMUX_E2E_WORKING_TREE=1 to test uncommitted server code)');
+    expect(probe.ok()).toBeTruthy();
+    expect((await s.pref('mdai_api_base', api.url)).ok()).toBeTruthy();
+    await openNode(page, s.file);
+    await page.locator('#mdai-chat-input').fill(ASK);
+    await page.locator('#mdai-chat-send').click();
+    await expect(page.locator('#mdai-chat-log .mdai-msg.ai .mdai-bubble').first()).toContainText('Added a Lifecycle column', { timeout: 60_000 });
+
+    // The model saw the file and the request, and the server wrote a file the engine reads.
+    expect(api.chatPrompts.length).toBe(1);
+    expect(api.chatPrompts[0]).toContain(ASK);
+    expect(api.chatPrompts[0]).toContain('Build a table of my workstreams');
+    const text = await readFile(s.file, 'utf8');
+    expect(text).toContain(NEW_SOURCE);
+    expect(text).toContain('Add a Lifecycle column');
+    expect(text, 'fields the edit did not touch survive').toContain('refresh: manual');
+    await expect(page.locator('#mdai-chat-log .mdai-diff .mdai-diff-l.add', { hasText: NEW_SOURCE })).toHaveCount(1);
+
+    // The run that follows sends the NEW instruction, and its output has the new column.
+    await expect.poll(() => api.runPrompts.length, { timeout: 60_000 }).toBeGreaterThanOrEqual(1);
+    expect(api.runPrompts[api.runPrompts.length - 1]).toContain('Lifecycle column');
+    // Wait for the run to finish ("Run again" renders only when nothing runs):
+    // its completion re-renders this panel, and on WebKit a click whose node is
+    // replaced between press and release fires nothing. CI f83afc792
+    // (ios-safari): the run finished, Chat stayed selected, no .mdai-output.
+    await expect(page.locator('#mdai-chat-log .mdai-chat-acts .btn', { hasText: 'Run again' })).toBeVisible({ timeout: 60_000 });
+    await expect(async () => {
+      await page.locator('#mdai-chat-log .mdai-chat-acts .btn', { hasText: 'See output' }).click();
+      await expect(page.locator('#mdai-overlay .mdai-tab[data-tab=preview]')).toHaveAttribute('aria-selected', 'true', { timeout: 2_000 });
+    }).toPass({ timeout: 15_000 });
+    await expect(page.locator('#mdai-body .mdai-output')).toContainText('restart path fixed', { timeout: 60_000 });
+
+    // The conversation is kept: a reload reads it back from the server.
+    await openNode(page, s.file);
+    await page.locator('#mdai-overlay .mdai-tab[data-tab=chat]').click();
+    await expect(page.locator('#mdai-chat-log .mdai-msg.me .mdai-bubble').first()).toHaveText(ASK);
+    await page.screenshot({ path: info.outputPath('mdai-chat-real.png') });
+  } finally {
+    await cleanup('restore MDAI prefs', () => Promise.all([s.pref('mdai_root', s.prior[0]), s.pref('mdai_api_base', s.prior[1])]), info);
+    await cleanup('stop the stand-in Messages API', () => api.close(), info);
+    await cleanup('remove temp folder', () => rm(s.dir, { recursive: true, force: true }), info);
   }
 });

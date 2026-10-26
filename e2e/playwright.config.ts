@@ -8,7 +8,7 @@ import { defineConfig, devices } from '@playwright/test';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import { E2E_ANTHROPIC_KEY } from './test-env';
+import { E2E_ANTHROPIC_KEY, geminiStubPort } from './test-env';
 import { reapStaleTmp } from './tmp-reap';
 import { buildTargets, buildProject } from './playwright-projects.mjs';
 
@@ -51,8 +51,35 @@ const fileMatchers = (files: string[]): RegExp[] =>
 // would have come back the moment anyone added a fourth project or a fourth
 // state-mutating spec. A port and a home each is the boundary; adding a target
 // below now costs nothing and races nothing.
+<<<<<<< HEAD
 const TARGETS = buildTargets(devices);
 const PROJECTS = TARGETS.map(buildProject);
+=======
+// The ports are fixed, and every lane on one machine runs this suite against
+// the same three. A second concurrent run fails "is already used", or worse,
+// a test reaches the other lane's server. AMUX_E2E_PORT_OFFSET moves all
+// three (e.g. 1000 -> 19823/19833/19843).
+const PORT_OFFSET = Number(process.env.AMUX_E2E_PORT_OFFSET || 0) || 0;
+const TARGETS = [
+  { name: 'desktop', port: 18823 + PORT_OFFSET, use: { viewport: { width: 1280, height: 800 } } },
+  // Mobile is a first-class target (amux is mobile-first): 375px must
+  // render without overflow.
+  { name: 'mobile', port: 18833 + PORT_OFFSET, use: { viewport: { width: 375, height: 667 } } },
+  // iOS SAFARI IS ITS OWN TARGET, not a viewport (AMUX tab-customizer, 2026-08-13).
+  // A bottom-sheet fix passed desktop+mobile Chromium at 375px while Ethan still
+  // could not see the menu on his phone — Chromium at a phone WIDTH is not Safari
+  // on a phone. WebKit differs on exactly what this UI depends on: position:fixed
+  // inside a transformed ancestor, env(safe-area-inset-*), and dvh/vh behaviour.
+  //
+  // It runs the WHOLE suite. It briefly did not: a `testMatch` narrowed it to
+  // four layout specs because the cross-project races above were misread as
+  // iOS-specific reds. That scoping was honest about what it covered and still
+  // wrong in effect — a new mobile spec would silently never reach iOS, which
+  // is the one target that motivated the project. Isolation removed the reason
+  // for it, so the list is gone; do not reintroduce one to quiet a red.
+  { name: 'ios-safari', port: 18843 + PORT_OFFSET, use: { ...devices['iPhone 15'] } },
+];
+>>>>>>> upstream/main
 
 // The broad suite exercises dashboard/runtime behaviour, not a real Anthropic
 // credential. A clean CI home has no key, which makes the product correctly
@@ -87,6 +114,12 @@ for (const home of Object.values(homes)) {
     `ANTHROPIC_API_KEY=${E2E_ANTHROPIC_KEY}\n`,
     { mode: 0o600 },
   );
+  // Each server's scratchpad lives in its own temp home. The default,
+  // ~/Vault/Scratchpad under the REAL $HOME, collected 150 test notes in the
+  // owner's folder before this (2026-10-18). e2e/scratchpad-dir.ts refuses
+  // to run a scratchpad test against the real folder.
+  fs.mkdirSync(path.join(home, 'scratchpad'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'scratchpad.json'), JSON.stringify({ retain_days: 0, dir: path.join(home, 'scratchpad') }));
 }
 console.log(
   '[e2e] provider prerequisite: seeded each isolated server.env with a non-secret test key; ' +
@@ -233,6 +266,70 @@ export default defineConfig({
       : SPEC_SELECTION[t.name]
         ? { testMatch: fileMatchers(SPEC_SELECTION[t.name] as string[]) }
         : {}),
+<<<<<<< HEAD
+=======
+    name: t.name,
+    use: {
+      ...t.use,
+      baseURL: `https://localhost:${t.port}`,
+      // WALKTHROUGH OFF BY DEFAULT — opt-OUT, like serviceWorkers above and for
+      // the same reason (AMUX-4986/4987). `_wtMaybeStart` opens it 1500ms after
+      // load when `sessions.length === 0`, which is the NORMAL state of every CI
+      // project's isolated server, and `#wt-tooltip` then eats the click until
+      // the budget is gone. 38 of 75 specs do not set this key themselves.
+      // A spec that TESTS the walkthrough clears the key in its own
+      // addInitScript.
+      storageState: {
+        cookies: [],
+        origins: [{
+          origin: `https://localhost:${t.port}`,
+          // amux_cloud_offer: the self-hosted Cloud offer stays off too (fixtures.ts).
+          // WebKit (ios-safari) ignores this localStorage (measured 2026-10-23: a raw
+          // @playwright/test page there started empty and wrote the cloud_offer
+          // pref). The fixtures.ts init script is what covers WebKit, so a spec
+          // that renders at phone width imports test from ./fixtures.
+          localStorage: [{ name: 'amux_walkthrough_done', value: '1' }, { name: 'amux_cloud_offer', value: '{"dismissed":1}' }],
+        }],
+      },
+    },
+    // AMUX-4983. ios-safari alone gets a larger budget, because the thing it
+    // spends it on is not the test.
+    //
+    // Measured 2026-09-23: with the server up and webkit warm, the test that
+    // failed CI runs in 2.4-2.6s, five times out of five (--repeat-each=5,
+    // one server start). The failure is never an assertion — it is
+    // "Test timeout of 30000ms exceeded while setting up \"page\"", i.e. the
+    // 30s TEST budget consumed by a COLD page/browser launch before any test
+    // code runs. Reproduced 1 in 3 locally on identical bytes.
+    //
+    // So the margin here is enormous rather than generous: a warm run uses 3%
+    // of 90s. It cannot hide a slow test; it only stops a cold launch from
+    // being charged to the first test that happens to draw it. That matters
+    // beyond this spec — a setup timeout lands on whichever test went first,
+    // so the spec NAME in such a failure is noise, which is how AMUX-4967
+    // ended up cataloguing five unrelated "flaky specs" and was discarded.
+    //
+    // retries stays 0 on purpose. A retry would also paper over this, and
+    // would additionally hide a genuinely failing assertion; a bigger budget
+    // cannot, because the assertion still runs and still fails.
+    //
+    // This is the cheapest of the three options on the card. If it recurs,
+    // the next step is instrumenting the launch itself — the config already
+    // prints host load every run for exactly that reason (AMUX-3605/3646,
+    // load averages in the thirties on 28 cores).
+    ...(t.name === 'ios-safari'
+      ? {
+          timeout: 90_000,
+          // Full trace for this project only. `retain-on-failure` records
+          // every test and discards the passes, so it is the one setting here
+          // with a real per-test cost — scoped to where the failures actually
+          // are (4 of the 5 specs AMUX-4967 catalogued were ios-safari).
+          // Widening it to the others is a one-line change if a desktop
+          // failure ever needs it.
+          use: { ...t.use, baseURL: `https://localhost:${t.port}`, trace: 'retain-on-failure' as const },
+        }
+      : {}),
+>>>>>>> upstream/main
   })),
   webServer: TARGETS.map((t) => ({
     // Builds from COMMITTED HEAD, not this shared working tree — a peer
@@ -274,6 +371,10 @@ export default defineConfig({
       // The vault's master key goes to a 0600 file in the throwaway home, never
       // into the developer's login Keychain (vault_secrets.rs keystore_is_file).
       AMUX_VAULT_KEYSTORE: 'file',
+      // Every Gemini call (Dictate, Recordings) goes to a local stub port, never
+      // the real billed API; a spec that needs an answer listens there
+      // (e2e/transcription-settings.spec.ts). Nothing listening is a failure.
+      AMUX_GEMINI_BASE: `http://127.0.0.1:${geminiStubPort(t.port)}`,
     },
   })),
 });

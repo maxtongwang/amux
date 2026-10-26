@@ -101,7 +101,8 @@ pub enum Verdict {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
-    /// `exit`, `refused` or `failed` (timeout, spawn error, failed delivery).
+    /// `exit`, `refused`, `failed` (timeout, spawn error, failed delivery), or
+    /// `credential` (an expired user credential, whatever the exit path).
     pub kind: &'static str,
     pub exit_code: Option<i32>,
     /// The line the signature is computed from.
@@ -123,12 +124,33 @@ impl Failure {
     }
 }
 
+/// The verdict for one outcome. A failure whose text is an expired USER
+/// credential gets kind `credential` (GS-12 finding 5: 881 runs failed on
+/// expired gcloud user tokens and each read as its own error).
 pub fn classify(outcome: &RunOutcome) -> Verdict {
+    match classify_raw(outcome) {
+        Verdict::Fail(mut f) => {
+            let text = format!("{}\n{}\n{}", f.detail, f.error_line, f.tail);
+            if super::schedule_lifecycle::credential_cause(&text).is_some() {
+                f.kind = "credential";
+            }
+            Verdict::Fail(f)
+        }
+        other => other,
+    }
+}
+
+fn classify_raw(outcome: &RunOutcome) -> Verdict {
     match outcome {
         RunOutcome::Delivered { .. } | RunOutcome::Queued { .. } | RunOutcome::ShellOk { .. } => {
             Verdict::Pass
         }
         RunOutcome::Refused { reason } if reason.starts_with(RESERVE_PREFIX) => Verdict::Neutral,
+        // A goal-continuation fire skipped because the goal is met, the worker
+        // is busy or was just continued: working as designed, not a failure.
+        RunOutcome::Refused { reason } if reason.starts_with(super::schedule_wake::GATE_PREFIX) => {
+            Verdict::Neutral
+        }
         RunOutcome::Refused { reason } => Verdict::Fail(Failure {
             kind: "refused",
             exit_code: None,
@@ -296,7 +318,7 @@ impl WorkerProbe for LiveProbe {
     }
 }
 
-async fn resolve_route(store: &SharedStore, worker: &str, probe: &dyn WorkerProbe) -> Route {
+pub(crate) async fn resolve_route(store: &SharedStore, worker: &str, probe: &dyn WorkerProbe) -> Route {
     use crate::api::session_verbs::{permanently_blocked_resolved, schedule_target_refusal, TargetRefusal};
     let mut refusal = schedule_target_refusal(worker);
     // A rust-managed worker has no env file; its `_amux_workers` row proves it
@@ -368,6 +390,9 @@ pub fn notice_text(
             "\nLast output (up to {TAIL_LINES} lines):\n{}\n",
             tail_lines(&f.tail, TAIL_LINES)
         ));
+    }
+    if f.kind == "credential" {
+        out.push_str(&format!("\n{}\n", super::schedule_lifecycle::CREDENTIAL_HINT));
     }
     out.push_str(&format!(
         "\nAsk: fix the cause (the script, its inputs, or the schedule itself), then rerun it with \
@@ -490,6 +515,19 @@ async fn handle(
     let Some((streak, action, notice)) = slot.lock().expect("failure slot").take() else {
         return Ok(());
     };
+    if let Verdict::Fail(f) = &verdict {
+        if f.kind == "credential" {
+            if matches!(action, Action::Notify(_)) {
+                tracing::warn!(schedule = %id, worker = %worker, streak, cause = "expired_user_credential",
+                    verdict = "schedule_run_credential_expired", measured = true, n_considered = 1,
+                    "schedule failed on an expired user credential; one cause, not a new error");
+            } else {
+                tracing::info!(schedule = %id, worker = %worker, streak, cause = "expired_user_credential",
+                    verdict = "schedule_run_credential_expired", measured = true, n_considered = 1,
+                    "schedule failed on an expired user credential again");
+            }
+        }
+    }
     // Before the dedupe below: a repeat of the same error is suppressed as a
     // notice, but it still counts toward pausing an orphaned schedule.
     if let (Verdict::Fail(f), Some(Route::Owner { cause })) = (&verdict, &route) {
@@ -504,6 +542,19 @@ async fn handle(
                 store_notice(store, &id, &n).await?;
             }
             return Ok(());
+        }
+    }
+    // A pass answers any open "keeps failing" ask: the harness closes its own
+    // card rather than leaving the owner a question about a schedule that is
+    // fine (Ethan, 2026-10-26: SCHED-754 passed every run for six days while
+    // AMUX-6257 still asked whether to fix, move or disable it). Checked on
+    // every pass, not only at the streak reset, so a card left open by an
+    // earlier build is answered too.
+    if matches!(verdict, Verdict::Pass) {
+        if let Some(card) = resolve_owner_card(store, &id, now).await? {
+            tracing::info!(schedule = %id, card = %card, verdict = "schedule_failure_card_resolved",
+                measured = true, n_considered = 1,
+                "schedule passed again; closed its open failure card");
         }
     }
     let f = match (&verdict, action) {
@@ -552,6 +603,48 @@ async fn handle(
     store_notice(store, &id, &notice).await
 }
 
+/// Close the harness's open failure card for `id`, if there is one, saying the
+/// schedule passed again. Returns the card's id.
+async fn resolve_owner_card(store: &SharedStore, id: &str, now: i64) -> anyhow::Result<Option<String>> {
+    let source_ref = owner_card_ref(id);
+    let note = format!("\n\n---\n{}\nResolved by the harness: the schedule passed again.", fmt_ts(now));
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let slot_w = slot.clone();
+    store
+        .write_async(move |conn| {
+            use rusqlite::OptionalExtension;
+            let open: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM issues WHERE source_ref=?1 AND COALESCE(archived,0)=0 \
+                     AND status NOT IN ('done','verified','discarded') ORDER BY rowid DESC LIMIT 1",
+                    [&source_ref],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(card) = open else {
+                return Ok(WriteOutcome { applied: false, events: vec![] });
+            };
+            conn.execute(
+                "UPDATE issues SET \"desc\" = COALESCE(\"desc\",'') || ?1, status='done', updated=?2, \
+                 rev = COALESCE(rev,0) + 1 WHERE id=?3",
+                rusqlite::params![note, now, card],
+            )?;
+            *slot_w.lock().expect("card slot") = Some(card.clone());
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Task,
+                    entity_id: card.clone(),
+                    mutation: amux_core::revision::MutationKind::Updated,
+                    payload: Some(json!({"id": card, "source": "schedule_failure"})),
+                }],
+            })
+        })
+        .await?;
+    let card = slot.lock().expect("card slot").take();
+    Ok(card)
+}
+
 /// Disable the schedule and close the harness's own open card for it with the
 /// reason. Returns that card's id, or "" when there was none.
 async fn pause_orphan(
@@ -571,12 +664,22 @@ async fn pause_orphan(
         truncate(error_line, 200)
     );
     let (id_w, source_ref) = (id.to_string(), owner_card_ref(id));
+    let (worker_w, cause_w) = (worker.to_string(), cause.to_string());
     let slot = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let slot_w = slot.clone();
     store
         .write_async(move |conn| {
             use rusqlite::OptionalExtension;
-            conn.execute("UPDATE schedules SET enabled=0, updated=?2 WHERE id=?1", rusqlite::params![id_w, now])?;
+            // The 10-16 orphan pauses left no schedule_audit row (GS-12 review),
+            // so the harness's own disable was the one change nobody could trace.
+            let why = format!("paused by the harness: failed {streak} times in a row and its worker {worker_w} {}", cause_sentence(&cause_w));
+            let was = conn.execute(
+                "UPDATE schedules SET enabled=0, updated=?2, disabled_reason=?3 WHERE id=?1 AND enabled=1",
+                rusqlite::params![id_w, now, why],
+            )?;
+            if was > 0 {
+                super::scheduler::insert_audit(conn, &id_w, "enabled", "1", "0", "harness:schedule_failure", SENDER)?;
+            }
             let open: Option<String> = conn
                 .query_row(
                     "SELECT id FROM issues WHERE source_ref=?1 AND COALESCE(archived,0)=0 \
@@ -992,6 +1095,28 @@ mod tests {
         let cards = owner_cards(&store, "SCHED-9").await;
         assert_eq!(cards.len(), 1, "one open owner card per schedule");
         assert!(cards[0].3.contains("other"), "{}", cards[0].3);
+    }
+
+    /// A pass closes the open "keeps failing" ask, including one whose streak
+    /// had already reset before this check existed.
+    #[tokio::test]
+    async fn a_passing_run_closes_the_open_failure_card() {
+        let (fx, _g) = fixture(&[("raw", "CC_TAGS=plg\nCC_ISOLATED=1\n")]);
+        let store = fx.store.clone();
+        add(&store, sched("SCHED-11", "raw")).await;
+        on_run_outcome_with(&store, &sched("SCHED-11", "raw"), &exit(127, "No such file"), "cron-rs", &Up(true)).await;
+        assert_eq!(owner_cards(&store, "SCHED-11").await[0].1, "needsyou");
+        on_run_outcome_with(&store, &sched("SCHED-11", "raw"), &ok(), "cron-rs", &Up(true)).await;
+        let cards = owner_cards(&store, "SCHED-11").await;
+        assert_eq!(cards[0].1, "done", "{cards:?}");
+        assert!(cards[0].3.contains("passed again"), "{}", cards[0].3);
+        // A card left open while the streak was already 0 is closed by the next pass.
+        let card = cards[0].0.clone();
+        store.write_async(move |c| { c.execute("UPDATE issues SET status='needsyou' WHERE id=?1", [&card])?;
+            Ok(WriteOutcome { applied: true, events: vec![] }) }).await.unwrap();
+        assert_eq!(state(&store, "SCHED-11").await.0, 0);
+        on_run_outcome_with(&store, &sched("SCHED-11", "raw"), &ok(), "cron-rs", &Up(true)).await;
+        assert_eq!(owner_cards(&store, "SCHED-11").await[0].1, "done");
     }
 
     /// An archived worker is not woken or unarchived; the owner is told why.

@@ -3,6 +3,14 @@ name: rust
 # Grows stages as phases land: Playwright golden scenarios, perf baselines,
 # migration rehearsal. Every stage here must be able to FAIL (ethos rule 7).
 on:
+  # A manual run of main's tip (full suite, as on a push). Deploys take the
+  # newest commit where rust is green, and the push filter below skips docs
+  # and site commits. So after one red run (2026-10-23: c5aba6e5e, two iOS
+  # flakes that pass locally), every later non-Rust commit leaves main with
+  # no green rust run newer than the last deploy, and the builder logs
+  # ci_gate_held_back until somebody happens to push Rust. Dispatch is the
+  # way out: gh workflow run rust.yml --ref main.
+  workflow_dispatch:
   push:
     branches: [main]
     # `amux` + `scripts/**` are here so the CLI gates below (shellcheck + the AF-78
@@ -64,11 +72,21 @@ on:
 # and keeps ONE pending run, which a newer push replaces, so every completed
 # run judges a recent head. Pull requests still cancel their own stale runs.
 #
+<<<<<<< HEAD
 # A workflow_dispatch run gets a group of its own. A control dispatches many
 # runs on one ref, and sharing the ref's group would let each new dispatch
 # replace the previous pending one, so most repetitions would never run.
 concurrency:
   group: rust-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id)) || github.ref }}
+=======
+# A RE-RUN IS NEVER REPLACED (2026-10-24). "Re-run failed jobs" queues attempt
+# 2 into the same group, where the next push's run replaced it as the one
+# pending run: 68ade32c3's and 31351128f's re-runs were cancelled after 27
+# minutes each. A re-run attempt gets its own group, so it runs beside the
+# queue; it re-runs only the failed jobs, so it costs one or two shards.
+concurrency:
+  group: rust-${{ github.event.pull_request.number || github.ref }}${{ github.run_attempt > 1 && format('-attempt-{0}', github.run_attempt) || '' }}
+>>>>>>> upstream/main
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -205,6 +223,13 @@ jobs:
       # complements the static gate; it does not replace it.
       - name: runtime smoke -- CLI launch unbound-var (the AMUX-3145 scope shape shellcheck cannot see)
         run: bash scripts/test-cli-launch-unbound.sh
+      # M0 for the OpenCode provider. The bash start path builds an `opencode`
+      # command for CC_PROVIDER=opencode and rewrites amux's --yolo into
+      # opencode's --auto; before that branch existed the run fell through to
+      # `claude` (the D6 divergence the CLI's own comments warn about). Dry-run
+      # only, so no tmux/fleet is touched. Carries a claude positive control.
+      - name: runtime smoke -- OpenCode provider command build (M0)
+        run: bash scripts/test-cli-opencode-provider.sh
       # AF-120: the frustrations audit existed, detected its failure class
       # precisely (a headingless append folds into the previous entry and
       # vanishes from every census), and NOTHING RAN IT — six malformed
@@ -868,3 +893,31 @@ jobs:
           path: e2e-verdict.json
           if-no-files-found: error
           retention-days: 7
+
+  # Intermediate build artifacts are consumed inside this run (nextest-archive
+  # by test-shards, amux-server-bin by e2e-shards) and nothing else reads them.
+  # Even at retention-days 1/3 they held ~107 GB of the org-wide Actions quota on
+  # 2026-10-16 (about 2 GB per push x ~48 pushes a day), and mixpeek/mixpeek's
+  # uploads were refused with "Artifact storage quota has been hit". Delete them
+  # when the run has no failure. A run with a failure keeps them, because
+  # re-running its failed jobs downloads them again.
+  artifact-cleanup:
+    needs: [test, e2e]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete this run's intermediate build artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          n=0
+          for id in $(gh api "repos/$REPO/actions/runs/$RUN/artifacts?per_page=100" \
+                --jq '.artifacts[] | select(.name=="nextest-archive" or .name=="amux-server-bin") | .id'); do
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$id" && n=$((n + 1))
+          done
+          echo "artifact_cleanup deleted=$n run=$RUN"

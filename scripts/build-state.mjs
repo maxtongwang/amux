@@ -26,6 +26,8 @@ for(const [name,node] of functions) {
     const method=options?.type==='ObjectExpression' && options.properties.find(p=>p.key?.name==='method')?.value?.value;
     if(['fetch','apiCall','_directInteractionFetch','_origFetch','_uploadRequest'].includes(callee) && /^(POST|PUT|PATCH|DELETE)$/i.test(method || '')) mutations.add(name);
     if(callee==='_interactionAccept' || callee==='_queueOp') mutations.add(name);
+    // _mdaiJson(path, method, body): the method is the second argument.
+    if(callee==='_mdaiJson' && /^(POST|PUT|PATCH|DELETE)$/i.test(child.arguments[1]?.value || '')) mutations.add(name);
   });
   graph.set(name,calls);
 }

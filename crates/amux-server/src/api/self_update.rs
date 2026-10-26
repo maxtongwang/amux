@@ -37,7 +37,242 @@ use std::time::Duration;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/pull", post(pull))
+    Router::new().route("/api/pull", post(pull).get(pull_status))
+}
+
+// ---- deploy status: what this server runs, against main -----------------
+//
+// Ethan, 2026-10-24: "i should easily keep the mac server up to date". The
+// button used to report the shared checkout's `git pull` ("Already up to
+// date") while the server ran a hand build of a fork two weeks behind main,
+// and while the CI gate held every deploy. Neither fact reached the Settings
+// card. Now GET /api/pull says what runs, what main has, and what the gate is
+// doing, and POST adds the same report after it fetches and starts the builder.
+
+/// The ref the activation authority deploys from (its launchd plist sets it).
+fn activation_ref() -> String {
+    std::env::var("AMUX_RS_ACTIVATION_REF").unwrap_or_else(|_| "origin/main".into())
+}
+
+pub(crate) fn gate_state() -> Option<serde_json::Value> {
+    let path = std::env::var("AMUX_ACTIVATION_GATE_STATE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| crate::api::session_verbs::home().join(".amux/activation-gate.json"));
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(9)]
+}
+
+/// (state, sentence) from the measured facts. Pure, so every branch is tested.
+/// `tip` is None when main could not be read; `on_main` is whether the live
+/// commit is an ancestor of it; `behind` counts main's commits the server lacks.
+pub(crate) fn deploy_summary(
+    live: &str,
+    tip: Option<&str>,
+    on_main: bool,
+    behind: u64,
+    gate: Option<&serde_json::Value>,
+) -> (&'static str, String) {
+    let Some(tip) = tip else {
+        return ("unmeasured", format!("Server runs {}. main could not be read here, so it cannot say whether that is current.", short(live)));
+    };
+    let target = gate.and_then(|g| g["target"].as_str()).filter(|t| !t.is_empty());
+    let tip_state = gate.and_then(|g| g["tip_state"].as_str()).unwrap_or("unknown");
+    if !on_main {
+        return ("off_main", match target {
+            Some(t) => format!("Server runs {}, which is not on main (a local or forked build). The builder replaces it with {}, the newest main commit that passed CI.", short(live), short(t)),
+            None => format!("Server runs {}, which is not on main (a local or forked build). No main commit has passed CI recently, so the builder has nothing to replace it with yet.", short(live)),
+        });
+    }
+    if live == tip || behind == 0 {
+        return ("current", format!("Up to date: server runs {}, the latest commit on main.", short(live)));
+    }
+    if let Some(t) = target.filter(|t| *t != live) {
+        return ("deploying", format!("Updating: the builder is deploying {}, the newest main commit that passed CI. Server runs {}, {behind} commit(s) behind main.", short(t), short(live)));
+    }
+    let why = match tip_state {
+        "red" => format!("main is failing CI at {}", short(tip)),
+        "pending" => format!("CI is still running on {}", short(tip)),
+        _ => format!("main's newer commits have not passed CI ({} is {tip_state})", short(tip)),
+    };
+    ("held", format!("Server runs {}, the newest main commit that passed CI. main is {behind} commit(s) ahead; they deploy once they pass CI ({why}).", short(live)))
+}
+
+async fn deploy_status(dir: Option<&Path>) -> serde_json::Value {
+    let full = env!("AMUX_BUILD_COMMIT_FULL");
+    let live = full.trim_end_matches("-dirty");
+    let gate = gate_state();
+    let mut tip: Option<String> = None;
+    let (mut on_main, mut behind) = (false, 0u64);
+    if let Some(dir) = dir {
+        let r = activation_ref();
+        tip = git(dir, &["rev-parse", "--verify", "-q", &format!("{r}^{{commit}}")], GIT_TIMEOUT)
+            .await
+            .filter(|o| o.status.success())
+            .map(|o| out_of(&o))
+            .filter(|s| !s.is_empty());
+        if let Some(t) = tip.as_deref() {
+            on_main = git(dir, &["merge-base", "--is-ancestor", live, t], GIT_TIMEOUT)
+                .await
+                .is_some_and(|o| o.status.success());
+            if on_main {
+                behind = git(dir, &["rev-list", "--count", &format!("{live}..{t}")], GIT_TIMEOUT)
+                    .await
+                    .and_then(|o| out_of(&o).parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+    }
+    let (state, summary) = deploy_summary(live, tip.as_deref(), on_main, behind, gate.as_ref());
+    if state == "off_main" {
+        tracing::warn!(live = %live, tip = ?tip, measured = true, n_considered = 1, verdict = "server_off_main",
+            "the running server is not a build of main");
+    }
+    json!({
+        "measured": tip.is_some(),
+        "n_considered": 1,
+        "state": state,
+        "summary": summary,
+        "live": live,
+        "live_dirty": full.ends_with("-dirty"),
+        "ref": activation_ref(),
+        "tip": tip,
+        "on_main": on_main,
+        "behind": behind,
+        "gate": gate,
+        // The checkout this server builds from, so /amux-contribute can find it.
+        "repo": dir.map(|d| d.display().to_string()),
+    })
+}
+
+/// Start the builder now instead of on its next 60s tick. Best effort: the
+/// answer says whether it ran, and the timer catches up either way.
+async fn kick_builder() -> serde_json::Value {
+    let (prog, args): (&str, Vec<String>) = if cfg!(target_os = "macos") {
+        let uid = unsafe { libc::getuid() };
+        ("launchctl", vec!["kickstart".into(), format!("gui/{uid}/com.amux.server-rs-builder")])
+    } else {
+        ("systemctl", vec!["--user".into(), "start".into(), "amux-builder.service".into()])
+    };
+    let run = tokio::process::Command::new(prog)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .output();
+    match tokio::time::timeout(GIT_TIMEOUT, run).await {
+        Ok(Ok(o)) if o.status.success() => json!({"kicked": true}),
+        Ok(Ok(o)) => json!({"kicked": false, "why": out_of(&o)}),
+        Ok(Err(e)) => json!({"kicked": false, "why": e.to_string()}),
+        Err(_) => json!({"kicked": false, "why": "timed out"}),
+    }
+}
+
+async fn pull_status() -> Response {
+    Json(deploy_status(repo_dir().as_deref()).await).into_response()
+}
+
+/// The scoped switch that makes "Pull from remote" send local work upstream as
+/// a pull request and then replace it with remote main (`amux contribute
+/// --then-pull`). Cloud servers turn it on (cloud/desktop bootstrap.sh and
+/// update.sh): one owner, one checkout. Off by default, because a shared
+/// checkout holds other workers' uncommitted drafts, which are not the owner's
+/// to publish or replace.
+pub(crate) const PULL_SENDS_LOCAL_KEY: &str = "AMUX_PULL_SENDS_LOCAL_AS_PR";
+
+fn pull_sends_local_as_pr() -> bool {
+    super::settings::effective_env(&crate::config::amux_home(), PULL_SENDS_LOCAL_KEY)
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+}
+
+/// The amux CLI beside this server's binary (both install to the same bin
+/// dir), else whatever `amux` the PATH finds.
+fn amux_cli() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("amux")))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("amux"))
+}
+
+/// The `AMUX_CONTRIBUTE {...}` line `amux contribute --json` ends with.
+pub(crate) fn contribute_result(output: &str) -> Option<serde_json::Value> {
+    output
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix("AMUX_CONTRIBUTE "))
+        .and_then(|j| serde_json::from_str(j).ok())
+}
+
+/// Send the checkout's local work as a pull request, then match remote main.
+/// Ok carries the CLI's result; Err is the whole reply for a pull that must
+/// not go on, because the local work is not safely on GitHub yet.
+async fn contribute_then_override(dir: &Path) -> Result<serde_json::Value, serde_json::Value> {
+    let cli = amux_cli();
+    let run = tokio::process::Command::new(&cli)
+        .args(["contribute", "--then-pull", "--json", "--repo"])
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true)
+        .output();
+    let out = match tokio::time::timeout(Duration::from_secs(300), run).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, cli = %cli.display(), measured = false, n_considered = 1,
+                verdict = "pull_contribute_unavailable", "Pull from remote could not run amux contribute; nothing was replaced");
+            return Err(json!({"ok": false, "output": format!("Could not run amux contribute ({e}). Nothing was replaced.")}));
+        }
+        Err(_) => {
+            tracing::warn!(measured = false, n_considered = 1, verdict = "pull_contribute_timed_out",
+                "amux contribute did not finish within 300s; nothing was replaced");
+            return Err(json!({"ok": false, "output": "Sending your local changes as a pull request took over 5 minutes. Nothing was replaced."}));
+        }
+    };
+    let text = out_of(&out);
+    let result = contribute_result(&text).unwrap_or_else(|| json!({"verdict": "no_result"}));
+    let verdict = result["verdict"].as_str().unwrap_or("no_result").to_string();
+    let shown: String = text.lines().filter(|l| !l.starts_with("AMUX_CONTRIBUTE ")).collect::<Vec<_>>().join("\n");
+    match out.status.code() {
+        Some(0) => {
+            tracing::info!(verdict = %verdict, pr_url = result["pr_url"].as_str().unwrap_or(""), measured = true, n_considered = 1,
+                "Pull from remote: local work handled by amux contribute");
+            Ok(json!({"verdict": verdict, "pr_url": result["pr_url"], "output": shown}))
+        }
+        code => {
+            tracing::warn!(verdict = %verdict, exit = ?code, measured = true, n_considered = 1,
+                "Pull from remote stopped: the local work could not be sent as a pull request, so nothing was replaced");
+            Err(json!({"ok": false, "needs_github": code == Some(4) && verdict == "github_not_connected",
+                "contribute": {"verdict": verdict}, "output": shown}))
+        }
+    }
+}
+
+async fn pull() -> Response {
+    let mut contribute = serde_json::Value::Null;
+    if let (Some(dir), true) = (repo_dir(), pull_sends_local_as_pr()) {
+        match contribute_then_override(&dir).await {
+            Ok(v) => contribute = v,
+            Err(v) => return Json(v).into_response(),
+        }
+    }
+    let resp = pull_checkout().await;
+    let (parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 1 << 20).await else {
+        return Json(json!({"ok": false, "output": "could not read the pull result"})).into_response();
+    };
+    let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({"ok": false}));
+    let dir = repo_dir();
+    if dir.is_some() {
+        v["builder"] = kick_builder().await;
+    }
+    v["deploy"] = deploy_status(dir.as_deref()).await;
+    if !contribute.is_null() {
+        v["contribute"] = contribute;
+    }
+    (parts.status, Json(v)).into_response()
 }
 
 async fn git(dir: &Path, args: &[&str], timeout: Duration) -> Option<std::process::Output> {
@@ -248,7 +483,7 @@ pub(crate) async fn preflight(dir: &Path) -> Option<serde_json::Value> {
     None
 }
 
-async fn pull() -> Response {
+async fn pull_checkout() -> Response {
     match install_channel().0 {
         "brew" => {
             return Json(json!({"ok": false, "channel": "brew",
@@ -388,6 +623,41 @@ fn https_equiv(url: &str) -> Option<String> {
         return Some(format!("https://{host}/{}", path.trim_end_matches(".git")));
     }
     None
+}
+
+#[cfg(test)]
+mod deploy_summary_tests {
+    use super::deploy_summary;
+    use serde_json::json;
+
+    const LIVE: &str = "08c8c6973e71ba5b391ec2a553c550e1fe350248";
+    const TIP: &str = "3e0f0823a30bf324737e596bda94673ef82efea7";
+
+    #[test]
+    fn every_state_names_what_runs_and_why() {
+        let (s, m) = deploy_summary(LIVE, None, false, 0, None);
+        assert_eq!(s, "unmeasured", "{m}");
+        let (s, m) = deploy_summary(LIVE, Some(LIVE), true, 0, None);
+        assert_eq!(s, "current", "{m}");
+        // The 2026-10-24 morning: a fork build live, a green main commit to replace it.
+        let g = json!({"target": LIVE, "tip_state": "pending"});
+        let (s, m) = deploy_summary("03adc2a58cf4a7f3430f0166268d2487166b1e70", Some(TIP), false, 0, Some(&g));
+        assert_eq!(s, "off_main", "{m}");
+        assert!(m.contains("not on main") && m.contains("08c8c6973"), "{m}");
+        // Live is the newest green; main is ahead and red.
+        let g = json!({"target": LIVE, "tip_state": "red"});
+        let (s, m) = deploy_summary(LIVE, Some(TIP), true, 62, Some(&g));
+        assert_eq!(s, "held", "{m}");
+        assert!(m.contains("62 commit(s) ahead") && m.contains("failing CI at 3e0f0823a"), "{m}");
+        // A newer green exists than what runs: deploying.
+        let g = json!({"target": TIP, "tip_state": "green"});
+        let (s, m) = deploy_summary(LIVE, Some(TIP), true, 62, Some(&g));
+        assert_eq!(s, "deploying", "{m}");
+        // Off main with nothing green: say there is nothing to replace it with.
+        let (s, m) = deploy_summary("03adc2a58", Some(TIP), false, 0, Some(&json!({"target": "", "tip_state": "red"})));
+        assert_eq!(s, "off_main");
+        assert!(m.contains("nothing to replace it with"), "{m}");
+    }
 }
 
 #[cfg(test)]
@@ -573,5 +843,21 @@ mod tests {
         assert_eq!(https_equiv("git@github.com"), None, "no colon, no path");
         assert_eq!(https_equiv(""), None);
         assert_eq!(https_equiv("/local/path/repo.git"), None);
+    }
+}
+
+#[cfg(test)]
+mod contribute_tests {
+    use super::contribute_result;
+
+    #[test]
+    fn reads_the_last_contribute_line_and_nothing_else() {
+        let out = "  local commits not on origin/main: 1\n  Pull request: https://github.com/mixpeek/amux/pull/7\n\
+            AMUX_CONTRIBUTE {\"verdict\": \"pr_opened\", \"exit\": 0, \"pr_url\": \"https://github.com/mixpeek/amux/pull/7\"}\n";
+        let v = contribute_result(out).unwrap();
+        assert_eq!(v["verdict"], "pr_opened");
+        assert_eq!(v["pr_url"], "https://github.com/mixpeek/amux/pull/7");
+        assert!(contribute_result("no result line\n").is_none());
+        assert!(contribute_result("AMUX_CONTRIBUTE not json\n").is_none());
     }
 }

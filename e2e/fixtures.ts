@@ -40,7 +40,7 @@
  * writing it down is what stops the guard from being switched off wholesale.
  */
 import { test as base, expect } from '@playwright/test';
-import type { Page } from '@playwright/test';
+import type { BrowserContext, Page, TestInfo } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 
@@ -65,6 +65,32 @@ const dashboardAssets = [
 
 export { expect };
 export type { Page };
+
+// THIRD-PARTY CDN ASSETS GATE THE PAGE "load" EVENT. index.html pulls about
+// twenty stylesheets and scripts from jsdelivr, unpkg and cdnjs, and
+// page.goto('/') waits for "load", which waits for every one of them. When one
+// CDN request stalls, the dashboard renders and works but "load" never fires,
+// so the test dies in page.goto at its own timeout with nothing pointing at the
+// network. Measured on main: run 38936517715 (settings.spec.ts:560, ios-safari)
+// has a trace whose only unfinished request is cdnjs's github-dark.min.css, and
+// run 38848402875 (peek-split-view-memory.spec.ts:170, desktop) shows the same
+// page.goto "waiting until load" timeout over a fully rendered dashboard.
+//
+// So each Playwright worker fetches a CDN URL once and serves later requests
+// from memory, which removes most of the live CDN traffic a shard makes, and a
+// fetch that has no answer after CDN_FETCH_TIMEOUT_MS is aborted with a
+// `[e2e] cdn-stall` line naming the URL. The abort lets "load" fire; a test
+// that genuinely needs the stalled library then fails on that, next to a log
+// line that says why, rather than as an unexplained navigation timeout.
+const CDN_URL = /^https:\/\/(?:cdn\.jsdelivr\.net|unpkg\.com|cdnjs\.cloudflare\.com)\//;
+const CDN_FETCH_TIMEOUT_MS = 10_000;
+type CdnEntry = { status: number; headers: Record<string, string>; body: Buffer };
+const cdnCache = new Map<string, CdnEntry>();
+const cdnStats = { fetched: 0, served_from_cache: 0, stalled: 0 };
+process.on('exit', () => {
+  if (cdnStats.fetched + cdnStats.served_from_cache + cdnStats.stalled === 0) return;
+  console.log('[e2e] cdn cache: ' + JSON.stringify(cdnStats));
+});
 
 type Stub = { pattern: string; hits: number };
 type RouteOwner = Page;
@@ -143,21 +169,86 @@ function assertRoutesUsed(st: RouteState): void {
   );
 }
 
-export const test = base.extend({
+// First-run surfaces off for every context a test opens, including the ones a
+// spec makes itself with browser.newContext (golden_realtime_convergence, ...).
+// Those used to skip this, so a phone-width second context showed the Cloud
+// offer and wrote the server-wide cloud_offer pref while cloud-offer.spec.ts,
+// in the other worker, had just reset it (run 39968514404).
+async function seedFirstRunOff(context: BrowserContext, testInfo: TestInfo): Promise<void> {
+  // FIRST-RUN WALKTHROUGH OFF unless a test asks for it. The scratch server
+  // starts with no workers, and the walkthrough correctly opens for an empty
+  // fleet ~1.5s after load (_wtMaybeStart). On slower ios-safari runners it
+  // opened before the test's first click and #wt-backdrop swallowed it:
+  // browser-history, message-context-filter and mobile-header-visibility
+  // timed out on main (run 36921271354). Opt in with
+  // test.info().annotations.push({type:'walkthrough'}) set before navigation,
+  // or {annotation:{type:'walkthrough'}} on the test.
+  if (!testInfo.annotations.some(a => a.type === 'walkthrough')) {
+    await context.addInitScript(() => {
+      try { if (!localStorage.getItem('amux_walkthrough_done')) localStorage.setItem('amux_walkthrough_done', '1'); } catch (_) {}
+    });
+  }
+  // amux CLOUD OFFER OFF unless a test asks for it, for the walkthrough's
+  // reason: every e2e server is self-hosted and owned, so the first phone-width
+  // page would get a fixed card over the bottom of the screen. Opt in with
+  // {annotation:{type:'cloud-offer'}} (e2e/cloud-offer.spec.ts).
+  if (!testInfo.annotations.some(a => a.type === 'cloud-offer')) {
+    await context.addInitScript(() => {
+      try { if (!localStorage.getItem('amux_cloud_offer')) localStorage.setItem('amux_cloud_offer', '{"dismissed":1}'); } catch (_) {}
+    });
+  }
+}
+
+export const test = base.extend<{ _seedNewContexts: void }>({
+  // browser is per worker and a worker runs one test at a time, so wrapping
+  // newContext for the length of a test cannot leak into another test.
+  _seedNewContexts: [async ({ browser }, use, testInfo) => {
+    const original = browser.newContext;
+    browser.newContext = async function (this: typeof browser, ...args: Parameters<typeof original>) {
+      const ctx = await original.apply(this, args);
+      await seedFirstRunOff(ctx, testInfo);
+      return ctx;
+    } as typeof original;
+    try { await use(); } finally { browser.newContext = original; }
+  }, { auto: true }],
   context: async ({ context }, use, testInfo) => {
-    // FIRST-RUN WALKTHROUGH OFF unless a test asks for it. The scratch server
-    // starts with no workers, and the walkthrough correctly opens for an empty
-    // fleet ~1.5s after load (_wtMaybeStart). On slower ios-safari runners it
-    // opened before the test's first click and #wt-backdrop swallowed it:
-    // browser-history, message-context-filter and mobile-header-visibility
-    // timed out on main (run 36921271354). Opt in with
-    // test.info().annotations.push({type:'walkthrough'}) set before navigation,
-    // or {annotation:{type:'walkthrough'}} on the test.
-    if (!testInfo.annotations.some(a => a.type === 'walkthrough')) {
-      await context.addInitScript(() => {
-        try { if (!localStorage.getItem('amux_walkthrough_done')) localStorage.setItem('amux_walkthrough_done', '1'); } catch (_) {}
-      });
-    }
+    await seedFirstRunOff(context, testInfo);
+    await context.route(CDN_URL, async route => {
+      const url = route.request().url();
+      const hit = cdnCache.get(url);
+      if (hit) {
+        cdnStats.served_from_cache++;
+        return route.fulfill(hit);
+      }
+      const started = Date.now();
+      let response;
+      try {
+        response = await route.fetch({ timeout: CDN_FETCH_TIMEOUT_MS });
+      } catch (e) {
+        cdnStats.stalled++;
+        console.log(`[e2e] cdn-stall: ${url} gave no response in ${Date.now() - started}ms `
+          + `(${String(e).split('\n')[0]}); aborting it so the page "load" event still fires `
+          + `(test: ${testInfo.titlePath.join(' > ')})`);
+        return route.abort('timedout').catch(() => {});
+      }
+      cdnStats.fetched++;
+      // The fetched body is already decoded; drop the transfer headers that
+      // describe the encoded bytes.
+      const headers = { ...response.headers() };
+      for (const h of ['content-encoding', 'content-length', 'transfer-encoding']) delete headers[h];
+      // A library the page asks for on first use (_lazyLib) can still be in
+      // flight when the test ends and its context closes. The body is gone
+      // then, and nobody is waiting for it, so that is not a test failure.
+      let body: Buffer;
+      try { body = await response.body(); }
+      catch (e) {
+        console.log(`[e2e] cdn-disposed: ${url} finished after its page closed (test: ${testInfo.titlePath.join(' > ')})`);
+        return;
+      }
+      const entry = { status: response.status(), headers, body };
+      if (response.ok()) cdnCache.set(url, entry);
+      return route.fulfill(entry).catch(() => {});
+    });
     // A second tab must run the same candidate asset as the first. Page-only
     // overrides silently mixed the candidate outbox with the installed one.
     for (const asset of dashboardAssets) {

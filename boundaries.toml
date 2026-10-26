@@ -1,0 +1,397 @@
+# amux worker boundaries: the one place they are written down.
+#
+# Every amux worker reads the `rule` text of each enabled boundary at launch
+# (it is composed into the worker's binding rules), and
+# scripts/hooks/boundary-guard.py refuses the tool calls described by `deny`.
+# GET /api/boundaries shows the merged result, whether each enforcer is live,
+# and how often each boundary fired in the last 24h. `amux boundaries` prints it.
+#
+# CHANGE A BOUNDARY HERE and land it like any other change. To change one on
+# this machine only, put a [[boundary]] with the same `id` in
+# ~/.amux/boundaries.toml: its fields replace these, `enabled = false` turns it
+# off, and a new `id` adds a boundary. Workers cannot edit either file (see
+# `boundaries-self`).
+#
+# Each deny rule carries examples. scripts/hooks/test-boundary-guard.py runs
+# every `block_examples` entry (must be refused) and every `allow_examples`
+# entry (must pass), so a pattern change that stops catching its own example,
+# or starts catching an innocent one, fails before it ships.
+#
+# WHAT A HOOK CAN AND CANNOT DO. Workers run as the owner's macOS user, so a
+# determined worker can reach anything the owner can. The hook stops the
+# direct routes and says why; the server gates (vault approval limit, email
+# external-send approval) stop the API routes. A worker that writes a script
+# to disk and runs it later is not seen by a command-text match. The future
+# per-worker VM (docs/design/worker-boundaries.md) is what turns these into
+# walls.
+#
+# Deny rule fields:
+#   tools       tool names the rule applies to (Bash, Read, Edit, Write, ...)
+#   match_all   Bash: regexes that must ALL match the command
+#   match_none  Bash: if ANY of these matches, the rule does not apply
+#   path        file tools (Read, Edit, Write, ...): regex on the file path
+#   content_any file tools: the rule applies only if the written text matches
+#   reason      what the worker is told, including the sanctioned route
+# Regexes are Python `re`, case-insensitive.
+
+version = 1
+
+# Isolated workers (CLAUDE.md "Isolated workers") get no injected prompts,
+# routing or board, but these boundaries still hold for them: a refusal adds
+# no context and steers nothing, and the payment, email and credential risks
+# are the same whether or not a worker is isolated. Set false (here or in
+# ~/.amux/boundaries.toml) to exempt isolated workers from the guard. The rule
+# text is still never injected into an isolated worker; the refusal message
+# carries the reason.
+apply_to_isolated = true
+
+[[boundary]]
+id = "payments"
+title = "Every payment is authorized"
+rule = """
+Never make a payment, charge, transfer or purchase except through `amux order`
+(the amux vault fills the form within the owner's approved limit and asks the
+owner above it). Never call a payment provider's API directly, never read card
+or vault data, and never approve a payment grant yourself. If a task needs a
+payment the vault cannot make, stop and ask the owner.
+"""
+enforced_by = [
+  "server: vault approval limit and single-use grants (api/vault.rs decide)",
+  "hook: boundary-guard (direct payment APIs, vault files, grant approval)",
+]
+
+[[boundary.deny]]
+tools = ["Bash"]
+match_all = ['\b(curl|wget|http|httpie|python3?|node|ruby)\b', '(api\.stripe\.com|api\.brex\.com|api(-m)?\.paypal\.com|api\.squareup\.com|connect\.squareup\.com|api\.mercury\.com|api\.ramp\.com|checkout\.stripe\.com)']
+reason = "Payments go through `amux order` only, so the owner's approval limit applies. Calling a payment provider directly skips it."
+block_examples = [
+  "curl -X POST https://api.stripe.com/v1/charges -u sk_live_x: -d amount=500",
+  "curl -s https://api.brex.com/v2/transfers -H 'Authorization: Bearer x'",
+]
+allow_examples = [
+  "grep -rn api.stripe.com docs/",
+  "amux order --amount 45.00 --merchant Acme --purpose subscription",
+]
+
+[[boundary.deny]]
+tools = ["Bash"]
+match_all = ['/api/vault/[^ ]*(grant|approve|reveal|rules)|/api/grants/[^ ]*/(approve|grant)']
+match_none = ['\bgrep\b', '\brg\b']
+reason = "Payment grants and vault rules are approved and edited by the owner in the dashboard. A worker approving its own grant defeats the limit."
+block_examples = [
+  "curl -sk -X POST $AMUX_URL/api/grants/gr_123/approve",
+  "curl -sk -X PATCH $AMUX_URL/api/vault/item1/rules -d '{\"max_usd_without_approval\":10000}'",
+]
+allow_examples = ["rg '/api/vault/' crates/amux-server/src"]
+
+[[boundary.deny]]
+tools = ["Bash", "Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "Grep", "Glob"]
+match_all = ['\.amux/(vault|ts-secrets)(/|\b)']
+match_none = ['^\s*((cd|ls|du|grep|rg)\b[^;&|]*(&&|\|\||;|\|)\s*)*(cd|ls|du|grep|rg)\b[^;&|]*$']
+path = '\.amux/(vault|ts-secrets)/'
+reason = "The vault holds card and secret data that only the amux server reads. Use `amux order` for a payment and ask the owner for anything else."
+block_examples = ["cat ~/.amux/vault/items.json", "ls ~/.amux/vault; cat ~/.amux/vault/items.json", "Read /Users/ethan/.amux/vault/items.json", "Grep /Users/ethan/.amux/vault", "Glob /Users/ethan/.amux/vault/*.json"]
+allow_examples = ["ls ~/.amux/vault", "cat ~/.amux/logs/vault-audit.jsonl", "Write /Users/ethan/Dev/amux/docs/vault.md"]
+
+# The same files reached without the full path: from inside ~/.amux, or
+# through a glob (the MSG-90256 adversarial pass, 2026-10-17).
+[[boundary.deny]]
+tools = ["Bash"]
+match_all = ['\.amux\b', "(^|[\\s/'\"=])(vault|ts-secrets)(/|\\s|$|['\"*])"]
+match_none = ['^\s*((cd|ls|du|grep|rg)\b[^;&|]*(&&|\|\||;|\|)\s*)*(cd|ls|du|grep|rg)\b[^;&|]*$']
+reason = "The vault holds card and secret data that only the amux server reads. Use `amux order` for a payment and ask the owner for anything else."
+block_examples = ["cd ~/.amux && cat vault/items.json", "cd ~/.amux/vault && cat items.json"]
+allow_examples = ["cat ~/.amux/logs/vault-audit.jsonl", "cd ~/.amux && ls vault"]
+
+[[boundary]]
+id = "email"
+title = "Outbound email goes through the amux email API"
+rule = """
+Send, reply to and read email only through the amux email API
+($AMUX_URL/api/email/send, /reply, /inbox, /search, /message) with your
+X-Amux-Session header. It sends from the right account with its signature,
+records every send in /api/email/log, and holds external sends for the owner's
+approval. Never use Mail.app, sendmail, SMTP, a mail provider's API or the
+stored Gmail tokens directly, and never approve a held send yourself.
+"""
+enforced_by = [
+  "server: external-send approval (api/email_approval.rs), send audit (/api/email/log)",
+  "hook: boundary-guard (Mail.app, SMTP, provider APIs, Gmail tokens, approvals)",
+]
+
+[[boundary.deny]]
+tools = ["Bash"]
+match_all = ['\bosascript\b', '''application\s+["']mail["']''']
+reason = "Mail.app sends from the machine's default (personal) account, skips the send audit, and a hand-rolled reply can send a blank email."
+block_examples = ["osascript -e 'tell application \"Mail\" to send newMessage'"]
+allow_examples = ["osascript -e 'tell application \"Messages\" to send \"hi\" to buddy \"x\"'", "grep 'application \"Mail\"' notes.md"]
+
+# The same through JavaScript for Automation.
+[[boundary.deny]]
+tools = ["Bash"]
+match_all = ['\bosascript\b', "Application\\(\\s*['\"]Mail['\"]\\s*\\)"]
+reason = "Mail.app sends from the machine's default (personal) account, skips the send audit, and a hand-rolled reply can send a blank email."
+block_examples = ["osascript -l JavaScript -e 'Application(\"Mail\").send()'"]
+allow_examples = ["osascript -l JavaScript -e 'Application(\"Messages\").send(\"hi\")'"]
+
+[[boundary.deny]]
+tools = ["Bash"]
+match_all = ['(^|[;&|(]\s*|\b(sudo|exec)\s+)(sendmail|msmtp|mutt|mailx|swaks|ssmtp)\b|(^|[;&|]\s*)mail\s+-s\b|\bsmtplib\b|\bnodemailer\b|\bsmtp\.(gmail|office365|mailgun|sendgrid)|smtps?://|\b(465|587)\b.*\b(smtp|starttls)\b|\bsmtp\b.*\b(465|587)\b']
+match_none = ['^\s*(grep|rg|man|which)\b']
+reason = "Email leaves this machine only through the amux email API, so it is audited and external recipients are held for approval."
+block_examples = [
+  "printf 'Subject: hi' | sendmail bob@example.com",
+  "python3 -c 'import smtplib; s=smtplib.SMTP(\"smtp.gmail.com\",587)'",
+  "echo body | mail -s 'hello' bob@example.com",
+  "curl --url smtps://smtp.gmail.com:465 --mail-rcpt bob@example.com",
+]
+allow_examples = ["grep -rn smtplib server/", "git commit -m 'mail -s docs'"]
+
+[[boundary.deny]]
+tools = ["Bash"]
+match_all = ['(gmail\.googleapis\.com|googleapis\.com/(gmail|upload/gmail)|api\.sendgrid\.com|api\.mailgun\.net|api\.postmarkapp\.com|api\.resend\.com|api\.sparkpost\.com|graph\.microsoft\.com/[^ ]*/(sendMail|messages))']
+match_none = ['^\s*(grep|rg)\b']
+reason = "Email goes through $AMUX_URL/api/email/*, never a provider's API: that is the path with the right sender, the audit ledger and the approval hold."
+block_examples = [
+  "curl -X POST https://gmail.googleapis.com/gmail/v1/users/me/messages/send -H 'Authorization: Bearer x'",
+  "curl https://api.sendgrid.com/v3/mail/send -d @mail.json",
+]
+allow_examples = ["curl -sk -X POST $AMUX_URL/api/email/send -d @mail.json"]
+
+[[boundary.deny]]
+tools = ["Bash", "Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "Grep", "Glob"]
+match_all = ['\.amux/(gmail-tokens|gmail-oauth-client\.json|gcal-token\.json|auth-token|auth_token|worker-tokens)(/|\b)']
+match_none = ['^\s*((cd|ls|du|grep|rg)\b[^;&|]*(&&|\|\||;|\|)\s*)*(cd|ls|du|grep|rg)\b[^;&|]*$']
+path = '\.amux/(gmail-tok|gmail-oauth|gcal-tok|auth[-_]tok|worker-tok)'
+reason = "These are the owner's credentials. Use the amux API, which holds them for you; a worker reading them can bypass every send gate."
+block_examples = ["cat ~/.amux/gmail-tokens/ethan@mixpeek.com.json", "ls ~/.amux/gmail-tokens && cat ~/.amux/gmail-tokens/x.json", "Read /Users/ethan/.amux/auth-token", "Grep /Users/ethan/.amux/gmail-tokens", "Glob /Users/ethan/.amux/gmail-tok*/*"]
+allow_examples = ["ls ~/.amux/gmail-tokens", "Read /Users/ethan/Dev/amux/docs/credentials.md"]
+
+# The same credentials reached without the full path (from inside ~/.amux, or
+# through a glob such as gmail-tok*).
+#
+# The credential name must START a path segment (after /, a space, a quote, = or
+# the start of the line). Until 2026-10-20 it matched anywhere in the command, so
+# any command that also mentioned ~/.amux and contained "sb-<ref>-auth-token" (the
+# Supabase localStorage key) read as reading the owner's credentials: on one
+# afternoon it refused a commit message, a memory note and a schedule test across
+# two lanes, each reported as "Outbound email" (Ethan: "fix both in amux").
+[[boundary.deny]]
+tools = ["Bash"]
+match_all = ['\.amux\b', '(?<![\w.*-])(gmail-tok|gmail-oauth|gcal-tok|auth[-_]tok|worker-tok)']
+match_none = ['^\s*((cd|ls|du|grep|rg)\b[^;&|]*(&&|\|\||;|\|)\s*)*(cd|ls|du|grep|rg)\b[^;&|]*$']
+reason = "These are the owner's credentials. Use the amux API, which holds them for you; a worker reading them can bypass every send gate."
+block_examples = ["cd ~/.amux && cat gmail-tokens/x.json", "cat ~/.amux/gmail-tok*/x.json", "cd ~/.amux; cat 'auth-token'", "cat ~/.amux/worker-tokens/x"]
+allow_examples = [
+  "cd ~/.amux && ls gmail-tokens",
+  "grep -rn auth-token ~/Dev/amux/docs",
+  "git commit -F msg.txt  # Supabase sb-*-auth-token; eval \"$(~/.amux/github-app/get-token.sh)\"",
+  "~/.amux/scripts/browser-session-check.sh ethan-tubescience https://x.ts.app/ '^sb-.*-auth-token$'",
+  "cat > ~/.claude/notes.md <<'EOF'\nnever copy a Supabase sb-abc-auth-token between browsers; see ~/.amux/logs\nEOF",
+]
+
+[[boundary.deny]]
+tools = ["Bash"]
+match_all = ['/api/email/(approve|reject)/|X-Amux-Approver']
+match_none = ['^\s*(grep|rg)\b']
+reason = "A held external email is released by the owner in the dashboard. Show the owner the draft instead of approving it."
+block_examples = ["curl -sk -X POST $AMUX_URL/api/email/approve/apr_123", "curl -H 'X-Amux-Approver: ethan' $AMUX_URL/api/email/approve/apr_1"]
+allow_examples = ["grep -n X-Amux-Approver crates/amux-server/src/api/email.rs"]
+
+[[boundary.deny]]
+tools = ["Bash", "Edit", "Write", "MultiEdit"]
+match_all = ['\.amux/email-approvals/']
+match_none = ['^\s*(ls|cat|grep|rg|jq|head|tail)\b']
+path = '\.amux/email-approvals/'
+reason = "Held sends are frozen so what you drafted is what the owner approves. Editing a held send defeats that."
+block_examples = ["sed -i 's/x/y/' ~/.amux/email-approvals/apr_1.json", "Edit /Users/ethan/.amux/email-approvals/apr_1.json"]
+allow_examples = ["cat ~/.amux/email-approvals/apr_1.approved.json"]
+
+[[boundary]]
+id = "resources"
+title = "Know what you use, and fit the machine"
+kind = "resources"
+rule = """
+This machine is shared by every worker. Before heavy work (builds, test suites,
+browsers, simulators, containers, media renders, model runs), run
+`amux resources`: it shows the machine's capacity and current pressure, what
+you are using now, and the resource profile you declared. Ask for only what the
+task needs: lower parallelism (`-j`, `--workers`) when the machine is strained,
+prefer remote hardware for big builds, and shut down what you started
+(simulators, browsers, containers, dev servers) when you are done. A process
+you started is still yours after your shell exits: `amux resources` lists such
+detached trees by root pid, and the cleanup tick lowers their priority when the
+machine is busy, so stop the ones you no longer need. The network is shared
+the same way: one Wi-Fi link (measured 69 Mbps down, 24 Mbps up on 2026-10-17)
+carries every worker, the nightly backup and the owner's calls, and uploads
+saturate first. Cap big transfers (`curl --limit-rate`, `rclone --bwlimit`,
+`gsutil -o GSUtil:parallel_thread_count=1`), avoid parallel pulls and pushes of
+large images, models, datasets and videos, and move bulk data on cloud hardware
+instead of through this Mac. When the
+machine is critical, heavy commands are refused until it recovers; if the work
+truly cannot wait, rerun with AMUX_RESOURCES_ACK="<why>" in front of the
+command, and that reason is recorded. Disk is budgeted per worker: your scratch
+(~/.amux/tmp/<you>, plus AMUX_WORKER_DISK_PATHS) is measured against
+AMUX_WORKER_DISK_GB (default below). Past 80% heavy commands warn; past the
+budget they are refused until you delete what you no longer need (finished
+build targets first; give your subagents one shared CARGO_TARGET_DIR). An
+override is AMUX_DISK_ACK="<why>" in front of the command, recorded the same way.
+"""
+enforced_by = [
+  "hook: boundary-guard (heavy commands refused at critical pressure)",
+  "hook: boundary-guard (heavy commands refused past the worker's disk budget, AMUX_WORKER_DISK_GB)",
+  "server: host_guard holds automated dispatch at critical (runtime_jobs/host_guard.rs)",
+  "server: worker admission refuses new starts under memory pressure (api/health.rs)",
+]
+
+[boundary.resources]
+# Commands that take real CPU, memory or disk. Matched against Bash commands.
+heavy = [
+  '\bcargo\s+(build|test|clippy|nextest|run|bench|install)\b',
+  '\bsafe-cargo\.sh\b',
+  '\b(npx\s+)?playwright\s+test\b',
+  '\bxcrun\s+simctl\s+(boot|install)\b',
+  '\bxcodebuild\b',
+  '\bdocker\s+(run|build|compose\s+up|buildx)\b',
+  '\b(npm|pnpm|yarn)\s+(run\s+)?(build|test)\b',
+  '\bremotion\s+render\b',
+  '\bffmpeg\b',
+  '\bwhisper(\.cpp)?\b',
+  '\bpytest\b.*(-n\s*\d+|-n\s*auto)',
+]
+heavy_block_examples = ["cargo build -p amux-server", "npx playwright test e2e/x.spec.ts --workers=6", "xcrun simctl boot 'iPhone 16'"]
+heavy_allow_examples = ["cargo fmt", "git status", "AMUX_RESOURCES_ACK='prod fix' cargo build"]
+# Host thresholds. Load is the 5-minute average per logical core; swap is the
+# used fraction; memory level is macOS kern.memorystatus_vm_pressure_level
+# (1 normal, 2 warn, 4 critical).
+load_per_core_strained = 1.5
+load_per_core_critical = 2.5
+swap_used_strained = 0.85
+swap_used_critical = 0.97
+mem_level_strained = 2
+mem_level_critical = 4
+ack_env = "AMUX_RESOURCES_ACK"
+# Per-worker disk budget (mxp-gs12 review, 2026-10-18: the data volume filled
+# twice from one worker's subagent cargo targets). AMUX_WORKER_DISK_GB in the
+# worker's scope wins; 0 turns the check off for that worker.
+disk_budget_gb_default = 100
+disk_warn_fraction = 0.8
+disk_ttl_s = 600
+
+[[boundary]]
+id = "subagents"
+title = "Fan out within the account's capacity"
+kind = "subagents"
+rule = """
+Every worker on this machine draws on one Claude account. Subagents (the Agent
+or Task tool) share its usage windows, and when a window runs out every running
+agent stops at once. Keep the number of subagents you run at the same time
+small: a new one is refused while you already have the limit running
+(AMUX_MAX_SUBAGENTS, default below) or while the account has less usage left
+than the floor below. When refused, wait for one of your agents to finish, do
+the step yourself, or retry after the window resets. `amux usage` and
+GET $AMUX_URL/api/sessions/<you>/quota show the remaining window.
+"""
+enforced_by = [
+  "hook: boundary-guard (new Agent/Task call refused at the running-subagent cap or under the usage headroom floor)",
+]
+
+[boundary.subagents]
+# mxp-gs12 review, 2026-10-18: usage limits stopped every subagent of one
+# isolated worker five times in four days (up to 21 agents on one plan).
+tools = ["Agent", "Task"]
+# AMUX_MAX_SUBAGENTS in the worker's env wins; 0 turns the count cap off.
+env_max = "AMUX_MAX_SUBAGENTS"
+max_running_default = 4
+# Refuse new subagents while the highest account-wide window in /api/usage
+# has less than this percent left. 0 turns the floor off.
+min_headroom_pct = 10
+# A subagent counts as running while its meta has no "finished" flag and its
+# transcript was written in the last stale_s (a killed agent never gets the
+# flag). A transcript with no meta file counts only while written in the last
+# no_meta_warm_s.
+stale_s = 1800
+no_meta_warm_s = 240
+
+[[boundary]]
+id = "fleet-tmux"
+title = "The fleet's tmux server is not yours to stop"
+rule = """
+Every worker runs inside one shared tmux server. Inside a pane, a bare tmux
+command goes to that server because $TMUX names it, even when TMUX_TMPDIR is
+set. Never run `tmux kill-server` or `tmux kill-session -a` without `-L <name>`
+or `-S <socket>` naming your own private server in the same command. For a
+private test server, start and stop it as `tmux -L <name> ...` (or
+`env -u TMUX tmux -S <path> ...`). Stop a worker with `amux stop <name>`.
+"""
+enforced_by = ["hook: boundary-guard (fleet tmux kill-server / kill-session -a)"]
+
+# 2026-10-17 14:51: a demo reset script ran `TMUX_TMPDIR=/tmp/lfvd.X tmux
+# kill-server` in a pane. $TMUX won, the fleet server died, and 36 lanes
+# dropped mid-turn. The rule: a kill-server (or kill-session -a) in a tmux
+# invocation that names no -L/-S is the fleet; so is one naming the default
+# socket explicitly.
+[[boundary.deny]]
+tools = ["Bash"]
+match_all = ['(?:^|[\s;&|(=])tmux\s(?:(?!(?<!\S)-[LS]\b)[^;&|\n])*\bkill-(server|session\b[^;&|\n]*\s-a\b)']
+reason = "A tmux kill without -L/-S inside a pane stops the shared fleet server and every worker with it ($TMUX wins over TMUX_TMPDIR). Name your private server: `tmux -L <name> kill-server`. Stop a worker with `amux stop <name>`."
+block_examples = [
+  "TMUX_TMPDIR=/tmp/lfvd.X tmux kill-server",
+  "tmux kill-server",
+  "tmux kill-session -a -t keep",
+  "cd /tmp && tmux kill-server 2>/dev/null || true",
+]
+allow_examples = [
+  "tmux -L lfvd kill-server",
+  "env -u TMUX tmux -S /tmp/lfvd/sock kill-server",
+  "tmux kill-session -t my-demo",
+  "grep -rn kill-server scripts/",
+]
+
+[[boundary.deny]]
+tools = ["Bash"]
+match_all = ['(?:^|[\s;&|(=])tmux\s[^;&|\n]*?-(L\s*default\b|S\s*\S*/tmux-\d+/default\b)[^;&|\n]*\bkill-(server|session\b[^;&|\n]*\s-a\b)']
+reason = "That socket is the shared fleet tmux server; killing it stops every worker. Use your own `-L <name>`, or `amux stop <name>` for a worker."
+block_examples = [
+  "tmux -L default kill-server",
+  "tmux -S /private/tmp/tmux-501/default kill-server",
+]
+allow_examples = ["tmux -L default ls", "tmux -S /tmp/tmux-501/demo kill-server"]
+
+[[boundary]]
+id = "boundaries-self"
+title = "Boundaries are the owner's to change"
+rule = """
+Do not edit, move or delete the boundary registry on this machine
+(~/.amux/boundaries.toml), the browser methods override
+(~/.amux/browser-methods.toml, which decides where screenshots of signed-in
+pages are sent) or the installed guard (~/.amux/hooks/boundary-guard.py,
+~/.amux/hooks/boundaries.toml), and do not remove the guard from Claude
+settings. Propose a change to boundaries.toml in the amux repo instead.
+"""
+enforced_by = ["hook: boundary-guard"]
+
+[[boundary.deny]]
+tools = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+path = '\.amux/(hooks/)?(boundaries\.toml|boundary-guard\.py|browser-methods\.toml)$'
+reason = "The installed boundary registry and guard are the owner's. Propose the change in the amux repo's boundaries.toml."
+block_examples = ["Write /Users/ethan/.amux/boundaries.toml", "Edit /Users/ethan/.amux/hooks/boundary-guard.py", "Write /Users/ethan/.amux/browser-methods.toml"]
+allow_examples = ["Edit /Users/ethan/Dev/amux/boundaries.toml"]
+
+[[boundary.deny]]
+tools = ["Bash"]
+match_all = ['\.amux/(hooks/)?(boundaries\.toml|boundary-guard\.py|browser-methods\.toml)', '(>|\btee\b|\bsed\s+-i|\bperl\s+-[a-z]*i|\bcp\b|\bmv\b|\brm\b|\bchmod\b|\btruncate\b|\bln\b)']
+match_none = ['^\s*(cat|grep|rg|head|tail|less|diff)\b[^>|;&]*$']
+reason = "The installed boundary registry and guard are the owner's. Propose the change in the amux repo's boundaries.toml."
+block_examples = ["rm ~/.amux/hooks/boundary-guard.py", "echo x > ~/.amux/boundaries.toml", "sed -i '' 's/a/b/' ~/.amux/hooks/boundaries.toml"]
+allow_examples = ["cat ~/.amux/boundaries.toml", "diff boundaries.toml ~/.amux/hooks/boundaries.toml"]
+
+[[boundary.deny]]
+tools = ["Bash", "Edit", "Write", "MultiEdit"]
+match_all = ['\.claude/settings(\.local)?\.json', '(>|\btee\b|\bsed\s+-i|\bmv\b|\bcp\b|disableAllHooks)']
+match_none = ['^\s*(cat|grep|rg|head|diff)\b[^>|;&]*$']
+path = '/\.claude/settings(\.local)?\.json$'
+content_any = ['"hooks"|boundary-guard|disableAllHooks']
+reason = "Claude settings carry the boundary guard. Removing or disabling hooks there turns every boundary off for every worker."
+block_examples = ["jq 'del(.hooks)' ~/.claude/settings.json > /tmp/s && mv /tmp/s ~/.claude/settings.json", "Write /Users/ethan/.claude/settings.json :: {\"hooks\": {}}"]
+allow_examples = ["cat ~/.claude/settings.json", "grep boundary-guard ~/.claude/settings.json", "Edit /Users/ethan/.claude/settings.json :: {\"permissions\": {}}"]

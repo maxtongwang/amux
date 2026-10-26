@@ -67,6 +67,7 @@ pub const PROXIED_FAMILIES: &[ProxiedFamily] = &[];
 pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/brex", "tokenized card issuance, webhook budget checks and credential health; disabled until configured (api/brex.rs)"),
     ("/api/_clear_sw", "service-worker cache reset landing page"),
+    ("/api/social", "publish to social platforms and read each post's results at 24h, 72h and 7d (api/social.rs)"),
     ("/health", "health + build discriminator"),
     // The /api-prefixed alias for the same handler. Lanes guess this path
     // because every sibling diagnostic is under /api/ (2026-08-30 sweep: 20
@@ -94,6 +95,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/orchestrate", "voice fleet-orchestrator: transcript -> helper-model routing plan (api/orchestrate.rs, AMUX-3074)"),
     ("/api/skin", "resolved skin (terms/colours/tabs) for a worker"),
     ("/api/config", "declarative instance config: export + idempotent apply"),
+    ("/api/move", "move bundle: config plus allowlisted data, export and add-only import (api/move_bundle.rs)"),
     // AMUX-2888. Complete: the relay client is ported, so start/stop drive a
     // real tunnel rather than answering the honest 501 they carried while the
     // client was missing.
@@ -115,6 +117,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
         "/api/models",
         "typed OpenAI, Claude, and Gemini model catalog shared by provider adapters and every worker picker (api/workers.rs)",
     ),
+    ("/api/task-history", "fleet-wide task list for the Tasks tab (api/sessions_legacy.rs task_list)"),
     ("/api/sessions", "python-SHAPE session list (rust-derived) + per-name verbs — peek/send/config/start/stop/… native over the fleet substrate (api/session_verbs.rs, AMUX-2598)"),
     ("/api/identity", "cloud user + auth-config introspection over server.env/.claude.json (mod.rs)"),
     ("/api/sessions-git", "bulk {session: {branch, repo}} map for the session cards — REUSES the session list's branch (one answer, not two) and adds repo, one rev-parse per DISTINCT dir, 30s TTL (api/sessions_git.rs, AMUX-2599)"),
@@ -138,6 +141,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/chat-delegate", "read-only background jobs a worker's Chat starts on the worker's own provider (api/chat_delegate.rs, AMUX-5432)"),
     ("/api/chatgpt-app", "ChatGPT app connections: approve, deny, revoke (api/chatgpt_app.rs, AMUX-5396)"),
     ("/api/signals", "named clearance signals: a card waits on a name, another lane raises it (api/signals.rs, AMUX-5237)"),
+    ("/api/subscriptions", "event subscriptions: an event pattern fires a send, board card, schedule or shell action; plus emit and fire history (api/signals.rs, migration 0130)"),
     ("/api/reclaim", "disk scan, reclaim findings, treemap, quarantine"),
     ("/api/recordings", "audio recorder: upload, list, folder config, local transcription (api/recordings.rs)"),
     ("/api/usage", "token usage"),
@@ -171,22 +175,24 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/tmux-sessions", "tmux sessions amux does not already own, for Connect (api/worker_create.rs)"),
     ("/api/iterm2", "open iTerm2 panes, for Connect-a-pane (api/worker_create.rs)"),
     ("/api/saved-messages", "peek composer's reusable snippets, per worker (api/saved_messages.rs, AMUX-2871)"),
-    ("/api/proxies", "Proxies tab CRUD; start/stop drive the tunnel relay (api/proxies.rs, AMUX-2887 + AMUX-2888)"),
     ("/api/pull", "self-update button; routes brew/pip installs, allows ahead-only no-op pulls, and refuses shared-checkout edits or non-fast-forward history (api/self_update.rs, AMUX-2891)"),
     ("/api/observability", "Cost tab rollup over token_ledger; does NOT index on request — the periodic job owns that (api/observability.rs, AMUX-2893)"),
     ("/api/habits", "Habits tab state — one JSON array in ~/.amux/habits.json (api/habits.rs, AMUX-2871)"),
     ("/api/scope", "uniform per-capability scope read/write — memory/rules/env/gates/status_mode at global/group/worker, python storage shared byte-for-byte (api/scope.rs, AMUX-2608: the family whose cutover emptied PROXIED_FAMILIES)"),
     ("/api/mcp", "MCP registry — list/import/remove (AMUX-2871)"),
     ("/api/sql", "SQL browser — schema/rows/query, read-only unless write:true"),
+    ("/api/pages", "Pages tab: HTML apps backed by a worker and their own SQLite file; sql, ask, version, file, snapshots (api/pages.rs)"),
     ("/api/skills", "skills list + save/delete"),
     ("/api/peek", "peek rendering steps (PEEK_SERVER_STEPS)"),
     ("/api/slash-commands", "slash commands"),
     ("/api/map", "map + geocoding"),
     ("/api/graph", "Map tab graph mode: mind-map store + Obsidian vault import + fleet org-chart projection (api/graph.rs, AMUX-2886)"),
     ("/api/terminal", "Workspace tab web-terminal panes: local-shell PTY, base64 I/O, long-poll output (api/terminal.rs, AMUX-2885)"),
+    ("/api/tailnet", "add this server to the owner's own tailnet: status, join (login link or auth key), leave (api/tailnet_join.rs)"),
     ("/api/reports", "Metrics tab report cards: CRUD + type registry + ops-server refresh fetchers (api/reports.rs, AMUX-2884)"),
     ("/api/env", "Declarative environment config: one YAML/JSON -> primitives (groups, workers; phase-2 schedules/columns/gates/files/global). Idempotent apply + dry-run + schema (api/env_config.rs, AMUX-2977)"),
     ("/api/history", "command history"),
+    ("/api/task-history", "Tasks tab: every worker's task rows from the session snapshots (api/sessions_legacy.rs task_list)"),
     ("/api/logs", "SPA Logs tab: python-shape events + raw over the structured request log (_amux_request_log) and the server-rs.log tracing tail (api/request_log.rs, AMUX-2605)"),
     ("/api/settings", "settings"),
     ("/api/push", "web push"),

@@ -1,7 +1,7 @@
 // File view bottom edge: every viewer's last line is reachable at every size, late responses cannot replace the current file.
 import {test, expect, Page, allowUnusedRoute} from './fixtures';
 import {cleanup} from './teardown';
-import {mkdtemp, writeFile, rm, copyFile, readFile} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, rm, copyFile, readFile} from 'node:fs/promises';
 import {createHash} from 'node:crypto';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -54,6 +54,22 @@ async function finalLine(page: Page, scroller = '#file-body', scroll = true, nee
     }
     return false;
   }, [needle, scroll] as [string, boolean]), 'the complete final line is visible and hit-testable after scrolling to the end').toBe(true);
+}
+
+// A worker whose split panes show `dir`: panes are the worker page, so a split
+// needs an open worker.
+async function openSplitWorker(page:Page,dir:string){
+  const w={name:'file-bottom-worker',dir,provider:'claude',status:'idle',running:true,tags:['e2e'],desc:'split fixture',pinned:false,isolated:false};
+  // Replaces the beforeEach stub: same worker, with this test's folder as its directory.
+  await page.unroute(/\/api\/sessions(?:\?.*)?$/);
+  // The beforeEach stub never fires when no page loaded before this; this
+  // one must (no worker, no panes, and the wait below times out).
+  allowUnusedRoute(page,/\/api\/sessions(?:\?.*)?$/);
+  await page.route(/\/api\/sessions(?:\?.*)?$/,route=>route.fulfill({json:[w]}));
+  await page.goto('/');
+  await page.waitForFunction(()=>JSON.parse(eval('JSON.stringify(sessions)')).some((r:any)=>r.name==='file-bottom-worker'));
+  await page.evaluate(()=>(window as any).openPeek('file-bottom-worker'));
+  await expect(page.locator('#peek-overlay')).toHaveAttribute('data-session','file-bottom-worker');
 }
 
 test('real Markdown preview, raw and edit reach the end in dashboard and embedded chat', async ({page,browserName}, info) => {
@@ -294,27 +310,24 @@ test('Files listing and worker split previews expose their final row and complet
       await expect(page.locator('#file-body')).toContainText(end);await finalLine(page);
       await page.locator('#file-overlay button[onclick="closeFilePreview()"]').click();
     }
-    await page.goto('/?peekEmbed=file-bottom-worker');
+    // A split pane is the worker page itself (b20e23647): the Files pane is the
+    // Files page in an iframe, so its final row and preview are the Files
+    // page's, checked above. What the split adds is the frame: it fits the
+    // pane in a short window and the last row of a long folder is reachable
+    // inside it.
+    await openSplitWorker(page,dir);
     for(const size of [sizes[0],sizes[1],sizes[3]]){
       await page.setViewportSize(size);
-      await page.evaluate(p=>{(window as any)._peekSplitOpen('files');return (window as any)._psfLoad(p);},dir);
-      await page.locator('#psf-body .fe-row').filter({hasText:'zzz-final.md'}).click();
-      await fits(page,'#psf-body .file-overlay-body');await finalLine(page,'#psf-body .file-overlay-body');
-      await page.evaluate(p=>(window as any)._psfViewFile(p),join(dir,'zzz-final.html'));
-      const frame=page.frameLocator('#psf-body iframe');await frame.locator('#end').waitFor();
-      await fits(page,'#psf-body iframe');
-      await frame.locator('html').evaluate(el=>{el.ownerDocument.scrollingElement!.scrollTop=el.ownerDocument.scrollingElement!.scrollHeight;});
-      expect(await frame.locator('#end').evaluate(el=>{const r=el.getBoundingClientRect();return r.top>=0&&r.bottom<=innerHeight;})).toBe(true);
-      if(size.height===350)await page.screenshot({path:info.outputPath('worker-split-final-paragraph.png')});
-      await page.evaluate(p=>(window as any)._psfViewFile(p),join(dir,'split.pdf'));
-      const pdf=page.locator('#psf-body .file-pdf');
-      await expect(pdf.locator('.pdf-page')).toHaveCount(3,{timeout:30000});await fits(page,'#psf-body .file-pdf');
-      await pdf.evaluate(el=>{el.scrollTop=el.scrollHeight;});
-      expect(await pdf.locator('.pdf-page').last().evaluate(el=>{const r=el.getBoundingClientRect();return r.bottom<=innerHeight&&r.bottom>0;})).toBe(true);
-      await expect.poll(()=>page.evaluate(async()=>{
-        const r=await (await fetch('/api/client-debug?kind=file-pdf-render')).json();
-        return r.beacons.some((b:any)=>b.body.viewer==='split'&&b.body.verdict==='rendered'&&b.body.pages===3);
-      })).toBe(true);
+      await page.evaluate(()=>(window as any)._peekSplitOpen('files'));
+      const pane=page.frameLocator('#psp-frame');
+      await pane.locator('#files-body').waitFor();
+      await fits(page,'#psp-frame');
+      await pane.locator('html').evaluate((el,p)=>(el.ownerDocument.defaultView as any).loadFiles(p),dir);
+      const last=pane.locator('#files-body .fe-row').filter({hasText:'zzz-final.md'});
+      await last.scrollIntoViewIfNeeded();
+      expect(await last.evaluate(el=>{const r=el.getBoundingClientRect();return r.top>=0&&r.bottom<=el.ownerDocument.defaultView!.innerHeight;}),
+        'the final row is inside the pane after scrolling').toBe(true);
+      if(size.height===350)await page.screenshot({path:info.outputPath('worker-split-final-row.png')});
     }
   }finally { await cleanup('remove temp folder', () => rm(dir,{recursive:true,force:true})); }
 });
@@ -362,13 +375,18 @@ test('computed Markdown node editor and raw view fit with its full instruction r
   }finally { await cleanup('remove temp folder', () => rm(dir,{recursive:true,force:true})); }
 });
 
-test('late directory and file responses cannot replace the worker current file',async({page})=>{
-  const dir=await mkdtemp(join(tmpdir(),'amux-file-race-'));
+test('a late directory response cannot replace the folder a split pane moved to',async({page})=>{
+  // The split's Files pane is the Files page (b20e23647), so the guard is
+  // loadFiles' generation check. Hold the first folder's listing, move to a
+  // second folder, release the first: the pane keeps the second.
+  const root=await mkdtemp(join(tmpdir(),'amux-file-race-'));
+  const oldDir=join(root,'old'), curDir=join(root,'current');
   try{
-    const oldFile=join(dir,'old.md'), currentFile=join(dir,'current.md');
-    await writeFile(oldFile,'OLD_FILE_MUST_NOT_REPLACE_CURRENT');await writeFile(currentFile,longText);
-    await page.goto('/?peekEmbed=file-bottom-worker');await page.setViewportSize(sizes[0]);
+    await mkdir(oldDir);await mkdir(curDir);
+    await writeFile(join(oldDir,'OLD_DIR_MUST_NOT_REPLACE_CURRENT.md'),'x');await writeFile(join(curDir,'current-folder.md'),'y');
+    await page.setViewportSize(sizes[0]);await openSplitWorker(page,root);
     await page.evaluate(()=>(window as any)._peekSplitOpen('files'));
+<<<<<<< HEAD
     for(const [matcher,start] of [
       [/\/api\/ls\?path=/,() => page.evaluate(p=>{void (window as any)._psfLoad(p);},dir)],
       [/\/api\/file\?path=.*old\.md/,() => page.evaluate(p=>{void (window as any)._psfViewFile(p);},oldFile)],
@@ -406,17 +424,37 @@ test('late directory and file responses cannot replace the worker current file',
       }finally{release();await cleanup('drain held route handlers', drain);}
     }
   }finally { await cleanup('remove temp folder', () => rm(dir,{recursive:true,force:true})); }
+=======
+    const pane=page.frameLocator('#psp-frame');await pane.locator('#files-body').waitFor();
+    const key='/api/ls?path='+encodeURIComponent(oldDir);
+    let release!:()=>void, arrived!:()=>void, completed!:()=>void, taken=false;
+    const held=new Promise<void>(r=>release=r), seen=new Promise<void>(r=>arrived=r), done=new Promise<void>(r=>completed=r);
+    await page.route(/\/api\/ls\?path=/,async route=>{
+      if(taken||!route.request().url().includes(key)) return route.fallback();
+      taken=true;const response=await route.fetch();arrived();await held;await route.fulfill({response});completed();
+    });
+    try{
+      await pane.locator('html').evaluate((el,p)=>{void (el.ownerDocument.defaultView as any).loadFiles(p);},oldDir);await seen;
+      await pane.locator('html').evaluate((el,p)=>(el.ownerDocument.defaultView as any).loadFiles(p),curDir);
+      await expect(pane.locator('#files-body')).toContainText('current-folder.md');
+      release();await done;
+      await expect(pane.locator('#files-body')).toContainText('current-folder.md');
+      await expect(pane.locator('#files-body')).not.toContainText('OLD_DIR_MUST_NOT_REPLACE_CURRENT');
+    }finally{release();await cleanup('unroute held response', () => page.unroute(/\/api\/ls\?path=/));}
+  }finally { await cleanup('remove temp folder', () => rm(root,{recursive:true,force:true})); }
+>>>>>>> upstream/main
 });
-
 
 test('capped PDF and large text disclose their limits and download the complete original',async({page})=>{
   const dir=await mkdtemp(join(tmpdir(),'amux-file-caps-'));
   try{
-    const fixtures={'large.txt':Buffer.from('Large evidence.\n'.repeat(16000)+end),'many-pages.pdf':pdfBytes(31)};
+    // Just past the viewer's 5,000,000-character text limit (it was 200,000 until
+    // a 410 KB note was cut in half, 2026-10-20).
+    const fixtures={'large.txt':Buffer.from('Large evidence.\n'.repeat(312600)+end),'many-pages.pdf':pdfBytes(31)};
     await page.goto('/');await page.setViewportSize(sizes[1]);
     for(const [name,bytes] of Object.entries(fixtures)){
       const file=join(dir,name);await writeFile(file,bytes);await page.evaluate(p=>(window as any).openFilePreview(p),file);
-      const note=name.endsWith('.pdf')?'Showing 30 of 31 pages — use Download to open the full document.':'... (truncated at 200KB)';
+      const note=name.endsWith('.pdf')?'Showing 30 of 31 pages — use Download to open the full document.':'... (truncated at 5MB)';
       await expect(page.locator('#file-body')).toContainText(note,{timeout:30000});await fits(page);await finalLine(page,'#file-body',true,note);
       await page.locator('#file-menu-btn').click();
       const downloading=page.waitForEvent('download');await page.locator('#file-download-btn').click();const download=await downloading;

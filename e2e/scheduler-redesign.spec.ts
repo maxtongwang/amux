@@ -340,6 +340,29 @@ test('row menu: run, pause, edit and delete are reachable from the list', async 
   await expect.poll(async () => (await listAll(request, tok)).some((s: any) => s.id === id)).toBe(false);
 });
 
+// Typing that starts right after the sheet opens stays in the field it began
+// in. The open used to focus Name 50ms later no matter what, so on a fast CI
+// runner the Message text landed in Name, Message stayed empty and the save was
+// refused (the create test below, desktop run 38814804812, mobile 38867620848).
+test('create: a field entered right after open keeps focus', async ({ page }) => {
+  await settle(page);
+  await openScheduler(page);
+  await page.evaluate(() => {
+    (window as any).openSchedModal();
+    document.getElementById('sched-command')!.focus();
+  });
+  await page.waitForTimeout(200);   // past the open's delayed focus of Name
+  expect(await page.evaluate(() => document.activeElement && document.activeElement.id)).toBe('sched-command');
+  await page.keyboard.insertText('typed early');
+  await expect(page.locator('#sched-command')).toHaveValue('typed early');
+  await expect(page.locator('#sched-title')).toHaveValue('');
+  // An untouched open still lands on Name.
+  await page.locator('#sched-overlay .sched-modal-foot .btn', { hasText: 'Cancel' }).click();
+  await page.locator('.sx-new').click();
+  await expect.poll(() => page.evaluate(() => document.activeElement && document.activeElement.id)).toBe('sched-title');
+  await page.locator('#sched-overlay .sched-modal-foot .btn', { hasText: 'Cancel' }).click();
+});
+
 // Every preset, alternating the two types, must write an expression the server
 // accepts, and the exact expression is checked.
 const PRESETS: Array<{ preset: string; fill?: (page: Page) => Promise<void>; expr: string | null; stype?: string }> = [
