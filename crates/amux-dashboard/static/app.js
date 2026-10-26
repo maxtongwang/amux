@@ -27832,13 +27832,17 @@ function _filesToolbarCheck() {
 }
 window.addEventListener('resize', _filesToolbarCheck);
 let _filesLoadGeneration = 0;
+// Opening Files with no explicit path waits for the saved cwd; any explicit
+// loadFiles(path) started meanwhile wins, and loadFiles itself never waits.
+async function _loadFilesDefault() {
+  const pendingGeneration = _filesLoadGeneration;
+  const body = document.getElementById('files-body');
+  if (body) body.innerHTML = '<div style="padding:16px;color:var(--dim)">Loading...</div>';
+  await _filesCwdReady;
+  if (pendingGeneration !== _filesLoadGeneration || activeView !== 'files') return;
+  loadFiles(_filesPath);
+}
 async function loadFiles(path) {
-  if (path === undefined) {
-    const pendingGeneration = _filesLoadGeneration;
-    await _filesCwdReady;
-    if (pendingGeneration !== _filesLoadGeneration || activeView !== 'files') return;
-    path = _filesPath;
-  }
   const generation = ++_filesLoadGeneration;
   const current = () => generation === _filesLoadGeneration;
   const body = document.getElementById('files-body');
@@ -34447,7 +34451,7 @@ function switchView(view, filesPath) {
   // "Message history" modal reached from inside a peek.
   if (view === 'sessions') { fetchSessions(); _dbgLog('Workers refreshed on navigation'); }
   if (view === 'messages') { _messagesLoad(true, ''); _cvEnter(); }
-  if (view === 'files') { loadFiles(filesPath); _filesRenderBookmarks(); }
+  if (view === 'files') { if (filesPath === undefined) _loadFilesDefault(); else loadFiles(filesPath); _filesRenderBookmarks(); }
   if (view === 'scratchpad') _scratchpadLoad();
   if (view === 'record') _recorderInit();
   if (view === 'mdai') _mdaiTabLoad();
