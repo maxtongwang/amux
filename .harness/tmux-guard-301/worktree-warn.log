@@ -1,0 +1,6 @@
+  ok: A: clean worktree -> no output
+  ok: B: dirty (tracked) worktree warns and names f.txt
+  ok: C: untracked file in the worktree also triggers the warning
+  ok: D: nonexistent path -> silent no-op
+  ok: E: every force-remove call site (2) has a matching warn_if_worktree_dirty call (3 total incl. the definition)
+cli-worktree-dirty-warn suite: PASS

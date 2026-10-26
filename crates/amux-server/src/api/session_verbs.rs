@@ -27558,6 +27558,11 @@ async fn post_dispatch(
             )
         }
         "stop" => {
+            // The CLI reaches this from guarded worker panes too. Authorize
+            // before spawning shutdown; refusal is logged by the shared gate.
+            if let Some(refusal) = peer_input_gate(headers, name, "stop") {
+                return refusal;
+            }
             let st2 = state.clone();
             let n = name.to_string();
             crate::db::interactions::spawn(async move {

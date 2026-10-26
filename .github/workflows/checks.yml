@@ -202,6 +202,8 @@ jobs:
         run: python3 scripts/test-frustration-delivery.py
       - name: a renamed worker's CLI calls carry its new name, not its launch name (TWN-1)
         run: python3 scripts/test-cli-stale-worker.py
+      - name: Worker stop uses the server without a local kill fallback
+        run: python3 scripts/test-cli-stop.py
       - name: amux model and amux usage send exactly what they say and report refusals (ai-config #149)
         run: python3 scripts/test-cli-model-usage.py
       - name: amux browser profiles says why discovery found nothing, never a silent zero

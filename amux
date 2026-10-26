@@ -680,29 +680,32 @@ PYEOF
 _stop_via_api() {
   local name="$1"
   local AMUX_API="${AMUX_API:-https://localhost:8824}"
-  local resp
-  resp=$(_curl -sk -m 15 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
-    "$AMUX_API/api/sessions/$name/stop" 2>/dev/null) || resp=""
-  if [[ -z "$resp" ]]; then
+  local resp status body
+  resp=$(_curl -sk -m 15 -w '\n%{http_code}' -X POST \
+    -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
+    "$AMUX_API/api/sessions/$name/stop") || {
+    echo "could not reach server to stop $name; no local stop attempted" >&2
     return 1
-  fi
-  # A non-empty body is NOT proof of success: an error JSON or a proxy's
-  # HTML page must fall through to the direct pane-close fallback, not
-  # masquerade as a graceful stop.
-  if ! RESP="$resp" python3 - <<'PYEOF'
+  }
+  status="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+  if ! RESP="$body" STATUS="$status" python3 - <<'PYEOF'
 import json, os, sys
 try:
     d = json.loads(os.environ["RESP"])
-except Exception:
-    sys.exit(1)
-if not isinstance(d, dict) or d.get("error") or d.get("ok") is False:
+    status = int(os.environ["STATUS"])
+    if not isinstance(d, dict) or not 200 <= status < 300 or d.get("ok") is not True or d.get("error"):
+        reason = d.get("error", "server did not accept stop") if isinstance(d, dict) else "invalid response"
+        print(f"stop refused (HTTP {status}): {reason}", file=sys.stderr)
+        sys.exit(1)
+except (ValueError, TypeError):
+    print("stop failed: invalid server response", file=sys.stderr)
     sys.exit(1)
 PYEOF
   then
     return 1
   fi
-  echo "${RED}stopping${RESET} $name (graceful, via server)"
-  return 0
+  echo "${RED}stopping${RESET} $name (accepted by server; completion is logged)"
 }
 
 # Check if tmux session is alive.
@@ -2457,54 +2460,11 @@ _send_settle_by_receipt() {
 
 cmd_stop() {
   local name
-  name=$(resolve_session "${1:-}")
-  if [[ "$(session_backend "$name")" == "herdr" ]]; then
-    if ! is_running "$name"; then
-      echo "${DIM}$name is not running${RESET}"
-      return
-    fi
-    # Prefer the server's graceful stop (transcript snapshot + /exit); if the
-    # server is down, close the pane directly — loud, like the tmux kill below.
-    if _stop_via_api "$name"; then
-      return
-    fi
-    need_herdr
-    local pane
-    pane=$(sed -n 's/^CC_HERDR_PANE_ID=//p' "$CC_SESSIONS/$name.env" | tail -1 | tr -d '"')
-    if [[ -n "$pane" ]] && herdr --session "$(herdr_session_name)" pane close "$pane" >/dev/null 2>&1; then
-      echo "${RED}stopped${RESET} $name (pane closed — server was unreachable, no transcript snapshot)"
-    else
-      die "failed to stop $name: server unreachable and pane close failed"
-    fi
-    return
-  fi
-  need_tmux
-
-  local tname
-  tname=$(tmux_name "$name")
-  if is_running "$name"; then
-    tmux kill-session -t "=$tname"
-    echo "${RED}stopped${RESET} $name"
-  else
-    echo "${DIM}$name is not running${RESET}"
-  fi
-
-  # Clean up worktree if one exists for this session
-  local wt_dir="$CC_HOME/worktrees/$name"
-  if [[ -d "$wt_dir" ]]; then
-    # Resolve the repo that owns this worktree from the .git file
-    local repo_dir=""
-    if [[ -f "$wt_dir/.git" ]]; then
-      repo_dir=$(sed -n 's/^gitdir: \(.*\)\/\.git\/worktrees\/.*/\1/p' "$wt_dir/.git")
-    fi
-    warn_if_worktree_dirty "$wt_dir"
-    if [[ -n "$repo_dir" ]] && git -C "$repo_dir" worktree remove --force "$wt_dir" 2>/dev/null; then
-      echo "  ${DIM}worktree removed: $wt_dir${RESET}"
-    else
-      rm -rf "$wt_dir"
-      echo "  ${DIM}worktree cleaned: $wt_dir${RESET}"
-    fi
-  fi
+  name=$(resolve_session "${1:-}") || return 1
+  # The server owns authorization and process shutdown. A worker's tmux guard
+  # deliberately forbids direct kills; refusal must never trigger a bypass.
+  # Stop preserves the workspace, including while the accepted job is pending.
+  _stop_via_api "$name"
 }
 
 cmd_pause() {
@@ -2585,7 +2545,7 @@ cmd_rm() {
   local name
   name=$(resolve_session "${1:-}")
 
-  # Stop if running (also cleans up any worktree)
+  # Stop if running (preserves the workspace)
   if is_running "$name" 2>/dev/null; then
     cmd_stop "$name"
   else
@@ -6534,7 +6494,7 @@ ${BOLD}Worker management:${RESET}
   amux start <name> [--detach]   Start a registered worker in tmux (-d = don't attach)
                                 (--dry-run: print the command without spawning)
   amux exec <name> [flags]       Register + start in one step
-  amux stop <name>               Stop a running worker
+  amux stop <name>               Request server stop (group-gated; keeps workspace)
   amux rm <name>                 Remove a worker (stops if running)
   amux fresh <name> [-y]         Restart the worker on a NEW conversation
                                  ${DIM}keeps env, cards, memory, groups — drops the${RESET}
