@@ -27700,16 +27700,34 @@ async function _filesRemoveBookmark(idx) {
 document.addEventListener('DOMContentLoaded', _filesRenderBookmarks);
 
 let _exploreSession = null;  // set when explore overlay is opened from a session
-// Load saved working dir + hidden files pref from server prefs
+// Default Files opens wait for cwd; explicit paths advance the load generation immediately.
+const _FILES_CWD_INIT_TIMEOUT_MS = 8000;   // Bound offline startup like a directory read.
+const _filesCwdReady = (async () => {
+  let outcome = 'failed';
+  try {
+    const r = await fetch(API + '/api/prefs?key=files_cwd', {signal: AbortSignal.timeout(_FILES_CWD_INIT_TIMEOUT_MS)});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    if (d.value) {
+      _filesCwd = d.value;
+      if (!_filesLoadGeneration) { _filesPath = d.value; outcome = 'applied'; }
+      else outcome = 'superseded';
+    } else outcome = 'empty';
+  } catch(e) {}
+  const diagnostic = {kind:'files_cwd_init',outcome,measured:true,n_considered:1,ver:APP_VER};
+  console.info('files_cwd_init', diagnostic);
+  try {
+    fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(diagnostic)}).catch(() => {});
+  } catch(e) {}
+})();
+// Load hidden files + shortcuts independently of the saved cwd.
 (async () => {
   try {
-    const [r1, r2, r3] = await Promise.all([
-      fetch(API + '/api/prefs?key=files_cwd'),
+    const [r2, r3] = await Promise.all([
       fetch(API + '/api/prefs?key=files_show_hidden'),
       fetch(API + '/api/prefs?key=files_bookmarks'),
     ]);
-    const d1 = await r1.json();
-    if (d1.value) { if (!_filesLoadGeneration) _filesPath = d1.value; _filesCwd = d1.value; }
     const d2 = await r2.json();
     if (d2.value !== undefined && d2.value !== null) _filesShowHidden = d2.value === '1';
     // Server-synced shortcuts win over the local mirror, so they follow you across devices.
@@ -27815,6 +27833,12 @@ function _filesToolbarCheck() {
 window.addEventListener('resize', _filesToolbarCheck);
 let _filesLoadGeneration = 0;
 async function loadFiles(path) {
+  if (path === undefined) {
+    const pendingGeneration = _filesLoadGeneration;
+    await _filesCwdReady;
+    if (pendingGeneration !== _filesLoadGeneration || activeView !== 'files') return;
+    path = _filesPath;
+  }
   const generation = ++_filesLoadGeneration;
   const current = () => generation === _filesLoadGeneration;
   const body = document.getElementById('files-body');
@@ -31173,10 +31197,9 @@ async function cacheFilesDir(rootPath, maxDepth = 2) {
 
 function openExplore(startPath, session) {
   const path = startPath || '/';
-  _filesPath = path;
   _exploreSession = session || null;
   closePeek();
-  switchView('files');
+  switchView('files', path);
   _updateFilesSessionBtn();
   _filesLoadBookmarks();   // load THIS session's shortcuts (or global if none)
 }
@@ -34361,7 +34384,7 @@ function _chromeSave() {
   } catch(e) {}
 }
 
-function switchView(view) {
+function switchView(view, filesPath) {
   // Explicit navigation supersedes a pending restore of an older worker.
   if (typeof _peekOpenGeneration !== 'undefined' && !peekSession) _peekOpenGeneration++;
   if (document.getElementById('grid-view').classList.contains('active')) exitGridMode();
@@ -34424,7 +34447,7 @@ function switchView(view) {
   // "Message history" modal reached from inside a peek.
   if (view === 'sessions') { fetchSessions(); _dbgLog('Workers refreshed on navigation'); }
   if (view === 'messages') { _messagesLoad(true, ''); _cvEnter(); }
-  if (view === 'files') { loadFiles(_filesPath); _filesRenderBookmarks(); }
+  if (view === 'files') { loadFiles(filesPath); _filesRenderBookmarks(); }
   if (view === 'scratchpad') _scratchpadLoad();
   if (view === 'record') _recorderInit();
   if (view === 'mdai') _mdaiTabLoad();
@@ -48629,12 +48652,10 @@ async function _handleDeeplink(hash) {
     const d = await r.json();
     if (d.error === 'not a directory') {
       const parent = dpath.split('/').slice(0, -1).join('/') || '/';
-      _filesPath = parent;
-      switchView('files');
+      switchView('files', parent);
       openFilePreview(dpath);
     } else if (!d.error) {
-      _filesPath = dpath;
-      switchView('files');
+      switchView('files', dpath);
     }
   } catch(e) {}
 }
