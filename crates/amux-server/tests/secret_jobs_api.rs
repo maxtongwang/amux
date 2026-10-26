@@ -116,7 +116,7 @@ async fn registered_jobs_are_scoped_authenticated_and_never_logged_as_values() {
         Some("127.0.0.1:12345"),
     )
     .await;
-    assert_eq!(status, 200);
+    assert_eq!(status, 200, "{result}");
     assert_eq!(result, json!({"values": {"MAX_TEST_KEY": CANARY}}));
     assert_eq!(cache, "no-store");
     for (job, names, token, peer, reason) in [
