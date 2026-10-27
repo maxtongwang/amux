@@ -17411,6 +17411,85 @@ mod tests {
         );
         assert_ne!(fault_key("ci|mixpeek/amux|rust|1"), fault_key("ci|mixpeek/amux|checks|1"));
     }
+
+    // Tick-level proofs that also run on the pre-fix base (same bodies, only the
+    // helpers differ), so each one is shown to fail there. They drive the real
+    // tick with the two inputs whose fault identity used to vary.
+
+    fn job(id: &str) -> crate::runtime_jobs::registry::HealthIssue {
+        crate::runtime_jobs::registry::HealthIssue {
+            id: id.into(),
+            name: id.into(),
+            status: "stalled",
+            interval_s: Some(5.0),
+            ticks: 10,
+            last_tick_age_s: Some(40.0),
+            last_tick_ms: Some(0.4),
+            in_flight_age_s: None,
+            documented: true,
+        }
+    }
+
+    fn jobs(n: usize) -> Vec<crate::runtime_jobs::registry::HealthIssue> {
+        (0..n).map(|i| job(&format!("job-{i}"))).collect()
+    }
+
+    async fn tick_in(
+        st: &AppState,
+        ci: &[CiRun],
+        sys: &[crate::runtime_jobs::registry::HealthIssue],
+    ) {
+        autofix_tick_with_inputs(st, std::path::Path::new("/nonexistent"), ci, vec![], sys, true).await;
+    }
+
+    #[tokio::test]
+    async fn n_jobs_changing_keeps_one_issue() {
+        let (st, _d) = state();
+        for n in [3, 5, 2, 13] {
+            tick_in(&st, &[], &jobs(n)).await;
+        }
+        let c = cards(&st);
+        assert_eq!(c.len(), 1, "N moved 3,5,2,13: one issue, got {c:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_flapping_ci_streak_keeps_one_issue() {
+        let (st, _d) = state();
+        let a = vec![
+            ci_run("rust", 10, "success", 5000.0),
+            ci_run("rust", 11, "failure", 400.0),
+            ci_run("rust", 12, "failure", 300.0),
+        ];
+        let mut b = a.clone();
+        b.push(ci_run("rust", 13, "success", 200.0));
+        b.push(ci_run("rust", 14, "failure", 100.0));
+        b.push(ci_run("rust", 15, "failure", 50.0));
+        tick_in(&st, &a, &[]).await;
+        tick_in(&st, &b, &[]).await;
+        let c = cards(&st);
+        assert_eq!(c.len(), 1, "same workflow red again: one issue, got {c:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_cleared_fault_closes_and_recurrence_opens_one_new() {
+        let (st, _d) = state();
+        tick_in(&st, &[], &jobs(3)).await;
+        assert_eq!(open_count(&st), 1);
+        age_all(&st);
+        tick_in(&st, &[], &[]).await;
+        assert_eq!(open_count(&st), 0, "fault gone: the item must close");
+        tick_in(&st, &[], &jobs(4)).await;
+        assert_eq!(open_count(&st), 1, "recurrence after close: one new item");
+        assert_eq!(cards(&st).len(), 2);
+    }
+
+    fn open_count(st: &AppState) -> usize {
+        fake_for(st).open_issues().len()
+    }
+
+    fn age_all(st: &AppState) {
+        age_open_issue(&fake_for(st));
+    }
 }
 
 /// AMUX-4839: the window arithmetic, and the coverage rule that keeps an empty
