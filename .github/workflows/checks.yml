@@ -819,6 +819,7 @@ jobs:
           ./scripts/test-build-disk-clear.sh
           python3 scripts/test-cargo-target-guard.py
           python3 scripts/test-cargo-budget.py
+          ./scripts/test-fork-build-speed.sh
           python3 scripts/test-disk-alarm.py
           ./scripts/test-build-activation-authority.sh
           bash scripts/test-build-authority-fetch.sh

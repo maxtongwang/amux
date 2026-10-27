@@ -29,7 +29,10 @@ set -euo pipefail
 
 # A concurrency slot bounds invocations, not rustc's internal parallelism or
 # libtest's threads. Cargo otherwise defaults to every CPU on the host, per
-# invocation. Avoid full DWARF and incremental trees for routine fleet checks.
+# invocation. The fork file below turns incremental on, with line-table debug
+# info only (ai-config#261); the defaults after it apply only where it sets nothing.
+# Fork build-speed defaults first, so they win over the ones below (ai-config#261).
+. "$(dirname "$0")/fork-build-speed.sh"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 export RUST_TEST_THREADS="${RUST_TEST_THREADS:-2}"
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
@@ -215,7 +218,9 @@ if [ "$rc" -eq 75 ] && [ -s "${_SC_VERDICT:-}" ]; then
   _reason=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("reason",""))' "$_SC_VERDICT" 2>/dev/null || true)
 fi
 if [ "$_reason" = target_size ] || [ "$_reason" = disk_reserve ]; then
-  _to_gb="${AMUX_CARGO_RECLAIM_TO_GB:-25}"
+  # Reclaim floor, same as cargo-target-guard.py: keeps a warm incremental cache (about 34 GiB) after a reclaim (ai-config#261).
+  _RECLAIM_TO_GB_DEFAULT=36
+  _to_gb="${AMUX_CARGO_RECLAIM_TO_GB:-$_RECLAIM_TO_GB_DEFAULT}"
   _reclaim_cmd=(python3 "$_target_guard" reclaim --max-gb "$_to_gb" --to-gb "$_to_gb")
   for _t in "${_guard_cmd[@]:4}"; do [ "$_t" = --target ] || [ "$_t" = --exclusive-run ] || _reclaim_cmd+=(--target "$_t"); done
   _reclaimed=$("${_reclaim_cmd[@]}") || true

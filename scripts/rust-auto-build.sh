@@ -699,20 +699,24 @@ fi
   # RECLAIM, NOT WIPE (DMIW-7). Over the threshold this used to clear ALL of
   # debug/, so every lane's next check or test rebuilt the world cold. The guard's
   # reclaim clears incremental/ first, then the least recently used dependency
-  # units, only down to AMUX_CARGO_RECLAIM_TO_GB (25), under the same lease, locks
+  # units, only down to AMUX_CARGO_RECLAIM_TO_GB (36), under the same lease, locks
   # and process probe; deploy/ and release/ are protected. It measures the
   # reclaimable profiles itself, so this tick needs no separate du.
   # A cheap du gates it, so the guard's own walk only runs when there is work.
+  # Idle debug-cache cleanup threshold: incremental state is about 34 GiB plus headroom (ai-config#261).
+  DEBUG_CLEAR_ABOVE_GB_DEFAULT=48
+  # Reclaim floor, same as cargo-target-guard.py: keeps a warm incremental cache (about 34 GiB) after a reclaim (ai-config#261).
+  RECLAIM_TO_GB_DEFAULT=36
   DEBUG_DIR="$HOME/.amux/rust-build-target/debug"
   DEBUG_GB=-1
   [ -d "$DEBUG_DIR" ] && DEBUG_GB=$(du -sk "$DEBUG_DIR" 2>/dev/null | awk '{print int($1/1048576)}')
-  if [ -d "$DEBUG_DIR" ] && [ "${DEBUG_GB:-0}" -gt "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-32}" ]; then
-    echo "== DEBUG ARTIFACTS: ${DEBUG_GB:-?}GB in $DEBUG_DIR. Reclaiming incremental and least recently used units down to ${AMUX_CARGO_RECLAIM_TO_GB:-25}GB, only after the Cargo safety guard permits it."
+  if [ -d "$DEBUG_DIR" ] && [ "${DEBUG_GB:-0}" -gt "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-$DEBUG_CLEAR_ABOVE_GB_DEFAULT}" ]; then
+    echo "== DEBUG ARTIFACTS: ${DEBUG_GB:-?}GB in $DEBUG_DIR. Reclaiming incremental and least recently used units down to ${AMUX_CARGO_RECLAIM_TO_GB:-$RECLAIM_TO_GB_DEFAULT}GB, only after the Cargo safety guard permits it."
     if [ -n "${AMUX_BUILD_PEER_PIDS_OVERRIDE:-}" ]; then
       echo "== WARN cargo_reclaim_deferred DEFERRED: peer build(s) in flight (pid $AMUX_BUILD_PEER_PIDS_OVERRIDE); retry after builds finish."
     else
       reclaim_cmd=(python3 "$REPO/scripts/cargo-target-guard.py" reclaim --target "$HOME/.amux/rust-build-target"
-                   --max-gb "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-32}" --to-gb "${AMUX_CARGO_RECLAIM_TO_GB:-25}")
+                   --max-gb "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-$DEBUG_CLEAR_ABOVE_GB_DEFAULT}" --to-gb "${AMUX_CARGO_RECLAIM_TO_GB:-$RECLAIM_TO_GB_DEFAULT}")
       if result=$(${reclaim_cmd[@]+"${reclaim_cmd[@]}"}); then
         echo "== Clearing done: cargo_reclaim_result $result"
       else

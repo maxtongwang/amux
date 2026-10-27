@@ -778,6 +778,12 @@ def test_probe(targets, mutation_paths):
     return lambda _: ([], 1)
 
 
+# Same default as cargo-budget.py's MAX_TARGET_GB_DEFAULT: incremental state is about 34 GiB plus headroom (ai-config#261).
+MAX_TARGET_GB_DEFAULT = 56
+# Reclaim floor, also in rust-auto-build.sh and safe-cargo.sh: keeps a warm incremental cache (about 34 GiB) after a reclaim (ai-config#261).
+RECLAIM_TO_GB_DEFAULT = 36
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['run', 'clear', 'move', 'purge', 'reclaim', 'sweep'])
@@ -787,9 +793,9 @@ def main():
     parser.add_argument('--protected-path', action='append', default=[])
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--exclusive-run', action='store_true', help='run a target-mutating command only when no consumer lease is held')
-    parser.add_argument('--max-gb', type=float, default=float(os.environ.get('AMUX_CARGO_MAX_TARGET_GB', 40)),
+    parser.add_argument('--max-gb', type=float, default=float(os.environ.get('AMUX_CARGO_MAX_TARGET_GB', MAX_TARGET_GB_DEFAULT)),
                         help='reclaim: act only when the reclaimable profiles exceed this')
-    parser.add_argument('--to-gb', type=float, default=float(os.environ.get('AMUX_CARGO_RECLAIM_TO_GB', 25)),
+    parser.add_argument('--to-gb', type=float, default=float(os.environ.get('AMUX_CARGO_RECLAIM_TO_GB', RECLAIM_TO_GB_DEFAULT)),
                         help='reclaim: stop at or under this')
     parser.add_argument('--idle-s', type=int, default=SWEEP_IDLE_S, help='sweep: unused for this long')
     parser.add_argument('--now', type=float, help='sweep: the current time (a test clock)')
