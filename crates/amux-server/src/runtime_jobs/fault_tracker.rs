@@ -9,7 +9,7 @@
 //!   - no open issue                     -> the detector opens one.
 //!
 //! The tracker is an interface ([`FaultTracker`]): [`GithubIssueTracker`] is the
-//! production adapter (`gh`, repo [`ALERT_REPO`]), [`FakeTracker`] the in-memory
+//! production adapter (`gh`, repo [`DEFAULT_ALERT_REPO`]), [`FakeTracker`] the in-memory
 //! one every test uses. The key rides in the issue body as a stable HTML-comment
 //! marker so lookup is by key, never by title. Bodies are sanitized before they
 //! leave the machine: the issue repo is not the place for private paths, hosts
@@ -22,11 +22,13 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Repo alert issues are filed in (overridable with `AMUX_ALERT_REPO`). amux
+/// Default repo alert issues are filed in; `AMUX_ALERT_REPO` overrides it. amux
 /// itself is public, so alerts never go there.
-pub const ALERT_REPO: &str = "maxtongwang/ai-config";
-/// Labels every alert issue carries.
-pub const ALERT_LABELS: [&str; 2] = ["kind:alert", "amux"];
+pub const DEFAULT_ALERT_REPO: &str = "maxtongwang/hq";
+/// Default source label value (`repo:<source>`); `AMUX_ALERT_SOURCE` overrides.
+pub const DEFAULT_ALERT_SOURCE: &str = "amux";
+/// Labels every alert issue carries besides `repo:<source>`.
+pub const ALERT_BASE_LABELS: [&str; 2] = ["kind:alert", "team:dev"];
 /// How long a `gh issue list` result is reused. A 120s autofix tick would
 /// otherwise be 720 API calls a day; our own writes update the cache in place.
 const LIST_TTL_SECS: u64 = 300;
@@ -248,21 +250,31 @@ pub fn sanitize_public(text: &str) -> String {
 // Production adapter: GitHub issues through the `gh` CLI.
 // ---------------------------------------------------------------------------
 
-/// Files alert issues in [`ALERT_REPO`] with `gh`. Never falls back to another
+/// Files alert issues in [`DEFAULT_ALERT_REPO`] with `gh`. Never falls back to another
 /// tracker: when `gh` fails the caller gets the error and files nothing.
 pub struct GithubIssueTracker {
     repo: String,
+    labels: Vec<String>,
     cache: Mutex<Option<(std::time::Instant, Vec<TrackedFault>)>>,
     labels_ready: OnceLock<()>,
+}
+
+fn env_or(var: &str, default: &str) -> String {
+    std::env::var(var)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 impl GithubIssueTracker {
     pub fn from_env() -> Self {
         Self {
-            repo: std::env::var("AMUX_ALERT_REPO")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| ALERT_REPO.to_string()),
+            repo: env_or("AMUX_ALERT_REPO", DEFAULT_ALERT_REPO),
+            labels: ALERT_BASE_LABELS
+                .iter()
+                .map(|l| l.to_string())
+                .chain([format!("repo:{}", env_or("AMUX_ALERT_SOURCE", DEFAULT_ALERT_SOURCE))])
+                .collect(),
             cache: Mutex::new(None),
             labels_ready: OnceLock::new(),
         }
@@ -298,11 +310,16 @@ impl GithubIssueTracker {
         if self.labels_ready.get().is_some() {
             return Ok(());
         }
-        for label in ALERT_LABELS {
+        for label in &self.labels {
             Self::gh(&["label", "create", label, "--repo", &self.repo, "--force"], None)?;
         }
         let _ = self.labels_ready.set(());
         Ok(())
+    }
+
+    /// `--label x --label y ...` for every label this tracker owns.
+    fn label_args(&self) -> Vec<&str> {
+        self.labels.iter().flat_map(|l| ["--label", l.as_str()]).collect()
     }
 
     fn cached(&self) -> Option<Vec<TrackedFault>> {
@@ -341,15 +358,10 @@ impl FaultTracker for GithubIssueTracker {
         if let Some(list) = self.cached() {
             return Ok(list);
         }
-        let out = Self::gh(
-            &[
-                "issue", "list", "--repo", &self.repo,
-                "--label", ALERT_LABELS[0], "--label", ALERT_LABELS[1],
-                "--state", "open", "--limit", LIST_LIMIT,
-                "--json", "number,title,body",
-            ],
-            None,
-        )?;
+        let mut args = vec!["issue", "list", "--repo", &self.repo];
+        args.extend(self.label_args());
+        args.extend(["--state", "open", "--limit", LIST_LIMIT, "--json", "number,title,body"]);
+        let out = Self::gh(&args, None)?;
         let list = parse_issue_list(&out)?;
         if let Ok(mut g) = self.cache.lock() {
             *g = Some((std::time::Instant::now(), list.clone()));
@@ -359,14 +371,10 @@ impl FaultTracker for GithubIssueTracker {
 
     fn open(&self, title: &str, body: &str) -> anyhow::Result<String> {
         self.ensure_labels()?;
-        let out = Self::gh(
-            &[
-                "issue", "create", "--repo", &self.repo, "--title", title,
-                "--label", ALERT_LABELS[0], "--label", ALERT_LABELS[1],
-                "--body-file", "-",
-            ],
-            Some(body),
-        )?;
+        let mut args = vec!["issue", "create", "--repo", &self.repo, "--title", title];
+        args.extend(self.label_args());
+        args.extend(["--body-file", "-"]);
+        let out = Self::gh(&args, Some(body))?;
         let id = out
             .trim()
             .rsplit('/')

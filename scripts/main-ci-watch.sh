@@ -3,14 +3,15 @@
 # the builder deploys every main commit without waiting for it. So a red main
 # must be noticed by someone who will fix it. Run as a shell schedule every few
 # minutes: for each workflow, look at main's newest completed run and keep ONE
-# GitHub issue per fault key (`ci-main|<workflow>`) in the alert repo: a repeat
+# GitHub issue per fault key (`ci-main|<workflow>`) in the alert repo (maxtongwang/hq by default): a repeat
 # red run updates it, a green run closes it with a note, and red after that
 # opens one new issue. The key is stored in the issue body as a stable marker,
 # the same one the server's fault tracker writes. DRY=1 prints instead of filing.
 set -euo pipefail
 REPO=mixpeek/amux
-ALERT_REPO="${AMUX_ALERT_REPO:-maxtongwang/ai-config}"
-ALERT_LABELS="kind:alert,amux"
+ALERT_REPO="${AMUX_ALERT_REPO:-maxtongwang/hq}"
+ALERT_SOURCE="${AMUX_ALERT_SOURCE:-amux}"
+ALERT_LABELS="kind:alert,team:dev,repo:$ALERT_SOURCE"
 KEY_PREFIX="<!-- amux-fault-key: "
 GET_TOKEN="${AMUX_GET_TOKEN:-$HOME/.amux/github-app/get-token.sh}"
 STATE="${MAIN_CI_WATCH_STATE:-${AMUX_HOME:-$HOME/.amux}/state/main-ci-watch.json}"
@@ -30,7 +31,7 @@ sanitize() {
 # tracker cannot be read, so a read error is never taken for "no issue".
 find_issue() {
   local key=$1 out
-  out=$(ghi issue list --repo "$ALERT_REPO" --label kind:alert --label amux --state open --limit 100 \
+  out=$(ghi issue list --repo "$ALERT_REPO" --label kind:alert --label "repo:$ALERT_SOURCE" --state open --limit 100 \
         --json number,body --jq ".[] | select(.body | contains(\"${KEY_PREFIX}${key} -->\")) | .number") || return 1
   printf '%s\n' "$out" | head -1
 }
