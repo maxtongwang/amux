@@ -84,6 +84,6 @@ if [ -z "${AMUX_CLEANUP_FALLBACK_TICK:-}" ] || [ -n "${AMUX_CLEANUP_FALLBACK_LIB
   # shellcheck source=/dev/null
   AMUX_CLEANUP_LIB_ONLY=1 . "$L"
   rm -f -- "${L:?}"
-  echo "mac-cleanup-fallback: scheduler-silent card: $(file_card "$STATE_DIR/state" "scheduler_silent" "SCHED-465 did not complete: launchd ran the Mac cleanup tick instead" "The fallback found that $why, so the amux scheduler (inside the server) is not firing SCHED-465. launchd ran the tick; its output is $LAST. Check amux server health and the scheduler.")"
+  echo "mac-cleanup-fallback: scheduler-silent card: $(file_card "$STATE_DIR/state" "scheduler_silent" "fix(mac-cleanup): SCHED-465 did not complete, launchd ran the tick instead" "The fallback found that $why, so the amux scheduler (inside the server) is not firing SCHED-465. launchd ran the tick; its output is $LAST. Check amux server health and the scheduler.")"
 fi
 exit "$rc"

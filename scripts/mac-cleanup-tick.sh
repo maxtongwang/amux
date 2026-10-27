@@ -2561,7 +2561,7 @@ else
       echo "mac-cleanup: constraint $v — escalation to $ESCALATE_TO FAILED ($fails in a row): $reason (bundle $bundle)"
       # A failed send is otherwise visible only in a file nobody reads (DESKT-58).
       if [ "$fails" -ge "$SENDFAIL_CARD_AFTER" ]; then
-        echo "mac-cleanup:   send-failure card: $(file_card "$STATE" "sendfail" "Mac cleanup tick cannot reach $ESCALATE_TO: $cls escalations failing" "SCHED-465 failed to send $fails $cls escalation(s) in a row to $ESCALATE_TO. Last error: $reason. Constraint: $v. Bundle: $bundle. Full output: ~/.amux/logs/mac-cleanup-tick.last")"
+        echo "mac-cleanup:   send-failure card: $(file_card "$STATE" "sendfail" "fix(mac-cleanup): tick cannot reach $ESCALATE_TO, $cls escalations failing" "SCHED-465 failed to send $fails $cls escalation(s) in a row to $ESCALATE_TO. Last error: $reason. Constraint: $v. Bundle: $bundle. Full output: ~/.amux/logs/mac-cleanup-tick.last")"
       fi
     fi
   done <<EOF

@@ -407,6 +407,11 @@ fn nudge_feedback_report(conn: &Connection) -> Value {
     )
 }
 
+/// `type(scope): summary` card title (ai-config #411).
+fn stuck_lane_title(lane: &str, unheeded: i64) -> String {
+    format!("chore(board-drive): {lane}'s backlog has not moved across {unheeded} nudges, nudging stopped")
+}
+
 /// File the ONE card that replaces a nudge nobody is reading (AF-319).
 ///
 /// Owner is the LANE, because the lane is who can dispose of its own backlog —
@@ -417,8 +422,7 @@ fn nudge_feedback_report(conn: &Connection) -> Value {
 /// Exactly one per stuck stretch: `escalated_card` gates it, and the counter
 /// resets to 0 the moment any card in the lane moves, which clears the gate.
 async fn file_nudge_escalation(state: &AppState, lane: &str, backlog: i64, unheeded: i64) {
-    let title =
-        format!("{lane}'s backlog has not moved across {unheeded} nudges — nudging stopped");
+    let title = stuck_lane_title(lane, unheeded);
     let desc = format!(
         "board_drive nudged this lane {unheeded} times in a row about its {backlog}-card \
          backlog and not one card changed in between. It has stopped nudging.\n\n\
@@ -10237,6 +10241,11 @@ mod reviewer_renag_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn stuck_lane_title_passes_the_conventional_title_checker() {
+        crate::runtime_jobs::assert_conventional_title(&super::stuck_lane_title("review-worker", 3));
+    }
 
     #[test]
     fn lane_activity_probe_uses_the_at_index_and_counts_the_window() {

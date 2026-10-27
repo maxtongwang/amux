@@ -7575,6 +7575,14 @@ fn sup(kind: DetectorKind, signature: &str, reason: &str) -> Suppressed {
     }
 }
 
+/// Board card title for a finding: `fix(<detector>): <computed title>`, so a
+/// generated card obeys the same `type(scope): summary` rule as every commit
+/// and PR title (`scripts/conventional-title.py`). Every detector files a fault,
+/// hence the fixed type; the detector slug is the scope.
+fn card_title(f: &Finding) -> String {
+    truncate(&format!("fix({}): {}", f.kind.slug(), f.title), 160)
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         return s.to_string();
@@ -8677,7 +8685,7 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
         if already_filed(&conn, &f.signature) {
             // AEAB-59: do not just drop it — if the MEASUREMENT moved, say so on
             // the card that already exists. Read-only here; the write is below.
-            let fresh_title = truncate(&f.title, 160);
+            let fresh_title = card_title(f);
             let existing: Option<(String, String, String, i64)> = conn
                 .query_row(
                     "SELECT id, title, COALESCE(desc,''), COALESCE(updated_at, created_at) \
@@ -8734,7 +8742,7 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
     } else {
         Some(owner)
     };
-    let title = truncate(&f.title, 160);
+    let title = card_title(f);
     let desc = render_desc(f);
     let item_type = f.kind.item_type();
     let signature = f.signature.clone();
@@ -16842,6 +16850,50 @@ mod tests {
             again.is_empty(),
             "the quiet note must be exactly-once, got {again:?}"
         );
+    }
+
+    /// Generated card titles obey the repo-wide `type(scope): summary` rule:
+    /// run each detector's title through the vendored checker.
+    #[test]
+    fn every_detector_card_title_passes_the_conventional_title_checker() {
+        let checker = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/conventional-title.py");
+        for k in DetectorKind::all() {
+            let f = Finding {
+                kind: k,
+                signature: format!("t|{}", k.slug()),
+                title: "p95 412ms — 3.2x its trailing norm".into(),
+                evidence: vec![],
+                recheck: String::new(),
+                owner: None,
+                count: 1,
+                last_ts: 0.0,
+                parked_until: None,
+            };
+            let title = card_title(&f);
+            let out = std::process::Command::new("python3")
+                .arg(&checker)
+                .args(["--kind", "title", "--", &title])
+                .output()
+                .expect("python3 runs the checker");
+            assert!(
+                out.status.success(),
+                "{title:?} rejected: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+        let long = Finding {
+            kind: DetectorKind::Latency,
+            signature: "t|long".into(),
+            title: "x".repeat(400),
+            evidence: vec![],
+            recheck: String::new(),
+            owner: None,
+            count: 1,
+            last_ts: 0.0,
+            parked_until: None,
+        };
+        assert!(card_title(&long).starts_with("fix(latency): "));
     }
 
     /// Every detector's item type must be closable honestly — i.e. never
