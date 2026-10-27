@@ -87,6 +87,13 @@ class WorkerTmuxGuardTests(unittest.TestCase):
     def test_kill_session_refused(self):
         self.assert_refused('kill-session', '-t', 'amux-x')
 
+    def test_stop_cli_is_not_a_direct_kill_exception(self):
+        for args in (('kill-session',), ('kill-session', '-t', '=amux-worker'),
+                     ('kill-session', '-t', 'amux-worker'),
+                     ('kill-session', '-t', '=other-session')):
+            with self.subTest(args=args):
+                self.assert_refused(*args)
+
     def test_kill_pane_and_alias_refused(self):
         self.assert_refused('kill-pane', '-t', '%3')
         self.assert_refused('killp')

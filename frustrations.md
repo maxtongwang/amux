@@ -6173,3 +6173,18 @@ FIX: Withhold completion while scans or entries fail, persist pending paths, and
   retry at startup or once per minute on identity operations. Successful entries
   leave the pending list; WARN identity_migration_pending reports counts and
   identity_migration_attempt records each bounded pass.
+
+## Guarded workers cannot stop a peer through the CLI
+AREA: worker lifecycle
+SEVERITY: degrades
+STATUS: fixed (Rust verification blocked in builder sandbox)
+DATE: 2026-10-25
+SESSION: tmux-guard-301
+CARD: maxtongwang/ai-config#301
+SYMPTOM: `amux stop` invoked direct tmux kill-session from a guarded worker
+  pane, which refused even the exact named worker target.
+COST: Leads could not stop an idle worker through the supported CLI.
+FIX: Route stop through the existing server stop endpoint with worker identity;
+  apply the shared peer gate before scheduling shutdown. Server logs retain
+  stop_process_tree_confirmed/session_stop_failed and peer_input_refused.
+  No local kill fallback; accepted stop preserves the workspace.

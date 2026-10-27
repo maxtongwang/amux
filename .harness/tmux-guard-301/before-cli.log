@@ -1,0 +1,204 @@
+base=a174dde4222a8e37665d08de803a82dddd4a9ef0
+FFFFFFFFFFFF
+======================================================================
+FAIL: test_refusals_and_invalid_responses_never_fall_back (__main__.StopTests.test_refusals_and_invalid_responses_never_fall_back) (status=403, body='{"error":"outside worker groups"}', backend='tmux')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 77, in test_refusals_and_invalid_responses_never_fall_back
+    result = self.run_stop(status, body, backend)
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 60, in run_stop
+    self.assertNotIn('FORBIDDEN direct', result.stderr)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'FORBIDDEN direct' unexpectedly found in 'FORBIDDEN direct tmux\n'
+
+======================================================================
+FAIL: test_refusals_and_invalid_responses_never_fall_back (__main__.StopTests.test_refusals_and_invalid_responses_never_fall_back) (status=403, body='{"error":"outside worker groups"}', backend='herdr')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 77, in test_refusals_and_invalid_responses_never_fall_back
+    result = self.run_stop(status, body, backend)
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 61, in run_stop
+    self.assertEqual(requests, [('/api/sessions/target/stop', 'lead', 'test-token')])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: [('/api/sessions/target/stop', None, 'test-token')] != [('/api/sessions/target/stop', 'lead', 'test-token')]
+
+First differing element 0:
+('/api/sessions/target/stop', None, 'test-token')
+('/api/sessions/target/stop', 'lead', 'test-token')
+
+- [('/api/sessions/target/stop', None, 'test-token')]
+?                                ^^^
+
++ [('/api/sessions/target/stop', 'lead', 'test-token')]
+?                                ^^ +++
+
+
+======================================================================
+FAIL: test_refusals_and_invalid_responses_never_fall_back (__main__.StopTests.test_refusals_and_invalid_responses_never_fall_back) (status=404, body='{"error":"worker not found"}', backend='tmux')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 77, in test_refusals_and_invalid_responses_never_fall_back
+    result = self.run_stop(status, body, backend)
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 60, in run_stop
+    self.assertNotIn('FORBIDDEN direct', result.stderr)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'FORBIDDEN direct' unexpectedly found in 'FORBIDDEN direct tmux\n'
+
+======================================================================
+FAIL: test_refusals_and_invalid_responses_never_fall_back (__main__.StopTests.test_refusals_and_invalid_responses_never_fall_back) (status=404, body='{"error":"worker not found"}', backend='herdr')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 77, in test_refusals_and_invalid_responses_never_fall_back
+    result = self.run_stop(status, body, backend)
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 61, in run_stop
+    self.assertEqual(requests, [('/api/sessions/target/stop', 'lead', 'test-token')])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: [('/api/sessions/target/stop', None, 'test-token')] != [('/api/sessions/target/stop', 'lead', 'test-token')]
+
+First differing element 0:
+('/api/sessions/target/stop', None, 'test-token')
+('/api/sessions/target/stop', 'lead', 'test-token')
+
+- [('/api/sessions/target/stop', None, 'test-token')]
+?                                ^^^
+
++ [('/api/sessions/target/stop', 'lead', 'test-token')]
+?                                ^^ +++
+
+
+======================================================================
+FAIL: test_refusals_and_invalid_responses_never_fall_back (__main__.StopTests.test_refusals_and_invalid_responses_never_fall_back) (status=500, body='{"ok":true}', backend='tmux')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 77, in test_refusals_and_invalid_responses_never_fall_back
+    result = self.run_stop(status, body, backend)
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 60, in run_stop
+    self.assertNotIn('FORBIDDEN direct', result.stderr)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'FORBIDDEN direct' unexpectedly found in 'FORBIDDEN direct tmux\n'
+
+======================================================================
+FAIL: test_refusals_and_invalid_responses_never_fall_back (__main__.StopTests.test_refusals_and_invalid_responses_never_fall_back) (status=500, body='{"ok":true}', backend='herdr')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 77, in test_refusals_and_invalid_responses_never_fall_back
+    result = self.run_stop(status, body, backend)
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 61, in run_stop
+    self.assertEqual(requests, [('/api/sessions/target/stop', 'lead', 'test-token')])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: [('/api/sessions/target/stop', None, 'test-token')] != [('/api/sessions/target/stop', 'lead', 'test-token')]
+
+First differing element 0:
+('/api/sessions/target/stop', None, 'test-token')
+('/api/sessions/target/stop', 'lead', 'test-token')
+
+- [('/api/sessions/target/stop', None, 'test-token')]
+?                                ^^^
+
++ [('/api/sessions/target/stop', 'lead', 'test-token')]
+?                                ^^ +++
+
+
+======================================================================
+FAIL: test_refusals_and_invalid_responses_never_fall_back (__main__.StopTests.test_refusals_and_invalid_responses_never_fall_back) (status=200, body='{}', backend='tmux')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 77, in test_refusals_and_invalid_responses_never_fall_back
+    result = self.run_stop(status, body, backend)
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 60, in run_stop
+    self.assertNotIn('FORBIDDEN direct', result.stderr)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'FORBIDDEN direct' unexpectedly found in 'FORBIDDEN direct tmux\n'
+
+======================================================================
+FAIL: test_refusals_and_invalid_responses_never_fall_back (__main__.StopTests.test_refusals_and_invalid_responses_never_fall_back) (status=200, body='{}', backend='herdr')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 77, in test_refusals_and_invalid_responses_never_fall_back
+    result = self.run_stop(status, body, backend)
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 61, in run_stop
+    self.assertEqual(requests, [('/api/sessions/target/stop', 'lead', 'test-token')])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: [('/api/sessions/target/stop', None, 'test-token')] != [('/api/sessions/target/stop', 'lead', 'test-token')]
+
+First differing element 0:
+('/api/sessions/target/stop', None, 'test-token')
+('/api/sessions/target/stop', 'lead', 'test-token')
+
+- [('/api/sessions/target/stop', None, 'test-token')]
+?                                ^^^
+
++ [('/api/sessions/target/stop', 'lead', 'test-token')]
+?                                ^^ +++
+
+
+======================================================================
+FAIL: test_refusals_and_invalid_responses_never_fall_back (__main__.StopTests.test_refusals_and_invalid_responses_never_fall_back) (status=200, body='<html>error</html>', backend='tmux')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 77, in test_refusals_and_invalid_responses_never_fall_back
+    result = self.run_stop(status, body, backend)
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 60, in run_stop
+    self.assertNotIn('FORBIDDEN direct', result.stderr)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'FORBIDDEN direct' unexpectedly found in 'FORBIDDEN direct tmux\n'
+
+======================================================================
+FAIL: test_refusals_and_invalid_responses_never_fall_back (__main__.StopTests.test_refusals_and_invalid_responses_never_fall_back) (status=200, body='<html>error</html>', backend='herdr')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 77, in test_refusals_and_invalid_responses_never_fall_back
+    result = self.run_stop(status, body, backend)
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 61, in run_stop
+    self.assertEqual(requests, [('/api/sessions/target/stop', 'lead', 'test-token')])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: [('/api/sessions/target/stop', None, 'test-token')] != [('/api/sessions/target/stop', 'lead', 'test-token')]
+
+First differing element 0:
+('/api/sessions/target/stop', None, 'test-token')
+('/api/sessions/target/stop', 'lead', 'test-token')
+
+- [('/api/sessions/target/stop', None, 'test-token')]
+?                                ^^^
+
++ [('/api/sessions/target/stop', 'lead', 'test-token')]
+?                                ^^ +++
+
+
+======================================================================
+FAIL: test_worker_stop_uses_server_for_both_backends (__main__.StopTests.test_worker_stop_uses_server_for_both_backends) (backend='tmux')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 67, in test_worker_stop_uses_server_for_both_backends
+    result = self.run_stop(backend=backend)
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 60, in run_stop
+    self.assertNotIn('FORBIDDEN direct', result.stderr)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'FORBIDDEN direct' unexpectedly found in 'FORBIDDEN direct tmux\n'
+
+======================================================================
+FAIL: test_worker_stop_uses_server_for_both_backends (__main__.StopTests.test_worker_stop_uses_server_for_both_backends) (backend='herdr')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 67, in test_worker_stop_uses_server_for_both_backends
+    result = self.run_stop(backend=backend)
+  File "/Users/mwang/GitHub/amux/.claude/worktrees/tmux-guard-301/scripts/test-cli-stop.py", line 61, in run_stop
+    self.assertEqual(requests, [('/api/sessions/target/stop', 'lead', 'test-token')])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: [('/api/sessions/target/stop', None, 'test-token')] != [('/api/sessions/target/stop', 'lead', 'test-token')]
+
+First differing element 0:
+('/api/sessions/target/stop', None, 'test-token')
+('/api/sessions/target/stop', 'lead', 'test-token')
+
+- [('/api/sessions/target/stop', None, 'test-token')]
+?                                ^^^
+
++ [('/api/sessions/target/stop', 'lead', 'test-token')]
+?                                ^^ +++
+
+
+----------------------------------------------------------------------
+Ran 2 tests in 6.027s
+
+FAILED (failures=12)
