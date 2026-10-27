@@ -9,7 +9,10 @@ inventory  Verify docs/diagrams/ARCHITECTURE_PATHS: every tracked file is either
            cites is an architecture path, and in a scratch Git fixture a one-line
            change to one file per glob fails check-diagrams.py while a change to an
            excluded file passes.
-all        Both of the above (default).
+selftest   Run the inventory check on a scratch repo whose diagram cites a root file:
+           excluded, the citation must be reported; included or declared a store
+           ('# store: <path> — <reason>'), it must not.
+all        All of the above (default).
 
 Exit status: 0 pass, 1 check failed, 2 invalid input. A JSON report goes to stdout.
 """
@@ -30,6 +33,9 @@ SVG_NS = '{http://www.w3.org/2000/svg}'
 EXCLUDE_PREFIX = '# exclude:'
 # Named files the fixture must also probe, e.g. a past miss: '# probe: src/lock.py'.
 PROBE_PREFIX = '# probe:'
+# A tracked file a diagram draws as a content store (a catalog, a log), not code:
+# '# store: index.md — <reason>'. It counts as excluded, and its citation is allowed.
+STORE_PREFIX = '# store:'
 REASON_SEP = ' — '
 # Arrow heads stop short of a box edge by the marker length; starts sit on the edge.
 START_SLACK_PX, END_SLACK_PX = 6, 14
@@ -251,30 +257,43 @@ def git(repo, *args, check=True):
 
 
 def read_inventory(repo):
-    includes, excludes, probes = [], [], []
+    includes, excludes, probes, stores = [], [], [], []
     for n, raw in enumerate((repo / DIAGRAMS / 'ARCHITECTURE_PATHS').read_text().splitlines(), 1):
         line = raw.strip()
-        if line.startswith(EXCLUDE_PREFIX):
-            glob, sep, reason = line[len(EXCLUDE_PREFIX):].strip().partition(REASON_SEP)
-            if not sep or not reason.strip() or not glob.strip():
-                raise Invalid(f'ARCHITECTURE_PATHS:{n}: exclusion needs "<glob>{REASON_SEP}<reason>"')
-            excludes.append(glob.strip())
-        elif line.startswith(PROBE_PREFIX):
-            probes.append(line[len(PROBE_PREFIX):].split(REASON_SEP)[0].strip())
-        elif line and not line.startswith('#'):
-            includes.append(line)
-    return includes, excludes, probes
+        for prefix, into in ((EXCLUDE_PREFIX, excludes), (STORE_PREFIX, stores)):
+            if line.startswith(prefix):
+                glob, sep, reason = line[len(prefix):].strip().partition(REASON_SEP)
+                if not sep or not reason.strip() or not glob.strip():
+                    raise Invalid(f'ARCHITECTURE_PATHS:{n}: {prefix} needs "<path>{REASON_SEP}<reason>"')
+                into.append(glob.strip())
+                break
+        else:
+            if line.startswith(PROBE_PREFIX):
+                probes.append(line[len(PROBE_PREFIX):].split(REASON_SEP)[0].strip())
+            elif line and not line.startswith('#'):
+                includes.append(line)
+    return includes, excludes, probes, stores
 
 
 def cited_paths(repo, files):
-    """Tracked files named by a box subtitle or caption, e.g. 'src/cli.py' or 'tools/*/render.cjs'."""
+    """Tracked files named by a box subtitle or caption, e.g. 'src/cli.py', 'tools/*/render.cjs' or a root 'Home.md'.
+
+    A token without '/' counts only when it is a tracked root file, so a short module
+    name such as 'cli.py' for 'src/cli.py' is not a citation; a bare folder ('raw/')
+    names a store of content and is not one either.
+    """
+    root = {f for f in files if '/' not in f}
     cited = {}
     for name in VIEWS:
         svg = parse_svg((repo / DIAGRAMS / name).read_text())
         for t in svg.iter(SVG_NS + 'text'):
             for token in re.split(r'\s+·\s+|\s+', ''.join(t.itertext())):
-                token = token.strip('(),')
-                if '/' not in token or token.startswith(('~', '/', 'http')):
+                token = token.strip('(),;:').rstrip('.')
+                if token.startswith(('~', '/', 'http')):
+                    continue
+                if '/' not in token:
+                    if token in root:
+                        cited.setdefault(token, f'{name}: {token}')
                     continue
                 pat = token.rstrip('/')
                 # A file or file glob is a code citation; a bare folder names a store of content.
@@ -317,23 +336,29 @@ def fixture_run(repo, checker, samples, control):
 
 
 def check_inventory(repo):
-    includes, excludes, probes = read_inventory(repo)
+    includes, excludes, probes, stores = read_inventory(repo)
     if not includes:
         raise Invalid('ARCHITECTURE_PATHS has no architecture globs')
     # -z keeps non-ASCII and quoted names verbatim.
     files = [f for f in git(repo, 'ls-files', '-z').stdout.split('\0') if f]
     match = lambda pats, f: any(fnmatch.fnmatchcase(f, p) for p in pats)
     errors = []
-    unclassified = [f for f in files if not match(includes, f) and not match(excludes, f)]
+    unclassified = [f for f in files if not match(includes, f) and not match(excludes, f) and f not in stores]
     errors += [f'unclassified tracked file: {f}' for f in unclassified]
     errors += [f'architecture glob matches no tracked file: {p}' for p in includes if not any(fnmatch.fnmatchcase(f, p) for f in files)]
     errors += [f'exclusion matches no tracked file: {p}' for p in excludes if not any(fnmatch.fnmatchcase(f, p) for f in files)]
     cited = cited_paths(repo, files)
-    errors += [f'diagram cites {f} ({where}) but it is not an architecture path' for f, where in sorted(cited.items()) if not match(includes, f)]
+    errors += [f'diagram cites {f} ({where}) but it is not an architecture path' for f, where in sorted(cited.items())
+               if not match(includes, f) and f not in stores]
+    errors += [f'store is not a tracked file: {f}' for f in stores if f not in files]
+    errors += [f'store is also an architecture path: {f}' for f in stores if match(includes, f)]
+    errors += [f'store is not cited by any diagram: {f}' for f in stores if f in files and f not in cited]
     errors += [f'probe is not a tracked architecture path: {f}' for f in probes if f not in files or not match(includes, f)]
     samples = sorted({next(f for f in sorted(files) if fnmatch.fnmatchcase(f, p)) for p in includes if any(fnmatch.fnmatchcase(f, p) for f in files)}
                      | {f for f in probes if f in files and match(includes, f)})
-    control = next((f for f in sorted(files) if not match(includes, f) and not f.startswith(str(DIAGRAMS) + '/')), None)
+    # The control is a real excluded text file: not under docs/diagrams, not a dotfile, of a type the probe can comment.
+    control = next((f for f in sorted(files) if not match(includes, f) and not f.startswith(str(DIAGRAMS) + '/')
+                    and not Path(f).name.startswith('.') and Path(f).suffix in COMMENT_LINE and Path(f).suffix), None)
     results = fixture_run(repo, repo / 'scripts' / 'check-diagrams.py', samples, control)
     errors += [f'fixture: change to {f} exited {r["got"]}, expected {r["want"]}' for f, r in results.items() if r['got'] != r['want']]
     return {'tracked_files': len(files), 'architecture_files': sum(match(includes, f) for f in files),
@@ -341,9 +366,35 @@ def check_inventory(repo):
             'fixture': results, 'inventory_errors': errors}
 
 
+def selftest(repo):
+    """An excluded root file a diagram cites must fail the inventory; included or declared a store, it must not."""
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg"><text>Home.md</text>'
+           '<text>app.py · cli.py</text><text>notes/</text></svg>')
+    paths = 'app.py\nscripts/*\n# exclude: notes/* — content\n# exclude: docs/diagrams/* — the set\n# exclude: README.md — prose\n'
+    cases = {'excluded': ('# exclude: Home.md — root note content\n', ['Home.md']), 'included': ('Home.md\n', []),
+             'store': ('# store: Home.md — root note the diagram draws as content\n', [])}
+    errors = []
+    for case, (home_line, want) in cases.items():
+        with tempfile.TemporaryDirectory(prefix='diagram-selftest-') as tmp:
+            fx = Path(tmp)
+            files = {'app.py': 'x = 1\n', 'Home.md': '# Home\n', 'notes/a.md': 'a\n', 'README.md': 'r\n',
+                     'scripts/check-diagrams.py': (repo / 'scripts' / 'check-diagrams.py').read_text(),
+                     str(DIAGRAMS / 'README.md'): 'index\n', str(DIAGRAMS / 'ARCHITECTURE_PATHS'): paths + home_line}
+            files.update({str(DIAGRAMS / v): f'<html><body>{svg}</body></html>\n' for v in VIEWS})
+            for f, text in files.items():
+                (fx / f).parent.mkdir(parents=True, exist_ok=True)
+                (fx / f).write_text(text)
+            git(fx, 'init', '-q')
+            git(fx, 'add', '-A')
+            got = [e.split()[2] for e in check_inventory(fx)['inventory_errors'] if e.startswith('diagram cites ')]
+            if got != want:
+                errors.append(f'selftest {case}: diagram citation errors for {got}, expected {want}')
+    return {'selftest_errors': errors}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('command', nargs='?', default='all', choices=('all', 'phone', 'inventory'))
+    parser.add_argument('command', nargs='?', default='all', choices=('all', 'phone', 'inventory', 'selftest'))
     parser.add_argument('--repo', type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument('--write', action='store_true', help='phone: rewrite stale phone views instead of failing')
     args = parser.parse_args()
@@ -353,10 +404,12 @@ def main():
             report.update(check_phone(args.repo, args.write))
         if args.command in ('all', 'inventory'):
             report.update(check_inventory(args.repo))
+        if args.command in ('all', 'selftest'):
+            report.update(selftest(args.repo))
     except (Invalid, OSError, ET.ParseError) as exc:
         print(json.dumps({'status': 'error', 'errors': [str(exc)]}, indent=2))
         return 2
-    if report.get('phone_errors') or report.get('inventory_errors'):
+    if report.get('phone_errors') or report.get('inventory_errors') or report.get('selftest_errors'):
         report['status'] = 'fail'
     print(json.dumps(report, indent=2))
     return 0 if report['status'] == 'pass' else 1
