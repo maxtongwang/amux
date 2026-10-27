@@ -124,6 +124,8 @@ Everything in amux is built on **eight primitives**, and new capability is expre
 
 The uniform way to read/write per-scope configuration (memory, rules, env, board gates, status availability at global/group/worker level) is one endpoint: `GET`/`PUT /api/scope`.
 
+The [system diagram set](docs/diagrams/README.md) draws the components, the main message-delivery sequence, and the data flow; CI fails a change to the paths listed in `docs/diagrams/ARCHITECTURE_PATHS` unless something under `docs/diagrams/` changes too.
+
 Useful pointers:
 
 - **Server boundary / migration status:** [docs/rust-migration/server-boundary.md](docs/rust-migration/server-boundary.md) — the full ownership matrix (all families RUST-NATIVE, zero proxied) and the contract subtleties, cross-checked by tests and served live at `/api/debug/boundary`.
