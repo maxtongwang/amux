@@ -50,23 +50,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Conventional titles (vendored checker intact)
-        run: cd scripts && shasum -a 256 -c conventional-title.py.sha256
-      - name: Conventional titles (PR title, commit subjects in range)
-        if: github.event_name == 'pull_request'
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          BASE_REF: ${{ github.base_ref }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          python3 scripts/conventional-title.py --kind title -- "$PR_TITLE"
-          python3 scripts/conventional-title.py --range "origin/$BASE_REF..$HEAD_SHA"
-      - name: Conventional titles (pushed commit subjects)
-        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
-        env:
-          BEFORE_SHA: ${{ github.event.before }}
-          AFTER_SHA: ${{ github.sha }}
-        run: python3 scripts/conventional-title.py --range "$BEFORE_SHA..$AFTER_SHA"
       - name: Browser evidence and lifecycle cleanup controls (AF-768, AF-773)
         run: |
           npm ci --ignore-scripts

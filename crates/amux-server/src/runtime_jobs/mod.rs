@@ -47,6 +47,19 @@
 //!   instead of silently recording a run that delivered nothing (ethos rule
 //!   3: the honest refusal beats the quiet lie).
 
+/// Test helper: a title the runtime files obeys `type(scope): summary`; run it through the vendored checker.
+#[cfg(test)]
+pub(crate) fn assert_conventional_title(title: &str) {
+    let checker = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/conventional-title.py");
+    let out = std::process::Command::new("python3")
+        .arg(&checker)
+        .args(["--kind", "title", "--"])
+        .arg(title)
+        .output()
+        .expect("python3 runs the checker");
+    assert!(out.status.success(), "{title:?} rejected: {}", String::from_utf8_lossy(&out.stderr));
+}
+
 pub mod autofix;
 pub mod board_drain;
 pub mod board_drive;

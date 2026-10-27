@@ -7619,7 +7619,7 @@ _land_precheck_exec() {
 _land_pick_tree() {
   local onto="$1" c="$2" parent syn out rc=0
   if parent="$(git rev-parse -q --verify "$c^" 2>/dev/null)"; then
-    syn="$(git commit-tree "$(git rev-parse "$onto^{tree}")" -p "$parent" -m "amux land pick base" 2>/dev/null)" || return 1
+    syn="$(git commit-tree "$(git rev-parse "$onto^{tree}")" -p "$parent" -m "chore(land): pick base" 2>/dev/null)" || return 1
   else
     syn="$onto"
   fi
@@ -7656,7 +7656,7 @@ _land_pick_tree() {
           ok=0
         fi
         rm -f -- "${idx:?}"
-        if [ "$ok" = 1 ] && [ -n "$tree2" ] && c2="$(git commit-tree "$tree2" -p "$parent" -m "amux land: $c without regenerable paths" 2>/dev/null)"; then
+        if [ "$ok" = 1 ] && [ -n "$tree2" ] && c2="$(git commit-tree "$tree2" -p "$parent" -m "chore(land): drop regenerable paths from $c" 2>/dev/null)"; then
           rc=0; out="$(git merge-tree --write-tree --name-only "$syn" "$c2" 2>/dev/null)" || rc=$?
           if [ "$rc" = 0 ]; then
             printf '%s %s %s\n' "$(date -u +%FT%TZ)" "${AMUX_WORKER:-${AMUX_SESSION:-$(whoami)}}" \
@@ -7850,7 +7850,7 @@ _land_regenerate() {
   # commit had no Amux-Session trailer and Mixpeek's session-stamp leg refused
   # it at the END of the gate (planes 22:11Z, retrievers 21:53Z, 2026-10-02),
   # marking a dozen innocent tickets "solo after refusals".
-  new="$(git commit-tree "$tree" -p "$tip" -m "amux land: regenerate $n derived file(s) on the composed tree
+  new="$(git commit-tree "$tree" -p "$tip" -m "chore(land): regenerate $n derived file(s) on the composed tree
 
 Commands:
 $cmd

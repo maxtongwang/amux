@@ -1,0 +1,41 @@
+# Conventional titles: PR title, every commit subject in the PR range, and pushes to main. A workflow of its own so a
+# title edit reruns only this gate, not the repo's test suite (refs maxtongwang/ai-config#411). The checker is vendored
+# byte-identical with its sha256 beside it.
+name: Conventional titles
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  titles:
+    runs-on: ubuntu-latest
+    env:
+      CHECKER: scripts/conventional-title.py
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      BASE_REF: ${{ github.base_ref }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BEFORE_SHA: ${{ github.event.before }}
+      AFTER_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify the vendored checker
+        run: cd scripts && sha256sum -c conventional-title.py.sha256
+      - name: Check the PR title
+        if: github.event_name == 'pull_request'
+        run: python3 "$CHECKER" --kind title -- "$PR_TITLE"
+      - name: Check every commit subject in the PR range
+        if: github.event_name == 'pull_request'
+        run: python3 "$CHECKER" --range "origin/$BASE_REF..$HEAD_SHA"
+      - name: Check pushed commit subjects
+        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+        run: python3 "$CHECKER" --range "$BEFORE_SHA..$AFTER_SHA"
+      - name: Generated subjects and card titles obey the rule
+        run: python3 scripts/test-generated-subjects.py

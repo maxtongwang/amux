@@ -578,11 +578,7 @@ async fn tick(state: AppState) {
         return;
     }
 
-    let title = format!(
-        "{} regenerable cache(s) over {} GiB — review, nothing deleted",
-        rows.len(),
-        floor_bytes() / (1024 * 1024 * 1024)
-    );
+    let title = card_title(rows.len(), floor_bytes() / (1024 * 1024 * 1024));
     let desc = render(&scan_id, &rows, gib(free as u64), gib(total as u64));
     let src = format!("diskwatch:{scan_id}");
     let n = rows.len();
@@ -662,8 +658,19 @@ pub fn spawn(state: AppState) -> super::PeriodicTask {
     })
 }
 
+/// `type(scope): summary` card title (ai-config #411).
+fn card_title(caches: usize, floor_gib: u64) -> String {
+    format!("chore(disk-watch): {caches} regenerable cache(s) over {floor_gib} GiB, review, nothing deleted")
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn card_title_passes_the_conventional_title_checker() {
+        crate::runtime_jobs::assert_conventional_title(&super::card_title(1, 5));
+        crate::runtime_jobs::assert_conventional_title(&super::card_title(12, 50));
+    }
+
 
     // ── AEAB-59: the low-space trigger, and the cells that keep it honest ──
     //

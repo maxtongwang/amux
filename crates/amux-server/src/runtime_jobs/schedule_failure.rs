@@ -637,6 +637,11 @@ fn cause_sentence(cause: &str) -> String {
     }
 }
 
+/// `type(scope): summary` card title (ai-config #411).
+fn failing_schedule_title(id: &str, who: &str, cause: &str) -> String {
+    format!("fix(schedule): {id} is failing and its worker {who} {}", cause_sentence(cause))
+}
+
 /// One open needsyou card per schedule; a later notice appends to it.
 async fn owner_card(
     store: &SharedStore,
@@ -648,7 +653,7 @@ async fn owner_card(
 ) -> anyhow::Result<String> {
     let id = sched.id().to_string();
     let who = if worker.is_empty() { "(none)".to_string() } else { worker.to_string() };
-    let title = format!("{id} is failing and its worker {who} {}", cause_sentence(cause));
+    let title = failing_schedule_title(&id, &who, cause);
     let desc = format!("{title}.\n\nThe notice the worker would have received:\n\n{text}");
     let source_ref = owner_card_ref(&id);
     let new = crate::db::board_store::NewIssue {
@@ -732,6 +737,13 @@ pub fn expose(v: &mut serde_json::Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failing_schedule_title_passes_the_conventional_title_checker() {
+        for cause in ["isolated", "archived", "paused", "stopped", "unregistered", "no_target", "other"] {
+            crate::runtime_jobs::assert_conventional_title(&super::failing_schedule_title("SCHED-108", "mixpeek-funnel", cause));
+        }
+    }
+
     use super::*;
     use crate::db::Store;
     use crate::runtime_jobs::scheduler::{get_schedule, insert_schedule, ShellOutput};
