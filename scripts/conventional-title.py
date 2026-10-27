@@ -14,19 +14,25 @@ import subprocess
 import sys
 
 TYPES = ('feat', 'fix', 'docs', 'style', 'refactor', 'perf', 'test', 'build', 'ci', 'chore', 'revert')
-TITLE = re.compile(r'(?P<type>[a-z]+)(?:\((?P<scope>[A-Za-z0-9][A-Za-z0-9._/-]*)\))?(?P<breaking>!)?: (?P<summary>\S.*)')
+TITLE = re.compile(r'(?P<type>[a-z]+)(?:\((?P<scope>[^\W_][\w./-]*)\))?(?P<breaking>!)?: (?P<summary>\S.*)')
 # Subjects Git or GitHub generates. Revert is accepted everywhere (GitHub's Revert button titles a PR this way);
 # merge and autosquash subjects are accepted for commits only.
-REVERT = re.compile(r'Revert ".+"')
-COMMIT_ONLY = (re.compile(r'Merge (pull request #\d+|PR #\d+|branch |remote-tracking branch |tag )'),
-               re.compile(r'(fixup|squash|amend)! \S'))
+REVERT = re.compile(r'Revert "(?P<original>.+)"')
+MERGE = re.compile(r"Merge (?:pull request #\d+ from \S+|PR #\d+: \S.*"
+                   r"|(?:remote-tracking )?(?:branch|tag) '?[^\s']+'?(?: into \S+)?)")
+AUTOSQUASH = re.compile(r'(?:fixup|squash|amend)! (?P<rest>\S.*)')  # git writes the target subject after the marker
 EXAMPLE = 'feat(scope): add the thing'
 
 
 def check(text, kind='title'):
     """(ok, reason) for one string. Pure; the single definition every caller shares."""
-    if REVERT.fullmatch(text) or (kind == 'commit' and any(p.match(text) for p in COMMIT_ONLY)):
+    revert = REVERT.fullmatch(text)
+    if revert and check(revert['original'], kind)[0]:  # git's own `Revert "<subject>"` reverts a valid subject
         return True, 'generated'
+    if kind == 'commit':
+        autosquash = AUTOSQUASH.fullmatch(text)
+        if MERGE.fullmatch(text) or (autosquash and check(autosquash['rest'], kind)[0]):
+            return True, 'generated'
     if text != text.strip() or '\n' in text:
         return False, 'must be one line with no surrounding whitespace'
     match = TITLE.fullmatch(text)
