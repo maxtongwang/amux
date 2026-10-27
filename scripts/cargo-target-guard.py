@@ -144,6 +144,15 @@ PRIORITY_SETTINGS = {
 # The targets an ancestor `run` already leases. A build or reclaim nested inside
 # that build must not wait for a lease its own ancestor holds.
 LEASED_ENV = 'AMUX_CARGO_GUARD_LEASED'
+# The lease descriptor numbers `run` passes to Cargo. Cargo holds the lease for
+# the whole run, so a test process marks these close-on-exec: a child that
+# outlives its test (a daemonized tmux server) must not keep the lease, or every
+# later reclaim defers on a lock no build owns.
+LEASE_FDS_ENV = 'AMUX_CARGO_GUARD_LEASE_FDS'
+
+
+def inherited_lease_fds():
+    return {int(fd) for fd in os.environ.get(LEASE_FDS_ENV, '').split(',') if fd.strip().isdigit()}
 
 
 def priority_setting(key):
@@ -821,6 +830,7 @@ def main():
                 os.set_inheritable(fd, True)
             os.environ[LEASED_ENV] = os.pathsep.join(
                 sorted(str(p) for p in inherited_leases() | set(targets)))
+            os.environ[LEASE_FDS_ENV] = ','.join(str(fd) for fd in sorted(inherited_lease_fds() | set(fds)))
             os.execvp(command[0], command)
         if args.action in ('reclaim', 'sweep'):
             probe = test_probe(targets, []) or active_processes

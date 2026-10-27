@@ -1023,6 +1023,21 @@ class ReclaimPriorityTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn('AMUX_CARGO_RECLAIM_PRIORITY_WAIT_S', result.stderr)
 
+    def test_run_names_the_lease_fds_it_passes_to_cargo(self):
+        # A test process marks these close-on-exec, so it must get the
+        # descriptor numbers, and the new one must be the lease itself.
+        probe = ('import os; fds = os.environ["AMUX_CARGO_GUARD_LEASE_FDS"]; print(fds); '
+                 'print(" ".join("%d:%d" % (os.fstat(int(f)).st_dev, os.fstat(int(f)).st_ino) '
+                 'for f in fds.split(",") if f != "1"))')
+        result = subprocess.run([sys.executable, str(SCRIPT), 'run', '--target', str(self.root), '--',
+                                 sys.executable, '-c', probe],
+                                capture_output=True, text=True, env={**self.env, 'AMUX_CARGO_GUARD_LEASE_FDS': '1'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        listed, held = result.stdout.splitlines()
+        self.assertIn('1', listed.split(','), "an ancestor run's descriptor stays listed")
+        lease = os.stat(guard.lease_path(self.root))
+        self.assertEqual(held.split(), ['%d:%d' % (lease.st_dev, lease.st_ino)])
+
     def test_refused_exclusive_run_does_not_count_as_reclaim(self):
         fd = guard.open_lock(guard.lease_path(self.root), shared=True)
         try:

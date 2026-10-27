@@ -90,6 +90,37 @@ pub(crate) fn purge_build_target(path: &Path) -> Result<(), String> {
     mutate("purge", path, None, &[], &[path.to_path_buf()])
 }
 
+/// The lease descriptors the guard's `run` passed down (scripts/cargo-target-guard.py LEASE_FDS_ENV).
+#[cfg(test)]
+pub(crate) const LEASE_FDS_ENV: &str = "AMUX_CARGO_GUARD_LEASE_FDS";
+
+/// Keep the Cargo lifetime lease out of every child this process spawns.
+///
+/// Cargo itself holds the lease for the whole run, so a test process's own
+/// children never need it, and one that outlives its test (a daemonized tmux
+/// server) must not keep it: every later reclaim then defers on a lock no
+/// build owns. Close-on-exec rather than close: when the guard execs a
+/// test binary directly, that binary is the lease holder.
+#[cfg(test)]
+pub(crate) fn keep_lease_from_children() {
+    let Ok(list) = std::env::var(LEASE_FDS_ENV) else {
+        return;
+    };
+    for fd in list.split(',').filter_map(|f| f.trim().parse::<libc::c_int>().ok()) {
+        if fd <= 2 {
+            continue; // stdio is never a lease
+        }
+        // SAFETY: F_GETFD/F_SETFD only read and set this descriptor's flags; a
+        // number that is not open returns -1 and is left alone.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
 // Resolve existing symlink ancestors even when a restore destination is absent.
 fn resolved(path: &Path) -> PathBuf {
     if let Ok(path) = path.canonicalize() {

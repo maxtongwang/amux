@@ -1397,7 +1397,135 @@ pub(crate) async fn run_cmd(
 /// the two builders below collapse into it on rebase.
 #[cfg(test)]
 pub(crate) fn test_tmux_socket() -> String {
+    // Before this process's first tmux call: no tmux client (and so no server
+    // it forks) inherits the Cargo lease, and the private server is stopped at
+    // process exit even when a test left a session behind.
+    static SETUP: std::sync::Once = std::sync::Once::new();
+    SETUP.call_once(|| {
+        crate::cargo_target_guard::keep_lease_from_children();
+        // SAFETY: registers a plain extern "C" fn; it runs once, at exit.
+        unsafe { libc::atexit(stop_test_tmux_server) };
+    });
     format!("amux-test-{}", std::process::id())
+}
+
+/// Stops this test process's private tmux server. A test kills only its own
+/// sessions, and the server exits only once its last session is gone, so a
+/// session a test failed to clean up kept the server alive after the process.
+#[cfg(test)]
+extern "C" fn stop_test_tmux_server() {
+    let _ = std::process::Command::new("tmux")
+        .args(["-L", &format!("amux-test-{}", std::process::id()), "kill-server"])
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// A test tmux server outlived its test process and held the Cargo
+/// target reclaim lease, so every later guarded build was refused. The
+/// fixture runs in a child copy of this test binary with a stand-in lease on
+/// fd LEASE_FD, starts a session and never kills it.
+#[cfg(test)]
+mod test_tmux_server_lifetime {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    const FIXTURE_ENV: &str = "AMUX_TMUX_LIFETIME_FIXTURE";
+    const FIXTURE: &str = "api::session_verbs::test_tmux_server_lifetime::leaves_a_session_behind";
+    const LEASE_FD: libc::c_int = 200; // any number above stdio that the child does not open itself
+
+    #[test]
+    #[ignore = "child fixture of a_test_tmux_server_never_outlives_its_process_or_holds_the_lease"]
+    fn leaves_a_session_behind() {
+        let Ok(exit) = std::env::var(FIXTURE_ENV) else { return };
+        let created = super::tmux_command()
+            .args(["new-session", "-d", "-s", "lifetime-fixture", "/bin/sh"])
+            .output()
+            .expect("tmux required for the server lifetime proof");
+        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+        if exit == "killed" {
+            // A test killed mid-run: no Drop, no exit handler.
+            // SAFETY: ends this child process immediately, which is the point.
+            unsafe { libc::_exit(0) };
+        }
+    }
+
+    /// Stops the child's server in teardown whatever the assertions found,
+    /// then removes its socket dir (`_dir` drops after `drop` runs).
+    struct ChildServer {
+        socket: String,
+        tmpdir: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    impl ChildServer {
+        fn alive(&self) -> bool {
+            std::process::Command::new("tmux").args(["-L", &self.socket, "list-sessions"])
+                .env("TMUX_TMPDIR", &self.tmpdir).env_remove("TMUX").env_remove("TMUX_PANE")
+                .output().is_ok_and(|o| o.status.success())
+        }
+    }
+
+    impl Drop for ChildServer {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux").args(["-L", &self.socket, "kill-server"])
+                .env("TMUX_TMPDIR", &self.tmpdir).env_remove("TMUX").env_remove("TMUX_PANE")
+                .output();
+        }
+    }
+
+    /// Runs the fixture with a shared flock on a fresh lease file passed only
+    /// to the child, then reports whether the child's server is still up and
+    /// whether anyone still holds the lease once the child is gone.
+    fn run_fixture(exit: &str) -> (ChildServer, bool, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let lease_path = dir.path().join("lease.lock");
+        let lease = std::fs::File::create(&lease_path).unwrap();
+        let fd = lease.as_raw_fd();
+        // SAFETY: flock on a descriptor this test owns.
+        assert_eq!(unsafe { libc::flock(fd, libc::LOCK_SH) }, 0);
+        let tmpdir = dir.path().join("tmux");
+        std::fs::create_dir(&tmpdir).unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", FIXTURE, "--ignored", "--nocapture", "--test-threads=1"])
+            .env(FIXTURE_ENV, exit)
+            .env("TMUX_TMPDIR", &tmpdir)
+            .env(crate::cargo_target_guard::LEASE_FDS_ENV, LEASE_FD.to_string())
+            .env_remove("TMUX").env_remove("TMUX_PANE");
+        // SAFETY: dup2 is async-signal-safe. Only this child gets the lease on
+        // LEASE_FD; the test's own copy stays close-on-exec, so concurrent
+        // tests' children never see it.
+        unsafe {
+            command.pre_exec(move || match libc::dup2(fd, LEASE_FD) {
+                -1 => Err(std::io::Error::last_os_error()),
+                _ => Ok(()),
+            });
+        }
+        let child = command.spawn().unwrap();
+        let socket = format!("amux-test-{}", child.id());
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "fixture failed: {}", String::from_utf8_lossy(&output.stderr));
+        drop(lease);
+        let probe = std::fs::File::open(&lease_path).unwrap();
+        // SAFETY: flock on a descriptor this test owns; LOCK_NB never blocks.
+        let free = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        let server = ChildServer { socket, tmpdir, _dir: dir };
+        let alive = server.alive();
+        (server, alive, free)
+    }
+
+    #[test]
+    fn a_test_tmux_server_never_outlives_its_process_or_holds_the_lease() {
+        let (_server, alive, free) = run_fixture("normal");
+        assert!(!alive, "the test process exited but its private tmux server is still running");
+        assert!(free, "the Cargo lease is still held after the test process exited");
+
+        let (_server, _, free) = run_fixture("killed");
+        assert!(free, "a test killed mid-run left a tmux server holding the Cargo lease");
+    }
 }
 
 /// A blocking `tmux` command for sites that cannot go through [`run_cmd`]. In
