@@ -33,11 +33,13 @@
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'; // amux serves a self-signed cert on localhost
 import { chromium } from 'playwright';
 import { execSync } from 'node:child_process';
+import { testBase } from './lib/live-base.mjs';
 
 // `amux url` resolves the canonical base and self-heals past a stale $AMUX_URL
 // (a lane started pre-cutover carries the retired :8822 in its env -- AMUX-3046).
 // Do NOT read AMUX_URL directly: it is exactly the value that goes stale.
-const BASE = (process.env.AMUX_TEST_URL || execSync('./amux url', { encoding: 'utf8' })).trim();
+// The live base only on AMUX_TEST_LIVE=1 (tests/lib/live-base.mjs).
+const BASE = testBase('AMUX_TEST_URL', () => execSync('./amux url', { encoding: 'utf8' })).trim();
 const SESS = 'browserprofiletest';
 const NAME = 'e2eprof' + Math.random().toString(36).slice(2, 8);
 const K = 'amux_profile_reuse_marker';

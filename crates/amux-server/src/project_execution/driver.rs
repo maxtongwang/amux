@@ -294,6 +294,11 @@ pub(super) fn executor_flags(provider: &str, effort: Option<&str>, full_host_acc
     flags
 }
 
+/// An executor's groups (`CC_TAGS`): its project's group and nothing wider.
+pub(super) fn executor_groups(p: &store::Project) -> String {
+    p.name.clone()
+}
+
 fn configure_executor_env(env: &mut sv::EnvFile, p: &store::Project, row: &bs::IssueRow) {
     env.remove("CC_REVIEW_HELD");
     for (key, value) in [
@@ -312,7 +317,13 @@ fn configure_executor_env(env: &mut sv::EnvFile, p: &store::Project, row: &bs::I
     ] {
         env.set(key, value);
     }
-    env.set("CC_TAGS", &format!("{},ephemeral", p.name));
+    // ONE GROUP: the project's own, which its lead (lead.rs) and its other
+    // executors share. Executors used to carry a second, fleet-wide
+    // `ephemeral` group, so an executor of project A shared a group with every
+    // executor of every other project and could message across projects.
+    // Groups are messaging authority (worker_messaging.rs); a project's team is
+    // its boundary. `executor_groups` is the one definition, so a test pins it.
+    env.set("CC_TAGS", &executor_groups(p));
     let flags = executor_flags(
         &p.policy.executor.provider,
         p.policy.executor.effort.as_deref(),
@@ -2524,6 +2535,58 @@ mod command_tests {
         host_project.policy.executor_full_host_access = true;
         configure_executor_env(&mut env, &host_project, &row);
         assert!(env.get("CC_FLAGS").unwrap().contains("--sandbox danger-full-access"));
+    }
+    /// Executors of different projects shared the fleet-wide `ephemeral`
+    /// group, so an executor of project A could message project B's executors.
+    /// An executor's only group is now its project's, shared with that
+    /// project's lead and its other executors. An executor configured before
+    /// the change (its env file still says `<project>,ephemeral`) is held to
+    /// the same boundary. Fails on the base, where `configure_executor_env`
+    /// wrote `<project>,ephemeral` and every cross-project pair passed.
+    #[test]
+    fn executors_of_different_projects_share_no_group() {
+        use super::*;
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let (_dir, db, _) = super::super::outputs::tests::fixture();
+        let row = bs::get_issue(&db.read().unwrap(), "A").unwrap().unwrap();
+        let project = |name: &str| store::Project {
+            name: name.into(),
+            revision: 1,
+            policy: serde_json::from_value(serde_json::json!({
+                "repository": "/repo", "worktree": false,
+                "coordinator": {"provider": "claude", "model": "opus"},
+                "executor": {"provider": "claude", "model": "opus"},
+                "verify_command": "true", "enabled": true
+            })).unwrap(),
+        };
+        for (worker, proj) in [("pa-exec-1", "proj-a"), ("pa-exec-2", "proj-a"), ("pb-exec-1", "proj-b")] {
+            let mut env = sv::EnvFile::default();
+            configure_executor_env(&mut env, &project(proj), &row);
+            assert_eq!(env.get("CC_TAGS"), Some(proj), "{worker}: an executor's only group is its project's");
+            env.write(&sv::env_path(worker)).unwrap();
+        }
+        // The project's lead, as lead.rs configures it.
+        std::fs::write(sv::env_path("pa-lead"),
+            "CC_PROJECT=\"proj-a\"\nCC_PROJECT_LEAD=\"1\"\nCC_EPHEMERAL=\"1\"\nCC_TAGS=\"proj-a\"\n").unwrap();
+        // Two executors configured before the change, of two other projects.
+        for (worker, proj) in [("pc-old", "proj-c"), ("pd-old", "proj-d")] {
+            std::fs::write(sv::env_path(worker), format!(
+                "CC_PROJECT=\"{proj}\"\nCC_EPHEMERAL=\"1\"\nCC_TAGS=\"{proj},ephemeral\"\n")).unwrap();
+        }
+        let refused = |from: &str, to: &str| sv::peer_input_refusal(from, to).map(|r| r.code);
+        assert_eq!(refused("pa-exec-1", "pb-exec-1"), Some("worker_group_boundary"), "project A -> project B executor");
+        assert_eq!(refused("pb-exec-1", "pa-exec-1"), Some("worker_group_boundary"), "project B -> project A executor");
+        assert_eq!(refused("pb-exec-1", "pa-lead"), Some("worker_group_boundary"), "project B executor -> project A lead");
+        assert_eq!(refused("pc-old", "pd-old"), Some("worker_group_boundary"), "a stale `ephemeral` tag is not membership");
+        assert!(sv::cross_group_policy_ok("pa-exec-1", "pb-exec-1").is_err(), "the send gate refuses it too");
+        // Inside one project the team still talks.
+        assert_eq!(refused("pa-exec-1", "pa-exec-2"), None, "sibling executors");
+        assert_eq!(refused("pa-exec-1", "pa-lead"), None, "executor -> its lead");
+        assert_eq!(refused("pa-lead", "pa-exec-1"), None, "lead -> its executor");
+        assert!(sv::cross_group_policy_ok("pa-lead", "pa-exec-2").is_ok());
+        assert_eq!(sv::lane_groups("pc-old").into_iter().collect::<Vec<_>>(), vec!["proj-c".to_string()]);
     }
     #[test]
     fn project_verification_retry_failure_stays_waiting_without_model_repair() {

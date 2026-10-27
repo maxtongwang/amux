@@ -4,8 +4,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
+from test_isolation import isolated_env  # noqa: E402
 
 
 class BoardMessageTests(unittest.TestCase):
@@ -23,10 +27,11 @@ class BoardMessageTests(unittest.TestCase):
             curl = root / 'bin/curl'
             curl.write_text('#!/bin/sh\ncat "$BOARD_MESSAGE_FIXTURE"\n')
             curl.chmod(0o755)
-            env = dict(os.environ, PATH=str(root / 'bin') + ':' + os.environ['PATH'],
-                       AMUX_API='http://127.0.0.1:9', AMUX_URL='http://127.0.0.1:9',
-                       AMUX_SESSION='board-message-fixture', AMUX_HOME=str(root / 'home'),
-                       BOARD_MESSAGE_FIXTURE=str(root / 'response.json'))
+            (root / 'home').mkdir()
+            # Hermetic: never the live server or the real ~/.amux (lib/test_isolation.py).
+            env = isolated_env(root / 'home', PATH=str(root / 'bin') + ':' + os.environ['PATH'],
+                               AMUX_SESSION='board-message-fixture',
+                               BOARD_MESSAGE_FIXTURE=str(root / 'response.json'))
             def run(*args):
                 return subprocess.run(['bash', cli, 'board', 'show', 'TEST-1', *args],
                                       env=env, capture_output=True, text=True, timeout=10)

@@ -178,6 +178,14 @@ _amux_isolated_guard() {
 }
 _amux_isolated_guard
 
+# TEST MODE ONLY: under scripts/lib/test-isolation.sh every tmux call names the
+# private socket explicitly and drops TMUX/TMUX_PANE. TMUX_TMPDIR alone loses to
+# an inherited $TMUX inside a pane, which is how a test's kill-server killed the
+# live server (2026-10-16). Unset outside tests, so production is unchanged.
+if [[ -n "${AMUX_TMUX_SOCKET:-}" ]]; then
+  tmux() { env -u TMUX -u TMUX_PANE tmux -S "$AMUX_TMUX_SOCKET" "$@"; }
+fi
+
 # A localhost AMUX_API or AMUX_URL on a port that endpoint.json does not name is
 # stale: the server rewrites endpoint.json on every boot, while a lane's env is
 # fixed for its life. On 2026-10-05 a reboot raced two servers; the one on the
@@ -927,62 +935,79 @@ cmd_register() {
     *) die "CC_DIR must be absolute, got: $resolved_dir" ;;
   esac
 
-  local file="$CC_SESSIONS/$name.env"
-  # One lock shared with the server's incarnation/env writers. Reload inside
-  # it, assign at creation, then atomically replace; re-register keeps identity.
-  if ! python3 - "$file" "$name" "$resolved_dir" "$CC_FLAGS_STR" "$wt" "$wt_profile" <<'PYREGISTER'
-import fcntl, os, re, secrets, sys, tempfile
-from pathlib import Path
-path, name, directory, flags, wt, profile = sys.argv[1:]
-p = Path(path)
-p.parent.mkdir(parents=True, exist_ok=True)
-def quote(value):
-    if any(c in value for c in "\n\r\0"):
-        raise ValueError("worker env values cannot contain newline, carriage return or NUL")
-    return '"' + re.sub(r'([\\"$`])', r'\\\1', value) + '"'
-with (p.parent / ".incarnation.lock").open("a+") as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX)
-    text = p.read_text() if p.exists() else ""
-    updates = {"CC_NAME": name, "CC_DIR": directory, "CC_FLAGS": flags}
-    if wt: updates["CC_WORKTREE"] = "1"
-    if profile: updates["CC_WORKTREE_PROFILE"] = profile
-    # Match EnvFile's last-assignment-wins parsing and ASCII validation.
-    ids = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("CC_INCARNATION="): continue
-        value = line.split("=", 1)[1].strip()
-        if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
-            value = value[1:-1]
-        ids.append(value.strip())
-    valid_id = bool(ids and re.fullmatch(r"[A-Za-z0-9_.-]+", ids[-1]) and ids[-1] not in (".", ".."))
-    incarnation = ids[-1] if valid_id else secrets.token_hex(16)
-    updates["CC_INCARNATION"] = incarnation
-    if not text:
-        for key in ("AMUX_DISPATCH_BACKLOG_WHEN_IDLE", "CC_AUTO_PICKUP", "CC_AUTO_CONTINUE", "CC_STANDING_ORDERS", "AMUX_COMMAND_LIFECYCLE", "AMUX_BOARD_FORCE_ADHERENCE"):
-            updates[key] = "0"
-    kept = [line for line in text.splitlines() if line.split("=", 1)[0].strip() not in updates]
-    out = "\n".join(kept) + "\n" + "".join(key + "=" + quote(value) + "\n" for key, value in updates.items())
-    fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".register-")
-    try:
-        with os.fdopen(fd, "w") as stream:
-            stream.write(out)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(tmp, p)
-    finally:
-        if os.path.exists(tmp): os.unlink(tmp)
-    if not valid_id:
-        print("verdict=worker_incarnation_assigned worker=" + name, file=sys.stderr)
-PYREGISTER
-  then
-    echo "verdict=worker_registration_failed worker=$name" >&2
-    die "could not persist worker registration"
-  fi
+  _register_via_api "$name" "$resolved_dir" "$CC_FLAGS_STR" "$wt" "$wt_profile"
+}
 
-  echo "${GREEN}registered${RESET} ${BOLD}$name${RESET} → $resolved_dir"
-  [[ -n "$CC_FLAGS_STR" ]] && echo "  flags: $CC_FLAGS_STR"
-  return 0
+# REGISTER THROUGH THE SERVER, NEVER THE FILE.
+#
+# `amux register` and `amux exec` used to write ~/.amux/sessions/<name>.env
+# themselves, so a worker could mint a peer, or rewrite another worker's file,
+# past every server rule: only leads create workers, and only inside their own
+# team (session_verbs::worker_create_refusal). The server is now the only
+# writer:
+#
+#   new name       POST /api/sessions {name, dir, flags, worktree, start:false};
+#                  the server applies the create rule and the new-worker
+#                  defaults (board automation off, NEW_WORKER_AUTOMATION_OFF).
+#   existing name  PUT /api/scope {level:worker, capability:env, value:{...}}:
+#                  a key MERGE, so every key this verb does not own survives
+#                  (AMUX-3117), and only the owner or the worker itself may
+#                  change it.
+#
+# The owner (a terminal with no AMUX_SESSION) is unaffected. A worker gets the
+# server's own refusal and a nonzero exit. An unreachable server is a failure,
+# never a fallback to writing the file.
+_register_via_api() {
+  local name="$1" dir="$2" flags="$3" wt="$4" wt_profile="$5"
+  local api="${AMUX_API:-$(cmd_url)}" who="${AMUX_WORKER:-${AMUX_SESSION:-}}" body out code
+  body=$(python3 -c '
+import json, sys
+name, d, flags, wt, prof = sys.argv[1:6]
+b = {"name": name, "dir": d, "start": False}
+if flags: b["flags"] = flags
+if wt: b["worktree"] = True
+if prof: b["worktree_profile"] = prof
+print(json.dumps(b))' "$name" "$dir" "$flags" "$wt" "$wt_profile") || die "could not build the register request"
+  out=$(_curl -sk -m 30 -w $'\n%{http_code}' -X POST -H 'Content-Type: application/json' \
+        -H "X-Amux-Session: $who" --data-binary "$body" "$api/api/sessions" 2>/dev/null) || out=$'\n000'
+  code="${out##*$'\n'}"; out="${out%$'\n'*}"
+  if [[ "$code" == 409 && "$out" == *"already exists"* ]]; then
+    body=$(python3 -c '
+import json, sys
+name, d, flags, wt, prof = sys.argv[1:6]
+v = {"CC_DIR": d, "CC_FLAGS": flags}
+if wt: v["CC_WORKTREE"] = "1"
+if prof: v["CC_WORKTREE_PROFILE"] = prof
+print(json.dumps({"level": "worker", "name": name, "capability": "env", "value": v}))' \
+      "$name" "$dir" "$flags" "$wt" "$wt_profile") || die "could not build the register request"
+    out=$(_curl -sk -m 30 -w $'\n%{http_code}' -X PUT -H 'Content-Type: application/json' \
+          -H "X-Amux-Session: $who" --data-binary "$body" "$api/api/scope" 2>/dev/null) || out=$'\n000'
+    code="${out##*$'\n'}"; out="${out%$'\n'*}"
+    if [[ "$code" == 2?? ]]; then
+      echo "${GREEN}updated${RESET} ${BOLD}$name${RESET} → $dir"
+      [[ -n "$flags" ]] && echo "  flags: $flags"
+      return 0
+    fi
+  elif [[ "$code" == 2?? ]]; then
+    echo "${GREEN}registered${RESET} ${BOLD}$name${RESET} → $dir"
+    [[ -n "$flags" ]] && echo "  flags: $flags"
+    return 0
+  fi
+  if [[ -z "$code" || "$code" == 000 ]]; then
+    echo "${RED}not registered${RESET}: the amux server at $api did not answer. Workers are" >&2
+    echo "  created and changed only through the server; start it (amux server start) and retry." >&2
+    return 1
+  fi
+  local why
+  why=$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+print(d.get("error") or d.get("message") or json.dumps(d))' 2>/dev/null || true)
+  echo "${RED}not registered${RESET} (HTTP $code): ${why:-$out}" >&2
+  return 1
 }
 
 # amux worktree <name> [show|profiles|widen <profile-or-folder>...|profile <p>]
@@ -1729,8 +1754,8 @@ cmd_exec() {
   require_worker_name exec "$name" "amux exec <name> [--model opus] [--yolo] [--dir /path] [claude flags...]"
   shift
 
-  # Use the locked registrar and keep the same parsed flags/extra args.
-  cmd_register "$name" "$@"
+  # Register through the server and keep the same parsed flags/extra args.
+  cmd_register "$name" "$@" || return 1
 
   # Start
   cmd_start "$name" "${CC_EXTRA_ARGS[@]+"${CC_EXTRA_ARGS[@]}"}"
@@ -1954,9 +1979,7 @@ cmd_send() {
   # Check for --keys flag
   if [[ "${1:-}" == "--keys" ]]; then
     shift
-    is_running "$name" || die "worker '$name' is not running"
-    tmux send-keys -t "=$tname:" "$@"
-    echo "${GREEN}sent keys${RESET} to $name"
+    _send_keys_via_api "$name" "$@"; return $?
   else
     local text="$*"
     [[ -n "$text" ]] || { _send_usage; return 1; }
@@ -1971,6 +1994,30 @@ cmd_send() {
     fi
     _send_via_api "$name" "$text" "$_nb"
   fi
+}
+
+# Raw keys go through the server too (POST /api/sessions/<n>/keys, one call per
+# key, in order). This was `tmux send-keys` straight into the target's pane:
+# no origin, no audit, and no group boundary, so any worker could press y/n/
+# Enter in any other group's worker. The server now decides who may press
+# keys where, and refuses keys outside its allowed set (Enter, Escape, C-c,
+# arrows, y/n...) instead of typing arbitrary text; text is a message (`amux
+# send --stdin`). Stops at the first refusal, printing the server's reason.
+_send_keys_via_api() {
+  local name="$1"; shift
+  [[ $# -gt 0 ]] || die "usage: amux send <worker> --keys <key> [key...]"
+  local api="${AMUX_API:-$(cmd_url)}" who="${AMUX_WORKER:-${AMUX_SESSION:-}}" key body out code
+  for key in "$@"; do
+    body=$(python3 -c 'import json,sys; print(json.dumps({"keys": sys.argv[1]}))' "$key") || die "could not build the keys request"
+    out=$(_curl -sk -m 15 -w $'\n%{http_code}' -X POST -H 'Content-Type: application/json' \
+          -H "X-Amux-Session: $who" --data-binary "$body" "$api/api/sessions/$name/keys" 2>/dev/null) || out=$'\n000'
+    code="${out##*$'\n'}"; out="${out%$'\n'*}"
+    if [[ "$code" != 2?? ]]; then
+      echo "${RED}keys not sent${RESET} to $name (HTTP ${code:-000}, at '$key'): $out" >&2
+      return 1
+    fi
+  done
+  echo "${GREEN}sent keys${RESET} to $name"
 }
 
 # Deliver a message through the server: SERVER-VERIFIED origin stamp

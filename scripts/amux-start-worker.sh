@@ -82,6 +82,7 @@ done
 
 # Clean up the initialization session (no longer needed)
 echo "$(date): Cleaning up amux-init session" >> "$LOG_FILE"
+# tmux-lint: allow(production boot script: removes its own init session on the live server by design; never run by a test)
 /usr/bin/tmux kill-session -t amux-init 2>/dev/null || true
 
 # Every lane amux knows about, in the same directory `amux start-all` reads.

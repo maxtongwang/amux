@@ -25,9 +25,13 @@ def main():
         connections = []
         original_pid = None
 
+        # Explicit -S AND no inherited TMUX/TMUX_PANE: the shared rule for every
+        # tmux call a test makes (scripts/lib/test-isolation.sh).
+        clean = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
+
         def tmux(*args):
             return subprocess.run(["tmux", "-f", "/dev/null", "-S", path, *args],
-                                  capture_output=True, text=True, timeout=5)
+                                  capture_output=True, text=True, timeout=5, env=clean)
 
         try:
             created = tmux("new-session", "-d", "-s", "original-proof", "/bin/sh")
@@ -73,6 +77,7 @@ def main():
                         os.kill(original_pid, sig)
                     except ProcessLookupError:
                         pass
+            # tmux-lint: allow(this file's tmux() wrapper adds -f /dev/null -S <temp socket> to every call)
             tmux("-N", "kill-server")
 
 

@@ -21,6 +21,9 @@
 # Exit 0 = pass, 1 = failure, 2 = skipped (server unreachable — the test needs a
 # live /api/history and says so rather than passing vacuously).
 set -euo pipefail
+# Acts on the LIVE server by design: opt in with AMUX_TEST_LIVE=1 (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_require_live
 cd "$(dirname "$0")/.."
 
 PASS=0; FAIL=0
@@ -266,6 +269,7 @@ esac
 #    nothing and, under `set -euo pipefail`, aborted the script at the
 #    assignment -- before its own "this check proves nothing" arm and before the
 #    summary. Same bug as section 5, the same line apart.
+# tmux-lint: allow(a grep pattern over the CLI source, not a tmux call)
 INJECT=$(grep -n 'tmux send-keys .* -l "' amux | head -1 || true)
 if [ -n "$INJECT" ]; then
   bad "a raw send-keys injection path reappeared in ./amux ($INJECT) -- direct terminal pasting was removed after AMUX-4359 and revives AF-455/AMUX-1818"

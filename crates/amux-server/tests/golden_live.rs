@@ -877,6 +877,9 @@ async fn golden_live_backend_lifecycle_tmux() {
         eprintln!("SKIPPED: golden_live_backend_lifecycle_tmux — `tmux` not found on PATH; the tmux live lifecycle was NOT tested");
         return;
     }
+    // A private tmux server, never the host fleet's (amux_server::tmux_guard).
+    let tmux_home = tempfile::tempdir().expect("private tmux dir");
+    let _private_tmux = amux_server::tmux_guard::isolate_tests(tmux_home.path());
     run_live_backend_lifecycle(Arc::new(TmuxBackend::new()), "tmux").await;
 }
 

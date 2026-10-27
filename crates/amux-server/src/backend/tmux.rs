@@ -319,7 +319,7 @@ impl TmuxBackend {
 
     async fn run(&self, args: &[&str], timeout: Duration) -> Result<std::process::Output> {
         note_tmux_spawn(args);
-        let mut cmd = tokio::process::Command::new(&self.bin);
+        let mut cmd = crate::tmux_guard::tokio_cmd(&self.bin);
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1339,7 +1339,8 @@ mod tests {
             ""
         };
         let text = format!(
-            "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$*\" in\n  \"list-panes -a\"*)\ncat <<'EOF'\n{census}EOF\n    ;;\n{probes}  *) echo \"unexpected tmux call: $*\" >&2; exit 1 ;;\nesac\n",
+            // tmux_guard names the private socket first (`-S <path>`) in tests.
+            "#!/bin/sh\n[ \"$1\" = -S ] && shift 2\necho \"$*\" >> '{log}'\ncase \"$*\" in\n  \"list-panes -a\"*)\ncat <<'EOF'\n{census}EOF\n    ;;\n{probes}  *) echo \"unexpected tmux call: $*\" >&2; exit 1 ;;\nesac\n",
             log = log.display(),
         );
         std::fs::write(&script, text).unwrap();

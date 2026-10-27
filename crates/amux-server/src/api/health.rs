@@ -857,7 +857,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
 pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
     let socket_ownership = crate::backend::tmux_health::observe().await;
     let _ = socket_ownership.invariant();
-    let mut command = tokio::process::Command::new("tmux");
+    let mut command = crate::tmux_guard::tokio_tmux();
     command.kill_on_drop(true).args([
         "-N",
         "list-sessions",

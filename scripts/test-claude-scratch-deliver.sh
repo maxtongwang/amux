@@ -17,6 +17,9 @@
 # -e per the AF-561 ratchet: without it a harness prints PASS after calling a
 # helper that does not exist.
 set -euo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 cd "$(dirname "$0")/.."
 SUT="./scripts/claude-scratch-deliver.sh"
 PASS=0; FAIL=0

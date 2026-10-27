@@ -27,6 +27,9 @@
 # distinct marker when the budget or cap cuts. Never less coverage than before,
 # more when it fits, and the shortfall is named rather than silent.
 set -euo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 cd "$(dirname "$0")/.."
 HOOK="${OBSERVED_EDITS_HOOK:-$(pwd)/scripts/claude-hooks/observed-edits-post.py}"
 PASS=0; FAIL=0

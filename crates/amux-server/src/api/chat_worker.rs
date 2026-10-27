@@ -2311,9 +2311,15 @@ fn sse_event(serialized: &str) -> Event {
 /// `POST /api/sessions/{name}/chat/interrupt`: stop the running turn and
 /// keep the worker (and its queue). The chat equivalent of pressing Escape in
 /// a terminal worker. The partial reply is kept and marked interrupted.
-pub(crate) async fn interrupt_route(AxumPath(name): AxumPath<String>) -> Response {
+///
+/// A worker may interrupt only workers it shares a group with
+/// (`session_verbs::pane_write_refusal`); the owner is unchanged.
+pub(crate) async fn interrupt_route(AxumPath(name): AxumPath<String>, headers: axum::http::HeaderMap) -> Response {
     if !lane_exists(&name) {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "unknown worker"}))).into_response();
+    }
+    if let Some(refusal) = super::session_verbs::pane_write_refusal(&headers, &name, "chat:interrupt") {
+        return refusal;
     }
     let (interrupted, detail) = interrupt_turn(&name);
     Json(json!({"ok": true, "interrupted": interrupted, "detail": detail})).into_response()

@@ -74,6 +74,8 @@ async fn vault_secrets_lifecycle_authz_precedence_and_no_leaks() {
     std::fs::create_dir_all(&tmux_dir).unwrap();
     std::env::set_var("TMUX_TMPDIR", &tmux_dir);
     std::env::remove_var("TMUX");
+    std::env::remove_var("TMUX_PANE");
+    std::env::set_var(amux_server::tmux_guard::TEST_ISOLATED_ENV, "1");
     std::env::set_var("AMUX_HOME", &home);
     std::env::set_var("AMUX_VAULT_KEYSTORE", "file");
     let logs = Buf::default();

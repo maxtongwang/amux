@@ -516,8 +516,8 @@ pub(crate) fn unique_tmp_path(path: &Path) -> std::path::PathBuf {
     ))
 }
 
-/// Cross-process companion to env_write_lock. The Bash registrar uses the
-/// same flock, so its env replacement cannot race the server's first mint.
+/// Cross-process companion to env_write_lock. Every worker env replacement
+/// takes this same flock, including API registration and scope merges.
 pub(crate) fn incarnation_file_lock(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     use std::os::fd::AsRawFd;
     let Some(sessions) = path.parent().filter(|p| p.file_name().is_some_and(|n| n == "sessions")) else {
@@ -781,6 +781,25 @@ impl EnvFile {
         }
     }
 
+    /// Publish under the caller's env/incarnation locks, then announce a new
+    /// worker identity only after it exists on disk (never on a failed write).
+    fn publish(path: &Path, tmp: &Path) -> std::io::Result<()> {
+        let worker = path.parent().is_some_and(|p| p.file_name().is_some_and(|n| n == "sessions"))
+            && path.extension().is_some_and(|e| e == "env");
+        let before = worker.then(|| Self::load(path));
+        std::fs::rename(tmp, path)?;
+        if let Some(before) = before {
+            let after = Self::load(path);
+            let key = super::rename_identity::INCARNATION_KEY;
+            if after.get(key).is_some() && before.get(key) != after.get(key) {
+                tracing::info!(session = %path.file_stem().unwrap_or_default().to_string_lossy(),
+                    verdict = "worker_incarnation_assigned", measured = true, n_considered = 1,
+                    "a worker was given its incarnation id");
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn write_unlocked(&self, path: &Path) -> std::io::Result<()> {
         use std::io::Write as _;
         let mut out = format!(
@@ -804,7 +823,7 @@ impl EnvFile {
             f.write_all(out.as_bytes())?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        Self::publish(path, &tmp)
     }
 
     pub(crate) fn replace_text(path: &Path, text: &str) -> std::io::Result<()> {
@@ -826,7 +845,7 @@ impl EnvFile {
             f.write_all(text.as_bytes())?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        Self::publish(path, &tmp)
     }
 
     /// A value as it must appear in a file bash sources and both env parsers
@@ -901,7 +920,7 @@ impl EnvFile {
             file.write_all(text.as_bytes())?;
             file.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        Self::publish(path, &tmp)
     }
 }
 
@@ -1368,19 +1387,8 @@ pub(crate) async fn run_cmd(
     args: &[&str],
     timeout: Duration,
 ) -> Option<std::process::Output> {
-    let mut cmd = tokio::process::Command::new(bin);
-    // A TEST NEVER REACHES A REAL TMUX SERVER (2026-10-17 outage: a test
-    // killed the live tmux server). Every tmux call this module makes in a
-    // test build goes to a private per-process socket with $TMUX/$TMUX_PANE
-    // cleared, since $TMUX wins over TMUX_TMPDIR inside a pane. So a rename,
-    // stop or delete exercised by a test can only touch that private server.
-    #[cfg(test)]
-    if bin == "tmux" {
-        cmd.arg("-L")
-            .arg(test_tmux_socket())
-            .env_remove("TMUX")
-            .env_remove("TMUX_PANE");
-    }
+    // tmux goes through the test guard (tmux_guard): never the host server in a test.
+    let mut cmd = if bin == "tmux" { tmux_command_async() } else { tokio::process::Command::new(bin) };
     cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1392,31 +1400,14 @@ pub(crate) async fn run_cmd(
     }
 }
 
-/// The private tmux socket name every test-build tmux call uses (`-L`).
-/// Minimal on purpose: amux #17 adds a shared tmux_guard, and this guard and
-/// the two builders below collapse into it on rebase.
-#[cfg(test)]
-pub(crate) fn test_tmux_socket() -> String {
-    format!("amux-test-{}", std::process::id())
-}
-
-/// A blocking `tmux` command for sites that cannot go through [`run_cmd`]. In
-/// a test build it carries the same guard: private `-L` socket, no $TMUX.
+/// A blocking `tmux` command using the crate-wide private-socket guard.
 pub(crate) fn tmux_command() -> std::process::Command {
-    #[allow(unused_mut)]
-    let mut cmd = std::process::Command::new("tmux");
-    #[cfg(test)]
-    cmd.arg("-L").arg(test_tmux_socket()).env_remove("TMUX").env_remove("TMUX_PANE");
-    cmd
+    crate::tmux_guard::std_tmux()
 }
 
-/// [`tmux_command`] for async sites.
+/// [`tmux_command`] for async sites, using the same guarded socket.
 pub(crate) fn tmux_command_async() -> tokio::process::Command {
-    #[allow(unused_mut)]
-    let mut cmd = tokio::process::Command::new("tmux");
-    #[cfg(test)]
-    cmd.arg("-L").arg(test_tmux_socket()).env_remove("TMUX").env_remove("TMUX_PANE");
-    cmd
+    crate::tmux_guard::tokio_tmux()
 }
 
 async fn tmux(args: &[&str]) -> Option<std::process::Output> {
@@ -25424,6 +25415,13 @@ async fn dispatch(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        // A Chat tab speaks for the owner (chat_speaks_for_owner), so a lane's
+        // send into ANOTHER group's worker's tab was a route across the
+        // boundary with owner reach on the far side. Same rule as a send to
+        // the worker itself.
+        if method == Method::POST {
+            if let Some(refusal) = pane_write_refusal(&headers, &worker, "chat-tab:send") { return refusal; }
+        }
         return super::chat_worker::companion_route(
             &state, &worker, method == Method::POST, &action, receipt, &body, &caller,
         )
@@ -27999,16 +27997,24 @@ pub(crate) fn lane_groups(lane: &str) -> std::collections::BTreeSet<String> {
     if !valid_session_name(lane) || lane == "." || lane == ".." {
         return Default::default();
     }
-    parse_env(lane)
-        .get("CC_TAGS")
+    let env = parse_env(lane);
+    // A project executor's retired fleet-wide `ephemeral` group (driver.rs
+    // `executor_groups`) is not membership: executors configured before that
+    // change still carry it in their env file until their next configure, and
+    // it must not join them to every other project's executors meanwhile.
+    let project_executor = env.get("CC_EPHEMERAL") == Some("1") && env.get("CC_PROJECT").is_some_and(|p| !p.trim().is_empty());
+    env.get("CC_TAGS")
         .map(|v| {
             v.split(',')
                 .map(|t| t.trim().trim_matches('"').to_lowercase())
-                .filter(|t| !t.is_empty())
+                .filter(|t| !t.is_empty() && !(project_executor && t == RETIRED_EXECUTOR_GROUP))
                 .collect()
         })
         .unwrap_or_default()
 }
+
+/// The group every project executor used to share across projects.
+const RETIRED_EXECUTOR_GROUP: &str = "ephemeral";
 
 /// Why a worker-to-worker send is allowed, or `Err(reason)` if it is not.
 ///
@@ -34149,6 +34155,25 @@ fn rename_verb_target(body: &Value) -> &str {
         .unwrap_or("")
 }
 
+/// The group boundary for a request that writes into `target`'s pane or turn
+/// without being a message: an interrupt, a typed slash command, a send into
+/// its Chat tab. It is [`cross_group_policy_ok`], the predicate a text send
+/// already runs (fix/group-boundary-keys-ephemeral-register), as a 403: owner,
+/// dashboard, verified members, self and chat-for-owner pass; a worker reaches
+/// only workers it shares a group with, and never an isolated one. `verb`
+/// names the path in the log line so a sweep can count refusals per writer.
+/// The keys/start/instructions/git-push verbs take the same rule through the
+/// attribution follow-up's gate; the two can be unified on one name later. A
+/// config PATCH that would type `/model` into a pane needs no gate of its own:
+/// configuring another worker is owner-only (`peer_config_refusal`).
+pub(crate) fn pane_write_refusal(headers: &HeaderMap, target: &str, verb: &'static str) -> Option<Response> {
+    let origin = worker_origin(headers);
+    let reason = cross_group_policy_ok(&origin, target).err()?;
+    tracing::warn!(origin = %origin, target, verb, verdict = "pane_write_group_boundary",
+        measured = true, n_considered = 1, "a worker tried to write into another group's pane");
+    Some(jresp(StatusCode::FORBIDDEN, json!({"ok": false, "code": "worker_group_boundary", "error": reason, "verb": verb})))
+}
+
 /// The group whose members may create workers (Max, 2026-10-16: "Only leads
 /// can create workers"). Membership of it is the owner's to grant.
 pub(crate) const LEADS_GROUP: &str = "leads";
@@ -35866,6 +35891,40 @@ mod tests {
         }
     }
 
+    /// API registration's create and merge writers announce assignment once,
+    /// after persistence; a failed publication must announce nothing.
+    #[test]
+    fn registration_env_writers_announce_only_persisted_incarnations() {
+        type EnvWrite = fn(&Path) -> std::io::Result<()>;
+        let writers: [(&str, EnvWrite); 3] = [
+            ("create", |p| EnvFile::replace_text(p, "CC_DIR=/tmp\n")),
+            ("merge", |p| EnvFile::merge_plain(p, &[("CC_DIR".into(), Some("/tmp".into()))])),
+            ("write", |p| {
+                let mut env = EnvFile::load(p);
+                env.set("CC_DIR", "/tmp");
+                env.write(p)
+            }),
+        ];
+        let home = tempfile::tempdir().unwrap();
+        let (logs, _capture, _registration_peer) = held_capture_logs();
+        for (index, (name, write)) in writers.into_iter().enumerate() {
+            let path = home.path().join(format!("sessions/{name}.env"));
+            write(&path).unwrap();
+            let incarnation = super::super::rename_identity::incarnation(home.path(), name)
+                .expect("a successful write persisted its identity");
+            assert_eq!(held_capture_count(&logs, "worker_incarnation_assigned"), index + 1, "{name} assignment");
+            write(&path).unwrap();
+            assert_eq!(super::super::rename_identity::incarnation(home.path(), name).as_deref(), Some(incarnation.as_str()));
+            assert_eq!(held_capture_count(&logs, "worker_incarnation_assigned"), index + 1, "{name} re-register is silent");
+        }
+        let path = home.path().join("sessions/failed.env");
+        let _env = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _file = incarnation_file_lock(&path).unwrap();
+        assert!(EnvFile::publish(&path, &path.with_extension("missing")).is_err());
+        assert!(!path.exists());
+        assert_eq!(held_capture_count(&logs, "worker_incarnation_assigned"), writers.len(), "failed publish is silent");
+    }
+
     /// AF-716: a captured prompt under the cap gets no marker; over the cap it
     /// gets an explicit "[truncated, N of M chars]" tag naming both numbers,
     /// rather than stopping silently mid-sentence.
@@ -36099,8 +36158,7 @@ mod tests {
 
     #[test]
     fn tmux_shell_setup_keeps_line_and_enter_in_one_command() {
-        use std::process::Command;
-        if Command::new("tmux").arg("-V").output().is_err() {
+        if crate::tmux_guard::std_tmux().arg("-V").output().is_err() {
             eprintln!("tmux unavailable; live shell submission test not measured");
             return;
         }
@@ -36109,7 +36167,7 @@ mod tests {
         struct PrivateServer(std::path::PathBuf);
         impl Drop for PrivateServer {
             fn drop(&mut self) {
-                let _ = Command::new("tmux")
+                let _ = crate::tmux_guard::std_tmux()
                     .arg("-S")
                     .arg(&self.0)
                     .arg("kill-server")
@@ -36117,7 +36175,7 @@ mod tests {
             }
         }
         let _server = PrivateServer(socket.clone());
-        let created = Command::new("tmux")
+        let created = crate::tmux_guard::std_tmux()
             .arg("-S")
             .arg(&socket)
             .args([
@@ -36141,7 +36199,7 @@ mod tests {
                 "printf '%s\\n' {value} >> {}",
                 super::sh_quote(&receipt.to_string_lossy())
             );
-            let out = Command::new("tmux")
+            let out = crate::tmux_guard::std_tmux()
                 .arg("-S")
                 .arg(&socket)
                 .args(super::shell_line_args(&pt, &line))
@@ -36169,13 +36227,12 @@ mod tests {
 
     #[tokio::test]
     async fn startup_shell_receipts_preserve_long_input_and_wait_for_setup() {
-        use std::process::Command;
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let socket = dir.path().join("socket");
         struct PrivateServer(std::path::PathBuf);
         impl Drop for PrivateServer {
             fn drop(&mut self) {
-                let _ = Command::new("tmux")
+                let _ = crate::tmux_guard::std_tmux()
                     .arg("-S")
                     .arg(&self.0)
                     .arg("kill-server")
@@ -36183,7 +36240,7 @@ mod tests {
             }
         }
         let _server = PrivateServer(socket.clone());
-        let created = Command::new("tmux")
+        let created = crate::tmux_guard::std_tmux()
             .arg("-S")
             .arg(&socket)
             .args([
@@ -36206,7 +36263,7 @@ mod tests {
             let socket = socket.clone();
             async move {
                 let target = super::pt("startup-proof");
-                tokio::process::Command::new("tmux")
+                crate::tmux_guard::tokio_tmux()
                     .arg("-S")
                     .arg(socket)
                     .args(super::shell_line_args(&target, &line))
@@ -36389,7 +36446,7 @@ mod tests {
             .await
             .unwrap();
         let pt = super::pt("startup-proof");
-        let pane = Command::new("tmux")
+        let pane = crate::tmux_guard::std_tmux()
             .arg("-S")
             .arg(&socket)
             .args(["capture-pane", "-p", "-t", pt.as_str(), "-S", "-"])
@@ -45847,7 +45904,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         impl Drop for Pane {
             fn drop(&mut self) {
                 let st = session_target(&self.0);
-                let _ = tmux_command()
+                let _ = crate::tmux_guard::std_tmux()
                     .args(["kill-session", "-t", &st])
                     .output();
             }
@@ -46353,7 +46410,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         // And nothing was created. This is the assertion the incident needed:
         // the test could not tell it had spawned, because from inside every
         // call returned as though it worked.
-        let live = tmux_command_async()
+        let live = crate::tmux_guard::tokio_tmux()
             .args(["list-sessions", "-F", "#{session_name}"])
             .output()
             .await
@@ -47022,23 +47079,24 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         assert!(v["error"].as_str().unwrap().contains("rid-src"), "{v}");
     }
 
-    /// The test-build tmux guard: this module's tmux calls go to a private
-    /// `-L` socket with $TMUX ignored, even when the test runs inside a live
-    /// pane with $TMUX pointing at the real server. `list-sessions` is
-    /// read-only and starts no server.
-    #[tokio::test]
-    async fn review_test_builds_never_reach_the_live_tmux_server() {
-        match tmux(&["list-sessions"]).await {
-            None => {
-                // No tmux binary: nothing can reach a server. Still asserted.
-                assert!(std::process::Command::new("tmux").arg("-V").output().is_err());
+    /// Both command builders clear inherited pane identity and explicitly
+    /// name a private socket. Inspect the commands: the shared guard's private
+    /// server may already be running for another test, so absence is no oracle.
+    #[test]
+    fn review_test_builds_never_reach_the_live_tmux_server() {
+        let assert_guarded = |cmd: &std::process::Command| {
+            let args: Vec<_> = cmd.get_args().collect();
+            assert_eq!(args.len(), 2, "the builder supplies only -S <socket>");
+            assert_eq!(args[0], "-S");
+            let dir = Path::new(args[1]).parent().and_then(Path::parent)
+                .expect("private socket has a root and a uid directory");
+            assert!(crate::tmux_guard::is_private_tmux_dir(Some(dir)), "{dir:?}");
+            for key in ["TMUX", "TMUX_PANE"] {
+                assert!(cmd.get_envs().any(|(name, value)| name == key && value.is_none()), "{key} is cleared");
             }
-            Some(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                assert!(!out.status.success(), "the private socket has no server: {stderr}");
-                assert!(stderr.contains(&test_tmux_socket()), "addressed the private socket: {stderr}");
-            }
-        }
+        };
+        assert_guarded(&tmux_command());
+        assert_guarded(tmux_command_async().as_std());
     }
 
     #[tokio::test]
@@ -49894,7 +49952,7 @@ mod submission_gate_tests {
         impl Drop for Pane {
             fn drop(&mut self) {
                 let st = session_target(&self.0);
-                let _ = tmux_command()
+                let _ = crate::tmux_guard::std_tmux()
                     .args(["kill-session", "-t", &st])
                     .output();
             }
@@ -49930,7 +49988,7 @@ with open(sys.argv[3],'ab',buffering=0) as log:
         if key in (b'\r',b'\n'): paint(sys.argv[2])
 "#
         );
-        let output = tmux_command()
+        let output = crate::tmux_guard::std_tmux()
             .args([
                 "new-session",
                 "-d",
@@ -49988,7 +50046,7 @@ with open(sys.argv[3],'ab',buffering=0) as log:
         impl Drop for Pane {
             fn drop(&mut self) {
                 let stq = session_target(&self.0);
-                let _ = tmux_command()
+                let _ = crate::tmux_guard::std_tmux()
                     .args(["kill-session", "-t", &stq])
                     .output();
             }
@@ -50006,7 +50064,7 @@ with open(sys.argv[3],'ab',buffering=0) as log:
                 (now_f64() * 1_000_000.0) as u64
             );
             let pane = Pane(tmux_name(&lane));
-            let output = tmux_command().args([
+            let output = crate::tmux_guard::std_tmux().args([
                 "new-session", "-d", "-s", &pane.0, "-x", "200", "-y", "24",
                 "python3", "-c", "import pathlib,sys,time;print(pathlib.Path(sys.argv[1]).read_text(),flush=True);time.sleep(20)",
                 path.to_str().unwrap(),

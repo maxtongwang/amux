@@ -13,6 +13,9 @@
 # Runs the SHIPPED fleet-boot.sh, with AMUX_BIN and AMUX_FLEET_BOOT_BASE pointed
 # at stubs. No real worker is ever started by this file.
 set -euo pipefail
+# Private tmux server, never the host fleet's (lib/test-isolation.sh).
+# shellcheck source=lib/test-isolation.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/test-isolation.sh"; amux_test_isolate_tmux "$(mktemp -d)" || exit 1
 cd "$(dirname "$0")/.."
 BOOT="${FLEET_BOOT_SH:-$(pwd)/scripts/fleet-boot.sh}"
 PASS=0; FAIL=0

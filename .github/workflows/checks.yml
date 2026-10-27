@@ -53,7 +53,7 @@ jobs:
       - name: Browser evidence and lifecycle cleanup controls (AF-768, AF-773)
         run: |
           npm ci --ignore-scripts
-          node --test tests/ci-e2e-evidence.test.mjs tests/worker-lifecycle-cleanup.test.mjs tests/e2e-teardown-ratchet.test.mjs tests/e2e-plan.test.mjs tests/e2e-worker-control.test.mjs
+          node --test tests/ci-e2e-evidence.test.mjs tests/worker-lifecycle-cleanup.test.mjs tests/e2e-teardown-ratchet.test.mjs tests/e2e-plan.test.mjs tests/e2e-worker-control.test.mjs tests/live-base.test.mjs
           npm run test:project-setup
           npm run test:outbox
           npm run test:offline
@@ -567,10 +567,6 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/test-push-consent.sh
-      - name: a register write merges rather than clobbering a peer's
-        run: |
-          set -uo pipefail
-          bash scripts/test-register-merge.sh
       - name: a second-person resend fires only when it should (positive control)
         run: |
           set -uo pipefail
@@ -750,6 +746,23 @@ jobs:
       # while a CLI still sending `reviewer` leaves the feature dead.
       - name: CLI board request routes to the target
         run: ./scripts/test-board-request-routes-to-target.sh
+      # register/exec/--keys go through the server and never write a session
+      # file or a pane themselves, so the create rule and the group boundary
+      # reach the CLI. Its own step: a CLI that writes the file passes every
+      # server test while bypassing all of them.
+      - name: CLI register, exec and keys go through the server
+        run: ./scripts/test-cli-register-through-server.sh
+      # The shared hermetic environment every CLI test sources: it must pin
+      # HOME/CC_HOME/AMUX_HOME and refuse the real home or a reachable endpoint.
+      - name: CLI test isolation refuses the live home
+        run: ./scripts/test-test-isolation.sh
+      # 2026-10-16 outage: `TMUX_TMPDIR=... tmux kill-server` inside a pane
+      # killed the LIVE tmux server ($TMUX wins over TMUX_TMPDIR). Every
+      # destructive tmux call in test and tool scripts names its socket.
+      - name: tmux calls in test and tool scripts name their socket
+        run: ./scripts/lint-tmux-socket.py
+      - name: the tmux socket lint fires and passes where it should
+        run: ./scripts/test-lint-tmux-socket.sh
       # AMUX-4705: a piped brief splits into a one-line title and a body. Its
       # own step because the failure is silent: the card is created, exit 0, and
       # the title is a paragraph.
