@@ -67,6 +67,7 @@ pub mod contract_watch;
 pub mod land_queue;
 pub mod deploy_wake;
 pub mod disk_watch;
+pub mod fault_tracker;
 pub mod email_approval_digest;
 pub mod needs_input_auto;
 pub(crate) mod executor;

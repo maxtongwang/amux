@@ -74,9 +74,11 @@ const JOB: &str = "autofix";
 use crate::api::request_log as rl;
 use crate::api::AppState;
 use crate::db::board_store as bs;
+use super::fault_tracker::{self, FaultTracker};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Knobs. Every threshold in this file is named, defaulted and printed on the
@@ -1248,6 +1250,8 @@ pub struct AutofixReport {
     pub already_filed: Vec<String>,
     pub suppressed: Vec<(String, String, String)>,
     pub quiet_noted: Vec<(String, String)>,
+    /// (card, signature) — cards closed because their fault cleared.
+    pub cleared: Vec<(String, String)>,
     /// (card, "resolved"|"stopped being checkable") — cards told that the
     /// incident behind them is gone (AMUX-3574).
     pub resolved_noted: Vec<(String, String)>,
@@ -5222,37 +5226,10 @@ fn episode_sig(episode: i64) -> String {
 /// Distinct slow TARGETS in one tick before the outlier detector rolls up
 /// (AMUX-3588). Mirrors `AMUX_INVARIANT_ROLLUP_AT`; floor of 2 for the same
 /// reason — a "rollup" of one is just a card with worse wording.
-/// How stale a suppressing card may get before the suppression is called out
-/// as a MUTE rather than a dedupe (AMUX-3774).
-///
-/// Two days, because that is what the live specimen cost: AMUX-3651 sat in
-/// `backlog` from 08-24 while every server-wide stall since was correctly
-/// detected, correctly deduped, and filed nowhere. Config rather than a
-/// constant for the D4 reason — a policy baked into code becomes the ceiling.
-fn mute_warn_days() -> f64 {
-    env_f64("AMUX_AUTOFIX_MUTE_WARN_DAYS", 2.0).max(0.25)
-}
-
-/// When a suppressing card stops suppressing (AMUX-3774).
-///
-/// The mute has to END, or "one card per fault" quietly becomes "one card per
-/// fault, forever, whoever parks it first". Only OPEN cards suppress — that is
-/// deliberate, so a judged-and-discarded card lets the next occurrence through
-/// — but `backlog` is open AND parked, which is neither judged nor worked.
-///
-/// SEVEN DAYS, and the number is a judgement rather than a measurement, so it
-/// is stated as one: it is long enough that deliberately parking a card still
-/// buys real quiet (the whole point of parking), and short enough that a fault
-/// class cannot go dark for a fortnight without anyone choosing that. The live
-/// specimen reached 2 days before it was found by accident.
-///
-/// This does NOT bump the card's `updated`. That was the tempting version and it
-/// is worse: it would make a parked card look actively worked, defeat every
-/// staleness sweep that reads `updated`, and trade one dishonest signal for
-/// another. Expiring the suppression says the true thing instead — nobody has
-/// touched this, so the fault is loud again.
-fn mute_expire_days() -> f64 {
-    env_f64("AMUX_AUTOFIX_MUTE_EXPIRE_DAYS", 7.0).max(mute_warn_days())
+/// Seconds a fault must stay absent before its card closes as cleared. Long
+/// enough that a fault flapping around its threshold keeps one card.
+fn clear_after_secs() -> f64 {
+    env_f64("AMUX_AUTOFIX_CLEAR_MIN", 30.0).max(1.0) * 60.0
 }
 
 fn outlier_rollup_at() -> usize {
@@ -7672,11 +7649,22 @@ fn fault_identity(signature: &str) -> Option<&str> {
     // so one open card suppresses the next fire's refile; the epoch exists only
     // so a NEW episode after that card is judged is a new signature rather than
     // being swallowed by `already_filed` forever.
+    // `ci|<repo>|<workflow>|<anchor>|<bucket>`: the anchor (first run of the
+    // streak) moves whenever a green run interrupts the streak, so keying on it
+    // filed a new "CI red: <workflow>" card per flap while the old one stayed
+    // open. The fault is "this workflow is red", so the identity is the first
+    // three fields.
+    if signature.starts_with("ci|") {
+        return signature
+            .match_indices('|')
+            .nth(2)
+            .map(|(i, _)| &signature[..i]);
+    }
     if !(signature.starts_with("5xx|")
+        || signature.starts_with("silent|system-job|ROLLUP|")
         || signature.starts_with("latency|outlier|")
         || signature.starts_with("latency|p95|")
-        || signature.starts_with("silent|schedule-errors|")
-        || signature.starts_with("ci|"))
+        || signature.starts_with("silent|schedule-errors|"))
     {
         return None;
     }
@@ -7797,66 +7785,34 @@ fn covered_by_open_rollup(
         })
 }
 
-fn open_card_for_fault(conn: &Connection, signature: &str) -> Option<String> {
-    let ident = fault_identity(signature)?;
+/// The dedupe key of a fault: its identity when the signature carries a
+/// varying suffix, else the signature itself. Never contains a count, a job
+/// list or a timestamp, so one fault is one key however it moves.
+fn fault_key(signature: &str) -> &str {
+    fault_identity(signature).unwrap_or(signature)
+}
+
+/// The issue that tracked this fault before it cleared, when this occurrence
+/// is a recurrence. `close` renames the fault's idem to `...#cleared:<id>`, so
+/// the rename is the durable record that a predecessor existed.
+fn cleared_predecessor(conn: &Connection, signature: &str) -> Option<String> {
+    let key = fault_key(signature);
     conn.query_row(
-        &format!(
-            "SELECT id FROM issues \
-              WHERE (source_ref LIKE ?1 OR source_ref = ?2) \
-                AND status IN ({live}) \
-                AND archived = 0 AND deleted IS NULL \
-              ORDER BY id DESC LIMIT 1",
-            live = crate::db::board_store::live_work_status_list()
-        ),
-        // `= ?2` covers a card filed before its signature grew a trailing
-        // epoch (the CI bucket, AMUX-5371): its source_ref IS the identity.
-        rusqlite::params![format!("autofix:{ident}|%"), format!("autofix:{ident}")],
+        "SELECT substr(idem, instr(idem, ?2) + length(?2)) FROM session_events \
+          WHERE idem LIKE ?1 ESCAPE '\\' ORDER BY id DESC LIMIT 1",
+        rusqlite::params![
+            format!("autofix:{}%{}%", escape_like(key), escape_like(CLEARED_IDEM_SUFFIX)),
+            CLEARED_IDEM_SUFFIX
+        ],
         |r| r.get::<_, String>(0),
     )
     .ok()
 }
 
-/// The card that WAS suppressing this fault and no longer is, with why.
-///
-/// AMUX-3943. `open_card_for_fault` above stops matching the moment a card is
-/// archived (`AND archived = 0`), which is correct: archiving hides a card from
-/// every view and every autonomy loop, so a still-live fault with only an
-/// archived tracker is a fault nobody can see. Releasing the suppression is the
-/// right call.
-///
-/// What was missing is that the re-filed card could not say WHY IT APPEARED NOW.
-/// Measured: the `amux` board was bulk-archived at 21:46:03 and AMUX-3943 filed
-/// 45 seconds later for an occurrence from 16:17, which its predecessor
-/// AMUX-3864 had been holding for five and a half hours. 86 of the 159 archived
-/// cards were suppressing a fault signature, so that is 86 releases from one
-/// operator action, arriving as apparently-new reports.
-///
-/// A reader cannot act on that without knowing it. "New fault" and "a
-/// suppression you released" call for opposite responses, and nothing in the
-/// payload distinguished them (ethos rule 4: a wrong answer is rarely
-/// wrong-LOOKING; name what should appear BESIDE it).
-///
-/// Ordered by id DESC so the most recent predecessor wins, and returns the
-/// disposition rather than just the id, because "archived" and "discarded" mean
-/// different things to the reader: one was hidden, the other was judged.
-fn released_predecessor(conn: &Connection, signature: &str) -> Option<(String, String)> {
-    let ident = fault_identity(signature)?;
-    conn.query_row(
-        // The COMPLEMENT of the four "still open" sites, from the same source,
-        // so the two directions cannot drift apart (AMUX-4801).
-        &format!(
-            "SELECT id, CASE WHEN archived = 1 THEN 'archived' ELSE status END \
-               FROM issues \
-              WHERE source_ref LIKE ?1 \
-                AND deleted IS NULL \
-                AND (archived = 1 OR status NOT IN ({live})) \
-              ORDER BY id DESC LIMIT 1",
-            live = crate::db::board_store::live_work_status_list()
-        ),
-        rusqlite::params![format!("autofix:{ident}|%")],
-        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-    )
-    .ok()
+const CLEARED_IDEM_SUFFIX: &str = "#cleared:";
+
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
 /// One tick: run every detector, file what is new, note what went quiet.
@@ -7888,7 +7844,7 @@ pub async fn autofix_tick_with_ci(
     ci_runs: &[CiRun],
     ci_sup: Vec<Suppressed>,
 ) -> AutofixReport {
-    autofix_tick_with_inputs(state, home, ci_runs, ci_sup, &[]).await
+    autofix_tick_with_inputs(state, home, ci_runs, ci_sup, &[], false).await
 }
 
 /// Live tick with runtime-only instruments supplied by the spawner. Keeping
@@ -7901,6 +7857,10 @@ async fn autofix_tick_with_inputs(
     ci_runs: &[CiRun],
     ci_sup: Vec<Suppressed>,
     system_issues: &[crate::runtime_jobs::registry::HealthIssue],
+    // True only when `system_issues` is a real registry reading (an empty list
+    // then means healthy). Otherwise an empty list is absence of data and must
+    // not close system-job cards.
+    runtime_observed: bool,
 ) -> AutofixReport {
     let t0 = std::time::Instant::now();
     let now = unix_now();
@@ -8057,6 +8017,12 @@ async fn autofix_tick_with_inputs(
         tracing::info!(target: "amux::autofix", verdict = "autofix_detectors_skipped", skipped = ?skip,
             "autofix: detectors left out of this tick by AMUX_AUTOFIX_SKIP");
     }
+    let observed = Observed {
+        ci: !ci_runs.is_empty(),
+        runtime: runtime_observed,
+        disk: disk_s.is_empty(),
+        skipped: skip.clone(),
+    };
     let detected = state.store.read_async(move |conn| {
         let on = enabled(conn);
         let mut findings = system_findings;
@@ -8108,7 +8074,37 @@ async fn autofix_tick_with_inputs(
     };
     rep.enabled = on;
 
+    let tracker = fault_tracker::tracker_for(state);
+    let mut tracker_ok = true;
+    let mut open_by_key: BTreeMap<String, fault_tracker::TrackedFault> = BTreeMap::new();
+    {
+        let t = tracker.clone();
+        match tokio::task::spawn_blocking(move || t.list_open()).await {
+            Ok(Ok(list)) => {
+                for i in list {
+                    if let Some(k) = i.key() {
+                        open_by_key.insert(k, i);
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                tracker_ok = false;
+                tracing::warn!(verdict = "autofix_tracker_unavailable", error = %e,
+                    "autofix cannot list open alert issues; filing and clearing are skipped this tick \
+                     (never filing blind, which would duplicate)");
+                rep.errors.push(format!("tracker list: {e}"));
+            }
+            Err(e) => {
+                tracker_ok = false;
+                rep.errors.push(format!("tracker list panicked: {e}"));
+            }
+        }
+    }
     let ignore = ignore_list();
+    let live_keys: std::collections::BTreeSet<String> = findings
+        .iter()
+        .map(|f| fault_key(&f.signature).to_string())
+        .collect();
     let mut to_file: Vec<Finding> = Vec::new();
     for f in findings {
         rep.signatures_seen
@@ -8118,6 +8114,14 @@ async fn autofix_tick_with_inputs(
                 f.kind.slug().into(),
                 f.signature.clone(),
                 format!("matches AMUX_AUTOFIX_IGNORE entry {pat:?}"),
+            ));
+            continue;
+        }
+        if !tracker_ok {
+            rep.suppressed.push((
+                f.kind.slug().into(),
+                f.signature.clone(),
+                "the alert tracker is unreachable — detected, not filed, and not retried blind".into(),
             ));
             continue;
         }
@@ -8149,148 +8153,64 @@ async fn autofix_tick_with_inputs(
         // discard property — a judged-and-discarded card lets the next genuine
         // occurrence through.
         {
-            // ORDER MATTERS, and getting it wrong shadowed a real signal:
-            // running this ahead of `already_filed` made every repeat of an
-            // open fault report as "suppressed" instead of "already_filed", and
-            // `a_restart_does_not_refile` caught it. The two answer different
-            // questions and both are worth keeping — "I already filed THIS
-            // batch" is precise and cheap, "the fault is already in someone's
-            // queue" is the broad one. Ask the precise one first, and let
-            // file_finding own it.
-            let existing = state.store.read().ok().and_then(|c| {
-                if already_filed(&c, &f.signature) {
-                    return None;
-                }
-                open_card_for_fault(&c, &f.signature)
-            });
-            if let Some(card) = existing {
-                // NAME HOW STALE THE SUPPRESSING CARD IS (AMUX-3774).
-                //
-                // This used to assert "Its count is what moves; a second card
-                // would carry no new information." Nothing implemented that.
-                // This block pushes a report row and `continue`s; it never
-                // touches the card. Measured 2026-08-26: AMUX-3651 last updated
-                // 08-24 17:35 while the rollup suppressed against it every ~2
-                // minutes for two days, including through a live six-family
-                // stall. The count was not moving, so a second card WOULD have
-                // carried new information — that the fault recurred today.
-                //
-                // ethos rule 6: grep for what the docstring promises, and either
-                // implement it or delete the claim. Deleted, and replaced with a
-                // fact this code can actually establish.
-                //
-                // THE DEEPER HAZARD the staleness exposes: only OPEN cards
-                // suppress, and `backlog` is open. A fault card parked in
-                // backlog is a permanent mute on its whole class, with no
-                // expiry. `filed: []` then reads identically for "nothing is
-                // wrong" and "everything is muted" — the idiom ethos.md names.
-                let stale_d = state
+            // One open issue per fault KEY (kind + subject; see `fault_key`). A
+            // repeat updates that issue (last seen, current value, sightings)
+            // and files nothing.
+            if let Some(issue) = open_by_key.get(fault_key(&f.signature)).cloned() {
+                let was_filed = state
                     .store
                     .read()
-                    .ok()
-                    .and_then(|c| {
-                        c.query_row(
-                            "SELECT COALESCE(updated, created) FROM issues WHERE id=?1",
-                            rusqlite::params![&card],
-                            |r| r.get::<_, f64>(0),
-                        )
-                        .ok()
-                    })
-                    .map(|t| (crate::config::now_f64() - t) / 86400.0);
-                let age = match stale_d {
-                    Some(d) => format!(" It has not been touched in {d:.1} day(s)."),
-                    None => String::new(),
-                };
-                // SELF-ANNOUNCING once the mute is old enough to be a mute
-                // rather than a dedupe. A suppression is normal; suppressing
-                // against a card nobody has touched for days is the whole class
-                // going dark, and it should not need someone to open the debug
-                // surface to find out.
-                // THE MUTE EXPIRES (AMUX-3774, criterion 2: "a deliberately
-                // parked card still suppresses for a bounded, stated period").
-                // Past the bound this stops suppressing and the fault files
-                // again, because the alternative is that whoever parks a card
-                // first owns silence on its whole class indefinitely.
-                //
-                // Deliberately NOT a bump of the card's `updated`, which was the
-                // tempting fix: it would make a parked card look actively worked
-                // and defeat every staleness sweep reading that field. Letting
-                // the fault through says the true thing — nobody has touched
-                // this, so it is loud again.
-                if stale_d.unwrap_or(0.0) >= mute_expire_days() {
-                    tracing::warn!(
-                        card = %card,
-                        detector = f.kind.slug(),
-                        signature = %f.signature,
-                        stale_days = stale_d.unwrap_or(0.0),
-                        expire_days = mute_expire_days(),
-                        "autofix_mute_expired: this fault has been suppressed against an \
-                         untouched card past the bound, so it is being FILED again. The new \
-                         card is not a duplicate — it is evidence the fault recurred while \
-                         the old one sat parked (AMUX-3774)."
-                    );
-                    rep.suppressed.push((
-                        f.kind.slug().into(),
-                        format!("{}|mute-expired", f.signature),
-                        format!(
-                            "{card} held this fault for {:.1} day(s) without being touched, \
-                             past AMUX_AUTOFIX_MUTE_EXPIRE_DAYS ({:.1}). NOT suppressed: \
-                             re-filing, because a parked card must not mute its class forever.",
-                            stale_d.unwrap_or(0.0),
-                            mute_expire_days()
-                        ),
-                    ));
-                    // Fall through to file. The decision is recorded above so
-                    // "why did this re-file" is answerable without a bisect.
-                } else {
-                    if stale_d.unwrap_or(0.0) >= mute_warn_days() {
-                        tracing::warn!(
-                            card = %card,
-                            detector = f.kind.slug(),
-                            signature = %f.signature,
-                            stale_days = stale_d.unwrap_or(0.0),
-                            "autofix_mute: this fault keeps recurring and is suppressed against a \
-                             card nobody has touched. Only OPEN cards suppress and `backlog` is \
-                             open, so a parked card mutes its entire class with no expiry \
-                             (AMUX-3774). Judge or discard the card to let occurrences through."
-                        );
+                    .map(|c| already_filed(&c, &f.signature))
+                    .unwrap_or(false);
+                let (title, value, obs) = (truncate(&f.title, 160), f.count, (f.last_ts as i64).to_string());
+                let (t, target) = (tracker.clone(), issue.clone());
+                let updated = tokio::task::spawn_blocking(move || {
+                    fault_tracker::record_sighting(&*t, &target, &title, value, &obs, unix_now() as i64)
+                })
+                .await;
+                match updated {
+                    Ok(Ok(Some(fresh))) => {
+                        open_by_key.insert(fault_key(&f.signature).to_string(), fresh);
                     }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(issue = %issue.id, signature = %f.signature, error = %e,
+                            "autofix could not update the standing issue for a repeated fault");
+                        rep.errors.push(format!("{}: tracker update: {e}", f.signature));
+                    }
+                    Err(e) => rep.errors.push(format!("{}: tracker update panicked: {e}", f.signature)),
+                }
+                if was_filed {
+                    rep.already_filed.push(f.signature.clone());
+                } else {
                     rep.suppressed.push((
                         f.kind.slug().into(),
                         f.signature.clone(),
                         format!(
-                            "{card} is open for this same fault — one card per fault, not one \
-                         per scan (AMUX-3667).{age} NOTE: suppressing does NOT bump that \
-                         card, so its age is the only signal that this recurred. It stops \
-                         suppressing at {:.1} day(s).",
-                            mute_expire_days()
+                            "issue #{} is open for this same fault (key {}) — updated in place, no new issue (AMUX-3667)",
+                            issue.id,
+                            fault_key(&f.signature)
                         ),
                     ));
-                    continue;
                 }
+                continue;
             }
         }
-        // WHY THIS CARD IS APPEARING NOW (AMUX-3943). If a predecessor held this
-        // exact fault and has stopped suppressing, say so ON the card. A reader
-        // handed a fresh report cannot otherwise tell a NEW fault from a
-        // suppression somebody released, and those call for opposite responses.
-        //
-        // The bulk case is the one that hurts: archiving the `amux` board
-        // released 86 fault suppressions in a single operator action, and the
-        // first re-file arrived 45 seconds later carrying an occurrence from
-        // five and a half hours earlier with nothing to say about either fact.
-        let released = state
+        // WHY THIS ISSUE IS APPEARING NOW (AMUX-3943). A fault that cleared and
+        // came back files a fresh issue; name the one that closed so a reader
+        // can tell a recurrence from a brand-new fault.
+        let predecessor = state
             .store
             .read()
             .ok()
-            .and_then(|c| released_predecessor(&c, &f.signature));
+            .and_then(|c| cleared_predecessor(&c, &f.signature));
         let mut f = f;
-        if let Some((card, disp)) = released {
+        if let Some(prev) = predecessor {
             f.evidence.push((
                 "why_now".into(),
                 format!(
-                    "{card} tracked this same fault and is now `{disp}`, so it stopped                      suppressing and the next occurrence filed here. If you {} that card,                      this is the consequence rather than a new fault — the underlying                      occurrence may predate this card by hours. Only OPEN, unarchived cards                      suppress (`open_card_for_fault`).",
-                    if disp == "archived" { "archived" } else { "closed" }
+                    "issue #{prev} tracked this same fault and was closed when it cleared; \
+                     this is a recurrence, not a new fault."
                 ),
             ));
         }
@@ -8301,7 +8221,16 @@ async fn autofix_tick_with_inputs(
             .push((s.kind.slug().into(), s.signature, s.reason));
     }
 
+    let mut filed_keys: std::collections::BTreeSet<String> = Default::default();
     for f in to_file {
+        if !filed_keys.insert(fault_key(&f.signature).to_string()) {
+            rep.suppressed.push((
+                f.kind.slug().into(),
+                f.signature.clone(),
+                "another finding with the same fault key was filed this tick".into(),
+            ));
+            continue;
+        }
         match file_finding(state, &f).await {
             Ok(Some(card)) => {
                 // LINK THE INCIDENT TO THE CARD IT MINTED (AMUX-3574).
@@ -8419,6 +8348,13 @@ async fn autofix_tick_with_inputs(
         break; // ONE per tick. See the cap note above.
     }
 
+    if on && tracker_ok {
+        match close_cleared_issues(state, &tracker, now, &live_keys, &observed).await {
+            Ok(v) => rep.cleared = v,
+            Err(e) => rep.errors.push(format!("clear sweep: {e}")),
+        }
+    }
+
     match note_resolved_incidents(state).await {
         Ok(v) => rep.resolved_noted = v,
         Err(e) => rep.errors.push(format!("note_resolved_incidents: {e}")),
@@ -8433,6 +8369,101 @@ async fn autofix_tick_with_inputs(
         *g = Some(rep.clone());
     }
     rep
+}
+
+/// What this tick actually looked at. Absence of a finding only means "cleared"
+/// for a detector that ran with data (ethos rule 4).
+struct Observed {
+    ci: bool,
+    runtime: bool,
+    disk: bool,
+    skipped: Vec<String>,
+}
+
+/// Signature prefix -> owning detector. A table, not a chain of branches.
+const SIGNATURE_OWNERS: &[(&str, DetectorKind)] = &[
+    ("5xx|", DetectorKind::Http5xx),
+    ("latency|", DetectorKind::Latency),
+    ("dead-route|", DetectorKind::DeadRoute),
+    ("silent|", DetectorKind::SilentSubsystem),
+    ("invariant|", DetectorKind::InvariantBreach),
+    ("build|", DetectorKind::BuildDeploy),
+    ("disk|", DetectorKind::DiskPressure),
+    ("ci|", DetectorKind::CiFailure),
+    ("fd|", DetectorKind::FdPressure),
+    ("connector-", DetectorKind::ConnectorAuth),
+    ("stuck-composer|", DetectorKind::StuckComposer),
+];
+
+/// Did this tick observe the fault behind `signature` well enough to call its
+/// absence a clear? Unknown signatures are never cleared.
+fn observed_this_tick(signature: &str, obs: &Observed) -> bool {
+    let Some((_, kind)) = SIGNATURE_OWNERS.iter().find(|(p, _)| signature.starts_with(p)) else {
+        return false;
+    };
+    if obs.skipped.iter().any(|s| s == kind.slug()) {
+        return false;
+    }
+    match kind {
+        DetectorKind::CiFailure => obs.ci,
+        DetectorKind::DiskPressure => obs.disk,
+        DetectorKind::SilentSubsystem if signature.starts_with("silent|system-job|") => obs.runtime,
+        _ => true,
+    }
+}
+
+/// Close every open alert issue whose fault key is absent from this tick's
+/// findings, was observed, and was last seen at least `clear_after_secs` ago.
+/// Each closure posts a note (cleared at, last value) and releases the idem so
+/// a recurrence files one new issue.
+async fn close_cleared_issues(
+    state: &AppState,
+    tracker: &Arc<dyn FaultTracker>,
+    now: f64,
+    live_keys: &std::collections::BTreeSet<String>,
+    obs: &Observed,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let t = tracker.clone();
+    let open = tokio::task::spawn_blocking(move || t.list_open()).await??;
+    let mut cleared = Vec::new();
+    for issue in open {
+        let Some(key) = issue.key() else { continue };
+        let last_seen = issue.state().map_or(now, |s| s.last_seen as f64);
+        if live_keys.contains(&key)
+            || !observed_this_tick(&key, obs)
+            || now - last_seen < clear_after_secs()
+        {
+            continue;
+        }
+        let (t, i, note) = (tracker.clone(), issue.clone(), fault_tracker::clear_note(&issue, now as i64));
+        if let Err(e) = tokio::task::spawn_blocking(move || t.close(&i.id, &note)).await? {
+            tracing::warn!(issue = %issue.id, key = %key, error = %e, "autofix could not close a cleared issue");
+            continue;
+        }
+        let (k, id) = (key.clone(), issue.id.clone());
+        state
+            .store
+            .write_async(move |conn| {
+                release_idem(conn, &k, &id)?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await?;
+        tracing::info!(issue = %issue.id, key = %key, verdict = "autofix_fault_cleared",
+            "autofix closed an alert issue: its fault is no longer detected");
+        cleared.push((issue.id, key));
+    }
+    Ok(cleared)
+}
+
+/// Rename every filed-idem of `key` so the fault can file again. The rows stay
+/// (the event log keeps its history); only their dedupe role ends.
+fn release_idem(conn: &Connection, key: &str, issue_id: &str) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE session_events SET idem = idem || ?3 || ?2 \
+          WHERE (idem = 'autofix:' || ?1 OR substr(idem, 1, length(?1) + 9) = 'autofix:' || ?1 || '|') \
+            AND instr(idem, ?3) = 0",
+        rusqlite::params![key, issue_id, CLEARED_IDEM_SUFFIX],
+    )
 }
 
 /// File one finding. Returns the new card id, or None when the signature was
@@ -8568,298 +8599,82 @@ fn invariant_signature_parts(sig: &str) -> Option<(String, String)> {
     }
 }
 
-/// AEAB-59. A suppressed re-finding whose TITLE has changed is NOT a duplicate —
-/// it is news about the same condition, and dropping it is how an alarm becomes
-/// a stopped clock.
-///
-/// Measured 2026-08-25: AMUX-30 still read "disk: 4.2 GB free, below the 50 GB
-/// floor" while the volume was at 0.94 GB. The detector had found the condition
-/// every two minutes for five days and every one of those findings was
-/// discarded, because the idem index says one card per condition forever. That
-/// is right for avoiding duplicate cards and wrong for a card whose CONTENT is a
-/// measurement: the condition had not changed, the number had, by 4.5x, and the
-/// number is the whole point. A stopped clock reading "fine" is worse than no
-/// clock, because the board is read first and trusted.
-///
-/// Two gates, and they are what keep this from becoming the OTHER failure —
-/// rule 5, a card that accumulates until nothing about it is done or not-done:
-///   * the TITLE must have changed. These detectors put the measurement in the
-///     title, so an unchanged title means the number has not moved enough to
-///     render differently. A static condition writes nothing, forever.
-///   * and not more often than `AMUX_AUTOFIX_REFRESH_MIN_SECS` (default 6h),
-///     so a value oscillating around a rounding boundary cannot turn the card
-///     into a journal.
-///
-/// The desc block is REPLACED, never appended, for the same reason: the card
-/// stays one page however long the condition lasts.
-fn refresh_min_secs() -> i64 {
-    std::env::var("AMUX_AUTOFIX_REFRESH_MIN_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(6 * 3600)
-}
-
-const REFRESH_MARK: &str = "\n\n<!-- autofix:current -->\n";
-
-/// Strip any previous refresh block, so the replacement cannot stack.
-pub(crate) fn desc_without_refresh(desc: &str) -> &str {
-    match desc.find(REFRESH_MARK) {
-        Some(i) => &desc[..i],
-        None => desc,
-    }
-}
-
-/// Should the existing card be refreshed? Split out so both gates are testable
-/// without a store or a clock — the whole defect was a decision nobody could see.
-/// The count already carded, parsed back out of the rendered evidence block.
-///
-/// autofix writes that block itself from `Finding::evidence` as `key: value`
-/// lines, so this reads its own output rather than anything a caller controls.
-/// `None` when absent (older cards, or a finding kind with no count) — and an
-/// absent count must never ENABLE the escalation path below, only leave the
-/// cooldown in charge.
-pub(crate) fn carded_count(desc: &str) -> Option<u64> {
-    desc.lines()
-        .find_map(|l| l.trim().strip_prefix("count:"))
-        .and_then(|v| v.trim().parse::<u64>().ok())
-}
-
-/// AF-474: a fault card frozen at its first burst reports the incident's
-/// SMALLEST numbers for the whole time it matters.
-///
-/// Measured 2026-09-04. AMUX-4093 was filed at 15:36:13 on a pool starvation and
-/// said "4 request(s) across 3 route(s), last_seen 15:35:15". The real episode ran
-/// to 19:52:37 — 43 rows across 5 routes over 257 minutes, with 38 of them in the
-/// LAST hour. The title condition below passed the whole time ("4 ... 3" would
-/// have become "43 ... 5"); the 6h cooldown was the only thing blocking it, and
-/// it opened 103 minutes AFTER the episode ended.
-///
-/// One rule was serving two questions. "Has this fault recurred later" is what
-/// the cooldown is for and 6h is right for it (AEAB-59 added the refresh, and the
-/// cooldown is what stops a recurring fault rewriting its card every tick).
-/// "Is this happening RIGHT NOW and bigger than when I filed" is a different
-/// question, and on that one a 6h cooldown guarantees silence for the duration of
-/// almost every incident.
-///
-/// ESCALATION BYPASSES THE COOLDOWN, and only escalation. A doubling is the
-/// threshold because it makes the bypass SELF-LIMITING: refreshes are logarithmic
-/// in the fault's size, so an incident growing 4 -> 43 refreshes about three
-/// times, not once per tick. A steady fault never doubles and never bypasses.
-pub(crate) fn should_refresh_with_counts(
-    old_title: &str,
-    new_title: &str,
-    updated_at: i64,
-    now: i64,
-    min_secs: i64,
-    old_count: Option<u64>,
-    new_count: u64,
-) -> bool {
-    if old_title == new_title {
-        return false;
-    }
-    // An absent old count leaves the cooldown in charge — absence is not
-    // evidence of growth.
-    let escalating = old_count.is_some_and(|c| c > 0 && new_count >= c.saturating_mul(2));
-    escalating || now - updated_at >= min_secs
-}
-
 async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<String>> {
     // PER-TENANT CLOUD: do not drop the server's own health/ops findings onto a
-    // customer's board (AMUX-3014). Off by env in the cloud image; on locally
-    // where the board is the ops board. Detection still runs — only the card
-    // FILING is suppressed — and the operator reads /health + /api/health/
-    // invariants for cloud health.
+    // customer's tracker (AMUX-3014). Off by env in the cloud image; on locally.
+    // Detection still runs; only the FILING is suppressed.
     if !ops_health_cards_enabled() {
         return Ok(None);
     }
-    {
-        let conn = state.store.read()?;
-        if already_filed(&conn, &f.signature) {
-            // AEAB-59: do not just drop it — if the MEASUREMENT moved, say so on
-            // the card that already exists. Read-only here; the write is below.
-            let fresh_title = truncate(&f.title, 160);
-            let existing: Option<(String, String, String, i64)> = conn
-                .query_row(
-                    "SELECT id, title, COALESCE(desc,''), COALESCE(updated_at, created_at) \
-                       FROM issues WHERE source_ref = ?1 AND archived = 0 LIMIT 1",
-                    rusqlite::params![format!("autofix:{}", f.signature)],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                )
-                .ok();
-            let now_s = crate::api::reclaim::now_secs();
-            let Some((card_id, old_title, old_desc, updated_at)) = existing else {
-                return Ok(None);
-            };
-            if !should_refresh_with_counts(
-                &old_title,
-                &fresh_title,
-                updated_at,
-                now_s,
-                refresh_min_secs(),
-                carded_count(&old_desc),
-                f.count,
-            ) {
-                return Ok(None);
-            }
-            drop(conn);
-            let body = format!(
-                "{}{}The measurement moved. Re-read {} — previously titled:\n  {}\n\n{}",
-                desc_without_refresh(&old_desc),
-                REFRESH_MARK,
-                chrono::Utc::now().format("%Y-%m-%d %H:%M UTC"),
-                old_title,
-                render_desc(f)
-            );
-            let (cid, ttl) = (card_id.clone(), fresh_title.clone());
-            let _ = state.store.write(move |c| {
-                c.execute(
-                    "UPDATE issues SET title = ?2, desc = ?3, updated_at = ?4 WHERE id = ?1",
-                    rusqlite::params![cid, ttl, body, now_s],
+    // This exact signature was filed before. An OPEN issue for the fault was
+    // already updated by the tick; a closed one stays closed (a judged report
+    // sticks) until the fault clears and `release_idem` frees the signature.
+    if already_filed(&*state.store.read()?, &f.signature) {
+        return Ok(None);
+    }
+    let title = truncate(&f.title, 160);
+    let now_s = unix_now() as i64;
+    let mut text = render_desc(f);
+    if let Some(t) = f.parked_until {
+        text.push_str(&format!(
+            "\nparked_until: {} (a dwell-window fault: only the clock closes it)\n",
+            rl::local_when(t)
+        ));
+    }
+    let key = fault_key(&f.signature).to_string();
+    let body = fault_tracker::initial_body(&key, &text, &title, f.count, &(f.last_ts as i64).to_string(), now_s);
+    let public_title = fault_tracker::sanitize_public(&title);
+
+    // Reserve the signature BEFORE opening, so two ticks cannot both open: the
+    // idem insert is the lock. A failed open releases it again.
+    let (idem, sig, kind_slug) = (idem_of(&f.signature), f.signature.clone(), f.kind.slug().to_string());
+    let reserved = {
+        let idem = idem.clone();
+        state
+            .store
+            .write_async(move |conn| {
+                let n = conn.execute(
+                    "INSERT OR IGNORE INTO session_events (ts, session, type, data, idem, source) \
+                     VALUES (?1, '', 'autofix.filed', ?2, ?3, 'autofix')",
+                    rusqlite::params![now_s as f64, json!({"signature": sig, "detector": kind_slug}).to_string(), idem],
                 )?;
-                Ok(crate::db::WriteOutcome {
-                    applied: true,
-                    events: vec![],
+                Ok(crate::db::WriteOutcome { applied: n == 1, events: vec![] })
+            })
+            .await?
+    };
+    if !reserved.applied {
+        return Ok(None);
+    }
+    let tracker = fault_tracker::tracker_for(state);
+    let opened = tokio::task::spawn_blocking(move || tracker.open(&public_title, &body)).await?;
+    match opened {
+        Ok(id) => {
+            let (idem, id2) = (idem_of(&f.signature), id.clone());
+            state
+                .store
+                .write_async(move |conn| {
+                    conn.execute(
+                        "UPDATE session_events SET data = json_set(data, '$.card', ?2) WHERE idem = ?1",
+                        rusqlite::params![idem, id2],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
                 })
-            });
-            tracing::info!(
-                card = %card_id, detector = %f.signature,
-                "autofix refreshed a standing card — the measurement moved (AEAB-59)"
-            );
-            return Ok(None);
+                .await?;
+            tracing::info!(issue = %id, key = %key, signature = %f.signature, "autofix opened an alert issue");
+            Ok(Some(id))
+        }
+        Err(e) => {
+            let idem = idem_of(&f.signature);
+            let _ = state
+                .store
+                .write_async(move |conn| {
+                    conn.execute("DELETE FROM session_events WHERE idem = ?1", rusqlite::params![idem])?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .await;
+            Err(e)
         }
     }
-    let owner = f.owner.clone().unwrap_or_else(fixer_session);
-    let owner = if owner.trim().is_empty() {
-        None
-    } else {
-        Some(owner)
-    };
-    let title = truncate(&f.title, 160);
-    let desc = render_desc(f);
-    let item_type = f.kind.item_type();
-    let signature = f.signature.clone();
-    let idem = idem_of(&signature);
-    let kind_slug = f.kind.slug().to_string();
-    let now_s = unix_now() as i64;
-    let parked_until = f.parked_until;
-
-    // The new id has to come back OUT of the writer closure, which runs on the
-    // single writer thread — so it cannot ride a thread_local, and widening
-    // `write_async`'s return type would touch every writer in the crate for
-    // one string.
-    let created_id: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
-    let sink = created_id.clone();
-    state
-        .store
-        .write_async(move |conn| {
-            // Re-check inside the writer: two ticks cannot race a double file.
-            if conn
-                .query_row(
-                    "SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1",
-                    rusqlite::params![idem],
-                    |_| Ok(()),
-                )
-                .is_ok()
-            {
-                return Ok(crate::db::WriteOutcome {
-                    applied: false,
-                    events: vec![],
-                });
-            }
-            let new = bs::NewIssue {
-                acceptance_criteria: None,
-                next_action: None,
-                title: title.clone(),
-                desc: desc.clone(),
-                // PARKED, NOT QUEUED (AMUX-3645). A dwell-window fault has no
-                // action that closes it before its clock runs out, so filing it
-                // `todo` hands a lane work it cannot do — and board_drive picks
-                // from `todo`, so the cost is a real pickup and a real
-                // investigation every time. `backlog` plus the non-empty
-                // `source_ref` set below is the shape the drive already reads as
-                // "parked on a live trigger" (board_drive.rs:1614): out of the
-                // untracked-work nag, out of rot, still on the board.
-                //
-                // Deliberately NOT `tripwire`. That type is for a card ARMED
-                // ahead of an event; this one is filed after the event, and its
-                // exit is a date rather than a firing. Retyping it would trade
-                // one gate that does not fit for another.
-                status: if parked_until.is_some() {
-                    "backlog".into()
-                } else {
-                    "todo".into()
-                },
-                session: owner.clone(),
-                item_type: item_type.into(),
-                creator: "autofix".into(),
-                // owner_type=agent is what makes board_drive eligible to pick
-                // it up. A human-owned card would sit forever: the drive
-                // deliberately never touches a person's in-flight work.
-                owner_type: "agent".into(),
-                due: None,
-                due_time: None,
-                reviewer: None,
-                shepherd: None,
-                gate: vec![],
-                depends_on: vec![],
-                tags: vec!["autofix".into(), format!("detector:{kind_slug}")],
-                // Not an ask: this producer files ordinary cards, and a card
-                // filed into needsyou without one is what AMUX-3929 is about.
-                ask_type: None,
-                ask_question: None,
-                ask_unblocks: None,
-                ask_actor: None,
-                // AF-367: filed by the autofix detector.
-                source: Some("autofix".into()),
-                requested_by: None,
-                callback_session: None,
-                callback_prompt: None,
-            };
-            let row = bs::create_issue(conn, &new, now_s)?;
-            conn.execute(
-                "UPDATE issues SET source_ref = ?1 WHERE id = ?2",
-                rusqlite::params![format!("autofix:{signature}"), row.id],
-            )?;
-            // Stamp the park (AMUX-3645). `last_verified_at` is what makes a
-            // trigger nobody re-checks DETECTABLE rather than a card sleeping
-            // forever — parking without it buys silence with no expiry, which
-            // is the failure the backlog convention exists to prevent.
-            if parked_until.is_some() {
-                conn.execute(
-                    "UPDATE issues SET last_verified_at = ?1 WHERE id = ?2",
-                    rusqlite::params![now_s, row.id],
-                )?;
-            }
-            conn.execute(
-                "INSERT OR IGNORE INTO session_events (ts, session, type, data, idem, source) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    now_s as f64,
-                    owner.clone().unwrap_or_default(),
-                    "autofix.filed",
-                    json!({"card": row.id, "signature": signature, "detector": kind_slug})
-                        .to_string(),
-                    idem,
-                    "autofix"
-                ],
-            )?;
-            let event = crate::db::PendingEvent {
-                entity_type: amux_core::revision::EntityType::Task,
-                entity_id: row.id.clone(),
-                mutation: amux_core::revision::MutationKind::Created,
-                payload: Some(row.snapshot()),
-            };
-            if let Ok(mut g) = sink.lock() {
-                *g = Some(row.id.clone());
-            }
-            Ok(crate::db::WriteOutcome {
-                applied: true,
-                events: vec![event],
-            })
-        })
-        .await?;
-    let created = created_id.lock().ok().and_then(|g| g.clone());
-    Ok(created)
 }
 
 ///
@@ -9176,7 +8991,7 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
             // `AMUX_CI_POLL_MIN`, so a 120s tick is not 720 API calls a day.
             let (ci_runs, ci_sup) = fetch_ci_runs(unix_now()).await;
             let system_issues = crate::runtime_jobs::registry::health_issues(unix_now());
-            let r = autofix_tick_with_inputs(&state, &home, &ci_runs, ci_sup, &system_issues).await;
+            let r = autofix_tick_with_inputs(&state, &home, &ci_runs, ci_sup, &system_issues, true).await;
             release_freed_heap();
             if !r.filed.is_empty() || !r.errors.is_empty() {
                 tracing::info!(
@@ -9284,6 +9099,8 @@ async fn debug_autofix(
             "resolved_noted": r.resolved_noted.iter()
                 .map(|(c, w)| json!({"card": c, "what": w}))
                 .collect::<Vec<_>>(),
+            "cleared": r.cleared.iter()
+                .map(|(c, s)| json!({"card": c, "signature": s})).collect::<Vec<_>>(),
             "quiet_noted": r.quiet_noted.iter()
                 .map(|(c, w)| json!({"card": c, "what": w})).collect::<Vec<_>>(),
             // AMUX-3645. A parked card is filed and then deliberately does
@@ -10370,160 +10187,6 @@ mod tests {
     // number, and a card rewritten every tick until nothing on it is
     // done-or-not-done (ethos rule 5).
 
-    /// THE BUG. AMUX-30 read "4.2 GB free" for five days while the volume fell
-    /// to 0.94 GB. Same condition, same signature, different number — and the
-    /// number is the whole point of the card.
-    #[test]
-    fn a_moved_measurement_refreshes_the_standing_card() {
-        let day = 86_400;
-        assert!(super::should_refresh_with_counts(
-            "disk: 4.2 GB free, below the 50 GB floor",
-            "disk: 0.9 GB free, below the 50 GB floor",
-            0,
-            5 * day,
-            6 * 3600,
-            None,
-            0,
-        ));
-    }
-
-    /// THE CONTROL, and the one that stops this becoming rule 5's journal: an
-    /// unchanged title writes nothing, however long the condition stands. A
-    /// refresh that fired on a static condition would rewrite the card every
-    /// tick forever.
-    #[test]
-    fn an_unchanged_measurement_writes_nothing_however_old() {
-        let t = "disk: 4.2 GB free, below the 50 GB floor";
-        assert!(!super::should_refresh_with_counts(
-            t,
-            t,
-            0,
-            365 * 86_400,
-            6 * 3600,
-            None,
-            0
-        ));
-    }
-
-    /// The rate gate. A value oscillating across a rounding boundary would
-    /// otherwise rewrite the card on every tick — the same journal, arrived at
-    /// from the other direction.
-    #[test]
-    fn a_moved_measurement_still_waits_out_the_rate_gate() {
-        let now = 1_000_000;
-        assert!(!super::should_refresh_with_counts(
-            "a",
-            "b",
-            now - 60,
-            now,
-            6 * 3600,
-            None,
-            0
-        ));
-        assert!(super::should_refresh_with_counts(
-            "a",
-            "b",
-            now - 6 * 3600,
-            now,
-            6 * 3600,
-            None,
-            0
-        ));
-    }
-
-    /// AF-474. A card filed on an incident's FIRST BURST reports its smallest
-    /// numbers for the whole time it matters, because the cooldown outlasts the
-    /// incident.
-    ///
-    /// Real numbers: AMUX-4093 filed 15:36:13 saying "4 request(s) across 3
-    /// route(s)". The episode ran to 19:52:37 — 43 rows across 5 routes, 38 of
-    /// them in the last hour. The title condition passed throughout; the 6h
-    /// cooldown opened 103 minutes AFTER it ended.
-    #[test]
-    fn an_escalating_fault_refreshes_before_the_cooldown_but_a_steady_one_does_not() {
-        let now = 1_000_000;
-        let fresh = now - 60; // well inside the 6h cooldown
-        let (old_t, new_t) = (
-            "… 4 request(s) across 3 route(s) …",
-            "… 43 request(s) across 5 route(s) …",
-        );
-
-        // THE SPECIMEN: 4 -> 43 is more than a doubling, inside the cooldown.
-        assert!(
-            super::should_refresh_with_counts(old_t, new_t, fresh, now, 6 * 3600, Some(4), 43),
-            "an incident that grew 10x must update its card while it is still happening"
-        );
-        // A STEADY fault must NOT bypass — this is what the cooldown is for, and
-        // without this arm the change is just 'refresh always'.
-        assert!(
-            !super::should_refresh_with_counts(old_t, new_t, fresh, now, 6 * 3600, Some(40), 43),
-            "a fault ticking along must wait for the cooldown, or every tick rewrites the card"
-        );
-        // EXACTLY 2x is the boundary the doubling rule names.
-        assert!(super::should_refresh_with_counts(
-            old_t,
-            new_t,
-            fresh,
-            now,
-            6 * 3600,
-            Some(4),
-            8
-        ));
-        assert!(!super::should_refresh_with_counts(
-            old_t,
-            new_t,
-            fresh,
-            now,
-            6 * 3600,
-            Some(4),
-            7
-        ));
-        // ABSENT old count leaves the cooldown in charge. Absence is not growth.
-        assert!(
-            !super::should_refresh_with_counts(old_t, new_t, fresh, now, 6 * 3600, None, 9_999),
-            "a card with no carded count must not be escalated on a guess"
-        );
-        // An unchanged TITLE still short-circuits, escalation or not.
-        assert!(
-            !super::should_refresh_with_counts(old_t, old_t, fresh, now, 6 * 3600, Some(4), 43),
-            "no title change means nothing to say"
-        );
-    }
-
-    /// The count is read back out of autofix's OWN rendered evidence block.
-    #[test]
-    fn carded_count_reads_the_evidence_line_or_says_it_cannot() {
-        let desc = "verdict: whatever\ncount: 4\ndistinct_clients: 1 (ip:100.108.219.90)\n";
-        assert_eq!(super::carded_count(desc), Some(4));
-        assert_eq!(
-            super::carded_count("no count here\n"),
-            None,
-            "absent must be None, never 0 — 0 would read as a real measurement"
-        );
-        assert_eq!(super::carded_count("count: not-a-number\n"), None);
-    }
-
-    /// The refresh block is REPLACED, never appended, or the card grows without
-    /// bound for as long as the condition lasts — which for a disk alarm is
-    /// exactly the case where somebody eventually has to read it.
-    #[test]
-    fn the_refresh_block_replaces_and_never_stacks() {
-        let base = "original body";
-        let once = format!("{base}{}first", super::REFRESH_MARK);
-        assert_eq!(super::desc_without_refresh(&once), base);
-        let twice = format!("{once}{}second", super::REFRESH_MARK);
-        assert_eq!(
-            super::desc_without_refresh(&twice),
-            base,
-            "a second refresh must still strip back to the original body"
-        );
-        assert_eq!(
-            super::desc_without_refresh(base),
-            base,
-            "no block is a no-op"
-        );
-    }
-
     // ── connector-auth: token rot files one card per ACCOUNT ────────────────
 
     #[test]
@@ -10958,242 +10621,6 @@ mod tests {
         assert!(
             !tmp_candidate_name("tmux-501"),
             "the tmux socket dir is tiny and not ours to rank"
-        );
-    }
-
-    /// AMUX-3667 follow-up, rebuilt from the eight cards themselves.
-    ///
-    /// `POST /api/browser/start` filed AMUX-3650, 3652, 3653, 3654, 3655, 3656,
-    /// 3660 and 3661 in 50 minutes — one fault, eight cards, identical but for
-    /// the count in the title, 8 of the 23 in one lane's queue. Their
-    /// `source_ref`s differ only in the trailing epoch, which is exactly the
-    /// field added so a DISCARD would stick.
-    ///
-    /// So the treatment and the control pull against each other by design, and
-    /// both have to hold: an OPEN card suppresses, a DISCARDED one does not.
-    /// AMUX-3943. A released suppression must be DISTINGUISHABLE from a new
-    /// fault on the card itself.
-    ///
-    /// `open_card_for_fault` stops matching the instant a card is archived, and
-    /// that is correct: archiving hides a card from every view and every
-    /// autonomy loop, so a live fault tracked only by an archived card is a
-    /// fault nobody can see. What was wrong is that the re-file said nothing
-    /// about why it appeared.
-    ///
-    /// The bulk case is what makes it matter: archiving the `amux` board
-    /// released 86 fault suppressions in one operator action.
-    #[test]
-    fn a_released_suppression_names_the_card_that_stopped_suppressing() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE issues (id TEXT, source_ref TEXT, status TEXT, \
-             archived INTEGER DEFAULT 0, deleted TEXT);",
-        )
-        .unwrap();
-        let sig = "latency|outlier|GET|/api/sessions|1788121035";
-        let ident = fault_identity(sig).expect("this signature has a fault identity");
-        let add = |id: &str, status: &str, archived: i64| {
-            conn.execute(
-                "INSERT INTO issues (id, source_ref, status, archived, deleted) \
-                 VALUES (?1, ?2, ?3, ?4, NULL)",
-                rusqlite::params![id, format!("autofix:{ident}|1788008538"), status, archived],
-            )
-            .unwrap();
-        };
-
-        // Nothing yet: a genuinely new fault has no predecessor to name.
-        assert!(
-            released_predecessor(&conn, sig).is_none(),
-            "a first-ever fault must not invent a predecessor"
-        );
-
-        // An ARCHIVED card is the specimen: still `review`, hidden by an operator.
-        add("AMUX-3864", "review", 1);
-        let (id, disp) = released_predecessor(&conn, sig).expect("the archived card must be found");
-        assert_eq!(
-            (id.as_str(), disp.as_str()),
-            ("AMUX-3864", "archived"),
-            "archived must be reported as archived, not as its underlying status"
-        );
-
-        // CONTROL, and it is the half that keeps this honest: an OPEN card must
-        // NOT be reported as a released predecessor. It is still suppressing, so
-        // naming it would tell the reader a suppression was released when it was
-        // not — the same class of wrong answer, pointed the other way.
-        let conn2 = Connection::open_in_memory().unwrap();
-        conn2
-            .execute_batch(
-                "CREATE TABLE issues (id TEXT, source_ref TEXT, status TEXT, \
-                 archived INTEGER DEFAULT 0, deleted TEXT);",
-            )
-            .unwrap();
-        conn2
-            .execute(
-                "INSERT INTO issues (id, source_ref, status, archived, deleted) \
-                 VALUES ('AMUX-9', ?1, 'review', 0, NULL)",
-                rusqlite::params![format!("autofix:{ident}|1788008538")],
-            )
-            .unwrap();
-        assert!(
-            released_predecessor(&conn2, sig).is_none(),
-            "an OPEN card is still suppressing and is not a released predecessor"
-        );
-        assert!(
-            open_card_for_fault(&conn2, sig).is_some(),
-            "...and the open-card path must still find it, or the two predicates disagree"
-        );
-    }
-
-    #[test]
-    fn one_open_card_per_fault_but_a_discarded_one_does_not_suppress() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE issues (id TEXT, source_ref TEXT, status TEXT, \
-             archived INTEGER DEFAULT 0, deleted TEXT);",
-        )
-        .unwrap();
-        let add = |id: &str, sref: &str, status: &str| {
-            conn.execute(
-                "INSERT INTO issues (id, source_ref, status, archived, deleted) \
-                 VALUES (?1,?2,?3,0,NULL)",
-                rusqlite::params![id, sref, status],
-            )
-            .unwrap();
-        };
-        // The real signature shape, from the real cards.
-        let sig = |ts: i64| format!("5xx|502|POST|/api/browser|/api/browser/start|{ts}");
-
-        // Nothing filed yet: the first occurrence must get a card.
-        assert_eq!(open_card_for_fault(&conn, &sig(1787585028)), None);
-
-        // AMUX-3650 is open. A LATER batch of the same fault must not file.
-        add("AMUX-3650", &format!("autofix:{}", sig(1787585028)), "todo");
-        assert_eq!(
-            open_card_for_fault(&conn, &sig(1787585376)).as_deref(),
-            Some("AMUX-3650"),
-            "a newer batch of an already-open fault must be suppressed"
-        );
-
-        // CONTROL 1: discarded must NOT suppress, or judging a spurious report
-        // would silence the fault permanently — the opposite failure, and the
-        // one the trailing timestamp exists to avoid.
-        conn.execute(
-            "UPDATE issues SET status='discarded' WHERE id='AMUX-3650'",
-            [],
-        )
-        .unwrap();
-        assert_eq!(
-            open_card_for_fault(&conn, &sig(1787585376)),
-            None,
-            "a discarded card must let the next genuine occurrence through"
-        );
-        for st in ["done", "verified"] {
-            conn.execute(
-                "UPDATE issues SET status=?1 WHERE id='AMUX-3650'",
-                rusqlite::params![st],
-            )
-            .unwrap();
-            assert_eq!(open_card_for_fault(&conn, &sig(1787585376)), None, "{st}");
-        }
-        // An ARCHIVED open card is not in anyone's queue either.
-        conn.execute(
-            "UPDATE issues SET status='todo', archived=1 WHERE id='AMUX-3650'",
-            [],
-        )
-        .unwrap();
-        assert_eq!(
-            open_card_for_fault(&conn, &sig(1787585376)),
-            None,
-            "archived"
-        );
-
-        // CONTROL 2: a DIFFERENT fault must still file. Matching on the prefix
-        // with a `LIKE` makes over-matching the live risk — `/api/browser` is a
-        // prefix of `/api/browser/start`, so a sloppy pattern would fold every
-        // endpoint under one card and the board would go quiet about real
-        // faults.
-        conn.execute(
-            "UPDATE issues SET status='todo', archived=0 WHERE id='AMUX-3650'",
-            [],
-        )
-        .unwrap();
-        let other = "5xx|502|POST|/api/browser|/api/browser/stop|1787585376";
-        assert_eq!(
-            open_card_for_fault(&conn, other),
-            None,
-            "a different target is a different fault"
-        );
-        let other_status = "5xx|500|POST|/api/browser|/api/browser/start|1787585376";
-        assert_eq!(
-            open_card_for_fault(&conn, other_status),
-            None,
-            "a different status too"
-        );
-
-        // AMUX-3673: a ROLLUP's identity is "the server was slow", not which
-        // endpoints it caught. These two are the REAL signatures of AMUX-3651
-        // and AMUX-3673, which differ by one element and are the same fault.
-        let r1 = "latency|outlier|ROLLUP|/api/board,/api/board/{id},/api/browser/start,\
-                  /api/sessions,/api/sessions-git,/api/sessions/{name}/{*verb}";
-        let r2 = "latency|outlier|ROLLUP|/api/board,/api/browser/action,/api/browser/start,\
-                  /api/sessions,/api/sessions-git,/api/sessions/{name}/{*verb}";
-        assert_eq!(fault_identity(r1), Some("latency|outlier|ROLLUP"));
-        assert_eq!(
-            fault_identity(r1),
-            fault_identity(r2),
-            "two rollups differing by one endpoint are one fault, not two cards"
-        );
-        // CONTROL: a rollup must NOT collapse into a per-endpoint fault, or the
-        // first slow endpoint would silence every server-wide report after it.
-        assert_ne!(
-            fault_identity(r1),
-            fault_identity("latency|outlier|GET|/api/board|1787585028"),
-            "a rollup and a single-endpoint outlier are different faults"
-        );
-
-        // AMUX-4648: the p95 rollup gets the same treatment. These are the real
-        // signatures of AMUX-4640 and AMUX-4646, filed 33 minutes apart during
-        // one loaded stretch, differing only in which families were over.
-        let p1 = "latency|p95|ROLLUP|/api/email,/api/logs,/api/sessions,/api/sessions-git";
-        let p2 = "latency|p95|ROLLUP|/api/email,/api/logs,/api/sessions-git";
-        assert_eq!(fault_identity(p1), Some("latency|p95|ROLLUP"));
-        assert_eq!(
-            fault_identity(p1),
-            fault_identity(p2),
-            "two p95 rollups differing by one family are one fault, not two cards"
-        );
-        // CONTROLS: a p95 rollup does not suppress an outlier rollup, and a
-        // single-family p95 finding still has no identity, as before this change.
-        assert_ne!(
-            fault_identity(p1),
-            fault_identity(r1),
-            "a p95 rollup and an outlier rollup are different detectors"
-        );
-        assert_eq!(fault_identity("latency|p95|/api/board"), None);
-
-        // Invariant signatures dedup by invariant name: all violations of the
-        // same invariant (different entities, different episodes) are one fault.
-        assert_eq!(
-            fault_identity("invariant|hooks.guard|fleet|1787223065"),
-            Some("invariant|hooks.guard")
-        );
-        assert_eq!(
-            fault_identity("invariant|hooks.guard|fleet"),
-            Some("invariant|hooks.guard"),
-            "an invariant signature without an epoch still has a fault identity"
-        );
-        assert_eq!(
-            fault_identity("invariant|hooks.guard|fleet|1787223065"),
-            fault_identity("invariant|hooks.guard|other-entity|1787224000"),
-            "same invariant, different entity = same fault"
-        );
-        assert_eq!(
-            fault_identity("5xx|502|POST|/api/x|/api/x|nota-number"),
-            None
-        );
-        assert_eq!(
-            fault_identity("latency|outlier|GET|/api/board|1787585028"),
-            Some("latency|outlier|GET|/api/board")
         );
     }
 
@@ -12644,19 +12071,22 @@ mod tests {
             .unwrap();
     }
 
+    /// Every alert issue the detectors have filed against this test's store,
+    /// open or closed, as (id, title, body, "", fault key). The fourth slot is
+    /// kept so older assertions keep their tuple shape; issues have no type.
     fn cards(st: &AppState) -> Vec<(String, String, String, String, String)> {
-        let conn = st.store.read().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, title, desc, type, COALESCE(source_ref,'') FROM issues ORDER BY id",
-            )
-            .unwrap();
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        let fake = super::super::fault_tracker::FakeTracker::typed_for_db(st.store.db_path());
+        let mut all: Vec<_> = fake
+            .open_issues()
+            .into_iter()
+            .chain(fake.closed_issues().into_iter().map(|(f, _)| f))
+            .map(|f| {
+                let key = f.key().unwrap_or_default();
+                (f.id, f.title, f.body, String::new(), key)
             })
-            .unwrap();
-        rows.flatten().collect()
+            .collect();
+        all.sort();
+        all
     }
 
     /// AMUX-3840. A pool starvation is ONE fault with many victims, and filing
@@ -12897,132 +12327,6 @@ mod tests {
         );
     }
 
-    /// AMUX-3774: a suppression must not claim a count it does not bump, and a
-    /// STALE suppressing card must say how stale it is.
-    ///
-    /// The reason text asserted "Its count is what moves; a second card would
-    /// carry no new information." Nothing implemented that — the block pushes a
-    /// report row and `continue`s, and never touches the card. Measured on the
-    /// live board: AMUX-3651 last updated 08-24 17:35 while the rollup
-    /// suppressed against it every ~2 minutes for two days, through a live
-    /// six-family stall. The count was not moving, so a second card WOULD have
-    /// carried new information.
-    ///
-    /// Both cells, because a message that always shouts "stale" is as useless
-    /// as one that never does — and the FRESH arm is the common case that must
-    /// stay quiet.
-    #[tokio::test]
-    async fn a_stale_suppressing_card_says_so_and_a_fresh_one_does_not() {
-        async fn reason_after_aging(days: f64) -> String {
-            let (st, _d) = state();
-            let now = unix_now();
-            for i in 0..4 {
-                log_row(
-                    &st,
-                    Row {
-                        ts: now - 60.0 - i as f64,
-                        method: "POST",
-                        path: "/api/browser/start",
-                        family: "/api/browser",
-                        status: 502,
-                        body: "{}",
-                        worker: "l",
-                        ua: "curl/8",
-                        ms: 9.0,
-                    },
-                );
-            }
-            let r = autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
-            assert!(!r.filed.is_empty(), "the first occurrence must file: {r:?}");
-            // Age the card, then re-run: the same fault must now suppress.
-            // A NEW OCCURRENCE, not a re-scan of the same rows. `already_filed`
-            // runs BEFORE the open-card check by design (its comment: asking
-            // the precise question first is what keeps "I filed this batch"
-            // distinct from "the fault is in someone's queue"), so re-ticking
-            // the identical rows never reaches the suppression under test.
-            // A newer row mints a newer trailing epoch, which is exactly the
-            // real case: the fault recurred.
-            let later = unix_now();
-            log_row(
-                &st,
-                Row {
-                    ts: later - 1.0,
-                    method: "POST",
-                    path: "/api/browser/start",
-                    family: "/api/browser",
-                    status: 502,
-                    body: "{}",
-                    worker: "l",
-                    ua: "curl/8",
-                    ms: 9.0,
-                },
-            );
-            let stamp = unix_now() - days * 86400.0;
-            st.store
-                .write(move |c| {
-                    c.execute("UPDATE issues SET updated=?1", rusqlite::params![stamp])?;
-                    Ok(crate::db::WriteOutcome {
-                        applied: true,
-                        events: vec![],
-                    })
-                })
-                .expect("age the card");
-            let r2 = autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
-            r2.suppressed
-                .iter()
-                .find(|(_, _, why)| {
-                    why.contains("open for this same fault") || why.contains("NOT suppressed")
-                })
-                .map(|(_, _, why)| why.clone())
-                .unwrap_or_else(|| panic!("the second scan must suppress: {r2:?}"))
-        }
-
-        let fresh = reason_after_aging(0.0).await;
-        assert!(
-            !fresh.contains("Its count is what moves"),
-            "the claim that was never implemented must be GONE: {fresh}"
-        );
-        assert!(
-            fresh.contains("does NOT bump"),
-            "and the reason must say plainly that suppressing leaves the card untouched, or a \
-             reader assumes the recurrence was recorded somewhere: {fresh}"
-        );
-        assert!(
-            fresh.contains("0.0 day(s)"),
-            "a fresh card still reports its age — the number IS the signal, so it is present \
-             either way rather than only when alarming: {fresh}"
-        );
-
-        // 3 days: past the WARN threshold (2), inside the EXPIRY bound (7), so
-        // it still suppresses and must say how stale it is.
-        let stale = reason_after_aging(3.0).await;
-        assert!(
-            stale.contains("3.0 day(s)"),
-            "a stale card must report HOW stale — that number is the only signal a reader \
-             gets that the fault recurred while nobody was looking: {stale}"
-        );
-        assert!(
-            stale.contains("stops suppressing at"),
-            "and it must state the bound, or a reader cannot tell a park from a permanent \
-             mute: {stale}"
-        );
-
-        // PAST THE BOUND: the mute EXPIRES and the fault files again. Without
-        // this cell the bound could be any number, including infinity, and every
-        // assertion above would still pass (AMUX-3774 criterion 2).
-        let expired = reason_after_aging(30.0).await;
-        assert!(
-            expired.contains("NOT suppressed"),
-            "past AMUX_AUTOFIX_MUTE_EXPIRE_DAYS a parked card must stop muting its class: \
-             {expired}"
-        );
-        assert!(
-            expired.contains("re-filing"),
-            "and the decision must say what it did, so 'why did this re-file' needs no \
-             bisect: {expired}"
-        );
-    }
-
     /// A restart must not refile. This is the property an in-memory dedupe
     /// would pass in a single process and fail in production, silently, on
     /// every deploy — and this server re-execs whenever anyone saves.
@@ -13164,7 +12468,7 @@ mod tests {
         autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
         let c = cards(&st);
         assert_eq!(c.len(), 1);
-        let (id, title, desc, ty, sref) = &c[0];
+        let (id, title, desc, _ty, sref) = &c[0];
         for field in [
             "verdict:",
             "sample_request:",
@@ -13189,49 +12493,14 @@ mod tests {
             desc.contains("/api/logs/analyze"),
             "the recheck must be a runnable query"
         );
-        // AMUX-3591: the signature now carries OCCURRENCE IDENTITY (the newest
-        // offending row's second-resolution ts), so it cannot be pinned as a
-        // literal. Asserting the prefix keeps what this line was actually for —
-        // that source_ref is "autofix:" + the detector's signature and the
-        // target is normalized — while the suffix assertion below pins the new
-        // property: re-scanning the SAME rows must mint the SAME signature, or
-        // a judged report refiles forever.
-        let want_prefix = "autofix:5xx|500|POST|/api/sessions|/api/sessions/{name}/{*verb}|";
-        assert!(
-            sref.starts_with(want_prefix),
-            "source_ref must be autofix: + the signature, target normalized: got {sref}"
-        );
-        let ts_part = sref.trim_start_matches(want_prefix);
-        assert!(
-            ts_part.parse::<i64>().is_ok() && !ts_part.is_empty(),
-            "the occurrence suffix must be a bare epoch second, got {ts_part:?} — without it a \
-             discarded report re-arms and refiles the identical rows (AMUX-3581 -> 3589 -> 3591)"
-        );
-        // NEVER `code`: an auto-filed report has no merged commit to claim, so
-        // a code gate could only be exited by asserting something untrue.
+        // The tracker key is the FAULT identity: kind plus subject, with the
+        // occurrence epoch stripped, so re-scanning the same rows (or new rows
+        // of the same fault) lands on the one standing issue.
         assert_eq!(
-            ty, "investigation",
-            "auto-filed faults must not be gated as code"
+            sref, "5xx|500|POST|/api/sessions|/api/sessions/{name}/{*verb}",
+            "the key must be the fault identity with no epoch or count in it"
         );
         assert!(!title.is_empty());
-        // Owner comes from the request's own worker attribution.
-        let conn = st.store.read().unwrap();
-        let owner: Option<String> = conn
-            .query_row(
-                "SELECT session FROM issues WHERE id=?1",
-                rusqlite::params![id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(owner.as_deref(), Some("amux"));
-        let ot: String = conn
-            .query_row(
-                "SELECT owner_type FROM issues WHERE id=?1",
-                rusqlite::params![id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(ot, "agent", "board_drive only picks up agent-owned cards");
     }
 
     /// The toggle stops the WRITE, never the WATCH. A disabled watcher that
@@ -16494,7 +15763,7 @@ mod tests {
         autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
         let first = sref(&st);
         assert!(
-            first.starts_with("autofix:5xx|"),
+            first.starts_with("5xx|"),
             "precondition: a 5xx card was filed: {first}"
         );
 
@@ -16525,32 +15794,27 @@ mod tests {
              identical specimen comes back (AMUX-3581 -> 3589 -> 3591)"
         );
 
-        // CONTROL: a NEWER 5xx is genuinely new news and must mint a DIFFERENT
-        // signature, so the detector still fires after a discard.
-        let (st3, _d3) = state();
-        for i in 0..4 {
-            log_row(
-                &st3,
-                Row {
-                    ts: now - 10.0 + i as f64,
-                    method: "GET",
-                    path: "/api/sessions",
-                    family: "/api/sessions",
-                    status: 500,
-                    body: "timed out waiting for connection",
-                    worker: "amux",
-                    ua: "curl/8.7.1",
-                    ms: 30_100.0,
-                },
-            );
-        }
-        autofix_tick(&st3, std::path::Path::new("/nonexistent")).await;
-        assert_ne!(
-            sref(&st3),
-            first,
-            "a NEW occurrence must mint a NEW signature, or this trades a refile loop for a \
-             detector that goes silent after one discard"
+        // A NEWER 5xx on the same route is the same fault: the standing
+        // issue is updated and no new one opens, so the key must not move.
+        let now2 = unix_now();
+        log_row(
+            &st,
+            Row {
+                ts: now2 - 5.0,
+                method: "GET",
+                path: "/api/sessions",
+                family: "/api/sessions",
+                status: 500,
+                body: "timed out waiting for connection",
+                worker: "amux",
+                ua: "curl/8.7.1",
+                ms: 30_100.0,
+            },
         );
+        autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
+        let c = cards(&st);
+        assert_eq!(c.len(), 1, "a newer occurrence of the same fault opens nothing: {c:#?}");
+        assert_eq!(c[0].4, first, "the key must not move with new occurrences");
     }
 
     /// AMUX-3588: a server-wide fault files ONE card, not one per endpoint.
@@ -16814,7 +16078,21 @@ mod tests {
             last_ts: now - 86_400.0,
             parked_until: None,
         };
-        let id = file_finding(&st, &f).await.unwrap().expect("card filed");
+        // A LEGACY board card (filed before detectors moved to tracker issues):
+        // the sweep still annotates those and never closes them. New items
+        // are closed by the clear sweep instead.
+        let id = "AMUX-LEGACY-1".to_string();
+        let (i2, sref) = (id.clone(), format!("autofix:{}", f.signature));
+        st.store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO issues (id,title,status,session,created,updated,archived,source_ref) \
+                     VALUES (?1,'legacy card','todo','amux',0,0,0,?2)",
+                    rusqlite::params![i2, sref],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
 
         let noted = note_quiet_signatures(&st, now, &[]).await.unwrap();
         assert_eq!(noted.len(), 1, "a quiet signature must be noted: {noted:?}");
@@ -16888,14 +16166,19 @@ mod tests {
         }
     }
 
+    /// (status, last note, fault key) of one tracked issue. `todo` is an open
+    /// issue and `done` a closed one, mirroring what the board used to say.
     fn card_row(st: &AppState, id: &str) -> (String, String, String) {
-        let conn = st.store.read().unwrap();
-        conn.query_row(
-            "SELECT status, COALESCE(log,''), COALESCE(source_ref,'') FROM issues WHERE id=?1",
-            rusqlite::params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .unwrap()
+        let fake = super::super::fault_tracker::FakeTracker::typed_for_db(st.store.db_path());
+        if let Some(f) = fake.open_issues().into_iter().find(|f| f.id == id) {
+            return ("todo".into(), String::new(), f.key().unwrap_or_default());
+        }
+        let (f, note) = fake
+            .closed_issues()
+            .into_iter()
+            .find(|(f, _)| f.id == id)
+            .expect("no such tracked issue");
+        ("done".into(), note, f.key().unwrap_or_default())
     }
 
     /// THE test the whole card exists for. `deploy-cloud.yml` failed 31
@@ -16969,13 +16252,9 @@ mod tests {
             .expect("a finding must file a card");
         let (status, _log, sref) = card_row(&st, &card);
         assert_eq!(status, "todo", "a filed fault is queued, not pre-closed");
-        assert_eq!(sref, format!("autofix:{}", f[0].signature));
+        assert_eq!(sref, fault_key(&f[0].signature));
         let c = cards(&st);
         assert_eq!(c.len(), 1);
-        assert_eq!(
-            c[0].3, "blocker",
-            "a red deploy is a blocker, not a code card"
-        );
         assert!(
             c[0].1.contains("31x"),
             "count belongs in the computed title: {}",
@@ -17062,62 +16341,6 @@ mod tests {
         assert!(
             sig_new.contains("|200|"),
             "the anchor is the streak's OLDEST failure: {sig_new}"
-        );
-    }
-
-    /// "Stopped failing is not fixed." A green run appends a line and changes
-    /// NOTHING else — not the status, not the archive flag. A detector that
-    /// auto-closes on green declares a fix it did not verify, and the one time
-    /// that is wrong is the time the failing step was quietly deleted.
-    #[tokio::test]
-    async fn a_green_run_is_noted_never_closed() {
-        let (st, _d) = state();
-        let broken = vec![
-            ci_run("checks", 10, "success", 5000.0),
-            ci_run("checks", 11, "failure", 400.0),
-            ci_run("checks", 12, "failure", 300.0),
-        ];
-        let f = ci_findings(&broken, unix_now()).0;
-        let card = file_finding(&st, &f[0]).await.unwrap().unwrap();
-
-        // While red, there is nothing to say.
-        let noted = note_quiet_signatures(&st, unix_now(), &broken)
-            .await
-            .unwrap();
-        assert!(
-            noted.is_empty(),
-            "a still-failing workflow must not be reported as recovered"
-        );
-
-        let mut green = broken.clone();
-        green.push(ci_run("checks", 13, "success", 10.0));
-        let noted = note_quiet_signatures(&st, unix_now(), &green)
-            .await
-            .unwrap();
-        assert_eq!(noted.len(), 1, "a green run must be NOTED: {noted:?}");
-
-        let (status, log, _) = card_row(&st, &card);
-        assert_eq!(
-            status, "todo",
-            "green must not close, move or resolve the card"
-        );
-        assert!(
-            log.contains("GREEN again"),
-            "the note must be on the card: {log}"
-        );
-        assert!(
-            log.contains("STOPPED FAILING IS NOT FIXED"),
-            "and must say what green does NOT prove"
-        );
-
-        // Exactly once, forever — a recovery that re-nags every tick is its
-        // own well-documented failure in this repo.
-        let again = note_quiet_signatures(&st, unix_now(), &green)
-            .await
-            .unwrap();
-        assert!(
-            again.is_empty(),
-            "the green note must be exactly-once, got {again:?}"
         );
     }
 
@@ -18050,6 +17273,222 @@ mod tests {
             (open as u64) < limit,
             "a healthy test process is under its own limit ({open}/{limit})"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // One tracked issue per fault key (maxtongwang/ai-config#409): a repeat of
+    // the same fault updates the standing issue, a cleared fault closes it with
+    // a note, and only a new key or a recurrence after close opens another.
+    // -----------------------------------------------------------------------
+
+    fn five_xx_rows(st: &AppState, n: usize, newest_ago: f64) {
+        let now = unix_now();
+        for i in 0..n {
+            log_row(
+                st,
+                Row {
+                    ts: now - newest_ago - i as f64,
+                    method: "GET",
+                    path: "/api/sessions",
+                    family: "/api/sessions",
+                    status: 500,
+                    body: "timed out waiting for connection",
+                    worker: "amux",
+                    ua: "curl/8.7.1",
+                    ms: 30_100.0,
+                },
+            );
+        }
+    }
+
+    fn fake_for(st: &AppState) -> Arc<fault_tracker::FakeTracker> {
+        fault_tracker::FakeTracker::typed_for_db(st.store.db_path())
+    }
+
+    async fn tick_once(st: &AppState) {
+        autofix_tick(st, std::path::Path::new("/nonexistent")).await;
+    }
+
+    /// Pretend the standing issue was last seen two hours ago, so the clear
+    /// sweep's grace period has passed without sleeping in a test.
+    fn age_open_issue(fake: &fault_tracker::FakeTracker) {
+        for f in fake.open_issues() {
+            let mut state = f.state().expect("state block");
+            state.last_seen -= 7200;
+            let body = fault_tracker::with_state(&f.body, &state);
+            fault_tracker::FaultTracker::update(fake, &f.id, &f.title, &body).unwrap();
+        }
+    }
+
+    fn clear_rows(st: &AppState) {
+        st.store
+            .write(|conn| {
+                conn.execute("DELETE FROM _amux_request_log", [])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_second_alert_of_the_same_fault_opens_no_new_issue() {
+        let (st, _d) = state();
+        five_xx_rows(&st, 4, 300.0);
+        for _ in 0..3 {
+            tick_once(&st).await;
+        }
+        assert_eq!(fake_for(&st).opened_total(), 1, "three ticks, one fault, one issue");
+    }
+
+    #[tokio::test]
+    async fn a_changing_count_keeps_one_issue_and_updates_it() {
+        let (st, _d) = state();
+        five_xx_rows(&st, 4, 300.0);
+        tick_once(&st).await;
+        five_xx_rows(&st, 6, 10.0);
+        tick_once(&st).await;
+        let fake = fake_for(&st);
+        assert_eq!(fake.opened_total(), 1, "N moved from 4 to 10: still one issue");
+        let open = fake.open_issues();
+        assert_eq!(open.len(), 1);
+        assert!(open[0].title.contains("10 request"), "current N is on the issue: {}", open[0].title);
+        let s = open[0].state().unwrap();
+        assert!(s.sightings >= 2 && s.peak >= 10, "state records the repeat: {s:?}");
+    }
+
+    #[tokio::test]
+    async fn a_cleared_fault_closes_its_issue_with_a_note_and_recurrence_opens_one_new() {
+        let (st, _d) = state();
+        let fake = fake_for(&st);
+        five_xx_rows(&st, 4, 300.0);
+        tick_once(&st).await;
+        assert_eq!(fake.open_issues().len(), 1);
+
+        // Fault gone, but not yet for the grace period: stays open.
+        clear_rows(&st);
+        tick_once(&st).await;
+        assert_eq!(fake.open_issues().len(), 1, "a blip is not a clear");
+
+        age_open_issue(&fake);
+        tick_once(&st).await;
+        assert!(fake.open_issues().is_empty(), "cleared fault closes its issue");
+        let closed = fake.closed_issues();
+        assert_eq!(closed.len(), 1);
+        assert!(closed[0].1.contains("cleared") && closed[0].1.contains("last value"), "{}", closed[0].1);
+
+        // Recurrence after close opens exactly one new issue, then dedupes.
+        five_xx_rows(&st, 4, 20.0);
+        tick_once(&st).await;
+        tick_once(&st).await;
+        assert_eq!(fake.opened_total(), 2, "recurrence after close: one new issue");
+        assert_eq!(fake.open_issues().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_tracker_files_nothing_and_a_later_tick_files_once() {
+        let (st, _d) = state();
+        let fake = fake_for(&st);
+        five_xx_rows(&st, 4, 300.0);
+        fake.set_failing(true);
+        tick_once(&st).await;
+        assert_eq!(fake.opened_total(), 0, "never file blind");
+        fake.set_failing(false);
+        tick_once(&st).await;
+        tick_once(&st).await;
+        assert_eq!(fake.opened_total(), 1, "the failed tick left no latch behind");
+    }
+
+    #[test]
+    fn the_fault_key_ignores_the_changing_number_and_the_streak_anchor() {
+        assert_eq!(
+            fault_key("silent|system-job|ROLLUP|3"),
+            fault_key("silent|system-job|ROLLUP|13"),
+            "N unhealthy jobs must not be part of the key"
+        );
+        assert_eq!(
+            fault_key("ci|mixpeek/amux|rust|900|failure"),
+            fault_key("ci|mixpeek/amux|rust|901|failure"),
+            "a flapping streak anchor must not mint a new key"
+        );
+        assert_ne!(fault_key("ci|mixpeek/amux|rust|1"), fault_key("ci|mixpeek/amux|checks|1"));
+    }
+
+    // Tick-level proofs that also run on the pre-fix base (same bodies, only the
+    // helpers differ), so each one is shown to fail there. They drive the real
+    // tick with the two inputs whose fault identity used to vary.
+
+    fn job(id: &str) -> crate::runtime_jobs::registry::HealthIssue {
+        crate::runtime_jobs::registry::HealthIssue {
+            id: id.into(),
+            name: id.into(),
+            status: "stalled",
+            interval_s: Some(5.0),
+            ticks: 10,
+            last_tick_age_s: Some(40.0),
+            last_tick_ms: Some(0.4),
+            in_flight_age_s: None,
+            documented: true,
+        }
+    }
+
+    fn jobs(n: usize) -> Vec<crate::runtime_jobs::registry::HealthIssue> {
+        (0..n).map(|i| job(&format!("job-{i}"))).collect()
+    }
+
+    async fn tick_in(
+        st: &AppState,
+        ci: &[CiRun],
+        sys: &[crate::runtime_jobs::registry::HealthIssue],
+    ) {
+        autofix_tick_with_inputs(st, std::path::Path::new("/nonexistent"), ci, vec![], sys, true).await;
+    }
+
+    #[tokio::test]
+    async fn n_jobs_changing_keeps_one_issue() {
+        let (st, _d) = state();
+        for n in [3, 5, 2, 13] {
+            tick_in(&st, &[], &jobs(n)).await;
+        }
+        let c = cards(&st);
+        assert_eq!(c.len(), 1, "N moved 3,5,2,13: one issue, got {c:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_flapping_ci_streak_keeps_one_issue() {
+        let (st, _d) = state();
+        let a = vec![
+            ci_run("rust", 10, "success", 5000.0),
+            ci_run("rust", 11, "failure", 400.0),
+            ci_run("rust", 12, "failure", 300.0),
+        ];
+        let mut b = a.clone();
+        b.push(ci_run("rust", 13, "success", 200.0));
+        b.push(ci_run("rust", 14, "failure", 100.0));
+        b.push(ci_run("rust", 15, "failure", 50.0));
+        tick_in(&st, &a, &[]).await;
+        tick_in(&st, &b, &[]).await;
+        let c = cards(&st);
+        assert_eq!(c.len(), 1, "same workflow red again: one issue, got {c:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_cleared_fault_closes_and_recurrence_opens_one_new() {
+        let (st, _d) = state();
+        tick_in(&st, &[], &jobs(3)).await;
+        assert_eq!(open_count(&st), 1);
+        age_all(&st);
+        tick_in(&st, &[], &[]).await;
+        assert_eq!(open_count(&st), 0, "fault gone: the item must close");
+        tick_in(&st, &[], &jobs(4)).await;
+        assert_eq!(open_count(&st), 1, "recurrence after close: one new item");
+        assert_eq!(cards(&st).len(), 2);
+    }
+
+    fn open_count(st: &AppState) -> usize {
+        fake_for(st).open_issues().len()
+    }
+
+    fn age_all(st: &AppState) {
+        age_open_issue(&fake_for(st));
     }
 }
 

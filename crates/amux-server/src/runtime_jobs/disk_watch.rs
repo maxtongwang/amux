@@ -33,11 +33,9 @@
 //!
 //! So the tick is hourly and cheap, and "has a week passed?" is answered by
 //! `reclaim_scans` — durable state that survives every restart. The job is
-//! idempotent per scan: one card per scan id, ever, enforced by `source_ref`.
+//! idempotent per scan: one tracked issue per fault key; a scan is processed once, enforced by `idem`.
 
 use crate::api::AppState;
-use crate::db::board_store as bs;
-use serde_json::json;
 
 /// Registry id. `spawn_periodic` derives this job's kill switch from the name.
 const JOB: &str = super::registry::ids::DISK_WATCH;
@@ -272,10 +270,14 @@ pub(crate) fn render(scan_id: &str, rows: &[Growth], free_gib: f64, total_gib: f
     s
 }
 
-/// Has a card already been filed for this scan?
+/// Stable fault key: one tracked issue for "regenerable caches are over the
+/// floor", whatever scan noticed it.
+const FAULT_KEY: &str = "diskwatch|regenerable-caches";
+
+/// Has this scan already been processed (reported, updated or cleared)?
 fn already_filed(conn: &rusqlite::Connection, scan_id: &str) -> bool {
     conn.query_row(
-        "SELECT 1 FROM issues WHERE source_ref=?1 AND deleted IS NULL LIMIT 1",
+        "SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1",
         [format!("diskwatch:{scan_id}")],
         |_| Ok(()),
     )
@@ -505,6 +507,39 @@ fn report_disk_pressure() {
     }
 }
 
+/// Apply one finished scan to the single tracked fault: open it, update it, or
+/// close it when the scan is clean. Returns what happened, for the log.
+fn track_scan(
+    t: &dyn super::fault_tracker::FaultTracker,
+    scan_id: &str,
+    title: &str,
+    text: &str,
+    over_floor: u64,
+    clean: bool,
+    now: i64,
+) -> anyhow::Result<&'static str> {
+    use super::fault_tracker as ft;
+    let open = t.list_open()?.into_iter().find(|i| i.key().as_deref() == Some(FAULT_KEY));
+    match (open, clean) {
+        (Some(i), true) => {
+            t.close(&i.id, &ft::clear_note(&i, now))?;
+            Ok("cleared")
+        }
+        (Some(i), false) => {
+            ft::record_sighting(t, &i, title, over_floor, scan_id, now)?;
+            Ok("updated")
+        }
+        (None, false) => {
+            t.open(
+                &ft::sanitize_public(title),
+                &ft::initial_body(FAULT_KEY, text, title, over_floor, scan_id, now),
+            )?;
+            Ok("opened")
+        }
+        (None, true) => Ok("healthy"),
+    }
+}
+
 async fn tick(state: AppState) {
     report_disk_pressure();
     report_regenerable_growth(&state.store);
@@ -570,12 +605,11 @@ async fn tick(state: AppState) {
         (rows, free, total)
     };
 
-    // Nothing over the floor is the healthy state and files nothing. The INFO
-    // is what distinguishes "ran and found nothing" from "never ran" — a job
-    // whose silence is ambiguous is one nobody can tell is broken.
-    if rows.is_empty() {
+    // Nothing over the floor is the healthy state: it files nothing, and it
+    // closes the standing issue if there is one (the fault cleared).
+    let rows_is_empty = rows.is_empty();
+    if rows_is_empty {
         tracing::info!(job = JOB, scan = %scan_id, "disk watch: nothing over the floor");
-        return;
     }
 
     let title = format!(
@@ -583,75 +617,32 @@ async fn tick(state: AppState) {
         rows.len(),
         floor_bytes() / (1024 * 1024 * 1024)
     );
-    let desc = render(&scan_id, &rows, gib(free as u64), gib(total as u64));
-    let src = format!("diskwatch:{scan_id}");
-    let n = rows.len();
-
-    let res = state
-        .store
-        .write_async(move |conn| {
-            // Re-checked inside the writer so two ticks cannot race a double file.
-            if already_filed(conn, &scan_id) {
-                return Ok(crate::db::WriteOutcome {
-                    applied: false,
-                    events: vec![],
-                });
-            }
-            let new = bs::NewIssue {
-                acceptance_criteria: None,
-                next_action: None,
-                title: title.clone(),
-                desc: desc.clone(),
-                status: "todo".into(),
-                session: None,
-                // `ops`, not `code`: there is nothing to implement or merge, so
-                // a code gate could not be satisfied honestly and the card
-                // would rot or be force-closed (ethos rule 3).
-                item_type: "ops".into(),
-                creator: JOB.into(),
-                // owner_type=human on purpose. This card asks a person to make
-                // a call about their own files; an agent-owned one would be
-                // auto-picked up, and the whole point of the owner choosing
-                // "report only" was that the deciding stays with them.
-                owner_type: "human".into(),
-                due: None,
-                due_time: None,
-                reviewer: None,
-                shepherd: None,
-                gate: vec![],
-                depends_on: vec![],
-                tags: vec!["disk".into(), "reclaim".into()],
-                // Not an ask: this producer files ordinary cards, and a card
-                // filed into needsyou without one is what AMUX-3929 is about.
-                ask_type: None,
-                ask_question: None,
-                ask_unblocks: None,
-                ask_actor: None,
-                // AF-367: filed by the disk watcher.
-                source: Some("disk_watch".into()),
-                requested_by: None,
-                callback_session: None,
-                callback_prompt: None,
-            };
-            let row = bs::create_issue(conn, &new, crate::api::reclaim::now_secs())?;
-            conn.execute(
-                "UPDATE issues SET source_ref = ?1 WHERE id = ?2",
-                rusqlite::params![src, row.id],
-            )?;
-            tracing::info!(job = JOB, card = %row.id, paths = n, "disk watch filed a report");
-            Ok(crate::db::WriteOutcome {
-                applied: true,
-                events: vec![crate::db::PendingEvent {
-                    entity_type: amux_core::revision::EntityType::Task,
-                    entity_id: row.id.clone(),
-                    mutation: amux_core::revision::MutationKind::Created,
-                    payload: Some(json!({"id": row.id, "source": JOB})),
-                }],
-            })
-        })
-        .await;
-    if let Err(e) = res {
-        tracing::error!(job = JOB, error = %e, "disk watch could not file its report");
+    let text = render(&scan_id, &rows, gib(free as u64), gib(total as u64));
+    let n = rows.len() as u64;
+    let tracker = super::fault_tracker::tracker_for(&state);
+    let (t, sid, now) = (tracker.clone(), scan_id.clone(), crate::api::reclaim::now_secs());
+    let result = tokio::task::spawn_blocking(move || {
+        track_scan(&*t, &sid, &title, &text, n, rows_is_empty, now)
+    })
+    .await;
+    match result {
+        Ok(Ok(outcome)) => {
+            let idem = format!("diskwatch:{scan_id}");
+            let _ = state
+                .store
+                .write_async(move |conn| {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO session_events (ts, session, type, data, idem, source) \
+                         VALUES (?1, '', 'diskwatch.scan', '{}', ?2, 'disk_watch')",
+                        rusqlite::params![now as f64, idem],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .await;
+            tracing::info!(job = JOB, scan = %scan_id, outcome = outcome, "disk watch tracked a scan");
+        }
+        Ok(Err(e)) => tracing::error!(job = JOB, error = %e, "disk watch could not reach the alert tracker; will retry next tick"),
+        Err(e) => tracing::error!(job = JOB, error = %e, "disk watch tracker task failed"),
     }
 }
 
@@ -900,10 +891,11 @@ mod tests {
         assert_eq!(got, vec!["REAL".to_string()], "got {got:?}");
     }
 
-    /// One card per scan, forever. A weekly job on an hourly tick would
-    /// otherwise file the same report 168 times.
+    /// One issue per fault key, across scans: repeated ticks and later scans
+    /// that still show growth update the single issue, a clean scan closes it,
+    /// and growth after that opens exactly one new issue.
     #[tokio::test]
-    async fn a_scan_is_reported_at_most_once() {
+    async fn a_scan_is_tracked_as_one_issue_per_fault() {
         let (s, _d) = store();
         let state = AppState {
             store: s.clone(),
@@ -912,35 +904,39 @@ mod tests {
             auth_token: None,
             reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
+        let fake = super::super::fault_tracker::FakeTracker::typed_for_db(s.db_path());
         let now = crate::api::reclaim::now_secs();
-        seed_scan(&s, "S1", "done", now);
+        seed_scan(&s, "S1", "done", now - 300);
         seed_finding(&s, "S1", "/huge", 90, true);
 
         tick(state.clone()).await;
         tick(state.clone()).await;
         tick(state.clone()).await;
+        assert_eq!(fake.opened_total(), 1, "three ticks on one scan open one issue");
 
-        let conn = s.read().unwrap();
-        let n: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM issues WHERE source_ref='diskwatch:S1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(n, 1, "three ticks on one scan must file exactly one card");
+        // A later scan with the same growth updates the same issue.
+        seed_scan(&s, "S2", "done", now - 200);
+        seed_finding(&s, "S2", "/huge", 95, true);
+        tick(state.clone()).await;
+        assert_eq!(fake.opened_total(), 1, "a second scan of the same fault opens nothing");
+        assert_eq!(fake.open_issues().len(), 1);
 
-        // And it is owned by a human, so board_drive never auto-picks it up:
-        // the owner chose report-only precisely so the deciding stays theirs.
-        let (owner, kind): (String, String) = conn
-            .query_row(
-                "SELECT owner_type, type FROM issues WHERE source_ref='diskwatch:S1'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(owner, "human");
-        assert_eq!(kind, "ops");
+        // A clean scan closes it with a note.
+        // A completed scan must record something to count, so the clean scan
+        // holds one small finding under the floor.
+        seed_scan(&s, "S3", "done", now - 100);
+        seed_finding(&s, "S3", "/small", 1, true);
+        tick(state.clone()).await;
+        assert!(fake.open_issues().is_empty(), "a clean scan closes the issue");
+        assert_eq!(fake.closed_issues().len(), 1);
+        assert!(fake.closed_issues()[0].1.contains("cleared"));
+
+        // Recurrence opens one new issue.
+        seed_scan(&s, "S4", "done", now - 50);
+        seed_finding(&s, "S4", "/huge", 99, true);
+        tick(state.clone()).await;
+        assert_eq!(fake.opened_total(), 2);
+        assert_eq!(fake.open_issues().len(), 1);
     }
 
     // ---- DESKT-27: the cheap sampler that cannot lose the re-exec race ----
