@@ -20156,8 +20156,9 @@ const MEM_TOPIC_FILE: &str = "amux-api.md";
 /// shipped indented by nine spaces, and so did the table HEADER, which in
 /// markdown is an indented code block and breaks the table it heads (AMUX-3810).
 const FLEET_ROSTER_HEADER: &str = "\n## Fleet — who else is running (auto-generated, do not edit)\n\n\
-     Every live worker, INCLUDING YOU ($AMUX_SESSION). Message a peer with `amux send <name> --stdin`; \
-     wait on a peer's event with `amux signal wait <CARD> <name>` (the peer clears it with `amux signal raise <name>`). Models and workspaces: `amux ls`.\n\n\
+     Every live worker, INCLUDING YOU ($AMUX_SESSION). Message a peer with native `SendMessage` (the name is the address); agents never use `amux send`, \
+     which types into the peer's input box as if the owner wrote it (Max, 2026-10-26). \
+     Wait on a peer's event with `amux signal wait <CARD> <name>` (the peer clears it with `amux signal raise <name>`). Models and workspaces: `amux ls`.\n\n\
      | worker | groups | description |\n|---|---|---|\n";
 
 /// The fleet roster every worker gets, regenerated on each write.
@@ -53643,6 +53644,10 @@ mod roster_tests {
         // AMUX-5237: every worker learns the signal verbs without opting in.
         assert!(FLEET_ROSTER_HEADER.contains("amux signal wait <CARD> <name>"));
         assert!(FLEET_ROSTER_HEADER.contains("amux signal raise <name>"));
+        // Max, 2026-10-26 ("we should ban amux send"): the roster names the
+        // native channel and never offers `amux send` as the way to message.
+        assert!(FLEET_ROSTER_HEADER.contains("native `SendMessage`"));
+        assert!(!FLEET_ROSTER_HEADER.contains("amux send <name>"));
     }
 
     /// A header over nothing is itself a claim ("this lane recorded nothing").

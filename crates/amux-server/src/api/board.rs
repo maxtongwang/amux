@@ -2587,7 +2587,7 @@ pub(crate) fn lease_exits(
         exits.insert(
             "ask_the_holder".into(),
             json!(format!(
-                "amux send {holder} --stdin   (ask them to move {card} to {target})"
+                "SendMessage to {holder} (ask them to move {card} to {target}; never `amux send`)"
             )),
         );
     } else {
@@ -20392,7 +20392,7 @@ mod lease_exit_tests {
         assert!(live["ask_the_holder"]
             .as_str()
             .unwrap()
-            .contains("amux send amux --stdin"));
+            .contains("SendMessage to amux"));
         assert!(live.get("holder_is_gone").is_none());
         assert!(live["override_on_the_record"]
             .as_str()
