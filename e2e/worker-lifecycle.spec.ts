@@ -1,4 +1,5 @@
 // The full worker lifecycle, end to end, through the surfaces a person uses.
+// Board gates need a non-isolated worker, so the spec unticks the isolated-by-default box (refs ai-config #340).
 //
 // This owns the whole journey that the narrower renderer and API suites do
 // not: create a named-model worker, persist its first human prompt, watch its
@@ -55,6 +56,8 @@ for (const modelFamily of ['sonnet', 'haiku']) {
       await page.fill('#create-dir', process.env.AMUX_E2E_DIR || '/tmp');
       await page.fill('#create-prompt', prompt);
       await page.selectOption('#create-model', namedModel);
+      await page.locator('#create-isolated').uncheck();
+      await expect(page.locator('#create-isolated')).not.toBeChecked();
       const [created] = await Promise.all([
         page.waitForResponse(response => new URL(response.url()).pathname === '/api/sessions'
           && response.request().method() === 'POST'),
