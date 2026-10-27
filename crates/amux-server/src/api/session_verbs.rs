@@ -3696,6 +3696,24 @@ pub const SESSION_SCOPED_FIELDS: &[(&str, RenameDisposition)] = &[
         ),
     ),
     (
+        "cmd_history.approval_native_session",
+        RenameDisposition::KeepForAudit(
+            "the owner's Claude conversation ID binds approval evidence; \
+             it is not an amux worker name and must survive a worker rename unchanged",
+        ),
+    ),
+    (
+        "_amux_delegation_grants.reply_session",
+        RenameDisposition::KeepForAudit(
+            "a request is bound to the owner lane and incarnation it was asked under; \
+             after a rename an open request fails closed instead of moving to the new name",
+        ),
+    ),
+    (
+        "_amux_delegation_resolutions",
+        RenameDisposition::KeepForAudit("a resolution records which lane a reply was decided for at the time"),
+    ),
+    (
         "_amux_request_log.amux_session",
         RenameDisposition::KeepForAudit("the caller name records who made the request at the time"),
     ),
