@@ -70,6 +70,9 @@ pub(crate) struct DeliveryContext<'a> {
     pub state: &'a AppState,
     pub name: &'a str,
     pub text: &'a str,
+    /// The text before the send layer's stamp (PR #10). Parks store it, and the
+    /// native transport stamps it itself, so it never carries two stamps.
+    pub body: &'a str,
     pub cfg: &'a EnvFile,
     pub mode: &'a SendMode,
     pub admitted_claim: Option<(String, i64, String)>,

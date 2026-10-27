@@ -197,7 +197,9 @@ pub(crate) fn check(
     home: &Path,
     headers: &HeaderMap,
 ) -> Result<GrantUse, (StatusCode, Value)> {
-    let name = worker_identity::verified_worker(headers)
+    // The worker token proves the claim below (`authenticated_incarnation`);
+    // the grant predates PR #10's process-proof `verified_worker`.
+    let name = worker_identity::claimed_identity(headers)
         .ok()
         .flatten()
         .filter(|n| n == crate::api::session_verbs::OWNER_AGENT)

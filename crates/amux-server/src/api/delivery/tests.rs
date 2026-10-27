@@ -711,6 +711,8 @@ async fn only_unavailable_before_write_falls_back_once_never_around_native_hold_
         allow_mid_turn: false,
         hook_confirmed_idle: false,
         origin: super::super::session_verbs::SendOrigin::Automation,
+        sender: None,
+        owner_proven: false,
         native_peer: None,
     };
     for outcome in [
@@ -737,6 +739,7 @@ async fn only_unavailable_before_write_falls_back_once_never_around_native_hold_
             state: &st,
             name: "receiver",
             text: "prose",
+            body: "prose",
             cfg: &cfg,
             mode: &mode,
             admitted_claim: None,
@@ -1275,6 +1278,8 @@ async fn native_prewrite_rechecks_shared_groups_isolation_pause_and_preserves_th
             allow_mid_turn: false,
             hook_confirmed_idle: false,
             origin: SendOrigin::Automation,
+            sender: None,
+            owner_proven: false,
         };
         let cfg = EnvFile::default();
         let mut queue_id = None;
@@ -1282,6 +1287,7 @@ async fn native_prewrite_rechecks_shared_groups_isolation_pause_and_preserves_th
             state: &st,
             name,
             text: "prose",
+            body: "prose",
             cfg: &cfg,
             mode: &mode,
             admitted_claim: None,
@@ -2027,6 +2033,8 @@ async fn real_native_flag_off_selects_paste_and_creates_no_attempt() {
         allow_mid_turn: false,
         hook_confirmed_idle: false,
         origin: super::super::session_verbs::SendOrigin::Automation,
+        sender: None,
+        owner_proven: false,
         native_peer: Some(VerifiedPeer {
             sender: "peer".into(),
             message_id: uuid(),
@@ -2038,6 +2046,7 @@ async fn real_native_flag_off_selects_paste_and_creates_no_attempt() {
         state: &st,
         name: "receiver",
         text: "prose",
+        body: "prose",
         cfg: &cfg,
         mode: &mode,
         admitted_claim: None,
@@ -2238,6 +2247,8 @@ async fn record_later_delivery(st: &crate::api::AppState) {
         allow_mid_turn: false,
         hook_confirmed_idle: true,
         origin: super::super::session_verbs::SendOrigin::Owner,
+        sender: None,
+        owner_proven: false,
         native_peer: None,
     };
     let mut queue = None;
@@ -2245,6 +2256,7 @@ async fn record_later_delivery(st: &crate::api::AppState) {
         state: st,
         name: "receiver",
         text: "later",
+        body: "later",
         cfg: &cfg,
         mode: &mode,
         admitted_claim: None,
@@ -2279,6 +2291,8 @@ fn attempt_constructor_persists_claudes_lstart_instead_of_the_kernel_token() {
         allow_mid_turn: false,
         hook_confirmed_idle: false,
         origin: super::super::session_verbs::SendOrigin::Automation,
+        sender: None,
+        owner_proven: false,
         native_peer: Some(VerifiedPeer {
             sender: a.sender.clone(),
             message_id: a.message_id.unwrap(),
@@ -2290,6 +2304,7 @@ fn attempt_constructor_persists_claudes_lstart_instead_of_the_kernel_token() {
         state: &st,
         name: "receiver",
         text: "same body",
+        body: "same body",
         cfg: &cfg,
         mode: &mode,
         admitted_claim: None,

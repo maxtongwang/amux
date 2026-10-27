@@ -40,8 +40,8 @@ impl DeliveryTransport for ClaudeUdsV1 {
         if peer.sender.is_empty()
             || peer.sender == ctx.name
             || peer.message_id.is_empty()
-            || super::super::session_verbs::is_slash_command(ctx.text)
-            || ctx.text.trim().is_empty()
+            || super::super::session_verbs::is_slash_command(ctx.body)
+            || ctx.body.trim().is_empty()
         {
             return Eligibility::UnavailableBeforeWrite("unsupported_payload");
         }
@@ -157,10 +157,10 @@ impl DeliveryTransport for ClaudeUdsV1 {
         let peer = ctx.mode.native_peer.as_ref().unwrap();
         let stamped;
         let body = if peer.body_stamped {
-            ctx.text
+            ctx.body
         } else {
-            stamped = super::super::session_verbs::origin_stamped(&peer.sender, ctx.name, ctx.text)
-                .unwrap_or_else(|| ctx.text.to_string());
+            stamped = super::super::session_verbs::origin_stamped(&peer.sender, ctx.name, ctx.body)
+                .unwrap_or_else(|| ctx.body.to_string());
             &stamped
         };
         let attempt = match Attempt::new(ctx, &target, &relay, body) {

@@ -13348,6 +13348,16 @@ async fn send_text_inner(
     send_text_inner_bound(state, name, text, mode, None, queue_id).await
 }
 
+/// The stamp a delivery carries: the sender named beside the text, or the job
+/// delivering it when none was named (Automation is amux, an owner-origin send
+/// is unverified). One rule for the stamp and for what a park records.
+fn delivery_sender(mode: &SendMode) -> Sender {
+    mode.sender.clone().unwrap_or(match mode.origin {
+        SendOrigin::Automation => Sender::Amux,
+        SendOrigin::Owner => Sender::Unverified,
+    })
+}
+
 async fn send_text_inner_bound(
     state: &AppState,
     name: &str,
@@ -13409,10 +13419,7 @@ async fn send_text_inner_bound(
     // stamp of the job delivering it, so unstamped text in a pane can only
     // have been typed into that session directly.
     let named = sender.is_some();
-    let sender = sender.unwrap_or(match origin {
-        SendOrigin::Automation => Sender::Amux,
-        SendOrigin::Owner => Sender::Unverified,
-    });
+    let sender = delivery_sender(&mode);
     // What a park stores: the body, with its sender beside it in the row.
     let body = text;
     let (stamped_text, stamp_verdict) = delivery_text(body, &sender, name);
@@ -13474,7 +13481,7 @@ async fn send_text_inner_bound(
         return r;
     }
     super::delivery::dispatch(&mut super::delivery::DeliveryContext {
-        state, name, text, cfg: &cfg, mode: &mode, delivery, queue_id, admitted_claim,
+        state, name, text, body, cfg: &cfg, mode: &mode, delivery, queue_id, admitted_claim,
         payload_kind: if mode.native_peer.is_some() { super::delivery::PayloadKind::PeerProse } else { super::delivery::PayloadKind::TerminalInput },
         sender_permission_class: None,
     }).await
@@ -13486,7 +13493,9 @@ pub(super) async fn send_text_paste_bound(ctx:&mut super::delivery::DeliveryCont
     let (state,name,text,mode,delivery)=(ctx.state,ctx.name,ctx.text,ctx.mode.clone(),ctx.delivery);
     let admitted_claim=ctx.admitted_claim.clone();
     let queue_id=&mut *ctx.queue_id;
-    let SendMode { defer_if_busy, from_steering, allow_mid_turn, hook_confirmed_idle, origin, .. } = mode;
+    let SendMode { defer_if_busy, from_steering, allow_mid_turn, hook_confirmed_idle, origin, owner_proven, .. } = mode;
+    // A park stores the unstamped body with its sender beside it in the row.
+    let (body, sender) = (ctx.body, delivery_sender(ctx.mode));
     let cfg = parse_env(name);
     if backend_of_cfg(&cfg) == "herdr" {
         return herdr_send(name, text).await;
@@ -58744,7 +58753,7 @@ mod delivery_stamp_tests {
     fn only_the_send_layer_types_message_text_into_a_pane() {
         const PRIMITIVES: [&str; 6] = ["send_literal(", "\"paste-buffer\"", "herdr_prompt(", "herdr_send(", ".send_text(&", "\"-l\""];
         const ALLOWED: [(&str, &str, &str); 5] = [
-            ("api/session_verbs.rs", "send_text_inner_bound", "the send layer: stamps, then types"),
+            ("api/session_verbs.rs", "send_text_paste_bound", "the paste transport: types only what send_text_inner_bound stamped, via delivery::dispatch"),
             ("api/session_verbs.rs", "send_literal", "the primitive itself"),
             ("api/session_verbs.rs", "herdr_send", "the herdr send, called only by the send layer"),
             ("api/session_verbs.rs", "shell_line_args", "a shell setup line, not agent input"),
