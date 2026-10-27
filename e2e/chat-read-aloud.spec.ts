@@ -27,6 +27,60 @@ const MSGS=[
  {role:'assistant',text:'Second reply, plain.',turn_id:'t2',ts:1760000002},
 ];
 
+test('Read aloud survives a matching version ping during generation and chat reload',async({page},info)=>{
+ let release=()=>{};
+ const generated=new Promise<void>(resolve=>{release=resolve;});
+ await page.route(/\/api\/sessions(?:\?.*)?$/,r=>r.fulfill({json:[{name:'chat-ra-fixture',provider:'claude',chat_companion:true,running:false,dir:'/tmp'}]}));
+ const fixture=await stubChat(page,()=>({messages:MSGS}));
+ await page.route(/\/api\/tts$/,async r=>{
+  await generated;
+  await r.fulfill({json:{url:LONG,engine:'say'}}).catch(()=>{});
+ });
+ try{
+  // APIRequestContext bypasses the candidate route: this is the version the
+  // real server publishes in its ping, not the version the fixture supplied.
+  const response=await page.request.get('/app.js');
+  expect(response.ok()).toBe(true);
+  const version=(await response.text()).match(/^const APP_VER = '([^']+)';/m)?.[1];
+  expect(version).toBeTruthy();
+  expect(version).not.toBe('__AMUX_ASSET_VER__');
+  await page.goto('/');
+  await expect.poll(()=>page.evaluate(()=>typeof (window as any)._chatReadAloud)).toBe('function');
+  await page.evaluate(()=>{const w=window as any;w.openPeek('chat-ra-fixture');w.setPeekTab('chat');});
+  const read=page.locator('.chat-read-btn').first();
+  await expect(read).toHaveText('Read aloud');
+  await read.click();
+  await expect(read).toHaveText('Loading…');
+  // Force the exact event that previously arrived on its ten-second schedule.
+  // A false update is observable synchronously, before its reload timer fires.
+  const reload=await page.evaluate(v=>{
+   const sse=eval('_sse');
+   if(!sse?.onmessage)throw new Error('dashboard SSE handler is not connected');
+   sse.onmessage(new MessageEvent('message',{data:JSON.stringify({type:'ping',v})}));
+   return sessionStorage.getItem('amux_ver_reload');
+  },version!);
+  expect(reload,'a matching server ping must not schedule a document reload').toBeNull();
+  await fixture.load();
+  await expect(read).toHaveText('Loading…');
+  await expect(read).toHaveAttribute('data-ra-phase','loading');
+  release();
+  await expect(read).toHaveText('Stop');
+  await fixture.load();
+  await expect(read).toHaveText('Stop');
+  await expect(read).toHaveAttribute('data-ra-phase','playing');
+
+  // A real version change still reloads, with one measured signal explaining
+  // why active read-aloud state disappeared (no speech text in the payload).
+  const beacon=page.waitForRequest(r=>r.url().endsWith('/api/client-debug')&&r.method()==='POST'
+   &&r.postDataJSON()?.reason==='asset-version-reload');
+  const navigated=page.waitForEvent('framenavigated',frame=>frame===page.mainFrame());
+  await page.evaluate(v=>eval('_sse').onmessage(new MessageEvent('message',{data:JSON.stringify({type:'ping',v:v+'-updated'})})),version!);
+  expect((await beacon).postDataJSON()).toMatchObject({kind:'chat-read-aloud',outcome:'interrupted',phase:'playing',measured:true,n_considered:1});
+  // The beacon and the navigation are the outcome; the reloaded document is not under test.
+  await navigated;
+ }finally{release();fixture.finish();await cleanup('stop playback',()=>page.evaluate(()=>{try{eval('_ttsCancel()');}catch{}}),info);}
+});
+
 for(const variant of [{name:'dashboard Chat tab',q:null},{name:'embedded chat',q:''},{name:'split-pane chat',q:'&peekSplitChild=1'}]){
 test(`Read aloud sits beside Copy and speaks one reply at a time (${variant.name})`,async({page},info)=>{
  const tts:{text:string}[]=[];let mode:'ok'|'short'|'slow'|'fail'='ok';

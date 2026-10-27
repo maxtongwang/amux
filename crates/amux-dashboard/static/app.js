@@ -45103,8 +45103,13 @@ function connectSSE() {
             const _upd = (navigator.serviceWorker && navigator.serviceWorker.getRegistration)
               ? navigator.serviceWorker.getRegistration().then(r => r && r.update()).catch(() => {})
               : Promise.resolve();
-            _upd.finally ? _upd.finally(() => setTimeout(() => location.reload(), 2500))
-                         : setTimeout(() => location.reload(), 2500);
+            const reload = () => {
+              if (_chatRA.phase !== 'idle') _chatReadBeacon({ outcome: 'interrupted', reason: 'asset-version-reload',
+                phase: _chatRA.phase, measured: true, n_considered: 1 });
+              location.reload();
+            };
+            _upd.finally ? _upd.finally(() => setTimeout(reload, 2500))
+                         : setTimeout(reload, 2500);
           }
         }
       }
