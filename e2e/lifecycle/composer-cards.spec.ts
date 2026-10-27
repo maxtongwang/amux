@@ -1,12 +1,13 @@
+// Card composer coverage — mock runtime without launching providers (refs ai-config #339).
 import { test, expect } from '../fixtures';
-import { boot, auth, getSessionsResilient, deleteOwnedWorkers } from './evidence';
+import { boot, auth, getSessionsResilient, deleteOwnedWorkers, createMockWorker } from './evidence';
 
 for (const mode of ['send', 'steer'] as const) {
   test(`LC-CARD-COMPOSER: ${mode} local queue clears input, retains refused delivery, and retry preserves a newer draft`, async ({ page, request }, info) => {
     await boot(page);
     const headers = await auth(page);
     const name = `lc-card-compose-${info.project.name}-${Date.now()}`;
-    expect((await request.post('/api/sessions', { headers, data: { name, dir: '/tmp' } })).status()).toBe(201);
+    await createMockWorker(request, headers, name);
     const rows = await (await getSessionsResilient(request, headers)).json();
     // Only physical runtime is a fixture; persistence and the actual composer
     // are real. A stopped worker does not expose a card composer.

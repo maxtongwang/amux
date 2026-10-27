@@ -1,12 +1,13 @@
+// Composer layout coverage — inspect stopped worker fixtures (refs ai-config #339).
 import { test, expect } from '../fixtures';
-import { boot, auth, checkpoint, deleteOwnedWorkers } from './evidence';
+import { boot, auth, checkpoint, deleteOwnedWorkers, createMockWorker } from './evidence';
 
 test('LC-COMPOSER-LAYOUT: compact mobile writing space and Queue controls stay aligned and reachable', async ({ page, request }, info) => {
   test.setTimeout(90_000);
   await boot(page);
   const headers = await auth(page);
   const name = `lc-layout-${info.project.name}-${Date.now()}`;
-  expect((await request.post('/api/sessions', { headers, data: { name, dir: '/tmp' } })).status()).toBe(201);
+  await createMockWorker(request, headers, name);
   const input = page.locator('#peek-cmd-input');
   const more = page.locator('#peek-composer-more-btn');
   const main = page.locator('#peek-overlay .send-split-main');

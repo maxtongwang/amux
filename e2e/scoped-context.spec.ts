@@ -13,7 +13,7 @@
 // - the memory editor called a per-worker file "Shared, not per-worker" and
 //   said nothing for an isolated worker that never receives it.
 import { test, expect, Page } from './fixtures';
-import { boot, deleteOwnedWorkers } from './lifecycle/evidence';
+import { boot, deleteOwnedWorkers, createMockWorker } from './lifecycle/evidence';
 import { cleanup } from './teardown';
 
 async function appToken(page: Page): Promise<string> {
@@ -32,9 +32,7 @@ test('SCOPED-CONTEXT: group panel, single detail, honest memory save and reach',
   const a = `lc-sc-a-${sfx}`, b = `lc-sc-b-${sfx}`, iso = `lc-sc-i-${sfx}`;
   try {
     for (const [name, tags, isolated] of [[a, [group], false], [b, ['scg-other'], false], [iso, [group], true]] as const) {
-      const r = await request.post('/api/sessions', { headers: auth,
-        data: { name, dir: '/tmp', start: false, tags, isolated } });
-      expect(r.status(), `create ${name}`).toBe(201);
+      await createMockWorker(request, auth, name, { tags, isolated });
     }
 
     // The server names who a group memory write reaches and who it cannot.

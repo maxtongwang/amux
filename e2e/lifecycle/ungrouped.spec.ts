@@ -1,5 +1,6 @@
+// Ungrouped awareness coverage — inspect fixtures without provider startup (refs ai-config #339).
 import { test, expect } from '../fixtures';
-import { boot, auth, deleteOwnedWorkers, getSessionsResilient } from './evidence';
+import { boot, auth, deleteOwnedWorkers, getSessionsResilient, createMockWorker } from './evidence';
 
 test('LC-COORD-UNGROUPED: workers without groups retain peer and task awareness', async ({ page, request }, info) => {
   test.setTimeout(90_000);
@@ -9,9 +10,7 @@ test('LC-COORD-UNGROUPED: workers without groups retain peer and task awareness'
   const grouped = `lc-grouped-${suffix}`, ungrouped = `lc-ungrouped-${suffix}`;
   try {
     for (const name of [grouped, ungrouped]) {
-      const made = await request.post('/api/sessions', { headers,
-        data: { name, dir: '/tmp', tags: name === grouped ? [`lc-team-${suffix}`] : [] } });
-      expect(made.status()).toBe(201);
+      await createMockWorker(request, headers, name, { tags: name === grouped ? [`lc-team-${suffix}`] : [] });
     }
     for (const [origin, target] of [[grouped, ungrouped], [ungrouped, grouped]]) {
       const peerHeaders = { ...headers, 'X-Amux-Worker': origin };

@@ -1,5 +1,6 @@
+// Upload coverage — verify stored bytes without launching providers (refs ai-config #339).
 import { test, expect } from '../fixtures';
-import { boot, auth, checkpoint, deleteOwnedWorkers } from './evidence';
+import { boot, auth, checkpoint, deleteOwnedWorkers, createMockWorker } from './evidence';
 import { createHash } from 'node:crypto';
 
 const digest = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
@@ -10,7 +11,7 @@ test('LC-UPLOAD: real multi-chunk bytes, image preview, worker switching and rem
   const headers = await auth(page);
   const suffix = `${info.project.name}-${Date.now()}`;
   const names = [`lc-upload-${suffix}`, `lc-upload-peer-${suffix}`];
-  for (const name of names) expect((await request.post('/api/sessions', { headers, data: { name, dir: '/tmp' } })).status()).toBe(201);
+  for (const name of names) await createMockWorker(request, headers, name);
   const open = async (name: string) => {
     await page.goto('/');
     await page.locator(`.card[data-session="${name}"]`).locator('visible=true').first().locator('.card-menu-btn').click();
@@ -61,7 +62,7 @@ test('LC-UPLOAD-RETRY: a failed upload blocks Send and Retry preserves the origi
   await boot(page);
   const headers = await auth(page);
   const name = `lc-upload-retry-${info.project.name}-${Date.now()}`;
-  expect((await request.post('/api/sessions', { headers, data: { name, dir: '/tmp' } })).status()).toBe(201);
+  await createMockWorker(request, headers, name);
   let refuse = true, sends = 0;
   await page.route('**/api/upload/start', route => refuse
     ? route.fulfill({ status: 422, json: { error: 'upload retry fixture' } }) : route.continue());

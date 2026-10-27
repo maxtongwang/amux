@@ -1,5 +1,6 @@
+// Linked record coverage — inspect seeded outputs without provider startup (refs ai-config #339).
 import { test, expect } from '../fixtures';
-import { boot, auth, checkpoint, deleteOwnedWorkers } from './evidence';
+import { boot, auth, checkpoint, deleteOwnedWorkers, createMockWorker } from './evidence';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
@@ -14,7 +15,7 @@ test('LC-LINKED-RECORD: epic, children, criteria, evidence and real file/URL/com
   for (const args of [['init'], ['add', 'result.md'], ['-c', 'user.name=Lifecycle Test', '-c', 'user.email=lifecycle@example.test', 'commit', '-m', 'Produce linked invoice report']]) execFileSync('git', args, { cwd: dir, stdio: 'pipe' });
   const commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
   await boot(page); const headers = await auth(page);
-  expect((await request.post('/api/sessions', { headers, data: { name: worker, dir } })).ok()).toBe(true);
+  await createMockWorker(request, headers, worker, { dir });
   const make = async (data: any) => {
     const r = await request.post('/api/board', { headers, data: { type: 'chore', session: worker, ...data } });
     expect(r.ok(), await r.text()).toBe(true); const card = await r.json();

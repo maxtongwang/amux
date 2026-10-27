@@ -1,5 +1,6 @@
+// Coordination policy coverage — exercise refusals without provider startup (refs ai-config #339).
 import { test, expect } from '../fixtures';
-import { boot, auth, checkpoint, deleteOwnedWorkers, getSessionsResilient } from './evidence';
+import { boot, auth, checkpoint, deleteOwnedWorkers, getSessionsResilient, createMockWorker } from './evidence';
 
 test('LC-COORD-POLICY: peer task awareness spans groups; stopped targets and isolation refuse delivery without grants', async ({ page, request }, info) => {
   test.setTimeout(90_000);
@@ -12,9 +13,7 @@ test('LC-COORD-POLICY: peer task awareness spans groups; stopped targets and iso
   try {
     for (const [name, group, isolated] of [[author, 'build', false], [peer, 'build', false],
       [outside, 'review', false], [raw, 'build', true]] as const) {
-      const made = await request.post('/api/sessions', { headers,
-        data: { name, dir: '/tmp', start: false, tags: [`lc-${group}-${suffix}`], isolated } });
-      expect(made.status()).toBe(201);
+      await createMockWorker(request, headers, name, { tags: [`lc-${group}-${suffix}`], isolated });
     }
     const cards: any[] = [];
     for (const name of [peer, outside]) {

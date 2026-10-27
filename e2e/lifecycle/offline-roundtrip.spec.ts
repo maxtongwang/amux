@@ -1,9 +1,10 @@
+// Offline roundtrip coverage — keep queued messages on a stopped fixture (refs ai-config #339).
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { test, expect } from './offline-fixtures';
-import { boot, auth, checkpoint } from './evidence';
+import { boot, auth, checkpoint, createMockWorker } from './evidence';
 
 // Unlike route-fault tests, this exercises the real service worker, cached
 // shell, browser network switch, API writes and durable server queue together.
@@ -51,7 +52,7 @@ test('LC-OFFLINE-ROUNDTRIP: cold offline reload preserves edits and messages; re
   const messages = [`Offline owner assignment ${name}`, `Offline follow-up ${name}`];
   const queued = () => page.evaluate(() => JSON.parse(localStorage.getItem('amux_offline_queue') || '[]'));
   try {
-    expect((await request.post('/api/sessions', { headers, data: { name, dir: '/tmp' } })).status()).toBe(201);
+    await createMockWorker(request, headers, name);
     for (let i = 0; i < 3; i++) {
       const made = await request.post('/api/board', { headers,
         data: { title: `Offline original ${i} ${name}`, type: 'chore', session: name } });

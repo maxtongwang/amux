@@ -1,10 +1,11 @@
+// Deep link coverage — navigate fixtures without launching providers (refs ai-config #339).
 import { test, expect } from '../fixtures';
-import { boot, auth, deleteOwnedWorkers, checkpoint } from './evidence';
+import { boot, auth, deleteOwnedWorkers, checkpoint, createMockWorker } from './evidence';
 
 test('LC-DEEPLINK: task-to-worker navigation closes the task overlay and preserves its edit', async ({page,request},info) => {
   await boot(page); const headers=await auth(page);
   const name=`lc-deeplink-${info.project.name}-${Date.now()}`;
-  expect((await request.post('/api/sessions',{headers,data:{name,dir:'/tmp'}})).status()).toBe(201);
+  await createMockWorker(request, headers, name);
   const response=await request.post('/api/board',{headers,data:{title:'Preserve linked task draft',type:'chore',session:name}});
   expect(response.ok()).toBe(true);const card=await response.json();
   try {

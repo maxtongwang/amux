@@ -1,11 +1,12 @@
+// Composer file coverage — test uploads without launching providers (refs ai-config #339).
 import {test,expect} from '../fixtures';
-import {boot,auth,checkpoint,getSessionsResilient,deleteOwnedWorkers} from './evidence';
+import {boot,auth,checkpoint,getSessionsResilient,deleteOwnedWorkers,createMockWorker} from './evidence';
 
 for(const surface of ['card','details'] as const) for(const mode of ['Send','Queue'] as const) {
  test(`LC-COMPOSER-FILES: ${surface} ${mode} preserves uploaded bytes through offline recovery and newer drafts across reload`,async({page,request,context},info)=>{
   test.setTimeout(90_000); page.setDefaultTimeout(15_000); await boot(page); const headers=await auth(page);
   const name=`lc-files-${surface}-${mode.toLowerCase()}-${info.project.name}-${Date.now()}`;
-  expect((await request.post('/api/sessions',{headers,data:{name,dir:'/tmp'}})).status()).toBe(201);
+  await createMockWorker(request, headers, name);
   const rows=await(await getSessionsResilient(request,headers)).json();
   Object.assign(rows.find((s:any)=>s.name===name),{running:true,status:'active'});
   // Only runtime and final send transport are controlled. Upload/storage/UI and

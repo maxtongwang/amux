@@ -4,7 +4,7 @@
 // session registry, but deliberately stops before tmux/LLM delivery: a peer
 // relay must be refused at the API boundary, before it could auto-wake a model.
 import { test, expect, Page } from './fixtures';
-import { boot, checkpoint, deleteOwnedWorkers, getSessionsResilient } from './lifecycle/evidence';
+import { boot, checkpoint, deleteOwnedWorkers, getSessionsResilient, createMockWorker } from './lifecycle/evidence';
 
 async function appToken(page: Page): Promise<string> {
   await boot(page);
@@ -26,11 +26,9 @@ test('LC-ISOLATED-BOUNDARY: refused peer sends create no board work or queued me
     // Create both in the same group: group policy must not be what hides the
     // raw lane, and the ordinary peer is the negative control for discovery.
     for (const [name, raw] of [[isolated, true], [peer, false], [outside, false]] as const) {
-      const created = await request.post('/api/sessions', {
-        headers: auth,
-        data: { name, dir: '/tmp', start: false, tags: [name === outside ? 'e2e-outside' : 'e2e-isolation'], isolated: raw },
+      await createMockWorker(request, auth, name, {
+        tags: [name === outside ? 'e2e-outside' : 'e2e-isolation'], isolated: raw,
       });
-      expect(created.status(), `create ${name}`).toBe(201);
     }
 
     // The owner dashboard remains able to see the raw lane.
@@ -101,9 +99,7 @@ test('LC-ISOLATED-OWNER: owner queue survives reload and UI isolation toggles in
   const peer = `lc-control-${info.project.name}-${Date.now()}`;
   try {
     for (const [worker, isolated] of [[name, true], [peer, false]] as const) {
-      const created = await request.post('/api/sessions', { headers,
-        data: { name: worker, dir: '/tmp', start: false, tags: ['e2e-isolation'], isolated } });
-      expect(created.status()).toBe(201);
+      await createMockWorker(request, headers, worker, { tags: ['e2e-isolation'], isolated });
     }
     const text = `Owner-only queued assignment ${name}`;
     const accepted = await request.post(`/api/sessions/${name}/steer`, {

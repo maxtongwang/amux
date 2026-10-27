@@ -1,10 +1,11 @@
+// Acceptance receipt coverage — keep transport fixtures provider-free (refs ai-config #339).
 import { test, expect } from '../fixtures';
-import { boot, auth, checkpoint, deleteOwnedWorkers } from './evidence';
+import { boot, auth, checkpoint, deleteOwnedWorkers, createMockWorker } from './evidence';
 
 test('LC-RECEIPT: accepted native message clears pending before the original HTTP response', async ({page, request}, info) => {
   await boot(page);const headers=await auth(page);
   const name=`lc-receipt-${info.project.name}-${Date.now()}`;
-  expect((await request.post('/api/sessions',{headers,data:{name,dir:'/tmp'}})).status()).toBe(201);
+  await createMockWorker(request, headers, name);
   let release!:()=>void;const held=new Promise<void>(r=>release=r);
   let payload:any;let posts=0;let confirmed=false;
   await page.route(`**/api/sessions/${name}/send`,async r=>{posts++;payload=r.request().postDataJSON();await held;await r.fulfill({json:{ok:true,submitted:true}});});

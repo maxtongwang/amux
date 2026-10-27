@@ -1,5 +1,6 @@
+// Composer delivery coverage — keep mocked outcomes provider-free (refs ai-config #339).
 import { test, expect, allowUnusedRoute } from '../fixtures';
-import { boot, auth, checkpoint, deleteOwnedWorkers } from './evidence';
+import { boot, auth, checkpoint, deleteOwnedWorkers, createMockWorker } from './evidence';
 
 for (const outcome of ['refused', 'accepted', 'queued', 'unconfirmed'] as const) {
   test(`LC-COMPOSER: ${outcome} delivery clears only after local persistence, before server response`, async ({ page, request }, info) => {
@@ -7,7 +8,7 @@ for (const outcome of ['refused', 'accepted', 'queued', 'unconfirmed'] as const)
     await boot(page);
     const headers = await auth(page);
     const name = `lc-compose-${info.project.name}-${Date.now()}`;
-    expect((await request.post('/api/sessions', { headers, data: { name, dir: '/tmp' } })).status()).toBe(201);
+    await createMockWorker(request, headers, name);
     let release!: () => void;
     const pending = new Promise<void>(resolve => { release = resolve; });
     const payloads: any[] = [];
@@ -163,7 +164,7 @@ test('LC-COMPOSER: failed local persistence retains draft and sends nothing', as
   await boot(page);
   const headers = await auth(page);
   const name = `lc-storage-${Date.now()}`;
-  expect((await request.post('/api/sessions', {headers, data:{name, dir:'/tmp'}})).status()).toBe(201);
+  await createMockWorker(request, headers, name);
   let sends = 0;
   const storageFailures: any[] = [];
   await page.route('**/api/client-debug', route => {
