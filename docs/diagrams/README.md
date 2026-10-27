@@ -12,7 +12,7 @@ Open each HTML file in a browser. These static, accessible figures use Diagram D
 
 ## Check Contract
 
-`scripts/check-diagrams.py` is the guard. It is vendored byte-identical from maxtongwang/ai-config@777a3b2b65e491f96bbecfe55f624fdbb240bd9f (sha256 `151491d8f6037dd1c2a298371997b8d2effa4e1eed9411dc4230f837472af1a2`) because ai-config is private and hosted CI cannot fetch it. To update, copy the new ai-config version and record its SHA and sha256 here.
+`scripts/check-diagrams.py` is the guard. It is vendored byte-identical from its upstream at commit 777a3b2b65e491f96bbecfe55f624fdbb240bd9f (sha256 `151491d8f6037dd1c2a298371997b8d2effa4e1eed9411dc4230f837472af1a2`), so CI runs it without fetching another repository. To update, copy the new upstream version and record its commit and sha256 here.
 
 Run `python3 scripts/check-diagrams.py --repo <checkout> --base <ref> [--head <commit>]` from the repo root. `DIAGRAMS_BASE` supplies the default base, followed by `origin/HEAD`; the candidate defaults to `HEAD`. JSON reports `status`, resolved `head` and `merge_base`, matching `architecture_paths`, `diagrams_updated`, and `errors`. Exit codes: 0 pass or `not-opted-in`, 1 policy failure, 2 invalid input/history (JSON `status: error`; argparse usage errors go to stderr).
 
