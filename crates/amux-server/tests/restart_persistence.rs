@@ -65,6 +65,7 @@ struct Rig {
     /// Local OAuth fixtures own the wire; suppress external health probes.
     no_external_probes: bool,
     server_binary: Option<PathBuf>,
+    fake_tmux_dir: Option<PathBuf>,
     #[cfg(unix)]
     server_uid: Option<u32>,
     /// Keeps the temp dir alive for the rig's lifetime.
@@ -108,6 +109,7 @@ impl Rig {
             log,
             no_external_probes: false,
             server_binary: None,
+            fake_tmux_dir: None,
             #[cfg(unix)]
             server_uid: None,
             _tmp: tmp,
@@ -166,10 +168,24 @@ impl Rig {
             use std::os::unix::process::CommandExt;
             command.uid(uid).gid(uid);
         }
+        let path = match &self.fake_tmux_dir {
+            Some(dir) => std::env::join_paths(std::iter::once(dir.clone()).chain(
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()))).unwrap(),
+            None => std::env::var_os("PATH").unwrap_or_default(),
+        };
+        command.env_clear();
+        if self.fake_tmux_dir.is_some() {
+            // Exercise only capture recovery. Other jobs can reap processes,
+            // inspect signing state or launch host applications on macOS.
+            for job in amux_server::runtime_jobs::registry::ALL_IDS {
+                if *job != amux_server::runtime_jobs::registry::ids::MESSAGE_CAPTURE {
+                    command.env(format!("AMUX_{}_SECS", job.to_uppercase().replace('-', "_")), "0");
+                }
+            }
+        }
         let child = command
-            .env_clear()
             .env("HOME", self.home.join("fixture-home"))
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("PATH", path)
             .env("AMUX_HOME", &self.home)
             .env("AMUX_BIND", "127.0.0.1")
             .env("AMUX_DB", &self.db)
@@ -310,6 +326,10 @@ impl Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         self.kill();
+        if self.fake_tmux_dir.is_some() && std::thread::panicking() {
+            self._tmp.disable_cleanup(true);
+            eprintln!("held claim failure evidence retained: {}", self._tmp.path().display());
+        }
     }
 }
 
@@ -1654,4 +1674,85 @@ async fn corrupted_connector_scope_stays_denied_after_sigkill_and_can_be_repaire
         .unwrap()
         .contains("connector_scope_unreadable"));
     println!("PASS scope corruption: 12 faults across global/group/worker, 3 SIGKILL restarts, preserved grants and exact owner repair");
+}
+
+/// The outbox fault holds the real process at the durable claim/release gap;
+/// SIGKILL must not turn that committed owner message into a permanent orphan.
+#[cfg(unix)]
+#[tokio::test]
+async fn held_claim_recovers_after_process_sigkill() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut rig = Rig::new();
+    rig.no_external_probes = true;
+    let bin = rig._tmp.path().join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let tmux = bin.join("tmux");
+    // An exit 1 with no "no server running" text reads as a failed lookup,
+    // and the server's owner check then refuses the owner request (403).
+    std::fs::write(&tmux, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\necho 'no server running on /nonexistent' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    rig.fake_tmux_dir = Some(bin);
+    rig.spawn();
+    let before = rig.wait_healthy().await;
+    let lane = "held-process-fixture";
+    std::fs::create_dir_all(rig.home.join("sessions")).unwrap();
+    std::fs::write(rig.home.join("sessions").join(format!("{lane}.env")),
+        "CC_ISOLATED=1\nCC_AUTO_START=0\n").unwrap();
+    let conn = rusqlite::Connection::open(&rig.db).unwrap();
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    conn.execute_batch("CREATE TRIGGER hold_release BEFORE INSERT ON steering_queue BEGIN SELECT RAISE(ABORT,'held claim release fault'); END;").unwrap();
+    conn.execute("INSERT INTO cmd_history (text,type,session,ts,origin,delivery,capture_pending) VALUES (?1,'user',?2,?3,'','board',1)",
+        rusqlite::params!["keep this owner message across SIGKILL", lane, chrono::Utc::now().timestamp_millis()]).unwrap();
+    let id = conn.last_insert_rowid();
+    drop(conn);
+    assert_eq!(rig.post_owner("/api/system-jobs/message-capture/run", json!({})).await.0, 200);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let conn = rusqlite::Connection::open(&rig.db).unwrap();
+        let (pending, delivery): (i64, String) = conn.query_row(
+            "SELECT capture_pending,delivery FROM cmd_history WHERE id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        if pending == 0 {
+            assert_eq!(delivery, "board", "claim committed but release cannot commit");
+            break;
+        }
+        assert!(Instant::now() < deadline, "capture did not reach claim: {}", std::fs::read_to_string(&rig.log).unwrap());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let old_pid = rig.child.as_ref().unwrap().id();
+    rig.kill(); // Real SIGKILL after claim and before any successful release.
+    let conn = rusqlite::Connection::open(&rig.db).unwrap();
+    conn.execute_batch("DROP TRIGGER hold_release").unwrap();
+    conn.execute("UPDATE cmd_history SET intake_result=?2 WHERE id=?1",
+        rusqlite::params![id, json!({"state":"isolated","claimed_at_ms":chrono::Utc::now().timestamp_millis()-61_000}).to_string()]).unwrap();
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM steering_queue WHERE id=?1", [format!("board-conversation-{id}")], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    drop(conn);
+    rig.spawn();
+    let after = rig.wait_healthy().await;
+    assert_eq!(before["build"].as_str().expect("initial build identity"), after["build"].as_str().expect("restarted build identity"), "restart must use the same binary");
+    assert_ne!(rig.child.as_ref().unwrap().id(), old_pid);
+    assert_eq!(rig.post_owner("/api/system-jobs/message-capture/run", json!({})).await.0, 200);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let conn = rusqlite::Connection::open(&rig.db).unwrap();
+        let delivery: String = conn.query_row("SELECT delivery FROM cmd_history WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        // Receipt marking precedes the aggregate log. Wait for both before
+        // SIGKILL, or the test itself can truncate the recovery event.
+        if delivery == "queued" && std::fs::read_to_string(&rig.log).unwrap().contains("held_message_release_recovered") {
+            let n: i64 = conn.query_row("SELECT (SELECT COUNT(*) FROM steering_queue WHERE id=?1)+(SELECT COUNT(*) FROM steering_history WHERE id=?1)",
+                [format!("board-conversation-{id}")], |r| r.get(0)).unwrap();
+            assert_eq!(n, 1, "one stable delivery after SIGKILL");
+            let total: i64 = conn.query_row("SELECT (SELECT COUNT(*) FROM steering_queue WHERE session=?1)+(SELECT COUNT(*) FROM steering_history WHERE session=?1)",
+                [lane], |r| r.get(0)).unwrap();
+            assert_eq!(total, 1, "no duplicate delivery under another identity");
+            break;
+        }
+        assert!(Instant::now() < deadline, "held message stranded after SIGKILL: delivery={delivery}\n{}", std::fs::read_to_string(&rig.log).unwrap());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    rig.kill();
+    let log = std::fs::read_to_string(&rig.log).unwrap();
+    assert!(log.contains("held_message_release_recovered"), "{log}");
+    // The fixture executable records probes and never invokes a real tmux,
+    // including for private sockets. No terminal exists to drain this queue.
+    println!("PASS held claim SIGKILL: committed claim recovered exactly once; loopback + fake tmux");
 }

@@ -375,7 +375,7 @@ pub const CATALOG: &[Doc] = &[
     Doc {
         id: ids::MESSAGE_CAPTURE,
         name: "Message capture recovery",
-        purpose: "Resumes durable pending message-to-card capture after interruption, using the original history row and semantic intake without resending commands. Historical unlinked messages require explicit reviewed attribution.",
+        purpose: "Resumes durable pending message-to-card capture and releases timestamped no-plan held claims older than 60 seconds through the stable delivery outbox. Historical unlinked messages require explicit reviewed attribution.",
         env: &[EnvControl {
             var: "AMUX_MESSAGE_CAPTURE_SECS",
             effect: "0 disables recovery; otherwise the loop runs every 90 seconds (positive values do not change its interval)",

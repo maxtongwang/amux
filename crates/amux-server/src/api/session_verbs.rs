@@ -8566,8 +8566,8 @@ pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
             .store
             .write_async(move |conn| {
                 let n = conn.execute(
-                    "UPDATE cmd_history SET capture_pending=0 WHERE id=?1 AND capture_pending!=0",
-                    [row_id],
+                    "UPDATE cmd_history SET capture_pending=0,intake_result=?2 WHERE id=?1 AND capture_pending!=0",
+                    rusqlite::params![row_id, json!({"state":"isolated","claimed_at_ms":chrono::Utc::now().timestamp_millis()}).to_string()],
                 )?;
                 Ok(crate::db::WriteOutcome {
                     applied: n > 0,
@@ -8578,6 +8578,8 @@ pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
         match result {
             Ok(reply) if !reply.applied => capture_already_claimed(&cap_session, row_id, "isolated"),
             Ok(_) => {
+                #[cfg(test)]
+                capture_gate::at(&cap_session, "before_release").await;
                 tracing::info!(session=%cap_session, message_id=row_id, measured=true, n_considered=1,
                 verdict="isolated_capture_suppressed", "isolated input is not board work; pending intake cleared");
                 release_held_message(state, row_id, &cap_session, "isolated").await;
@@ -8606,7 +8608,7 @@ pub(crate) async fn capture_recorded_message(state: &AppState, row_id: i64) {
         // one whose UPDATE took the pending row may release it.
         let result = state.store.write_async(move |conn| {
             let n = conn.execute("UPDATE cmd_history SET capture_pending=0,intake_result=?2 WHERE id=?1 AND card_id IS NULL AND capture_pending!=0",
-                rusqlite::params![row_id, json!({"state":"board_capture_off","reason":"decompose onto board is off for this worker"}).to_string()])?;
+                rusqlite::params![row_id, json!({"state":"board_capture_off","claimed_at_ms":chrono::Utc::now().timestamp_millis(),"reason":"decompose onto board is off for this worker"}).to_string()])?;
             Ok(crate::db::WriteOutcome { applied: n > 0, events:vec![] })
         }).await;
         match result {
@@ -41496,6 +41498,140 @@ mod tests {
         assert_eq!(delivery, "queued");
         assert_eq!(held_capture_count(&logs, "board_held_message_released"), 1, "released once");
         assert_eq!(held_capture_count(&logs, "capture_already_claimed"), 1, "the other capture says it found the row claimed");
+    }
+
+    async fn held_claim_fixture(st: &AppState, dir: &std::path::Path, lane: &str, isolated: bool) -> i64 {
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        std::fs::write(dir.join("sessions").join(format!("{lane}.env")),
+            if isolated { "CC_ISOLATED=1\n" } else { "AMUX_COMMAND_LIFECYCLE=0\n" }).unwrap();
+        let lane = lane.to_string();
+        st.store.write_async(move |c| {
+            ensure_fleet_tables(c)?;
+            c.execute("INSERT INTO cmd_history (text,type,session,ts,origin,delivery,capture_pending) VALUES (?1,'user',?2,?3,'','board',1)",
+                rusqlite::params!["preserve this held owner message", lane, now_i64() * 1000])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        st.store.read().unwrap().query_row("SELECT MAX(id) FROM cmd_history", [], |r| r.get(0)).unwrap()
+    }
+
+    async fn backdate_held_claim(st: &AppState, id: i64, isolated: bool) {
+        let intake_state = if isolated { "isolated" } else { "board_capture_off" };
+        st.store.write_async(move |c| {
+            let raw: String = c.query_row("SELECT intake_result FROM cmd_history WHERE id=?1", [id], |r| r.get(0))?;
+            let claim: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(claim["state"], intake_state);
+            assert!(claim["claimed_at_ms"].as_i64().is_some_and(|at| at > 0), "claim time must be durable before release");
+            c.execute("UPDATE cmd_history SET intake_result=json_set(intake_result,'$.claimed_at_ms',?2) WHERE id=?1",
+                rusqlite::params![id, now_i64()*1000-61_000])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+    }
+
+    fn assert_held_claim_released_once(st: &AppState, id: i64) {
+        let c = st.store.read().unwrap();
+        let delivery: String = c.query_row("SELECT delivery FROM cmd_history WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(delivery, "queued", "a claimed held message must be recovered after 60s");
+        let n: i64 = c.query_row("SELECT (SELECT COUNT(*) FROM steering_queue WHERE id=?1)+(SELECT COUNT(*) FROM steering_history WHERE id=?1)",
+            [format!("board-conversation-{id}")], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "exactly one delivery with the stable identity");
+        let total: i64 = c.query_row("SELECT (SELECT COUNT(*) FROM steering_queue WHERE session=(SELECT session FROM cmd_history WHERE id=?1))+(SELECT COUNT(*) FROM steering_history WHERE session=(SELECT session FROM cmd_history WHERE id=?1))",
+            [id], |r| r.get(0)).unwrap();
+        assert_eq!(total, 1, "no second delivery under any other identity");
+    }
+
+    /// Drop the capture future at the committed claim, then reopen the Store:
+    /// nothing about the release may depend on the lost request's memory.
+    #[tokio::test]
+    async fn held_claim_recovers_after_store_restart() {
+        let (logs, _guard, _peer) = held_capture_logs();
+        for isolated in [false, true] {
+            let (st, dir) = state();
+            let _home = crate::api::settings::test_env::set_home(dir.path());
+            let lane = if isolated { "held-restart-isolated" } else { "held-restart-off" };
+            let id = held_claim_fixture(&st, dir.path(), lane, isolated).await;
+            let gate = capture_gate::hold(lane, "before_release");
+            {
+                let capture = capture_recorded_message(&st, id);
+                tokio::pin!(capture);
+                tokio::select! {
+                    () = &mut capture => panic!("capture passed its held gate"),
+                    () = async {
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            while gate.reached() == 0 { tokio::time::sleep(Duration::from_millis(2)).await; }
+                        }).await.expect("capture must reach its committed claim");
+                    } => {}
+                }
+                assert_eq!(gate.reached(), 1, "capture committed its claim before cancellation");
+            } // Kill point: drop the held future, without ever opening its gate.
+            drop(st);
+            let restarted = AppState {
+                store: std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap()),
+                started: std::time::Instant::now(), build_hash: "restarted".into(), auth_token: None,
+                reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            };
+            backdate_held_claim(&restarted, id, isolated).await;
+            crate::runtime_jobs::message_capture::tick(&restarted).await;
+            assert_held_claim_released_once(&restarted, id);
+            crate::runtime_jobs::message_capture::tick(&restarted).await;
+            assert_held_claim_released_once(&restarted, id);
+            assert_eq!(held_capture_count(&logs, "held_message_release_recovered"), if isolated { 2 } else { 1 }, "one recovery summary per nonempty sweep");
+            let log = String::from_utf8_lossy(&logs.lock().unwrap()).to_string();
+            assert!(log.lines().filter(|line| line.contains("held_message_release_recovered")).all(|line| line.contains("n=1") && line.contains("measured=true")), "{log}");
+        }
+    }
+
+    /// A living but slow claimant and recovery can both release the same row.
+    /// Prove recovery actually releases before allowing the original to finish.
+    #[tokio::test]
+    async fn held_claim_live_capture_and_sweep_deliver_once() {
+        for isolated in [false, true] {
+            let (st, dir) = state();
+            let _home = crate::api::settings::test_env::set_home(dir.path());
+            let lane = if isolated { "held-alive-isolated" } else { "held-alive-off" };
+            let id = held_claim_fixture(&st, dir.path(), lane, isolated).await;
+            let gate = capture_gate::hold(lane, "before_release");
+            let capture = capture_recorded_message(&st, id);
+            tokio::pin!(capture);
+            tokio::select! {
+                () = &mut capture => panic!("capture passed its held gate"),
+                () = async {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while gate.reached() == 0 { tokio::time::sleep(Duration::from_millis(2)).await; }
+                    }).await.expect("capture must reach its committed claim");
+                } => {}
+            }
+            assert_eq!(gate.reached(), 1);
+            // A fresh claim is never stolen by the sweep.
+            crate::runtime_jobs::message_capture::tick(&st).await;
+            let delivery: String = st.store.read().unwrap().query_row("SELECT delivery FROM cmd_history WHERE id=?1", [id], |r| r.get(0)).unwrap();
+            assert_eq!(delivery, "board");
+            backdate_held_claim(&st, id, isolated).await;
+            crate::runtime_jobs::message_capture::tick(&st).await;
+            assert_held_claim_released_once(&st, id);
+            gate.open();
+            capture.await;
+            assert_held_claim_released_once(&st, id);
+            // Replay the narrower crash window: outbox committed, receipt not
+            // yet marked. The stable id must also survive that second release.
+            st.store.write_async(move |c| {
+                c.execute("UPDATE cmd_history SET delivery='board' WHERE id=?1", [id])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            }).await.unwrap();
+            assert!(release_held_message(&st, id, lane, "replay").await);
+            assert_held_claim_released_once(&st, id);
+            // Already delivered is also a no-op, even if receipt marking
+            // was lost. This exercises the other half of stable-id dedup.
+            st.store.write_async(move |c| {
+                let delivery_id = format!("board-conversation-{id}");
+                c.execute("INSERT INTO steering_history(id,session,text,queued_at,delivered_at) SELECT id,session,text,queued_at,?2 FROM steering_queue WHERE id=?1",
+                    rusqlite::params![delivery_id, now_f64()])?;
+                c.execute("DELETE FROM steering_queue WHERE id=?1", [&delivery_id])?;
+                c.execute("UPDATE cmd_history SET delivery='board' WHERE id=?1", [id])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            }).await.unwrap();
+            assert!(release_held_message(&st, id, lane, "delivered_replay").await);
+            assert_held_claim_released_once(&st, id);
+        }
     }
 
     #[tokio::test]
