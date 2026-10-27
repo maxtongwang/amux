@@ -23,6 +23,21 @@ use std::path::{Path, PathBuf};
 /// ways to name a pane stays small enough to audit by eye.
 const ALLOWED: &[&str] = &["st", "pt", "stq", "ptq"];
 
+/// Verbs whose `-t` names a PANE. Given the session form (`=<ref>`, i.e.
+/// `st`/`stq`) tmux 3.6a answers "no such session" / "can't find pane" and does
+/// nothing, and every caller here ignores the result, so the option or key
+/// silently never lands. Measured on a private socket: has-session,
+/// list-panes, set-window-option, rename-window, display-message and
+/// set-environment accept the session form; these do not.
+const PANE_TARGET_VERBS: &[&str] = &[
+    "set-option",
+    "show-options",
+    "capture-pane",
+    "send-keys",
+    "respawn-pane",
+];
+const SESSION_FORMS: &[&str] = &["st", "stq"];
+
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -120,6 +135,13 @@ fn scan(src: &str) -> Vec<(usize, String)> {
         }
         let expr = normalise(&tail[..end]);
         if ALLOWED.contains(&expr.as_str()) {
+            let stmt = &src[stmt_start..at];
+            let pane_verb = PANE_TARGET_VERBS
+                .iter()
+                .find(|v| stmt.contains(&format!("\"{v}\"")));
+            if let (Some(verb), true) = (pane_verb, SESSION_FORMS.contains(&expr.as_str())) {
+                found.push((at, format!("{expr} (session form given to {verb}; use pt/ptq)")));
+            }
             continue;
         }
         found.push((at, expr));
@@ -143,8 +165,8 @@ fn offenders() -> Vec<String> {
         for (at, expr) in scan(&src) {
             let line = src[..at].matches('\n').count() + 1;
             bad.push(format!(
-                "{}:{line}: tmux -t target `{expr}` is not one of {ALLOWED:?} \
-                 (build it with session_target()/pane_target())",
+                "{}:{line}: tmux -t target `{expr}` is not an exact helper target of the \
+                 right form (one of {ALLOWED:?}, pane form for {PANE_TARGET_VERBS:?})",
                 f.display()
             ));
         }
@@ -266,4 +288,21 @@ fn the_non_tmux_exemption_silences_touch_but_never_tmux() {
         "pane_target() output must pass: {:?}",
         scan(ok)
     );
+}
+
+/// A pane-target verb given the session form is flagged; the pane form, and a
+/// session-target verb given the session form, are not.
+#[test]
+fn the_audit_flags_a_session_form_on_a_pane_target_verb() {
+    let planted = r#"
+        let _ = tmux(&["set-option", "-t", &stq, "remain-on-exit", "on"]).await;
+        let _ = tmux(&["send-keys", "-t", &st, "Enter"]).await;
+        let _ = tmux(&["set-option", "-t", &ptq, "allow-rename", "off"]).await;
+        let _ = tmux(&["has-session", "-t", &stq]).await;
+        let _ = tmux(&["set-window-option", "-t", &stq, "automatic-rename", "off"]).await;
+    "#;
+    let found: Vec<String> = scan(planted).into_iter().map(|(_, e)| e).collect();
+    assert_eq!(found.len(), 2, "exactly the set-option and send-keys session forms; got {found:?}");
+    assert!(found.iter().any(|f| f.contains("set-option")), "{found:?}");
+    assert!(found.iter().any(|f| f.contains("send-keys")), "{found:?}");
 }
