@@ -27700,16 +27700,48 @@ async function _filesRemoveBookmark(idx) {
 document.addEventListener('DOMContentLoaded', _filesRenderBookmarks);
 
 let _exploreSession = null;  // set when explore overlay is opened from a session
-// Load saved working dir + hidden files pref from server prefs
+// Default Files opens wait for cwd; explicit paths advance the load generation immediately.
+const _FILES_CWD_INIT_TIMEOUT_MS = 8000;   // Bound offline startup like a directory read.
+let _filesCwdSettled = false;
+function _filesClientDiagnostic(diagnostic) {
+  console.info(diagnostic.kind, diagnostic);
+  try {
+    fetch(API + '/api/client-debug', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(diagnostic)}).catch(() => {});
+  } catch(e) {}
+}
+const _filesCwdReady = (async () => {
+  let outcome = 'failed';
+  try {
+    const r = await fetch(API + '/api/prefs?key=files_cwd', {signal: AbortSignal.timeout(_FILES_CWD_INIT_TIMEOUT_MS)});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    if (d.value) {
+      _filesCwd = d.value;
+      if (!_filesLoadGeneration) { _filesPath = d.value; outcome = 'applied'; }
+      else outcome = 'superseded';
+    } else outcome = 'empty';
+  } catch(e) {}
+  _filesCwdSettled = true;
+  _filesClientDiagnostic({kind:'files_cwd_init',outcome,measured:true,n_considered:1,ver:APP_VER});
+})();
+// Actions that write into "this folder" resolve it here, so one started while
+// the saved cwd is still loading targets that cwd rather than "/". Explicit
+// navigation already set _filesPath and still wins. Bounded by the cwd timeout.
+async function _filesTargetDir(action) {
+  const waited = !_filesCwdSettled;
+  await _filesCwdReady;
+  const dir = _filesPath || '/';
+  if (waited) _filesClientDiagnostic({kind:'files_target_dir',action,waited,root:dir === '/',measured:true,n_considered:1,ver:APP_VER});
+  return dir;
+}
+// Load hidden files + shortcuts independently of the saved cwd.
 (async () => {
   try {
-    const [r1, r2, r3] = await Promise.all([
-      fetch(API + '/api/prefs?key=files_cwd'),
+    const [r2, r3] = await Promise.all([
       fetch(API + '/api/prefs?key=files_show_hidden'),
       fetch(API + '/api/prefs?key=files_bookmarks'),
     ]);
-    const d1 = await r1.json();
-    if (d1.value) { if (!_filesLoadGeneration) _filesPath = d1.value; _filesCwd = d1.value; }
     const d2 = await r2.json();
     if (d2.value !== undefined && d2.value !== null) _filesShowHidden = d2.value === '1';
     // Server-synced shortcuts win over the local mirror, so they follow you across devices.
@@ -27721,6 +27753,14 @@ let _exploreSession = null;  // set when explore overlay is opened from a sessio
   } catch(e) {}
 })();
 function setFilesCwd() {
+  // Before the saved home loads and with no explicit navigation, _filesPath is
+  // only the "/" placeholder; saving it would overwrite the real home with "/".
+  // Stays synchronous so the request keeps its pressed feedback.
+  if (!_filesCwdSettled && !_filesLoadGeneration) {
+    _filesClientDiagnostic({kind:'files_target_dir',action:'set_home',waited:false,refused:true,measured:true,n_considered:1,ver:APP_VER});
+    showToast('Home folder is still loading');
+    return;
+  }
   _filesCwd = _filesPath;
   fetch(API + '/api/prefs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({key:'files_cwd', value:_filesCwd})}).catch(()=>{});
   _updateFilesCwdBtn();
@@ -27814,6 +27854,16 @@ function _filesToolbarCheck() {
 }
 window.addEventListener('resize', _filesToolbarCheck);
 let _filesLoadGeneration = 0;
+// Opening Files with no explicit path waits for the saved cwd; any explicit
+// loadFiles(path) started meanwhile wins, and loadFiles itself never waits.
+async function _loadFilesDefault() {
+  const pendingGeneration = _filesLoadGeneration;
+  const body = document.getElementById('files-body');
+  if (body) body.innerHTML = '<div style="padding:16px;color:var(--dim)">Loading...</div>';
+  await _filesCwdReady;
+  if (pendingGeneration !== _filesLoadGeneration || activeView !== 'files') return;
+  loadFiles(_filesPath);
+}
 async function loadFiles(path) {
   const generation = ++_filesLoadGeneration;
   const current = () => generation === _filesLoadGeneration;
@@ -28378,7 +28428,7 @@ async function _filesNewFolder() {
   if (!name || !name.trim()) return;
   const fname = name.trim();
   if (/[\/\0]/.test(fname) || fname === '.' || fname === '..') { showToast('Invalid folder name'); return; }
-  const fpath = (_filesPath || '/').replace(/\/$/, '') + '/' + fname;
+  const fpath = (await _filesTargetDir('new_folder')).replace(/\/$/, '') + '/' + fname;
   try {
     const r = await fetch(API + '/api/fs/mkdir', {
       method: 'POST', headers: _authHeaders({'Content-Type':'application/json'}),
@@ -28389,11 +28439,11 @@ async function _filesNewFolder() {
     else showToast(d.error || 'Could not create folder');
   } catch (e) { showToast('Could not create folder'); }
 }
-function _filesNewFile() {
+async function _filesNewFile() {
   const name = prompt('File name (e.g. notes.txt, script.py, data.json):');
   if (!name || !name.trim()) return;
   const fname = name.trim();
-  const fpath = (_filesPath || '/').replace(/\/$/, '') + '/' + fname;
+  const fpath = (await _filesTargetDir('new_file')).replace(/\/$/, '') + '/' + fname;
   // Open the file overlay in edit mode with empty content
   _fileData = { path: fpath, content: '', is_markdown: /\.md$/i.test(fname), _isNew: true };
   _fileViewMode = 'edit';
@@ -30163,7 +30213,7 @@ async function _mdaiNewFile(dirOrOpts) {
   let dir = null, silent = false, noOpen = false;
   if (typeof dirOrOpts === 'string') dir = dirOrOpts;
   else if (dirOrOpts) { dir = dirOrOpts.dir || null; silent = !!dirOrOpts.silent; noOpen = !!dirOrOpts.noOpen; }
-  if (!noOpen) { _mdaiCreatePage({ dir: dir || ((activeView === 'files' && _filesPath && !_exploreSession) ? _filesPath : null) }); return null; }
+  if (!noOpen) { _mdaiCreatePage({ dir: dir || ((activeView === 'files' && !_exploreSession) ? await _filesTargetDir('mdai_new_page') : null) }); return null; }
   if (!dir) dir = _mdaiRoot();
   const raw = prompt('New .mdai node name (e.g. weekly-brief.mdai):', 'node.mdai');
   if (!raw || !raw.trim()) return null;
@@ -31062,7 +31112,7 @@ async function handleFilesUpload(files) {
   if (!files || !files.length) return;
   const statusEl = document.getElementById('files-cache-status');
   if (statusEl) statusEl.textContent = online ? 'Uploading\u2026' : 'Offline \u2014 queueing\u2026';
-  const { uploaded, queued } = await _uploadOrQueue(files, _filesPath, 'file');
+  const { uploaded, queued } = await _uploadOrQueue(files, await _filesTargetDir('upload'), 'file');
   if (statusEl) statusEl.textContent = '';
   const inp = document.getElementById('files-upload-input');
   if (inp) inp.value = '';
@@ -31173,10 +31223,9 @@ async function cacheFilesDir(rootPath, maxDepth = 2) {
 
 function openExplore(startPath, session) {
   const path = startPath || '/';
-  _filesPath = path;
   _exploreSession = session || null;
   closePeek();
-  switchView('files');
+  switchView('files', path);
   _updateFilesSessionBtn();
   _filesLoadBookmarks();   // load THIS session's shortcuts (or global if none)
 }
@@ -31197,7 +31246,7 @@ function _updateFilesSessionBtn() {
 }
 async function setFilesSessionDir() {
   if (!_exploreSession) return;
-  const dir = _filesPath;
+  const dir = await _filesTargetDir('session_dir');
   try {
     await fetch(API + '/api/sessions/' + encodeURIComponent(_exploreSession) + '/config', {
       method: 'PATCH', headers: {'Content-Type':'application/json'},
@@ -34361,7 +34410,7 @@ function _chromeSave() {
   } catch(e) {}
 }
 
-function switchView(view) {
+function switchView(view, filesPath) {
   // Explicit navigation supersedes a pending restore of an older worker.
   if (typeof _peekOpenGeneration !== 'undefined' && !peekSession) _peekOpenGeneration++;
   if (document.getElementById('grid-view').classList.contains('active')) exitGridMode();
@@ -34424,7 +34473,7 @@ function switchView(view) {
   // "Message history" modal reached from inside a peek.
   if (view === 'sessions') { fetchSessions(); _dbgLog('Workers refreshed on navigation'); }
   if (view === 'messages') { _messagesLoad(true, ''); _cvEnter(); }
-  if (view === 'files') { loadFiles(_filesPath); _filesRenderBookmarks(); }
+  if (view === 'files') { if (filesPath === undefined) _loadFilesDefault(); else loadFiles(filesPath); _filesRenderBookmarks(); }
   if (view === 'scratchpad') _scratchpadLoad();
   if (view === 'record') _recorderInit();
   if (view === 'mdai') _mdaiTabLoad();
@@ -48629,12 +48678,10 @@ async function _handleDeeplink(hash) {
     const d = await r.json();
     if (d.error === 'not a directory') {
       const parent = dpath.split('/').slice(0, -1).join('/') || '/';
-      _filesPath = parent;
-      switchView('files');
+      switchView('files', parent);
       openFilePreview(dpath);
     } else if (!d.error) {
-      _filesPath = dpath;
-      switchView('files');
+      switchView('files', dpath);
     }
   } catch(e) {}
 }

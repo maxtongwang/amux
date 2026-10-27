@@ -1560,8 +1560,20 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_filesClientDiagnostic": {
+      "kind": "command._filesClientDiagnostic",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_filesFtsToggle": {
       "kind": "command._filesFtsToggle",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_filesNewFile": {
+      "kind": "command._filesNewFile",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1604,6 +1616,12 @@
     },
     "_filesSetSort": {
       "kind": "command._filesSetSort",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_filesTargetDir": {
+      "kind": "command._filesTargetDir",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2060,6 +2078,12 @@
     },
     "_loadCmdHistoryFromServer": {
       "kind": "command._loadCmdHistoryFromServer",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_loadFilesDefault": {
+      "kind": "command._loadFilesDefault",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
