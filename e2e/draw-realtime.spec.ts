@@ -120,11 +120,22 @@ async function strokeInPage(page: Page, frames = 150) {
   }), { cx, cy, r: Math.min(w, h) * 0.3, frames });
 }
 
+// The drawing on disk. Saves are atomic (PUT /api/file renames a complete
+// file into place), so a read is the old scene or the new one; a file that
+// does not parse is a cut-short write and says so, instead of surfacing as a
+// bare "Unexpected end of JSON input" (e2e control 7ca1c0d3, line 324).
+async function readDisk(path: string) {
+  const raw = await readFile(path, 'utf8');
+  try { return JSON.parse(raw); } catch (e) {
+    throw new Error(`[DRAW-PARTIAL-READ] ${path} did not parse (${raw.length} bytes): a save was observed mid-write: ${e}`);
+  }
+}
+
 const scene = (page: Page) => page.evaluate(() => (window as unknown as Win)._draw.api.getSceneElements()
   .map((e: any) => ({ id: e.id, type: e.type, v: e.version, n: e.points ? e.points.length : 0, x: Math.round(e.x), y: Math.round(e.y) }))
   .sort((a: any, b: any) => (a.id < b.id ? -1 : 1)));
 
-const resetStats = (page: Page) => page.evaluate(() => { (window as unknown as Win)._drawRt.stats = { applied: 0, frames: 0, lat: [], frameTimes: [], snapshots: 0 }; });
+const resetStats = (page: Page) => page.evaluate(() => { (window as unknown as Win)._drawRt.stats = { applied: 0, frames: 0, lat: [], frameTimes: [], transport: [], wait: [], snapshots: 0 }; });
 
 function pct(a: number[], q: number) {
   if (!a.length) return NaN;
@@ -133,13 +144,14 @@ function pct(a: number[], q: number) {
 }
 
 async function measure(page: Page, t0: number, t1: number) {
-  const s = await page.evaluate(() => { const st = (window as unknown as Win)._drawRt.stats; return { lat: st.lat, frames: st.frameTimes }; });
+  const s = await page.evaluate(() => { const st = (window as unknown as Win)._drawRt.stats; return { lat: st.lat, frames: st.frameTimes, transport: st.transport || [], wait: st.wait || [] }; });
   // The steady part of the stroke: skip the first 100 ms (first element, cold
   // paths) and anything after the pen lifted.
   const lo = t0 + 100, hi = t1;
   const frames = s.frames.filter((t: number) => t >= lo && t <= hi + 20);
   const fps = frames.length / ((hi - lo) / 1000);
-  return { p50: pct(s.lat, 0.5), p95: pct(s.lat, 0.95), max: Math.max(...s.lat), n: s.lat.length, fps };
+  return { p50: pct(s.lat, 0.5), p95: pct(s.lat, 0.95), max: Math.max(...s.lat), n: s.lat.length, fps,
+    transportP95: pct(s.transport, 0.95), waitP95: pct(s.wait, 0.95), nTransport: s.transport.length };
 }
 
 function perfBudget(info: TestInfo) {
@@ -211,14 +223,38 @@ test('realtime draw: live stroke at frame rate, equal scenes, no remote undo, on
     // 85% of what was actually sent (printed, so a low bar is visible).
     const inputHz = moves * 1000 / (t1 - t0);
     const fpsBar = Math.min(budget.fps, Math.floor(inputHz * 0.85));
-    const line = `[rt-perf] ${info.project.name} per-frame stroke: input ${inputHz.toFixed(1)} moves/s; latency p50=${m.p50.toFixed(1)}ms p95=${m.p95.toFixed(1)}ms max=${m.max.toFixed(1)}ms n=${m.n}; remote fps=${m.fps.toFixed(1)} over ${t1 - t0}ms (budget ${budget.strict ? 'strict' : 'loose'}: p95<${budget.p95}, fps>=${fpsBar})`;
+    // Decided before the line is printed, so the line says whether the total
+    // was judged: an annotation alone never reaches the CI log (PR #48 review).
+    const judgeTotal = inputHz >= 20;
+    const totalState = judgeTotal ? 'total judged (measured=true)' : `total NOT judged (measured=false): sender ${inputHz.toFixed(1)} moves/s < 20`;
+    const line = `[rt-perf] ${info.project.name} per-frame stroke: input ${inputHz.toFixed(1)} moves/s; latency p50=${m.p50.toFixed(1)}ms p95=${m.p95.toFixed(1)}ms max=${m.max.toFixed(1)}ms n=${m.n}; transport p95=${m.transportP95.toFixed(1)}ms frame-wait p95=${m.waitP95.toFixed(1)}ms; remote fps=${m.fps.toFixed(1)} over ${t1 - t0}ms (budget ${budget.strict ? 'strict' : 'loose'}: p95<${budget.p95}, fps>=${fpsBar}); ${totalState}`;
     console.log(line);
     info.annotations.push({ type: 'rt-perf', description: line });
     // Side by side, for whoever reads the run: A drew, B shows it with A's cursor.
     await A.p.screenshot({ path: info.outputPath('A-sender.png') });
     await B.p.screenshot({ path: info.outputPath('B-receiver.png') });
     expect(m.n, 'B applied remote updates during the stroke').toBeGreaterThan(30);
-    expect(m.p95).toBeLessThan(budget.p95);
+    // Latency splits into transport (sent -> received by B: the relay this
+    // feature owns) and frame wait (received -> applied on B's next frame: the
+    // host's scheduling). The relay is judged on every project. On a starved
+    // host the total is mostly frame wait: in the e2e control (7ca1c0d3) CI
+    // WebKit sent 12 moves/s alone and 7.6 beside a second worker, and its
+    // total p95 rose from 69-90 ms to 107-162 ms with the product unchanged,
+    // twice over 150. So the total is judged where the sender keeps up, the
+    // same line the fps check draws below, and otherwise said not to be.
+    expect(m.nTransport, 'B recorded transport samples for the stroke').toBe(m.n);
+    expect(m.transportP95, 'relay latency (sent -> received)').toBeLessThan(budget.p95);
+    // Chromium (desktop, mobile) sends ~60 moves/s in CI, so the cutoff must
+    // never quietly stop judging it: there the total is always judged.
+    if (info.project.name === 'desktop' || info.project.name === 'mobile') {
+      expect(judgeTotal, `${info.project.name} judges total latency (sender ${inputHz.toFixed(1)} moves/s)`).toBe(true);
+    }
+    if (judgeTotal) expect(m.p95, 'total latency (sent -> applied)').toBeLessThan(budget.p95);
+    else {
+      const notJudged = `[rt-perf] ${info.project.name} total latency NOT judged (measured=false): the sender produced only ${inputHz.toFixed(1)} moves/s; total p95 ${m.p95.toFixed(1)}ms, frame-wait p95 ${m.waitP95.toFixed(1)}ms`;
+      console.log(notJudged);
+      info.annotations.push({ type: 'rt-perf', description: notJudged });
+    }
     // Below ~20 moves/s the SENDER is starved (CI WebKit measured 8.3 moves/s
     // on 2026-10-15) and a frame rate over a handful of frames is noise, not
     // a measurement: 6.6 against a bar of 7 failed a run whose scenes matched
@@ -251,7 +287,7 @@ test('realtime draw: live stroke at frame rate, equal scenes, no remote undo, on
     // ── only the saver writes the file ──
     await expect(A.p.locator('#draw-save-state')).toHaveAttribute('data-state', 'saved', { timeout: 15_000 });
     await expect.poll(async () => {
-      const disk = JSON.parse(await readFile(path, 'utf8'));
+      const disk = (await readDisk(path));
       return disk.elements.filter((e: any) => !e.isDeleted).map((e: any) => e.id).sort();
     }, { timeout: 10_000 }).toEqual((await scene(A.p)).map((e: any) => e.id).sort());
     expect(puts.B, 'the follower tab never PUTs the file').toBe(0);
@@ -283,7 +319,7 @@ test('realtime draw: late joiner snapshot, disconnect mid-stroke, saver hand-off
     await A.p.mouse.move(ca.cx - 150, ca.cy - 150); await A.p.mouse.down();
     await A.p.mouse.move(ca.cx - 60, ca.cy - 90, { steps: 5 }); await A.p.mouse.up();
     const rectId = await A.p.evaluate(() => (window as unknown as Win)._draw.api.getSceneElements().find((e: any) => e.type === 'rectangle').id);
-    const disk0 = JSON.parse(await readFile(path, 'utf8'));
+    const disk0 = (await readDisk(path));
     expect(disk0.elements.map((e: any) => e.id), 'the rectangle is not saved yet').not.toContain(rectId);
     const C = await ctx(browser); contexts.push(C.c);
     await openShared(C.p, path);
@@ -321,7 +357,7 @@ test('realtime draw: late joiner snapshot, disconnect mid-stroke, saver hand-off
     for (const p of [B.p, C.p]) await expect.poll(async () => JSON.stringify(await scene(p)), { timeout: 10_000 }).toBe(final);
     expect(await A.p.evaluate(() => (window as unknown as Win)._drawRt.h.isSaver()), 'A rejoined as a follower').toBe(false);
     // The new saver persists the shared scene.
-    await expect.poll(async () => JSON.parse(await readFile(path, 'utf8')).elements.filter((e: any) => !e.isDeleted).length, { timeout: 15_000 })
+    await expect.poll(async () => (await readDisk(path)).elements.filter((e: any) => !e.isDeleted).length, { timeout: 15_000 })
       .toBe(JSON.parse(final).length);
   } finally {
     for (const c of contexts) await cleanup('close context', () => c.close(), info);

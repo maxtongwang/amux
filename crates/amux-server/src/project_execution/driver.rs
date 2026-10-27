@@ -14,6 +14,7 @@ use rusqlite::params;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 fn permit(state: &AppState, project: &str, id: &str, expected: &Execution) -> Result<(), String> {
@@ -558,6 +559,20 @@ async fn archive_declared_diagnostics(
 /// candidate without another model turn; the independent acceptance runner
 /// still performs the privileged check and can fail it. No claim of runtime
 /// success is created here.
+/// Create the recovery note, never writing through a name that already exists:
+/// the workspace is the worker's, and a committed symlink at the note's path
+/// (dangling, so `exists()` said no) took `fs::write` outside the workspace
+/// (PR #48 round 3 sweep, ai-config #211). O_EXCL refuses any entry there.
+fn create_note(note: &Path, body: &str) -> Result<(), String> {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(note)
+        .and_then(|mut f| f.write_all(body.as_bytes()))
+        .map_err(|e| format!("recovery note {}: {e}", note.display()))
+}
+
 async fn recover_host_execution(
     state: &AppState,
     p: &store::Project,
@@ -677,7 +692,7 @@ async fn recover_host_execution(
         let parent = std::fs::canonicalize(note.parent().unwrap()).map_err(|e| e.to_string())?;
         if !parent.starts_with(&root) { return Err("recovery note escaped workspace".into()); }
         let body = format!("# Candidate awaiting independent execution\n\nProject: `{}`  \nTask: `{id}`  \nWorker: `{}`  \nImplementation head: `{original_head}`\n\nThe worker committed an implementation but its provider sandbox could not access the host Docker socket. Amux retained the failed local attempt under its private operational diagnostics and will run the approved execution contract on a fresh candidate from the host. This note is **not** lifecycle proof. Only the independent execution receipt, raw measurements, Docker image attestation, and human review can establish the requested outcome.\n", p.name, expected.worker);
-        std::fs::write(&note, body).map_err(|e| e.to_string())?;
+        create_note(&note, &body)?;
         workspace::git(&w.path, &["add", "--", &note_rel]).await?;
         workspace::git(&w.path, &["-c", "user.name=amux", "-c", "user.email=amux@local", "commit", "-m", "Record host execution recovery candidate", "--", &note_rel]).await?;
     }
@@ -1808,6 +1823,25 @@ pub(crate) async fn apply_pause(state: &AppState, name: &str, paused: bool) -> a
 #[cfg(test)]
 mod observation_tests {
     use super::*;
+
+    /// PR #48 round 3 sweep: a dangling symlink committed at the note's path
+    /// made `exists()` false and `fs::write` created its target outside the
+    /// workspace.
+    #[cfg(unix)]
+    #[test]
+    fn the_recovery_note_is_never_written_through_a_planted_link() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let escaped = outside.path().join("escaped.md");
+        let note = ws.path().join("note.md");
+        std::os::unix::fs::symlink(&escaped, &note).unwrap();
+        assert!(!note.exists(), "dangling, as the caller's check sees it");
+        assert!(create_note(&note, "body").is_err());
+        assert!(!escaped.exists(), "nothing was created outside the workspace");
+        let fresh = ws.path().join("fresh.md");
+        create_note(&fresh, "body").unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "body");
+    }
     #[tokio::test]
     async fn mistyped_report_head_needs_unique_commit_and_matching_asset_bytes() {
         let dir = tempfile::tempdir().unwrap();
