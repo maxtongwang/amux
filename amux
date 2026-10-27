@@ -2585,27 +2585,32 @@ cmd_rm() {
   local name
   name=$(resolve_session "${1:-}")
 
-  # Stop if running (also cleans up any worktree)
-  if is_running "$name" 2>/dev/null; then
-    cmd_stop "$name"
-  else
-    # Not running, but a stale worktree might still exist
-    local wt_dir="$CC_HOME/worktrees/$name"
-    if [[ -d "$wt_dir" ]]; then
-      local repo_dir=""
-      if [[ -f "$wt_dir/.git" ]]; then
-        repo_dir=$(sed -n 's/^gitdir: \(.*\)\/\.git\/worktrees\/.*/\1/p' "$wt_dir/.git")
-      fi
-      warn_if_worktree_dirty "$wt_dir"
-      if [[ -n "$repo_dir" ]]; then
-        git -C "$repo_dir" worktree remove --force "$wt_dir" 2>/dev/null || rm -rf "$wt_dir"
-      else
-        rm -rf "$wt_dir"
-      fi
-    fi
+  # The server owns deletion, including shell-only panes, worktrees and identity
+  # state. Local tmux kills are forbidden in worker panes; never fall back to one.
+  local resp rc=0
+  resp=$(_curl -fsk -m 90 -X DELETE \
+    -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+    -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
+    "$AMUX_API/api/sessions/$name") || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    RESP="$resp" python3 - <<'PYEOF' || rc=$?
+import json, os, sys
+try:
+    reply = json.loads(os.environ["RESP"])
+except ValueError:
+    reply = None
+if not isinstance(reply, dict) or reply.get("ok") is not True or reply.get("error"):
+    print("server did not confirm removal", file=sys.stderr)
+    sys.exit(1)
+PYEOF
   fi
-
-  rm -f "$CC_SESSIONS/$name.env"
+  if [[ "$rc" -ne 0 ]]; then
+    mkdir -p "$CC_HOME/logs"
+    printf '%s WARN amux::cli verdict=worker_remove_failed session=%s exit=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" "$rc" >> "$CC_HOME/logs/server-rs.log"
+    echo "failed to remove $name through the server; check server access and deletion permissions" >&2
+    return 1
+  fi
   echo "${RED}removed${RESET} $name"
 }
 

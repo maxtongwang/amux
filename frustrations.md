@@ -6173,3 +6173,14 @@ FIX: Withhold completion while scans or entries fail, persist pending paths, and
   retry at startup or once per minute on identity operations. Successful entries
   leave the pending list; WARN identity_migration_pending reports counts and
   identity_migration_attempt records each bounded pass.
+
+## amux rm refused for a finished worker with a shell pane
+AREA: cli
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-10-26
+SESSION: dev-lead (reported in build brief)
+CARD: maxtongwang/ai-config#495
+SYMPTOM: amux rm called local tmux kill-session on a finished worker; the worker guard refused it and the worker stayed listed.
+COST: Five retired workers could not be removed through the CLI in the reported incident.
+FIX: Route rm/remove/del through the server deletion endpoint, retain server authorization, and log worker_remove_failed on failure. Regression reproduced before the fix with the real guard.

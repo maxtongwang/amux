@@ -273,3 +273,16 @@ SIGKILL test recovers a committed encrypted write and unfinished audit without
 duplicate notices or events. All homes, token fixtures and keystores are private
 temporary files; no real vault or Keychain is used. The CLI tests execute the
 shipped Bash dispatch against a fake HTTP transport.
+
+## Worker removal under guard
+
+Run `python3 scripts/test-cli-rm-guard.py` and
+`python3 scripts/test-worker-tmux-guard.py`. Pass: both suites report `OK`.
+The CLI fixture runs `amux rm` with the real guard and an isolated HTTP server:
+only the named worker is removed, failures preserve local state and log
+`worker_remove_failed`, and raw session/server kills remain refused.
+
+`amux rm` uses `DELETE /api/sessions/<name>`; the server owns pane, identity and
+worktree cleanup. Server deletion authorization still applies (including
+`AMUX_ALLOW_AGENT_SESSION_DELETE` for automation); a refusal or unreachable server
+returns nonzero with no local deletion fallback.
