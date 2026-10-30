@@ -528,6 +528,29 @@ fn worker_isolated(home: &Path, worker: &str) -> bool {
 // Delivery
 // ---------------------------------------------------------------------------
 
+/// Jobs share vault precedence, but never inherit a worker scope with the same label.
+/// All requested names must resolve before any plaintext leaves this function.
+pub(crate) fn deliver_job(
+    home: &Path,
+    groups: &std::collections::BTreeSet<String>,
+    names: &std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<String, String>, (&'static str, std::collections::BTreeSet<String>)> {
+    let items = load(home).map_err(|_| ("vault_unavailable", names.clone()))?;
+    let resolved = resolve_with(&items, "", groups);
+    let missing: std::collections::BTreeSet<_> = names.iter().filter(|n| !resolved.contains_key(*n)).cloned().collect();
+    if !missing.is_empty() {
+        return Err(("missing_or_wrong_group", missing));
+    }
+    let master = master_key(home, false).ok().flatten().ok_or_else(|| ("vault_key_unavailable", names.clone()))?;
+    names.iter().map(|name| {
+        let value = open(&master, resolved[name].0).map_err(|_| ("vault_decrypt_failed", [name.clone()].into()))?;
+        if value.contains('\0') {
+            return Err(("invalid_secret_value", [name.clone()].into()));
+        }
+        Ok((name.clone(), value))
+    }).collect()
+}
+
 /// Every execution path that hands a worker its secrets. Named in the audit
 /// line so "did the shell schedule get it" is answerable from the file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,0 +1,89 @@
+FFFFFFFFF
+======================================================================
+FAIL: test_environment_argv_stdin_and_exit (__main__.SecretExecTests.test_environment_argv_stdin_and_exit)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/var/folders/w9/rnp9xtb10fzb0pqyln54k4lw0000gn/T/secret-exec-before-ckwmb2o2/scripts/test-secret-exec.py", line 68, in test_environment_argv_stdin_and_exit
+    self.assertEqual(out.returncode, 0, out.stderr)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 1 != 0 : 
+
+======================================================================
+FAIL: test_refusals_are_clear_and_child_never_runs (__main__.SecretExecTests.test_refusals_are_clear_and_child_never_runs) (reason='job_identity_refused')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/var/folders/w9/rnp9xtb10fzb0pqyln54k4lw0000gn/T/secret-exec-before-ckwmb2o2/scripts/test-secret-exec.py", line 81, in test_refusals_are_clear_and_child_never_runs
+    self.assertIn(reason, out.stderr)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'job_identity_refused' not found in ''
+
+======================================================================
+FAIL: test_refusals_are_clear_and_child_never_runs (__main__.SecretExecTests.test_refusals_are_clear_and_child_never_runs) (reason='unknown_job')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/var/folders/w9/rnp9xtb10fzb0pqyln54k4lw0000gn/T/secret-exec-before-ckwmb2o2/scripts/test-secret-exec.py", line 81, in test_refusals_are_clear_and_child_never_runs
+    self.assertIn(reason, out.stderr)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'unknown_job' not found in ''
+
+======================================================================
+FAIL: test_refusals_are_clear_and_child_never_runs (__main__.SecretExecTests.test_refusals_are_clear_and_child_never_runs) (reason='name_not_allowed')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/var/folders/w9/rnp9xtb10fzb0pqyln54k4lw0000gn/T/secret-exec-before-ckwmb2o2/scripts/test-secret-exec.py", line 81, in test_refusals_are_clear_and_child_never_runs
+    self.assertIn(reason, out.stderr)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'name_not_allowed' not found in ''
+
+======================================================================
+FAIL: test_refusals_are_clear_and_child_never_runs (__main__.SecretExecTests.test_refusals_are_clear_and_child_never_runs) (reason='missing_or_wrong_group')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/var/folders/w9/rnp9xtb10fzb0pqyln54k4lw0000gn/T/secret-exec-before-ckwmb2o2/scripts/test-secret-exec.py", line 81, in test_refusals_are_clear_and_child_never_runs
+    self.assertIn(reason, out.stderr)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'missing_or_wrong_group' not found in ''
+
+======================================================================
+FAIL: test_response_values_never_echoed_on_failure (__main__.SecretExecTests.test_response_values_never_echoed_on_failure)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/var/folders/w9/rnp9xtb10fzb0pqyln54k4lw0000gn/T/secret-exec-before-ckwmb2o2/scripts/test-secret-exec.py", line 106, in test_response_values_never_echoed_on_failure
+    self.assertEqual(out.stdout, "")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+AssertionError: 'unknown command: secret-exec\nRun amux help for usage\n' != ''
+- unknown command: secret-exec
+- Run amux help for usage
+
+
+======================================================================
+FAIL: test_server_down (__main__.SecretExecTests.test_server_down)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/var/folders/w9/rnp9xtb10fzb0pqyln54k4lw0000gn/T/secret-exec-before-ckwmb2o2/scripts/test-secret-exec.py", line 90, in test_server_down
+    self.assertIn("server_unavailable", out.stderr)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'server_unavailable' not found in ''
+
+======================================================================
+FAIL: test_token_permissions_and_nonlocal_url_refused (__main__.SecretExecTests.test_token_permissions_and_nonlocal_url_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/var/folders/w9/rnp9xtb10fzb0pqyln54k4lw0000gn/T/secret-exec-before-ckwmb2o2/scripts/test-secret-exec.py", line 111, in test_token_permissions_and_nonlocal_url_refused
+    self.assertIn("job_credential_permissions", self.run_cli("unused").stderr)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'job_credential_permissions' not found in ''
+
+======================================================================
+FAIL: test_unregistered_local_job (__main__.SecretExecTests.test_unregistered_local_job)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/var/folders/w9/rnp9xtb10fzb0pqyln54k4lw0000gn/T/secret-exec-before-ckwmb2o2/scripts/test-secret-exec.py", line 96, in test_unregistered_local_job
+    self.assertIn("unregistered", out.stderr)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'unregistered' not found in ''
+
+----------------------------------------------------------------------
+Ran 6 tests in 3.665s
+
+FAILED (failures=9)
