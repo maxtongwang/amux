@@ -705,6 +705,60 @@ PYEOF
   return 0
 }
 
+# Retire a worker through the server (DELETE /api/sessions/<name>): the one
+# path a worker pane may use, since the pane's tmux guard refuses kill-session
+# (maxtongwang/ai-config#495). Exit 0 = server removed it; 1 = server
+# unreachable (caller may fall back to the local path); 2 = server answered but
+# refused or failed (error on stderr; the caller must NOT fall back to a raw kill).
+_rm_via_api() {
+  local name="$1"
+  local AMUX_API="${AMUX_API:-https://localhost:8824}"
+  local resp rc=0 code
+  resp=$(_curl -sk -m "${AMUX_RM_TIMEOUT:-60}" -w $'\n%{http_code}' -X DELETE -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+    "$AMUX_API/api/sessions/$name" 2>/dev/null) || rc=$?
+  # Only no server at all (curl 6 = cannot resolve, 7 = connection refused)
+  # is "unreachable". A timeout, a dropped or empty reply or an HTTP 5xx means a
+  # server may have acted, so it is a refusal, never a cue for a raw kill.
+  case "$rc" in
+    0) ;;
+    6|7) return 1 ;;
+    *) echo "no usable answer from the server (curl exit $rc)" >&2; return 2 ;;
+  esac
+  code="${resp##*$'\n'}"
+  resp="${resp%$'\n'*}"
+  if [[ -z "$resp" ]]; then
+    echo "empty answer from the server (HTTP $code)" >&2
+    return 2
+  fi
+  if [[ ! "$code" =~ ^2[0-9][0-9]$ ]]; then
+    CODE="$code" RESP="$resp" python3 - <<'PYEOF' || true
+import json, os, sys
+try:
+    d = json.loads(os.environ["RESP"])
+    msg = d.get("error") or d.get("message")
+except Exception:
+    msg = None
+print(f"server answered HTTP {os.environ['CODE']}" + (f": {msg}" if msg else ""), file=sys.stderr)
+PYEOF
+    return 2
+  fi
+  # A 2xx body is NOT proof of success: parse the JSON verdict.
+  RESP="$resp" python3 - <<'PYEOF'
+import json, os, sys
+try:
+    d = json.loads(os.environ["RESP"])
+except Exception:
+    print("server answered with a non-JSON body", file=sys.stderr)
+    sys.exit(2)
+if not isinstance(d, dict):
+    print("refused", file=sys.stderr)
+    sys.exit(2)
+if d.get("error") or d.get("ok") is False:
+    print(d.get("error") or d.get("message") or "refused", file=sys.stderr)
+    sys.exit(2)
+PYEOF
+}
+
 # Check if tmux session is alive.
 # NOTE: tmux's -t prefix-matches session names by default, so a bare
 # "amux-foo" would also match a running "amux-foo-worker". Prefix the
@@ -2584,6 +2638,18 @@ cmd_server() {
 cmd_rm() {
   local name
   name=$(resolve_session "${1:-}")
+
+  # A tmux-backed worker is retired by the server, which stops it, reclaims its
+  # worktree and removes its env file; a pane's tmux guard refuses the local kill.
+  if [[ "$(session_backend "$name")" != "herdr" ]]; then
+    local rm_rc=0 rm_err
+    rm_err=$(_rm_via_api "$name" 2>&1) || rm_rc=$?
+    case "$rm_rc" in
+      0) echo "${RED}removed${RESET} $name (via server)"; return 0 ;;
+      2) echo "${RED}failed to remove $name:${RESET} $rm_err" >&2; return 1 ;;
+    esac
+    # rc 1: server unreachable, fall through to the local path.
+  fi
 
   # Stop if running (also cleans up any worktree)
   if is_running "$name" 2>/dev/null; then
