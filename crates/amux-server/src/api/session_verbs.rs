@@ -31261,16 +31261,31 @@ const RETIRE_AGENTS_ENV: &str = "AMUX_SESSION_RETIRE_AGENTS";
 
 /// Pure gate for a listed agent retiring another worker: the verdict label
 /// (logged with its inputs) and whether it allows the delete. `caller` is the
-/// verified worker identity (`hdr_worker`), "" or `UNVERIFIED_IDENTITY` when none.
-fn retire_agent_verdict(list: &str, caller: &str, target: &str) -> (&'static str, bool) {
-    let listed = |n: &str| list.split(',').map(str::trim).any(|e| !e.is_empty() && e == n);
+/// registered caller name (`hdr_worker` resolved by [`registered_session_name`]),
+/// "" or `UNVERIFIED_IDENTITY` when none; `authenticated` = its worker token
+/// verified (`authenticated_incarnation`). `target` is the registered name, None
+/// when no such session exists. Names compare case-insensitively: the env file
+/// is opened through a case-folding filesystem on macOS.
+fn retire_agent_verdict(
+    list: &str,
+    caller: &str,
+    authenticated: bool,
+    target: Option<&str>,
+) -> (&'static str, bool) {
+    let listed = |n: &str| list.split(',').map(str::trim).any(|e| !e.is_empty() && e.eq_ignore_ascii_case(n));
     if list.trim().is_empty() {
         return ("retire_agents_off", false);
     }
     if caller.is_empty() || caller == super::worker_identity::UNVERIFIED_IDENTITY || !listed(caller) {
         return ("retire_caller_not_listed", false);
     }
-    if caller == target {
+    if !authenticated {
+        return ("retire_caller_unauthenticated", false);
+    }
+    let Some(target) = target else {
+        return ("retire_target_unregistered", false);
+    };
+    if caller.eq_ignore_ascii_case(target) {
         return ("retire_self_refused", false);
     }
     if listed(target) {
@@ -31279,21 +31294,50 @@ fn retire_agent_verdict(list: &str, caller: &str, target: &str) -> (&'static str
     ("retire_allowed", true)
 }
 
+/// The stored spelling of a registered session name (`<sessions>/<name>.env`),
+/// matched case-insensitively with an exact match preferred; None when no such
+/// session is registered.
+fn registered_session_name(name: &str) -> Option<String> {
+    if name.is_empty() || !valid_session_name(name) {
+        return None;
+    }
+    let stems: Vec<String> = std::fs::read_dir(sessions_dir()).ok()?.flatten()
+        .filter_map(|e| e.file_name().into_string().ok()?.strip_suffix(".env").map(String::from))
+        .collect();
+    stems.iter().find(|s| *s == name)
+        .or_else(|| stems.iter().find(|s| s.eq_ignore_ascii_case(name)))
+        .cloned()
+}
+
 async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Response {
     if let Err(error) = super::rename_identity::ensure_migrated(&home()) {
         return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": error.to_string()}));
     }
+    // A listed retiring agent acts on the target's REGISTERED name, so a
+    // case-variant spelling cannot dodge the self / listed-target checks.
+    let retire_target: Option<String>;
+    let mut name = name;
     if !session_destructive_allowed(state, headers) {
-        let caller = hdr_worker(headers);
+        let claimed = hdr_worker(headers);
+        let caller = registered_session_name(&claimed).unwrap_or(claimed.clone());
+        let authenticated = super::worker_identity::authenticated_incarnation(&home(), headers, &caller).is_some();
+        let target = registered_session_name(name);
         let list = std::env::var(RETIRE_AGENTS_ENV).unwrap_or_default();
-        let (verdict, allowed) = retire_agent_verdict(&list, &caller, name);
-        tracing::info!(caller = %caller, target = name, verdict, allowed, measured = true, n_considered = 1,
-            "session delete by a non-human caller: {RETIRE_AGENTS_ENV} gate decided");
+        let (verdict, allowed) = retire_agent_verdict(&list, &caller, authenticated, target.as_deref());
+        tracing::info!(caller = %caller, target = name, registered_target = ?target, authenticated, verdict, allowed,
+            measured = true, n_considered = 1, "session delete by a non-human caller: {RETIRE_AGENTS_ENV} gate decided");
         if !allowed {
+            if verdict == "retire_target_unregistered" {
+                return jresp(StatusCode::NOT_FOUND, json!({"error": "no such session"}));
+            }
             return jresp(
                 StatusCode::FORBIDDEN,
-                json!({"error": "deleting a session must be initiated by a human in the dashboard; sessions/agents cannot delete sessions (set AMUX_ALLOW_AGENT_SESSION_DELETE=1 in ~/.amux/server.env to allow all automation, or list the retiring worker in AMUX_SESSION_RETIRE_AGENTS)"}),
+                json!({"error": "deleting a session must be initiated by a human in the dashboard; sessions/agents cannot delete sessions (set AMUX_ALLOW_AGENT_SESSION_DELETE=1 in ~/.amux/server.env to allow all automation, or list the retiring worker in AMUX_SESSION_RETIRE_AGENTS; a listed worker must present its worker token)"}),
             );
+        }
+        retire_target = target;
+        if let Some(t) = retire_target.as_deref() {
+            name = t;
         }
     }
     let cfg = parse_env(name);
@@ -47281,10 +47325,16 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         let (state, _dir) = state();
         for n in ["ret-boss", "ret-boss2", "ret-a", "ret-b", "ret-c", "ret-d", "ret-e"] {
             rename_fixture_env(n, &format!("CC_NAME=\"{n}\"\nCC_TAGS=dev\nCC_AUTO_START=0\n"));
+            // Each worker holds a launch token "tok-<name>" (its digest on disk).
+            let inc = crate::api::rename_identity::ensure_incarnation(home.path(), n).unwrap();
+            let hash = crate::api::worker_identity::hash_path(home.path(), &inc);
+            std::fs::create_dir_all(hash.parent().unwrap()).unwrap();
+            std::fs::write(hash, crate::api::worker_identity::digest(&format!("tok-{n}"))).unwrap();
         }
         let by = |who: &str| {
             let mut h = HeaderMap::new();
             h.insert("x-amux-session", who.parse().unwrap());
+            h.insert("x-amux-worker-token", format!("tok-{}", who.to_ascii_lowercase()).parse().unwrap());
             h
         };
         let status = |who: &'static str, target: &'static str| {
@@ -47312,15 +47362,38 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         // An unlisted name claimed through an invalid identity is no caller either.
         assert_eq!(status("ret-boss/../x", "ret-b").await, StatusCode::FORBIDDEN);
         assert!(env_path("ret-b").exists() && env_path("ret-boss").exists() && env_path("ret-boss2").exists());
+        // Review B1: a case-variant spelling resolves to the registered name
+        // before the self / listed-target checks (macOS opens the env file
+        // case-insensitively).
+        assert_eq!(status("ret-boss", "RET-BOSS2").await, StatusCode::FORBIDDEN, "listed target, other case");
+        assert_eq!(status("ret-boss", "RET-BOSS").await, StatusCode::FORBIDDEN, "self, other case");
+        assert_eq!(status("RET-BOSS", "ret-boss").await, StatusCode::FORBIDDEN, "self, caller other case");
+        assert!(env_path("ret-boss2").exists() && env_path("ret-boss").exists());
+        // No registered session: refused, nothing created or removed.
+        assert_eq!(status("ret-boss", "ret-nobody").await, StatusCode::NOT_FOUND);
+        // An unlisted target in another case is still retired, by its stored name.
+        assert_eq!(status("ret-boss", "RET-D").await, StatusCode::OK, "unlisted target, other case");
+        assert!(!env_path("ret-d").exists());
+        // A listed name without its worker token is not an authenticated caller.
+        let mut no_token = by("ret-boss");
+        no_token.remove("x-amux-worker-token");
+        assert_eq!(delete_post(&state, "ret-b", &no_token).await.status(), StatusCode::FORBIDDEN);
+        let mut wrong_token = by("ret-boss");
+        wrong_token.insert("x-amux-worker-token", "tok-ret-c".parse().unwrap());
+        assert_eq!(delete_post(&state, "ret-b", &wrong_token).await.status(), StatusCode::FORBIDDEN);
+        assert!(env_path("ret-b").exists());
         // The pure gate names each verdict.
-        let v = |l, c, t| retire_agent_verdict(l, c, t);
-        assert_eq!(v("", "a", "b"), ("retire_agents_off", false));
-        assert_eq!(v("  ", "a", "b"), ("retire_agents_off", false));
-        assert_eq!(v("a", "", "b"), ("retire_caller_not_listed", false));
-        assert_eq!(v("a", "x", "b"), ("retire_caller_not_listed", false));
-        assert_eq!(v("a", "a", "a"), ("retire_self_refused", false));
-        assert_eq!(v("a,b", "a", "b"), ("retire_target_is_retirer", false));
-        assert_eq!(v("a,b", "a", "c"), ("retire_allowed", true));
+        let v = |l, c, a, t| retire_agent_verdict(l, c, a, t);
+        assert_eq!(v("", "a", true, Some("b")), ("retire_agents_off", false));
+        assert_eq!(v("  ", "a", true, Some("b")), ("retire_agents_off", false));
+        assert_eq!(v("a", "", true, Some("b")), ("retire_caller_not_listed", false));
+        assert_eq!(v("a", "x", true, Some("b")), ("retire_caller_not_listed", false));
+        assert_eq!(v("a", "a", false, Some("b")), ("retire_caller_unauthenticated", false));
+        assert_eq!(v("a", "a", true, None), ("retire_target_unregistered", false));
+        assert_eq!(v("a", "a", true, Some("a")), ("retire_self_refused", false));
+        assert_eq!(v("a", "a", true, Some("A")), ("retire_self_refused", false));
+        assert_eq!(v("a,b", "a", true, Some("B")), ("retire_target_is_retirer", false));
+        assert_eq!(v("a,b", "a", true, Some("c")), ("retire_allowed", true));
     }
 
     /// Review of 3f5ab3df, B1: x -> y -> z, then z is deleted and an unrelated

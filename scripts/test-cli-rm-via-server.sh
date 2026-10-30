@@ -38,7 +38,12 @@ class H(http.server.BaseHTTPRequestHandler):
         mode = open(os.environ["MODE_FILE"]).read().strip()
         code, body = {"ok": (200, '{"ok":true,"message":"deleted"}'),
                       "forbid": (403, '{"error":"agents cannot delete sessions"}'),
-                      "html": (502, '<html>bad gateway</html>')}[mode]
+                      "html": (502, '<html>bad gateway</html>'),
+                      "e500": (500, '{"error":"boom"}'),
+                      "empty": (200, ''),
+                      "slow": (200, '{"ok":true}')}[mode]
+        if mode == "slow":
+            import time; time.sleep(4)
         self.send_response(code); self.send_header("Content-Length", str(len(body))); self.end_headers()
         self.wfile.write(body.encode())
     def log_message(self, *a): pass
@@ -58,7 +63,7 @@ register() { printf 'CC_DIR="%s"\n' "$TMP" > "$CC_HOME/sessions/$1.env"; }
 run_rm() { # <api> <name>; sets OUT and RC
   : > "$TMUX_LOG"
   RC=0
-  OUT=$(PATH="$TMP/bin:$PATH" AMUX_API="$1" AMUX_SESSION=boss bash "$CLI" rm "$2" 2>&1) || RC=$?
+  OUT=$(PATH="$TMP/bin:$PATH" AMUX_API="$1" AMUX_SESSION=boss AMUX_RM_TIMEOUT=1 bash "$CLI" rm "$2" 2>&1) || RC=$?
 }
 kills() { grep -c 'kill-session' "$TMUX_LOG" || true; }
 
@@ -85,7 +90,20 @@ check "nonzero exit" "1" "$RC"
 check "no tmux kill-session" "0" "$(kills)"
 check "env file kept" "yes" "$([[ -f "$CC_HOME/sessions/w-html.env" ]] && echo yes || echo no)"
 
-echo "4. server unreachable: the old local path"
+refused_case() { # <label> <mode> <name> <expected text>
+  register "$3"; echo "$2" > "$MODE_FILE"
+  run_rm "http://127.0.0.1:$PORT" "$3"
+  check "$1: nonzero exit" "1" "$RC"
+  check "$1: error shown" "yes" "$([[ "$OUT" == *"$4"* ]] && echo yes || echo no)"
+  check "$1: no tmux kill-session" "0" "$(kills)"
+  check "$1: env file kept" "yes" "$([[ -f "$CC_HOME/sessions/$3.env" ]] && echo yes || echo no)"
+}
+echo "3b. 5xx, empty body and timeout are refusals, not unreachable"
+refused_case "HTTP 500 JSON" e500 w-500 "boom"
+refused_case "empty body" empty w-empty "empty answer"
+refused_case "timeout" slow w-slow "no usable answer"
+
+echo "4. server unreachable (connection refused): the old local path"
 register w-down
 run_rm "http://127.0.0.1:9" w-down
 check "exit 0" "0" "$RC"

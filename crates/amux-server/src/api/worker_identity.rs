@@ -52,7 +52,7 @@ pub(crate) fn release(home: &Path, incarnation: &str) {
     }
 }
 
-fn digest(token: &str) -> String {
+pub(crate) fn digest(token: &str) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
