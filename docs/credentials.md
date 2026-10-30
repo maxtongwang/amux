@@ -72,7 +72,8 @@ grep -oE '^[A-Z0-9_]+=' ~/.amux/server.env | tr -d '=' | sort
 ## Not credentials — behaviour flags
 
 `AMUX_COMMIT_GUARD`, `AMUX_TASK_GUARD`, `AMUX_RATE_LIMIT_MODE`, `AMUX_NOTES_DIR`,
-`AMUX_GCAL_ID`, `AMUX_BU_DRIVER_PYTHON`, `AMUX_ALLOW_AGENT_SESSION_DELETE`. Listed so
+`AMUX_GCAL_ID`, `AMUX_BU_DRIVER_PYTHON`, `AMUX_ALLOW_AGENT_SESSION_DELETE`,
+`AMUX_SESSION_RETIRE_AGENTS` (worker names, not secrets). Listed so
 their presence is not mistaken for a secret.
 
 ## Other persistence surfaces — keeping it out of git is necessary, not sufficient

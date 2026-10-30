@@ -301,6 +301,10 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-cli-start-no-orphan-worktree.sh
+      - name: amux rm retires a tmux worker through the server, never a raw kill (ai-config#495)
+        run: |
+          set -uo pipefail
+          ./scripts/test-cli-rm-via-server.sh
       - name: a local Claude launch carries named Remote Control, isolated workers none
         run: |
           set -uo pipefail
