@@ -15118,10 +15118,11 @@ pub(crate) fn interrupted_start_due(meta: &Map<String, Value>, now: i64) -> bool
 
 pub(crate) const RECYCLE_IN_PROGRESS_KEY: &str = "recycle_in_progress_since";
 
-/// Stop, kill and start on a fresh conversation, then clear the marker.
+/// Stop and start on a fresh conversation inside the same tmux session, then
+/// clear the marker.
 async fn run_recycle(state: &AppState, n: &str) {
     let _ = stop_session(state, n).await;
-    kill_tmux_session(n).await;
+    note_restart_in_place(n, "recycle");
     // skip_conv_id=true AND the meta already cleared: belt and braces,
     // because either one alone still leaves a path that could resume.
     let (ok, msg) = start_session(state, n, "", true).await;
@@ -18242,6 +18243,15 @@ async fn stop_session_process(name: &str) -> (bool, String) {
     (true, "stopped (hard-kill)".into())
 }
 
+/// Restart paths stop the provider and relaunch in the surviving tmux session
+/// (`start_session` reuses it), so attached Mosh/Moshi clients stay connected.
+/// Only true stops and removals call `kill_tmux_session`.
+fn note_restart_in_place(name: &str, path: &str) {
+    tracing::info!(session = name, path, verdict = "restart_kept_tmux_session",
+        measured = true, n_considered = 1,
+        "restarting inside the existing tmux session so attached clients stay connected");
+}
+
 async fn kill_tmux_session(name: &str) {
     let stq = st(name);
     let _ = tmux(&["kill-session", "-t", &stq]).await;
@@ -18714,7 +18724,7 @@ async fn reset_session(state: &AppState, name: &str) -> (bool, String) {
             }
         }
         let _ = stop_session(state, name).await;
-        kill_tmux_session(name).await;
+        note_restart_in_place(name, "reset");
     }
     let mut meta = load_meta(name);
     meta.remove("cc_conversation_id");
@@ -20946,8 +20956,8 @@ fn j200(v: Value) -> Response {
 /// (AMUX-3801).
 ///
 /// A config change that swaps provider/model/effort/yolo does not write a file
-/// and return — it runs `restart_for_swap`: stop the session, kill the tmux
-/// pane, start it again. Seconds is the correct duration for that. Measured
+/// and return — it runs `restart_for_swap`: stop the session, start it again
+/// in the same tmux pane. Seconds is the correct duration for that. Measured
 /// 2026-08-27: PATCH on a session path averaged 5161ms over 7 calls with a
 /// 22154ms worst, and autofix filed the 22s one as a latency defect against a
 /// flat 10s threshold that knows nothing about what the route DOES.
@@ -32780,7 +32790,7 @@ async fn restart_for_swap(state: &AppState, name: &str, provider: &str) -> bool 
         }
     }
     let _ = stop_session(state, name).await;
-    kill_tmux_session(name).await;
+    note_restart_in_place(name, "swap");
     let (ok, _msg) = start_session(state, name, "", false).await;
     ok
 }
@@ -33320,7 +33330,7 @@ async fn rename_session_inner(state: &AppState, name: &str, raw_new: &str) -> Re
 // `hot_model_switch: true` since RR-0043, and amux-core's
 // classify_config_change returns `NextTurn` for a same-provider model change
 // on a provider with that capability — but every fleet model change still went
-// through restart_for_swap (graceful /exit, kill tmux, relaunch --resume),
+// through restart_for_swap (graceful /exit, relaunch --resume in the same tmux pane),
 // paying a restart, a resume, and the whole boot choreography.
 //
 // SYNTAX, verified against Claude Code v2.1.226 in a throwaway tmux pane on
@@ -34956,10 +34966,11 @@ async fn config_patch_with_liveness(
             let st2 = state.clone();
             let n = name.to_string();
             crate::db::interactions::spawn(async move {
-                // py:76651 _restart_in_new_dir: hard-kill then start. The
+                // py:76651 _restart_in_new_dir: stop, then start in the same
+                // tmux session (start_session cds the reused shell). The
                 // graceful stop records the resumable name first.
                 let _ = stop_session(&st2, &n).await;
-                kill_tmux_session(&n).await;
+                note_restart_in_place(&n, "dir_change");
                 sleep_ms(2000).await;
                 let _ = start_session(&st2, &n, "", false).await;
             });
@@ -45830,6 +45841,68 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
         pane.0 = tmux_name(&renamed);
         assert_eq!(shown(pt(&renamed)).await, format!("[{renamed}] |40"));
+    }
+
+    /// hq#98: a restart must relaunch inside the existing tmux session, so the
+    /// Mosh/Moshi client attached to it stays connected. Killing the session
+    /// (the old behaviour) changes `session_created` and drops every client.
+    #[tokio::test]
+    async fn restarts_keep_the_tmux_session_and_its_clients() {
+        struct Pane(String);
+        impl Drop for Pane {
+            fn drop(&mut self) {
+                let _ = tmux_command().args(["kill-session", "-t", &session_target(&self.0)]).output();
+            }
+        }
+        async fn created_and_clients(name: &str) -> (String, usize) {
+            let fmt = tmux(&["display-message", "-p", "-t", &pt(name), "#{session_created}"]).await;
+            let created = fmt.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+            let clients = tmux(&["list-clients", "-t", &st(name)]).await
+                .map(|o| String::from_utf8_lossy(&o.stdout).lines().count()).unwrap_or(0);
+            (created, clients)
+        }
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let name = format!("keep-pane-{}-{}", std::process::id(), ulid::Ulid::new());
+        std::fs::write(home.path().join(format!("sessions/{name}.env")), "CC_DIR=\"/tmp\"\n").unwrap();
+        let (state, _dir) = state();
+        let pane = Pane(tmux_name(&name));
+        let created = tmux(&["new-session", "-d", "-s", &pane.0, "-x", "80", "-y", "24", "/bin/sh"])
+            .await
+            .expect("tmux required for keep-pane proof");
+        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+        // A fake attached client: a pty-backed `tmux attach` held open by the test.
+        let mut client = std::process::Command::new("script");
+        client.args(["-q", "/dev/null", "tmux", "-L", &test_tmux_socket(), "attach-session", "-t", &st(&name)])
+            .env_remove("TMUX").env_remove("TMUX_PANE")
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        let mut client = client.spawn().expect("script required for the fake client");
+        let mut before = created_and_clients(&name).await;
+        for _ in 0..20 {
+            if before.1 == 1 { break; }
+            sleep_ms(250).await;
+            before = created_and_clients(&name).await;
+        }
+        assert_eq!(before.1, 1, "fake client never attached");
+        assert!(!before.0.is_empty(), "session_created unreadable");
+
+        // Swap path, then the recycle path: each must leave the same session.
+        restart_for_swap(&state, &name, "codex").await;
+        assert_eq!(created_and_clients(&name).await, before, "restart_for_swap replaced the tmux session");
+        run_recycle(&state, &name).await;
+        assert_eq!(created_and_clients(&name).await, before, "run_recycle replaced the tmux session");
+
+        // reset and the directory change share the pattern; pin them at source,
+        // since reaching their kill needs a live provider process.
+        let src = include_str!("session_verbs.rs");
+        for f in ["async fn reset_session(", "async fn restart_for_swap(", "async fn run_recycle("] {
+            let body = &src[src.find(f).unwrap()..];
+            let body = &body[..body.find("\n}\n").unwrap()];
+            assert!(!body.contains("kill_tmux_session(name"), "{f} kills the tmux session");
+        }
+        let _ = client.kill();
+        let _ = client.wait();
     }
 
     #[tokio::test]
