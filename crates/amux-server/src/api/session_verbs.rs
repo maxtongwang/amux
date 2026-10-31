@@ -15592,6 +15592,24 @@ pub(crate) async fn start_session(
     extra_flags: &str,
     skip_conv_id: bool,
 ) -> (bool, String) {
+    start_session_with_resume_policy(state, name, extra_flags, ConversationLaunch {
+        skip_conv_id, require_resume: false,
+    }).await
+}
+
+struct ConversationLaunch {
+    skip_conv_id: bool,
+    require_resume: bool,
+}
+
+// Explicit restart must never take the ordinary launcher's fresh fallback.
+async fn start_session_with_resume_policy(
+    state: &AppState,
+    name: &str,
+    extra_flags: &str,
+    conversation: ConversationLaunch,
+) -> (bool, String) {
+    let ConversationLaunch { skip_conv_id, require_resume } = conversation;
     if !valid_session_name(name) {
         return (false, "invalid session name".into());
     }
@@ -16118,6 +16136,11 @@ pub(crate) async fn start_session(
             if conv_file.exists() {
                 resumable = true;
             }
+        }
+        if require_resume && !resumable {
+            tracing::warn!(session = name, verdict = "conversation_restart_resume_missing",
+                "exact resume transcript disappeared; refusing a fresh launch");
+            return (false, "exact resume transcript is unavailable".into());
         }
         session_flag = claude_session_flag(
             name,
@@ -17048,7 +17071,7 @@ pub(crate) async fn start_session(
             }
         }
     }
-    if !launched && !skip_conv_id && provider == "claude" {
+    if !launched && !skip_conv_id && provider == "claude" && !require_resume {
         let mut out_check = strip_ansi(&tmux_capture(name, 10).await);
         if at_resume_picker(&out_check) {
             // Escape ONLY on a positive picker match (the ⌕ glyph + picker
@@ -32752,10 +32775,180 @@ async fn patch_dispatch(state: &AppState, name: &str, action: &str, body: &Value
     }
 }
 
+// Resume keys mirror the three launch adapters that accept an exact identity.
+const RESTART_RESUME_KEYS: &[(&str, &str)] = &[
+    ("claude", "cc_conversation_id"),
+    ("codex", "codex_session_id"),
+    ("gemini", "gemini_session_id"),
+];
+
+/// Conservative inventory: a scheduling call is evidence even if its result
+/// was interrupted. Do not infer an empty live task list from transcript silence.
+fn restart_task_records(path: &Path) -> Result<Vec<Value>, String> {
+    use std::io::BufRead;
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("cannot inspect scheduled tasks: {e}"))?;
+    let mut tasks = Vec::new();
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.map_err(|e| format!("cannot inspect scheduled tasks: {e}"))?;
+        let record: Value = serde_json::from_str(&line)
+            .map_err(|e| format!("cannot parse task transcript: {e}"))?;
+        if let Some(content) = record.pointer("/message/content").and_then(Value::as_array) {
+            for block in content {
+                if block["type"] == "tool_use"
+                    && matches!(
+                        block["name"].as_str(),
+                        Some("CronCreate" | "ScheduleWakeup")
+                    )
+                {
+                    tasks.push(json!({"source":"transcript", "id":block["id"],
+                        "tool":block["name"], "input":block["input"]}));
+                }
+            }
+        }
+    }
+    Ok(tasks)
+}
+
+fn restart_tasks(name: &str, provider: &str) -> Result<Vec<Value>, String> {
+    if provider != "claude" {
+        return Ok(Vec::new());
+    }
+    let path = transcript_path_for(name).ok_or_else(|| {
+        "cannot inspect scheduled tasks: conversation transcript is missing".to_string()
+    })?;
+    let mut tasks = restart_task_records(&path)?;
+    let store = PathBuf::from(work_dir_of(&parse_env(name))).join(".claude/scheduled_tasks.json");
+    match std::fs::read(&store) {
+        Ok(bytes) => {
+            let value: Value = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("cannot parse durable task store: {e}"))?;
+            // Preserve the vendor's full store rather than guess its schema or
+            // silently filter another task kind. Empty stores need no override.
+            if value != json!({}) && value != json!([]) {
+                tasks.push(json!({"source":"project_task_store", "tasks":value}));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot read durable task store: {e}")),
+    }
+    Ok(tasks)
+}
+
+async fn restart_same_conversation(state: &AppState, name: &str, body: &Value) -> Response {
+    // Every send waits until the replacement exists, including on refusal.
+    let _send = lane_send_lock(name).lock_owned().await;
+    let provider = provider_of(&parse_env(name));
+    let key = RESTART_RESUME_KEYS
+        .iter()
+        .find(|(p, _)| *p == provider)
+        .map(|(_, k)| *k);
+    let before = key
+        .map(|k| meta_str(&load_meta(name), k))
+        .unwrap_or_default();
+    let mut result = json!({"schema_version":1, "name":name, "provider":provider,
+        "conversation_id_before":before, "conversation_id_after":before,
+        "restarted":false, "tasks":[], "error":null});
+    let error = if ["dry_run", "drop_tasks"]
+        .iter()
+        .any(|k| body.get(*k).is_some_and(|v| !v.is_boolean()))
+    {
+        Some("dry_run and drop_tasks must be booleans; nothing changed".to_string())
+    } else if crate::api::worker_exec::worker_type_of(name)
+        .descriptor()
+        .id
+        != amux_core::worker_type::WorkerTypeId::CODING
+    {
+        Some("worker type does not support terminal conversation resume".to_string())
+    } else if key.is_none() {
+        Some("provider does not support exact conversation resume".to_string())
+    } else if body
+        .get("expected_conversation_id")
+        .is_some_and(|v| v.as_str() != Some(before.as_str()))
+    {
+        Some("conversation changed since preflight; nothing changed".to_string())
+    } else if before.is_empty()
+        || !before
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        Some("no valid provider conversation id is recorded; nothing changed".to_string())
+    } else if is_running(name).await && !steer_lane_at_boundary(state, name).await {
+        result["code"] = json!("restart_busy");
+        Some("lane is busy or idle status is unmeasured; use --when-idle to wait".into())
+    } else {
+        // Old conversations can be hundreds of MB: never scan on a runtime
+        // worker, or repeatedly scan while --when-idle is still waiting.
+        let task_name = name.to_string();
+        let task_provider = provider.clone();
+        let tasks = crate::db::interactions::spawn_blocking(move || {
+            restart_tasks(&task_name, &task_provider)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("task inspection failed: {e}")));
+        match tasks {
+            Err(e) => Some(e),
+            Ok(tasks) => {
+                let has_tasks = !tasks.is_empty();
+                result["tasks"] = json!(tasks);
+                if has_tasks && body.get("drop_tasks").and_then(Value::as_bool) != Some(true) {
+                    Some("scheduled task records found (may include completed/cancelled tasks); survival is unverified: use --drop-tasks to accept loss and recreate them".into())
+                } else if is_running(name).await && !steer_lane_at_boundary(state, name).await {
+                    result["code"] = json!("restart_busy");
+                    Some(
+                        "lane is busy or idle status is unmeasured; use --when-idle to wait".into(),
+                    )
+                } else {
+                    None
+                }
+            }
+        }
+    };
+    if let Some(error) = error {
+        tracing::warn!(session = name, provider, verdict = "conversation_restart_refused",
+            reason = %error, "same-conversation restart refused before stop");
+        result["error"] = json!(error);
+        return jresp(StatusCode::CONFLICT, result);
+    }
+    if body.get("dry_run").and_then(Value::as_bool) == Some(true) {
+        return j200(result);
+    }
+    let _notice = ConversationRestart::begin(name);
+    let ok = restart_for_swap_with_resume_policy(state, name, &provider, true).await;
+    let after = meta_str(&load_meta(name), key.unwrap());
+    result["conversation_id_after"] = json!(after);
+    result["restarted"] = json!(ok && before == after);
+    if !ok || before != after {
+        result["error"] = json!(
+            "restart failed or conversation identity changed; inspect lane status before retrying"
+        );
+    }
+    tracing::warn!(session = name, provider, restarted = %result["restarted"],
+        identity_preserved = (before == after), verdict = "conversation_restart_result",
+        "same-conversation restart completed");
+    jresp(
+        if result["error"].is_null() {
+            StatusCode::OK
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        },
+        result,
+    )
+}
+
 /// The provider/model/effort/yolo restart choreography shared by four config
 /// keys (py:76470-76500 and friends): stash the live conversation id, stop
 /// for restart, start.
 async fn restart_for_swap(state: &AppState, name: &str, provider: &str) -> bool {
+    restart_for_swap_with_resume_policy(state, name, provider, false).await
+}
+
+async fn restart_for_swap_with_resume_policy(
+    state: &AppState,
+    name: &str,
+    provider: &str,
+    require_resume: bool,
+) -> bool {
     if provider == "claude" {
         // Python captures the LIVE conv id from process argv (py:20546
         // _live_conv_id). The argv walk is not ported; the meta id is what
@@ -32781,8 +32974,211 @@ async fn restart_for_swap(state: &AppState, name: &str, provider: &str) -> bool 
     }
     let _ = stop_session(state, name).await;
     kill_tmux_session(name).await;
-    let (ok, _msg) = start_session(state, name, "", false).await;
+    let (ok, _msg) = start_session_with_resume_policy(state, name, "", ConversationLaunch {
+        skip_conv_id: false, require_resume,
+    }).await;
     ok
+}
+
+#[cfg(test)]
+mod conversation_restart_tests {
+    use super::*;
+    const ID: &str = "10710710-7107-4107-8107-107107107107";
+
+    async fn report(state: &AppState, name: &str, status: &str) {
+        let value = json!({name:{"state":status,"ts":crate::config::now_f64()}}).to_string();
+        state
+            .store
+            .write_async(move |conn| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO prefs(key,value) VALUES('session_reports',?1)",
+                    [value],
+                )?;
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn payload(response: Response) -> Value {
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_provider_ids_and_worker_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::env::set_var("HOME", dir.path());
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        let (state, _store) = super::tests::state();
+        for (provider, key) in RESTART_RESUME_KEYS {
+            let name = format!("restart-107-{provider}");
+            let env = format!(
+                "CC_PROVIDER={provider}\nCC_DIR={}\nCC_TAGS=keep-group\nCC_TEST_FAKE_PANE=1\n",
+                dir.path().display()
+            );
+            std::fs::write(env_path(&name), &env).unwrap();
+            save_meta(
+                &name,
+                json!({*key:ID,"cc_task":"keep-card"}).as_object().unwrap(),
+            );
+            if *provider == "claude" {
+                let path = claude_home()
+                    .join("projects")
+                    .join(project_name(&dir.path().to_string_lossy()))
+                    .join(format!("{ID}.jsonl"));
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "{}\n").unwrap();
+            }
+            report(&state, &name, "idle").await;
+            let response = config_patch(&state, &name, &json!({"restart":true})).await;
+            let status = response.status();
+            let body = payload(response).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["restarted"], true);
+            assert_eq!(body["conversation_id_before"], ID);
+            assert_eq!(body["conversation_id_after"], ID);
+            let meta = load_meta(&name);
+            assert_eq!(meta[*key], ID);
+            assert_eq!(meta["cc_task"], "keep-card");
+            assert_eq!(std::fs::read_to_string(env_path(&name)).unwrap(), env);
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_refuses_busy_and_unsupported_without_changing_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::env::set_var("HOME", dir.path());
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        let (state, _store) = super::tests::state();
+        let name = "restart-107-refusal";
+        for provider in ["codex", "muse"] {
+            std::fs::write(
+                env_path(name),
+                format!("CC_PROVIDER={provider}\nCC_TEST_FAKE_PANE=1\n"),
+            )
+            .unwrap();
+            let meta = json!({"codex_session_id":ID});
+            save_meta(name, meta.as_object().unwrap());
+            report(&state, name, "active").await;
+            let response = config_patch(&state, name, &json!({"restart":true})).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = payload(response).await;
+            assert_eq!(body["restarted"], false);
+            assert!(body["error"]
+                .as_str()
+                .unwrap()
+                .contains(if provider == "codex" {
+                    "busy"
+                } else {
+                    "support"
+                }));
+            assert_eq!(load_meta(name), *meta.as_object().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_stale_identity_and_invalid_controls_before_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::env::set_var("HOME", dir.path());
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        let (state, _store) = super::tests::state();
+        let name = "restart-107-validation";
+        std::fs::write(env_path(name), "CC_PROVIDER=codex\nCC_TEST_FAKE_PANE=1\n").unwrap();
+        let meta = json!({"codex_session_id":ID});
+        save_meta(name, meta.as_object().unwrap());
+        for body in [
+            json!({"restart":true,"expected_conversation_id":"stale"}),
+            json!({"restart":true,"dry_run":"true"}),
+            json!({"restart":true,"drop_tasks":"true"}),
+        ] {
+            let response = config_patch(&state, name, &body).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(load_meta(name), *meta.as_object().unwrap());
+        }
+        save_meta(name, json!({}).as_object().unwrap());
+        let response = config_patch(&state, name, &json!({"restart":true})).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(payload(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("conversation id"));
+    }
+
+    #[tokio::test]
+    async fn restart_waits_for_the_lane_send_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::env::set_var("HOME", dir.path());
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        let (state, _store) = super::tests::state();
+        let name = "restart-107-lock";
+        std::fs::write(env_path(name), "CC_PROVIDER=muse\n").unwrap();
+        let guard = lane_send_lock(name).lock_owned().await;
+        let mut task =
+            tokio::spawn(async move { config_patch(&state, name, &json!({"restart":true})).await });
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut task)
+            .await
+            .is_err());
+        drop(guard);
+        let response = task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn restart_task_inventory_refuses_before_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::env::set_var("HOME", dir.path());
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        let name = "restart-107-tasks";
+        std::fs::write(
+            env_path(name),
+            format!(
+                "CC_PROVIDER=claude\nCC_DIR={}\nCC_TEST_FAKE_PANE=1\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        let meta = json!({"cc_conversation_id":ID});
+        save_meta(name, meta.as_object().unwrap());
+        let path = claude_home()
+            .join("projects")
+            .join(project_name(&dir.path().to_string_lossy()))
+            .join(format!("{ID}.jsonl"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let record = json!({"message":{"content":[{"type":"tool_use","name":"CronCreate","id":"task-107","input":{"cron":"0 9 * * *","prompt":"fixture"}}]}});
+        std::fs::write(&path, format!("{record}\n")).unwrap();
+        let (state, _store) = super::tests::state();
+        report(&state, name, "idle").await;
+        let response = config_patch(&state, name, &json!({"restart":true})).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = payload(response).await;
+        assert_eq!(body["tasks"][0]["id"], "task-107");
+        assert_eq!(load_meta(name), *meta.as_object().unwrap());
+        let response = config_patch(
+            &state,
+            name,
+            &json!({"restart":true,"drop_tasks":true,"dry_run":true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(load_meta(name), *meta.as_object().unwrap());
+        std::fs::write(&path, "malformed\n").unwrap();
+        assert!(restart_task_records(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(restart_tasks(name, "claude").is_err());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -34349,7 +34745,7 @@ const CONFIG_PATCH_OPS: &[&[&str]] = &[
     &["provider"], &["model", "effort"], &["dir"], &["task_summary"], &["desc"],
     &["toggle_pin"], &["isolated"], &["toggle_yolo"], &["external_email_allowed"],
     &["send_allow", "spans_groups"], &["worktree_profile"], &["branch"], &["tags"],
-    &["mcp"], &["new_conversation", "restart"],
+    &["mcp"], &["new_conversation", "restart", "drop_tasks", "dry_run", "expected_conversation_id"],
 ];
 
 /// The settings a config PATCH body names. Keys handled together by one
@@ -35410,6 +35806,12 @@ async fn config_patch_with_liveness(
     // explicitly (ethos rule 8). The 409 for the bare form now NAMES its own
     // escape in the sanctioned tooling rather than in HTTP terms only —
     // ethos rule 6, the constraint whose documented escape was unwalkable.
+    if body.get("restart").and_then(Value::as_bool) == Some(true)
+        && !body.get("new_conversation").map(py_truthy).unwrap_or(false)
+    {
+        return restart_same_conversation(state, name, body).await;
+    }
+
     if body.get("new_conversation").map(py_truthy).unwrap_or(false) {
         let restart = body.get("restart").map(py_truthy).unwrap_or(false);
         let running = is_running(name).await;

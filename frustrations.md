@@ -6173,3 +6173,21 @@ FIX: Withhold completion while scans or entries fail, persist pending paths, and
   retry at startup or once per minute on identity operations. Successful entries
   leave the pending list; WARN identity_migration_pending reports counts and
   identity_migration_attempt records each bounded pass.
+
+## Launch settings require a conversation-preserving restart
+AREA: cli
+SEVERITY: slows
+STATUS: open
+DATE: 2026-10-31
+SESSION: amux-restart-107
+CARD: maxtongwang/hq#107
+SYMPTOM: Long-running workers cannot reload launch-only settings with a restart
+  verb; fresh discards their conversation. The shared launcher's failed-resume
+  fallback can also open a fresh conversation.
+COST: The requester reports six leads/workers started Oct 25-26 still missing
+  the usage band installed Oct 30; no safe restart command was available.
+FIX: Worktree implementation adds amux restart with exact provider IDs, idle and task-loss refusals,
+  send-lock protection and a strict launch policy that disables fresh fallback.
+  Rust compilation and live task persistence still need verification.
+  WARN conversation_restart_refused and conversation_restart_result expose
+  refusals and identity preservation. Live task survival remains unverified.
