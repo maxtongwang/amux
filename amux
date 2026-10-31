@@ -6529,6 +6529,7 @@ verb parity. New verbs land in amux-rs (crates/amux-cli).${RESET}
 ${BOLD}Worker management:${RESET}
   amux register <name> [flags]   Register a worker with Claude Code flags
   amux worktree <name> [show|profiles|widen <p>...|profile <p>]   Sparse worktree profile, size, widen
+  amux restart <name> [-y] [--when-idle] [--drop-tasks] [--json]  Resume the same conversation
   amux model <name> [<model>] [--effort E]   Show or switch a worker's model (see amux model --help)
   amux usage [--json]            Provider budget windows: Claude 5-hour/weekly, Codex
   amux start <name> [--detach]   Start a registered worker in tmux (-d = don't attach)
@@ -7213,6 +7214,103 @@ cmd_whoami() {
 #
 # DEFAULT is a PURE FILE READ (no HTTP probe): probing per-call across ~48 lanes
 # would flood the server to ask where the server is. `--verify` opts into a probe.
+# Restart only after a read-only preflight; the server rechecks under its send lock.
+cmd_restart() {
+  local api="${AMUX_API:-$(cmd_url)}"
+  export -f _curl _transport_breadcrumb
+  CC_HOME="$CC_HOME" python3 - "$api" "$@" <<'PY_RESTART'
+import json, os, subprocess, sys, time, urllib.parse
+
+IDLE_TIMEOUT_SECONDS = 300
+IDLE_POLL_SECONDS = 2
+REQUEST_TIMEOUT_SECONDS = 180
+args = sys.argv[2:]
+flags = {"-y", "--yes", "--when-idle", "--json", "--drop-tasks"}
+names = [a for a in args if not a.startswith("-")]
+result = dict(schema_version=1, name=names[0] if names else "", provider=None,
+              conversation_id_before=None, conversation_id_after=None,
+              restarted=False, tasks=[], error=None)
+as_json = "--json" in args
+
+def finish(error=None, code=1):
+    if error:
+        result["error"] = error
+    if as_json:
+        print(json.dumps(result))
+    else:
+        if result["error"]:
+            for task in result["tasks"]:
+                print("Scheduled task record: " + json.dumps(task))
+            print(result["error"], file=sys.stderr)
+        elif result["restarted"]:
+            print("Conversation after: " + str(result["conversation_id_after"]))
+            print("Restarted " + result["name"])
+    raise SystemExit(code)
+
+if len(names) != 1 or any(a.startswith("-") and a not in flags for a in args):
+    finish("usage: amux restart <name> [-y] [--when-idle] [--drop-tasks] [--json]", 2)
+url = sys.argv[1].rstrip("/") + "/api/sessions/" + urllib.parse.quote(names[0], safe="") + "/config"
+
+def request(preflight):
+    payload = dict(restart=True, dry_run=preflight, drop_tasks="--drop-tasks" in args)
+    if not preflight:
+        payload["expected_conversation_id"] = result["conversation_id_before"]
+    try:
+        response = subprocess.run(["bash", "-c", '_curl "$@"', "restart",
+            "-sk", "--max-time", str(REQUEST_TIMEOUT_SECONDS), "-X", "PATCH",
+            "-H", "Content-Type: application/json", "-H",
+            "X-Amux-Session: " + os.environ.get("AMUX_SESSION", ""),
+            "-d", json.dumps(payload), url], text=True, capture_output=True)
+        if response.returncode:
+            finish("restart response unavailable; inspect lane status before retrying (curl exit %s)" % response.returncode)
+        value = json.loads(response.stdout)
+        # An older server's generic ok is not evidence of an exact-id restart.
+        if not isinstance(value, dict) or value.get("schema_version") != 1 or any(k not in value for k in ("name", "provider", "conversation_id_before", "conversation_id_after", "restarted", "tasks", "error")):
+            finish("server does not support verified restart: " + str(value.get("error", "invalid response") if isinstance(value, dict) else "invalid response"))
+        if not isinstance(value["tasks"], list) or type(value["restarted"]) is not bool or (value["error"] is not None and not isinstance(value["error"], str)):
+            finish("invalid restart response types")
+        if value["error"] is None and not all(isinstance(value[k], str) and value[k] for k in ("name", "provider", "conversation_id_before", "conversation_id_after")):
+            finish("restart response has no proven conversation identity")
+        result.pop("code", None)
+        result.update(value)
+    except (OSError, ValueError) as e:
+        finish("restart response unavailable; inspect lane status before retrying: " + str(e))
+
+started = time.monotonic()
+while True:
+    request(True)
+    if not result["error"]:
+        break
+    if "--when-idle" not in args or result.get("code") != "restart_busy":
+        finish()
+    if time.monotonic() - started >= IDLE_TIMEOUT_SECONDS:
+        finish("timed out waiting for idle; nothing changed")
+    print("Waiting for idle: " + result["error"], file=sys.stderr)
+    time.sleep(IDLE_POLL_SECONDS)
+print("Conversation before: " + str(result["conversation_id_before"]), file=sys.stderr if as_json else sys.stdout, flush=True)
+for task in result["tasks"]:
+    print("Scheduled task record: " + json.dumps(task), file=sys.stderr if as_json else sys.stdout, flush=True)
+if "-y" not in args and "--yes" not in args:
+    # stdin carries this program, so confirmation uses the controlling terminal.
+    try:
+        with open("/dev/tty", "r+") as tty:
+            tty.write("Restart " + names[0] + " and resume this conversation? [y/N] ")
+            tty.flush()
+            if tty.readline().strip().lower() != "y":
+                finish("restart cancelled; nothing changed")
+    except OSError:
+        finish("no terminal: use -y to confirm restart")
+before = result["conversation_id_before"]
+request(False)
+if result["error"]:
+    finish()
+if not result["restarted"] or before != result["conversation_id_before"] or before != result["conversation_id_after"]:
+    result["restarted"] = False
+    finish("restart did not preserve the conversation id")
+finish(code=0)
+PY_RESTART
+}
+
 # amux fresh <session> — recycle a worker's CONVERSATION, keep the worker.
 #
 # Why this exists (AMUX-3742). A lane resumes the same Claude conversation
@@ -9818,6 +9916,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     approvals)        shift; cmd_approvals "$@" ;;
     iac)              shift; cmd_config "$@" ;;
     whoami)           cmd_whoami ;;
+    restart)          shift; cmd_restart "$@" ;;
     fresh)            shift; cmd_fresh "$@" ;;
     url)              shift; cmd_url "$@" ;;
     pin)              shift; cmd_pin "$@" ;;

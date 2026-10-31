@@ -214,6 +214,10 @@ On top of it sits a **daily log sweep**: a scheduler entry that prompts a sessio
 
 ## CLI
 
+| Bash command | Behavior |
+|---|---|
+| `amux restart <name> [-y] [--when-idle] [--drop-tasks] [--json]` | Reload launch settings and resume the same conversation; refuse busy lanes and unacknowledged task loss. [Safety and API](docs/reference/restart.md) |
+
 `install.sh` also installs the Bash `amux` client. To update just that client
 from a resolved, reviewed checkout, run `make install-cli` (optionally
 `BIN_DIR=/usr/local/bin`). It checks a private snapshot before atomic publication;
