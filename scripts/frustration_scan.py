@@ -54,6 +54,10 @@ import sys
 import time
 from collections import defaultdict
 
+# Support direct execution and importlib callers outside the scripts directory.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from redact_loader import redact, redact_event
+
 DB = os.environ.get("AMUX_DB") or os.path.expanduser("~/.amux/amux.db")
 DAYS = float(os.environ.get("FRUSTRATION_SCAN_DAYS", "3"))
 MAX_OUT = int(os.environ.get("FRUSTRATION_SCAN_MAX", "12"))
@@ -340,9 +344,9 @@ def main():
             folder = os.path.join(os.environ.get("AMUX_HOME", os.path.expanduser("~/.amux")), "logs")
             os.makedirs(folder, exist_ok=True)
             with open(os.path.join(folder, "friction-sweep.log"), "a") as stream:
-                stream.write(json.dumps(event, sort_keys=True) + "\n")
+                stream.write(json.dumps(redact_event(event), sort_keys=True) + "\n")
         except OSError as error:
-            print(json.dumps({**event, "event": "friction_audit_unavailable", "reason": type(error).__name__}), file=sys.stderr)
+            print(json.dumps({**redact_event(event), "event": "friction_audit_unavailable", "reason": type(error).__name__}), file=sys.stderr)
 
     findings = defaultdict(lambda: {"score": 0, "why": [], "msgs": []})
 
@@ -530,7 +534,7 @@ def main():
                         "id": m["id"],
                         "when": time.strftime("%m-%d %H:%M", time.localtime(m["ts"] / 1000)),
                         "session": m["session"],
-                        "text": m["text"][:400],
+                        "text": redact(m["text"])[:400],
                         "submit_verdict": m.get("submit_verdict"),
                         "delivered": m.get("delivered", "unknown"),
                         "delivered_why": m.get("delivered_why", ""),
