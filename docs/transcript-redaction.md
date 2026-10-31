@@ -1,15 +1,15 @@
 # Transcript excerpt redaction
 
-The frustration scanners import `redact` from ai-config's `amux/bin/amux-origin`
-through `scripts/redact_loader.py`. Set `AI_CONFIG_DIR` to the ai-config checkout;
-the default is `~/GitHub/ai-config`. The upstream module owns the patterns,
-secret-key value policy, and maximum length. No pattern table is copied here.
-Its guarded CLI does not execute on import through `SourceFileLoader`.
+The frustration scanners use a private redaction module you configure with
+`AMUX_REDACT_MODULE`, an absolute path to an existing regular Python file exposing
+`redact(text) -> str`. The module owns patterns, value policy, and maximum length;
+no pattern table is copied here. Loading does not write bytecode to its directory.
 
-A missing module, absent callable, import error, or redactor error replaces the
-excerpt with `[excerpt withheld: redaction table unavailable]`. Dependency
-stdout and stderr are suppressed. Counts and theme labels remain readable.
-Audit events include `redaction_table_available` for discovery of missing tables.
+Unset, empty, relative, missing, or directory paths fail closed. An absent callable,
+import error, failed probe call, or redactor error replaces the excerpt with
+`[excerpt withheld: redaction table unavailable]`. Dependency stdout and stderr are
+suppressed. Counts and theme labels remain readable. Audit events include
+`redaction_table_available`, true only after a successful string-returning probe.
 Redaction precedes excerpt truncation and JSON encoding.
 
 ## Script output sweep
@@ -37,8 +37,8 @@ under `scripts/`. This checkout has no `bin/` directory.
 ## Verification command
 
 Run `python3 scripts/test-redact-excerpts.py` with the project test interpreter.
-Three tests cover the loader and both tools using fake credentials, a fixture
-redactor, missing configuration, and redactor failure. The theme test checks
+Five tests cover the loader and both tools using fake credentials, a fixture
+redactor, invalid and missing configuration, probe failure, bytecode suppression, and redactor failure. The theme test checks
 JSON, Markdown, audit JSONL and its stderr fallback. The scanner test exercises
 the actual SQLite query and serialized findings. Existing scanner suites remain
 `scripts/test-frustration-scan.sh` and `scripts/test-friction-themes.sh`.

@@ -198,6 +198,8 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-frustration-scan.sh
+      - name: transcript excerpts fail closed without a configured redactor
+        run: python3 scripts/test-redact-excerpts.py
       - name: direct delivery verdicts survive scanner SQL and output (AF-889)
         run: python3 scripts/test-frustration-delivery.py
       - name: a renamed worker's CLI calls carry its new name, not its launch name (TWN-1)

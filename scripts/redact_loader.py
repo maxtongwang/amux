@@ -1,29 +1,35 @@
-"""Runtime bridge to ai-config/amux/bin/amux-origin, the sole redaction owner.
-
-SourceFileLoader supports the extensionless source. Its CLI is protected by
-``if __name__ == '__main__'``; importing under a private name does not run it.
-No patterns are maintained here. Unavailable or broken redaction fails closed.
-"""
+"""Load a configured private redactor; unavailable or broken modules fail closed."""
 import contextlib
 import importlib.machinery
 import importlib.util
 import io
 import os
+import sys
 from pathlib import Path
 
 WITHHELD = "[excerpt withheld: redaction table unavailable]"
 
 
 def _load_redact():
-    path = Path(os.environ.get("AI_CONFIG_DIR", "~/GitHub/ai-config")).expanduser()
-    loader = importlib.machinery.SourceFileLoader(
-        "_amux_shared_redaction", str(path / "amux/bin/amux-origin"))
+    configured = os.environ.get("AMUX_REDACT_MODULE", "")
+    if not configured or not os.path.isabs(configured):
+        return None
     try:
-        # Never forward diagnostics from a failed dependency import.
+        path = Path(configured).resolve(strict=True)
+        if not path.is_file():
+            return None
+        loader = importlib.machinery.SourceFileLoader("_amux_shared_redaction", str(path))
+        # Never forward diagnostics or write caches into the dependency directory.
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
-            loader.exec_module(module)
-        return module.redact if callable(module.redact) else None
+            previous = sys.dont_write_bytecode
+            try:
+                sys.dont_write_bytecode = True
+                module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+                loader.exec_module(module)
+                candidate = getattr(module, "redact", None)
+                return candidate if callable(candidate) and isinstance(candidate(""), str) else None
+            finally:
+                sys.dont_write_bytecode = previous
     except (Exception, SystemExit):
         return None
 

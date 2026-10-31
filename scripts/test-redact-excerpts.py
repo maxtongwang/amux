@@ -36,9 +36,8 @@ class Redaction(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.env = dict(os.environ)
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(self.env)))
-        os.environ.update(AI_CONFIG_DIR=str(self.root), AMUX_HOME=str(self.root))
-        origin = self.root / 'amux/bin/amux-origin'
-        origin.parent.mkdir(parents=True)
+        os.environ.update(AMUX_REDACT_MODULE=str(self.root / 'redactor.py'), AMUX_HOME=str(self.root))
+        origin = self.root / 'redactor.py'
         # A fixture contract, not a copy of the upstream pattern table.
         origin.write_text('VALUES = ' + repr(SECRETS) + '\n'
                           'REDACT_MAX_CHARS = 1000\n'
@@ -57,10 +56,10 @@ class Redaction(unittest.TestCase):
         m = load('redact_loader')
         self.assertSafe(m.redact(TEXT), False)
         self.assertEqual(len(m.redact('x' * 1100)), 1000)
-        os.environ['AI_CONFIG_DIR'] = str(self.root / 'missing')
+        os.environ['AMUX_REDACT_MODULE'] = str(self.root / 'missing')
         self.assertEqual(load('redact_loader').redact(TEXT), m.WITHHELD)
-        origin = self.root / 'amux/bin/amux-origin'
-        os.environ['AI_CONFIG_DIR'] = str(self.root)
+        origin = self.root / 'redactor.py'
+        os.environ['AMUX_REDACT_MODULE'] = str(self.root / 'redactor.py')
         origin.write_text('def redact(text):\n    print(text)\n    raise ValueError(text)\n')
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
@@ -70,6 +69,38 @@ class Redaction(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
             self.assertEqual(load('redact_loader').redact(TEXT), m.WITHHELD)
         self.assertEqual(out.getvalue(), '')
+
+    def test_invalid_paths_never_import_cwd(self):
+        planted = self.root / 'foo/bar.py'
+        planted.parent.mkdir(parents=True)
+        planted.write_text('from pathlib import Path\n'
+                           'Path("imported").touch()\n'
+                           'def redact(text): return "PWNED"\n')
+        previous = os.getcwd()
+        self.addCleanup(os.chdir, previous)
+        os.chdir(self.root)
+        for value in ('', '.', 'foo/bar.py', str(self.root), str(self.root / 'missing.py')):
+            with self.subTest(path=value):
+                os.environ['AMUX_REDACT_MODULE'] = value
+                module = load('redact_loader')
+                self.assertEqual(module.redact(TEXT), module.WITHHELD)
+                self.assertFalse(module.redact_event({})['redaction_table_available'])
+                self.assertFalse((self.root / 'imported').exists())
+        os.environ.pop('AMUX_REDACT_MODULE')
+        self.assertEqual(load('redact_loader').redact(TEXT), module.WITHHELD)
+
+    def test_probe_and_no_bytecode(self):
+        previous = sys.dont_write_bytecode
+        self.addCleanup(setattr, sys, 'dont_write_bytecode', previous)
+        sys.dont_write_bytecode = False
+        module = load('redact_loader')
+        self.assertFalse(sys.dont_write_bytecode)
+        self.assertTrue(module.redact_event({})['redaction_table_available'])
+        self.assertFalse((self.root / '__pycache__').exists())
+        origin = self.root / 'redactor.py'
+        for body in ('raise ValueError("broken")', 'return None'):
+            origin.write_text('def redact(text):\n    ' + body + '\n')
+            self.assertFalse(load('redact_loader').redact_event({})['redaction_table_available'])
 
     def test_frustration_scan(self):
         db = self.root / 'fixture.db'
@@ -83,7 +114,7 @@ class Redaction(unittest.TestCase):
         con.close()
         os.environ['AMUX_DB'] = str(db)
         for missing in (False, True):
-            if missing: os.environ['AI_CONFIG_DIR'] = str(self.root / 'missing')
+            if missing: os.environ['AMUX_REDACT_MODULE'] = str(self.root / 'missing')
             run = subprocess.run([sys.executable, str(SCRIPTS / 'frustration_scan.py')],
                                  capture_output=True, text=True)
             self.assertEqual(run.returncode, 0, run.stderr)
@@ -99,7 +130,7 @@ class Redaction(unittest.TestCase):
 
     def test_friction_themes(self):
         for missing in (False, True):
-            if missing: os.environ['AI_CONFIG_DIR'] = str(self.root / 'missing')
+            if missing: os.environ['AMUX_REDACT_MODULE'] = str(self.root / 'missing')
             m = load('friction_themes')
             signal = m.Signal('fixture-theme', 'amux', 'Fixture theme', n_considered=2)
             signal.active = True
