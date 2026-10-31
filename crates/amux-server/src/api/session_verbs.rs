@@ -33061,7 +33061,7 @@ mod conversation_restart_tests {
         std::fs::create_dir_all(sessions_dir()).unwrap();
         let (state, _store) = super::tests::state();
         let name = "restart-107-refusal";
-        for provider in ["codex", "opencode"] {
+        for provider in ["codex", "muse"] {
             std::fs::write(
                 env_path(name),
                 format!("CC_PROVIDER={provider}\nCC_TEST_FAKE_PANE=1\n"),
@@ -33123,7 +33123,7 @@ mod conversation_restart_tests {
         std::fs::create_dir_all(sessions_dir()).unwrap();
         let (state, _store) = super::tests::state();
         let name = "restart-107-lock";
-        std::fs::write(env_path(name), "CC_PROVIDER=opencode\n").unwrap();
+        std::fs::write(env_path(name), "CC_PROVIDER=muse\n").unwrap();
         let guard = lane_send_lock(name).lock_owned().await;
         let mut task =
             tokio::spawn(async move { config_patch(&state, name, &json!({"restart":true})).await });
