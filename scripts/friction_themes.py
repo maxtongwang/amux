@@ -62,6 +62,10 @@ import sys
 import time
 from collections import Counter, defaultdict
 
+# Support direct execution and importlib callers outside the scripts directory.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from redact_loader import redact, redact_tree, redact_event
+
 DB = os.environ.get("AMUX_DB") or os.path.expanduser("~/.amux/amux.db")
 AMUX_REPO = os.environ.get("AMUX_REPO") or os.path.expanduser("~/Dev/amux")
 MIXPEEK_REPO = os.environ.get("MIXPEEK_REPO") or os.path.expanduser("~/Dev/mixpeek")
@@ -415,7 +419,7 @@ class Signal:
             "baseline_means": self.baseline_label,
             "active": self.active,
             "concentration": self.concentration,
-            "evidence": self.evidence[:MAX_PER_SIGNAL],
+            "evidence": redact_tree(self.evidence[:MAX_PER_SIGNAL]),
             "detail": self.detail,
         }
 
@@ -621,7 +625,7 @@ def signal_rule_restatement(con, now_ms, prompts_doc):
         s.evidence = [
             {"msg": f"MSG-{r['id']}", "session": r["session"],
              "ts": time.strftime("%Y-%m-%d %H:%M", time.localtime(r["ts"] / 1000)),
-             "text": (r["text"] or "")[:220]}
+             "text": redact(r["text"] or "")[:220]}
             for r in in_win[:MAX_PER_SIGNAL]
         ]
         out.append(s)
@@ -665,9 +669,9 @@ def log_friction_event(event):
         folder = os.path.join(os.environ.get("AMUX_HOME", os.path.expanduser("~/.amux")), "logs")
         os.makedirs(folder, exist_ok=True)
         with open(os.path.join(folder, "friction-sweep.log"), "a") as stream:
-            stream.write(json.dumps(event, sort_keys=True) + "\n")
+            stream.write(json.dumps(redact_event(event), sort_keys=True) + "\n")
     except OSError as error:
-        print(json.dumps({**event, "event": "friction_audit_unavailable",
+        print(json.dumps({**redact_event(event), "event": "friction_audit_unavailable",
                           "reason": type(error).__name__}), file=sys.stderr)
 
 
@@ -711,7 +715,7 @@ def signal_cross_lane_repeat(con, now_ms):
             "repos": sorted(repos),
             "cross_repo": len(repos - {"other"}) > 1,
             "msgs": [f"MSG-{h['id']}" for h in hits][:4],
-            "text": (hits[0]["text"] or "")[:200],
+            "text": redact(hits[0]["text"] or "")[:200],
         })
     s.evidence.sort(key=lambda e: (not e["cross_repo"], -len(e["lanes"])))
     evidence_repos = {repo for e in s.evidence for repo in e["repos"]}
@@ -812,7 +816,7 @@ def signal_ledger_clusters(now_ms):
             n += 1
             title = e.get("title", "")
             area = e.get("area") or canon_area(title)
-            rec = {"title": title[:120], "date": e.get("date", ""),
+            rec = {"title": redact(title)[:120], "date": e.get("date", ""),
                    "card": e.get("card", ""), "session": e.get("session", "")}
             primary = canon_area(area)
             add("amux", primary, rec)
@@ -824,7 +828,7 @@ def signal_ledger_clusters(now_ms):
             if e["status"] != "open":
                 continue
             n += 1
-            rec = {"title": e["title"][:120], "date": e["date"],
+            rec = {"title": redact(e["title"])[:120], "date": e["date"],
                    "card": "", "session": e.get("session", "")}
             primary = canon_area(e["title"])
             add("mixpeek", primary, rec)
@@ -1130,7 +1134,7 @@ def main():
         if s.detail:
             print(f"  detail: {json.dumps(s.detail)}")
         for e in s.evidence[:MAX_PER_SIGNAL]:
-            print(f"    - {json.dumps(e)[:300]}")
+            print(f"    - {json.dumps(redact_tree(e))[:300]}")
     print("\nSignals are candidates, not findings. Name the theme, decide which")
     print("file absorbs it, and say so on the card.")
     return 0

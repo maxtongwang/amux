@@ -372,3 +372,7 @@ amux is growing into the durable operating system around agents: it owns executi
 - iOS app: [App Store](https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435) · Managed onboarding: [amux.io/concierge](https://amux.io/concierge/)
 
 If amux saves you time, a ⭐ helps others find it.
+
+| Diagnostic tool | Excerpt protection |
+| --- | --- |
+| Frustration scan and friction themes | Shared runtime redaction; excerpts withheld when unavailable. See [configuration and output sweep](docs/transcript-redaction.md). |
