@@ -1081,9 +1081,11 @@ fn probe_failure_label(probe: &UsageProbe) -> Option<String> {
 /// The Claude wire body, with the usage-band file as the second source.
 ///
 /// An exact keychain body, or no file configured (`readings: None`), is exactly
-/// [`shape_probe`]. Otherwise fresh file windows replace the failure; with none,
-/// a degraded body keeps its cause and reason and gains the file problem, and a
-/// stale-but-real keychain snapshot is left as it was. Never a number without a
+/// [`shape_probe`]. Otherwise fresh file windows (at most 2 h old) replace the
+/// probe outcome, including an older keychain snapshot the probe fell back to:
+/// the file is rewritten every minute, so it is the newer reading. With no fresh
+/// window, a degraded body keeps its cause and reason and gains the file
+/// problem, and a keychain snapshot is left as it was. Never a number without a
 /// fresh reading.
 fn shape_claude_with_readings(
     probe: UsageProbe,
@@ -2795,7 +2797,9 @@ mod tests {
         assert_eq!(v["limits"][0]["percent"], json!(2.0));
         assert_eq!(v["limits"][1]["kind"], json!("weekly_all"));
         assert_eq!(v["limits"][1]["percent"], json!(55.0));
-        assert_eq!(v["limits"][1]["age_s"], json!(30));
+        // The fixture and the handler each read the clock; allow a second boundary.
+        let age = v["limits"][1]["age_s"].as_i64().unwrap();
+        assert!((30..=32).contains(&age), "age_s {age}");
         let row = v["providers"].as_array().unwrap().iter().find(|p| p["id"] == "claude").unwrap();
         assert_eq!(row["source"], json!("usage-band file"));
         assert_eq!(row["windows"][0]["label"], json!("5-hour session"));
