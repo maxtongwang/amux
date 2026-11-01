@@ -36,6 +36,21 @@
 //! missing credential. Every cause now has its own reason string, and an HTTP
 //! failure carries its status code.
 //!
+//! # Second Claude source: the usage-band file (ai-config#782)
+//!
+//! The keychain probe answers `no_token` on hosts where the Claude binary keeps
+//! no readable subscription token, which left every budget consumer of
+//! `amux usage` with no Claude number. A token-free reading exists: the Claude
+//! Code usage-band mod writes `~/.amux/usage/latest.json` (path override
+//! `USAGE_READINGS_FILE`). When the keychain probe yields anything but an exact
+//! body, [`shape_claude_with_readings`] shapes that file's `claude.five_hour`
+//! and `claude.seven_day` readings into the same `limits[]` wire body, marked
+//! `source: "usage-band file"` with per-window age, and keeps the probe failure
+//! beside it as `probe_failure`. A window older than [`READINGS_STALE_AFTER_S`]
+//! or already past its reset is omitted, never reported; with nothing fresh the
+//! original degraded reason is kept and the file problem appended. This adds no
+//! keychain read: the file is plain JSON.
+//!
 //! # Secrets
 //!
 //! No response on any path can contain a token. Claude's [`UsageProbe`] cannot
@@ -271,7 +286,14 @@ struct UsageProbes {
     claude_account: AccountFn,
     codex: ProviderProbeFn,
     gemini: ProviderProbeFn,
+    /// Second Claude source; `None` leaves the keychain outcome untouched.
+    readings: Option<ReadingsFn>,
 }
+
+/// The usage-band file as an injectable dependency: parsed JSON, or the problem
+/// that stopped it from being read.
+pub type ReadingsFn =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send>> + Send + Sync>;
 
 #[derive(Default)]
 struct UsageCache {
@@ -292,12 +314,25 @@ pub fn routes() -> Router<AppState> {
         claude_account: Arc::new(|| Box::pin(probe_claude_account())),
         codex: Arc::new(|| Box::pin(probe_codex_usage())),
         gemini: Arc::new(|| Box::pin(probe_gemini_usage())),
+        readings: Some(Arc::new(|| Box::pin(read_usage_readings_file()))),
     })
+}
+
+/// Test seam for the second Claude source.
+#[cfg(test)]
+pub fn routes_with_readings(probe: ProbeFn, readings: ReadingsFn) -> Router<AppState> {
+    let mut probes = test_probes(probe);
+    probes.readings = Some(readings);
+    routes_with_probes(probes)
 }
 
 /// Existing Claude-focused test seam. Other providers degrade explicitly so
 /// old tests stay hermetic while the response still proves total coverage.
 pub fn routes_with(probe: ProbeFn) -> Router<AppState> {
+    routes_with_probes(test_probes(probe))
+}
+
+fn test_probes(probe: ProbeFn) -> UsageProbes {
     let unavailable = |provider: &'static str| -> ProviderProbeFn {
         Arc::new(move || {
             Box::pin(async move {
@@ -308,12 +343,13 @@ pub fn routes_with(probe: ProbeFn) -> Router<AppState> {
             })
         })
     };
-    routes_with_probes(UsageProbes {
+    UsageProbes {
         claude: probe,
         claude_account: Arc::new(|| Box::pin(async { None })),
         codex: unavailable("Codex"),
         gemini: unavailable("Gemini"),
-    })
+        readings: None,
+    }
 }
 
 fn routes_with_probes(probes: UsageProbes) -> Router<AppState> {
@@ -346,7 +382,14 @@ async fn get_usage(
             (probes.codex)(),
             (probes.gemini)()
         );
-        let mut shaped = shape_all_providers(claude, codex, gemini);
+        // Read the file only when the keychain probe gave no exact body.
+        let readings = match &probes.readings {
+            Some(read) if claude.exact_body().is_none() => Some(read().await),
+            _ => None,
+        };
+        let claude_body =
+            shape_claude_with_readings(claude, readings, chrono::Utc::now().timestamp());
+        let mut shaped = shape_all_providers_from(claude_body, codex, gemini);
         if let Some(email) = claude_account {
             // Stored on the envelope so the stale fallback below serves the
             // account that went with those numbers, never today's login.
@@ -680,12 +723,20 @@ fn provider_probe_unavailable(
     }
 }
 
+#[cfg(test)]
 fn shape_all_providers(
     claude_probe: UsageProbe,
     codex_probe: ProviderProbe,
     gemini_probe: ProviderProbe,
 ) -> Value {
-    let mut body = shape_probe(claude_probe);
+    shape_all_providers_from(shape_probe(claude_probe), codex_probe, gemini_probe)
+}
+
+fn shape_all_providers_from(
+    mut body: Value,
+    codex_probe: ProviderProbe,
+    gemini_probe: ProviderProbe,
+) -> Value {
     let providers = vec![
         shape_claude_provider(&body),
         shape_codex_provider(codex_probe),
@@ -749,6 +800,7 @@ fn shape_claude_provider(body: &Value) -> Value {
             "reason": body.get("reason").cloned()
                 .unwrap_or_else(|| json!("Claude usage is unavailable.")),
             "retry_at": body.get("retry_at"),
+            "usage_band_problem": body.get("usage_band_problem").cloned().unwrap_or(Value::Null),
             "windows": [],
         });
     }
@@ -782,6 +834,7 @@ fn shape_claude_provider(body: &Value) -> Value {
                 "resets_at": limit.get("resets_at").cloned().unwrap_or(Value::Null),
                 "severity": limit.get("severity").cloned().unwrap_or(Value::Null),
                 "active": limit.get("is_active").cloned().unwrap_or(Value::Null),
+                "age_s": limit.get("age_s").cloned().unwrap_or(Value::Null),
             }))
         })
         .collect::<Vec<_>>();
@@ -789,7 +842,10 @@ fn shape_claude_provider(body: &Value) -> Value {
         "id": "claude", "label": "Claude", "available": true, "measured": true,
         "account": body.get("account_email").cloned().unwrap_or(Value::Null),
         "n_considered": windows.len(), "metered": true,
-        "source": "Anthropic subscription API", "windows": windows,
+        "source": body.get("source").cloned()
+            .unwrap_or_else(|| json!("Anthropic subscription API")),
+        "probe_failure": body.get("probe_failure").cloned().unwrap_or(Value::Null),
+        "windows": windows,
         "observed_at": body.get("observed_at"), "retry_at": body.get("retry_at"),
         "cache_age_s": body.get("cache_age_s"), "stale": body.get("stale"),
         "stale_reason": body.get("stale_reason"),
@@ -930,6 +986,128 @@ fn shape_gemini_provider(probe: ProviderProbe) -> Value {
         "credits": body.get("credits").cloned().unwrap_or(Value::Null),
         "windows": windows,
     })
+}
+
+/// A usage-band reading older than this is stale, matching the collector's
+/// `STALE_AFTER_S` in ai-config `scripts/usage-readings.py` (2 h, hq#107).
+const READINGS_STALE_AFTER_S: i64 = 2 * 3600;
+
+/// The label the Settings row and `amux usage` show for this source.
+const READINGS_SOURCE: &str = "usage-band file";
+
+/// `(reading id, limits[].kind, limits[].group)` for each Claude window the
+/// file can supply, in the order the keychain body lists them.
+const READINGS_WINDOWS: [(&str, &str, Option<&str>); 2] = [
+    ("claude.five_hour", "session", None),
+    ("claude.seven_day", "weekly_all", Some("weekly")),
+];
+
+/// `~/.amux/usage/latest.json`, or `USAGE_READINGS_FILE`.
+fn readings_path() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("USAGE_READINGS_FILE").filter(|p| !p.is_empty()) {
+        return Some(path.into());
+    }
+    Some(std::path::Path::new(&std::env::var_os("HOME")?).join(".amux/usage/latest.json"))
+}
+
+async fn read_usage_readings_file() -> Result<Value, String> {
+    let path = readings_path().ok_or_else(|| "no HOME to locate the usage file".to_string())?;
+    let bytes = tokio::fs::read(&path).await.map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => format!("{} does not exist", path.display()),
+        _ => format!("{} is unreadable: {error}", path.display()),
+    })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{} is not valid JSON: {error}", path.display()))
+}
+
+/// The fresh `limits[]` of a usage file, as `(limits, oldest observed_at)`, or
+/// the reason there are none. Pure: `now` is a Unix timestamp argument.
+fn readings_limits(doc: &Value, now: i64) -> Result<(Vec<Value>, i64), String> {
+    let readings = match (doc.get("version"), doc.get("readings").and_then(Value::as_object)) {
+        (Some(v), Some(map)) if v == &json!(1) => map,
+        _ => return Err("file is not a version-1 usage file".into()),
+    };
+    let parse = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.timestamp())
+    };
+    let (mut limits, mut oldest, mut omitted) = (Vec::new(), i64::MAX, Vec::new());
+    for (id, kind, group) in READINGS_WINDOWS {
+        let Some(row) = readings.get(id) else {
+            omitted.push(format!("{id} absent"));
+            continue;
+        };
+        let percent = row.get("percent").and_then(Value::as_f64);
+        let (observed, resets) = (parse(row.get("observed_at")), parse(row.get("resets_at")));
+        let (Some(percent), Some(observed), Some(resets)) = (percent, observed, resets) else {
+            omitted.push(format!("{id} unreadable"));
+            continue;
+        };
+        let age = (now - observed).max(0);
+        if age > READINGS_STALE_AFTER_S {
+            omitted.push(format!("{id} stale ({age}s old)"));
+        } else if resets <= now {
+            omitted.push(format!("{id} already reset"));
+        } else {
+            oldest = oldest.min(observed);
+            limits.push(json!({
+                "kind": kind, "group": group, "percent": percent,
+                "resets_at": row.get("resets_at"),
+                "observed_at": row.get("observed_at"), "age_s": age,
+            }));
+        }
+    }
+    if limits.is_empty() {
+        Err(format!("no fresh Claude window ({})", omitted.join(", ")))
+    } else {
+        Ok((limits, oldest))
+    }
+}
+
+/// The failure the keychain probe is carrying, as `keychain: <cause>`.
+fn probe_failure_label(probe: &UsageProbe) -> Option<String> {
+    match probe {
+        UsageProbe::Snapshot { failure, .. } => failure.as_deref().and_then(probe_failure_label),
+        UsageProbe::Deferred { failure, .. } => probe_failure_label(failure),
+        UsageProbe::Ok(_) => None,
+        other => shape_probe(other.clone())
+            .get("cause")
+            .and_then(Value::as_str)
+            .map(|cause| format!("keychain: {cause}")),
+    }
+}
+
+/// The Claude wire body, with the usage-band file as the second source.
+///
+/// An exact keychain body, or no file configured (`readings: None`), is exactly
+/// [`shape_probe`]. Otherwise fresh file windows replace the failure; with none,
+/// a degraded body keeps its cause and reason and gains the file problem, and a
+/// stale-but-real keychain snapshot is left as it was. Never a number without a
+/// fresh reading.
+fn shape_claude_with_readings(
+    probe: UsageProbe,
+    readings: Option<Result<Value, String>>,
+    now: i64,
+) -> Value {
+    let mut shaped = shape_probe(probe.clone());
+    let Some(readings) = readings.filter(|_| probe.exact_body().is_none()) else {
+        return shaped;
+    };
+    match readings.and_then(|doc| readings_limits(&doc, now)) {
+        Ok((limits, observed_at)) => json!({
+            "available": true, "limits": limits, "source": READINGS_SOURCE,
+            "observed_at": observed_at, "probe_failure": probe_failure_label(&probe),
+        }),
+        Err(problem) => {
+            if shaped.get("available") != Some(&json!(true)) {
+                let reason = shaped["reason"].as_str().unwrap_or_default().to_string();
+                shaped["reason"] = json!(format!("{reason} ({READINGS_SOURCE}: {problem})"));
+                shaped["usage_band_problem"] = json!(problem);
+            }
+            shaped
+        }
+    }
 }
 
 /// One probe outcome -> the wire body the SPA consumes.
@@ -2224,6 +2402,7 @@ mod tests {
             claude_account: Arc::new(|| Box::pin(async { Some("b@example.com".to_string()) })),
             codex: unavailable.clone(),
             gemini: unavailable,
+            readings: None,
         }));
         let (_, body) = get(&app).await;
         let claude = body["providers"]
@@ -2537,6 +2716,7 @@ mod tests {
                     }
                 })
             }),
+            readings: None,
         };
         let app = app_routes(routes_with_probes(probes));
         temp_env_ttl("0", || async {
@@ -2561,6 +2741,118 @@ mod tests {
         assert_eq!(v["cause"], json!("rate_limited"));
         assert!(v.get("limits").is_none());
         assert!(v.get("stale").is_none());
+    }
+
+    // --- usage-band file as the second Claude source (ai-config#782) ---
+
+    fn iso(ts: i64) -> String {
+        chrono::DateTime::from_timestamp(ts, 0)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    /// `(percent, observed age s, resets in s)` per window -> a usage file.
+    fn usage_file(five: Option<(f64, i64, i64)>, seven: Option<(f64, i64, i64)>) -> Value {
+        let now = chrono::Utc::now().timestamp();
+        let row = |id: &str, kind: &str, (pct, age, resets_in): (f64, i64, i64)| {
+            json!({"id": id, "provider": "claude", "kind": kind, "percent": pct,
+                   "resets_at": iso(now + resets_in), "observed_at": iso(now - age),
+                   "source": "claude-mod-usage"})
+        };
+        let mut readings = serde_json::Map::new();
+        if let Some(w) = five {
+            readings.insert("claude.five_hour".into(), row("claude.five_hour", "five_hour", w));
+        }
+        if let Some(w) = seven {
+            readings.insert("claude.seven_day".into(), row("claude.seven_day", "seven_day", w));
+        }
+        json!({"version": 1, "written_at": iso(now), "readings": readings, "errors": []})
+    }
+
+    fn readings_fn(result: Result<Value, String>) -> ReadingsFn {
+        Arc::new(move || {
+            let result = result.clone();
+            Box::pin(async move { result })
+        })
+    }
+
+    async fn get_with_file(probe: UsageProbe, file: Result<Value, String>) -> Value {
+        let routes = routes_with_readings(
+            probe_fn(probe, Arc::new(AtomicUsize::new(0))),
+            readings_fn(file),
+        );
+        get(&app_routes(routes)).await.1
+    }
+
+    #[tokio::test]
+    async fn no_token_with_a_fresh_file_serves_numbers_with_their_source() {
+        let file = usage_file(Some((2.0, 60, 3600)), Some((55.0, 30, 86_400)));
+        let v = get_with_file(UsageProbe::NoToken, Ok(file)).await;
+        assert_eq!(v["available"], json!(true), "{v}");
+        assert_eq!(v["source"], json!("usage-band file"));
+        assert_eq!(v["probe_failure"], json!("keychain: no_token"));
+        assert_eq!(v["limits"][0]["kind"], json!("session"));
+        assert_eq!(v["limits"][0]["percent"], json!(2.0));
+        assert_eq!(v["limits"][1]["kind"], json!("weekly_all"));
+        assert_eq!(v["limits"][1]["percent"], json!(55.0));
+        assert_eq!(v["limits"][1]["age_s"], json!(30));
+        let row = v["providers"].as_array().unwrap().iter().find(|p| p["id"] == "claude").unwrap();
+        assert_eq!(row["source"], json!("usage-band file"));
+        assert_eq!(row["windows"][0]["label"], json!("5-hour session"));
+        assert_eq!(row["windows"][1]["label"], json!("Weekly · all models"));
+        assert_eq!(row["windows"][1]["used_percent"], json!(55.0));
+    }
+
+    #[tokio::test]
+    async fn an_exact_keychain_body_is_not_touched_by_the_file() {
+        let file = usage_file(Some((99.0, 60, 3600)), Some((99.0, 60, 3600)));
+        let v = get_with_file(UsageProbe::Ok(live_shaped_body()), Ok(file)).await;
+        assert_eq!(v["available"], json!(true));
+        assert!(v.get("source").is_none(), "{v}");
+        assert_eq!(v["limits"][0]["percent"], json!(34.4));
+    }
+
+    #[tokio::test]
+    async fn no_token_with_only_stale_windows_stays_degraded_with_no_number() {
+        let file = usage_file(Some((2.0, 7300, 3600)), Some((55.0, 7300, 86_400)));
+        let v = get_with_file(UsageProbe::NoToken, Ok(file)).await;
+        assert_eq!(v["available"], json!(false), "{v}");
+        assert_eq!(v["cause"], json!("no_token"));
+        assert!(v.get("limits").is_none(), "{v}");
+        let reason = v["reason"].as_str().unwrap();
+        assert!(reason.starts_with("No Claude subscription token on this host"), "{reason}");
+        assert!(reason.contains("usage-band file"), "{reason}");
+        assert!(reason.contains("stale"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn no_token_with_a_missing_file_reports_both_reasons() {
+        let v = get_with_file(UsageProbe::NoToken, Err("/x/latest.json does not exist".into())).await;
+        assert_eq!(v["available"], json!(false));
+        let reason = v["reason"].as_str().unwrap();
+        assert!(reason.contains("No Claude subscription token"), "{reason}");
+        assert!(reason.contains("/x/latest.json does not exist"), "{reason}");
+        assert_eq!(v["providers"][0]["id"], json!("claude"));
+        assert_eq!(v["providers"][0]["measured"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn a_window_past_its_reset_is_omitted_and_the_other_kept() {
+        let file = usage_file(Some((2.0, 60, -5)), Some((55.0, 30, 86_400)));
+        let v = get_with_file(UsageProbe::Expired, Ok(file)).await;
+        assert_eq!(v["available"], json!(true), "{v}");
+        let limits = v["limits"].as_array().unwrap();
+        assert_eq!(limits.len(), 1, "{v}");
+        assert_eq!(limits[0]["kind"], json!("weekly_all"));
+        assert_eq!(v["probe_failure"], json!("keychain: expired_token"));
+    }
+
+    #[test]
+    fn a_non_usage_file_is_a_problem_not_a_number() {
+        let now = chrono::Utc::now().timestamp();
+        assert!(readings_limits(&json!({"version": 2, "readings": {}}), now).is_err());
+        assert!(readings_limits(&json!([]), now).is_err());
+        assert!(readings_limits(&json!({"version": 1, "readings": {}}), now).is_err());
     }
 
     #[tokio::test]
