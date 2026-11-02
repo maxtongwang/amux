@@ -43,5 +43,28 @@ test('isolated configuration scope exposes only environment and presentation',()
  const caps=['memory','rules','env','gates','skin','status_mode','connectors'].map(key=>({key}));
  assert.deepEqual(Array.from(ctx._visibleScopeCapabilities('worker',true,caps),c=>c.key),['env','skin']);
  assert.equal(ctx._visibleScopeCapabilities('worker',false,caps),caps);
- assert.deepEqual(Array.from(ctx._visibleScopeCapabilities('global',false,caps),c=>c.key),['memory','env','gates']);
+ assert.deepEqual(Array.from(ctx._visibleScopeCapabilities('global',false,caps),c=>c.key),['memory','rules','env','gates']);
+ assert.deepEqual(Array.from(ctx._visibleScopeCapabilities('group',false,caps),c=>c.key),['memory','rules','env','gates']);
+ assert.ok(ctx._visibleScopeCapabilities('worker',false,caps).some(c=>c.key==='rules'));
+});
+
+for (const level of ['global','group','worker']) test(`Rules editor saves through /api/scope: ${level}`,async()=>{
+ const code=source.slice(source.indexOf('async function _scopeEditSave('),source.indexOf('// What each switch really does'));
+ const sent=[], notices=[], loads=[];
+ const text='Owner rule\n  preserve spacing →';
+ const msg={style:{}};
+ const ctx=vm.createContext({_scopeEditCtx:{lvl:level,name:level==='global'?'':'alpha',key:'rules'},
+  document:{getElementById:id=>id==='scope-edit-input'?{value:text}:msg},API:'',
+  _authHeaders:()=>({}),showToast:s=>notices.push(s),_scopedContextToast:(label,d)=>`${label}: ${d.takes_effect}`,
+  _scopeTargetId:()=> 'panel',_scopeLoad:(scope,id)=>loads.push({scope,id}),
+  fetch:async(url,options)=>{sent.push({url,options});return {ok:true,json:async()=>({takes_effect:'re-read'})};}});
+ vm.runInContext(code,ctx);
+ await ctx._scopeEditSave();
+ assert.equal(sent.length,1);
+ assert.equal(sent[0].url,'/api/scope');
+ assert.equal(sent[0].options.method,'PUT');
+ assert.deepEqual(JSON.parse(sent[0].options.body),{level,name:level==='global'?'':'alpha',capability:'rules',value:{text}});
+ assert.equal(msg.textContent,'Saved');
+ assert.match(notices[0],/re-read/);
+ assert.equal(loads.length,1);
 });

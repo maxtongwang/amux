@@ -22,6 +22,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tower::ServiceExt;
 
@@ -122,9 +123,9 @@ async fn scoped_memory_and_rules_reach_only_their_worker_and_follow_every_change
     assert!(file_of("wx").contains(SCOPED_CONTEXT_MARKER), "Codex gets the re-read file too");
 
     // ---- 4. Owner writes through the real router. -------------------------
-    let store = Store::open(&h.join("scoped-context-test.db")).unwrap();
+    let store = std::sync::Arc::new(Store::open(&h.join("scoped-context-test.db")).unwrap());
     let app = router(AppState {
-        store: std::sync::Arc::new(store),
+        store: store.clone(),
         started: std::time::Instant::now(),
         build_hash: "test".into(),
         auth_token: None,
@@ -168,6 +169,48 @@ async fn scoped_memory_and_rules_reach_only_their_worker_and_follow_every_change
     assert!(file_of("wa").contains("WA-MEM-2") && !file_of("wa").contains("WA-MEM-1"));
     let (_, body) = call(&app, "POST", "/api/sessions/wi/memory", json!({"content":"WI-MEM-2"})).await;
     assert_eq!(body["isolated_not_reached"], json!(["wi"]), "{body}");
+
+    // hq#165: real scope PUTs persist and queue the reread notice at both
+    // restored dashboard levels. Fake only tmux liveness; never contact the fleet.
+    let bin = tempfile::tempdir().unwrap();
+    let fake_tmux = bin.path().join("tmux");
+    fs::write(&fake_tmux, "#!/bin/sh\n[ \"$1\" = has-session ]\n").unwrap();
+    fs::set_permissions(&fake_tmux, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH");
+    std::env::set_var("PATH", bin.path());
+    for (level, name, text, expected, path) in [
+        ("global", "", "GLOBAL-RULE-2", vec!["wa", "wb", "wx"], "memory/_rules.md"),
+        ("group", "alpha", "ALPHA-RULE-2", vec!["wa", "wx"], "memory/tags/alpha.rules.md"),
+    ] {
+        let (st, body) = call(&app, "PUT", "/api/scope",
+            json!({"level":level,"name":name,"capability":"rules","value":{"text":text}})).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["delivered_live"], json!(expected), "{body}");
+        assert_eq!(body["isolated_not_reached"], json!(["wi"]), "{body}");
+        assert_eq!(fs::read_to_string(h.join(path)).unwrap().trim(), text);
+        let conn = store.read().unwrap();
+        let mut query = conn.prepare(
+            "SELECT session, text FROM steering_queue WHERE guard='scoped-context' ORDER BY session"
+        ).unwrap();
+        let notices: Vec<(String, String)> = query.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap().map(Result::unwrap).collect();
+        assert_eq!(notices.iter().map(|(w, _)| w.as_str()).collect::<Vec<_>>(), expected);
+        for (worker, notice) in notices {
+            assert!(notice.starts_with(SCOPED_CONTEXT_MARKER), "{notice}");
+            assert!(notice.contains(&format!("rules ({level} scope")), "{notice}");
+            assert!(notice.contains(&worker_rules_file(&worker).display().to_string()), "{notice}");
+            assert!(file_of(&worker).contains(text));
+        }
+        assert!(!worker_rules_file("wi").exists());
+        drop(query);
+        drop(conn);
+        store.write_async(|conn| {
+            conn.execute("DELETE FROM steering_queue WHERE guard='scoped-context'", [])?;
+            Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+    }
+    if let Some(path) = old_path { std::env::set_var("PATH", path); }
+    else { std::env::remove_var("PATH"); }
 
     // ---- 5. Codex resume re-asserts a changed context, and only then. -----
     let mut meta = serde_json::Map::new();

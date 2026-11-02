@@ -11777,7 +11777,7 @@ function _workerConfigurationSection(key, title, note, rows) {
 // open-ended startup keys such as CC_BACKEND/CC_CREATOR/CC_FLAGS — it is part
 // of this same tab, not a hidden file-editing workflow.
 function _visibleScopeCapabilities(level, isolated, capabilities) {
-  const keys = level === 'worker' ? (isolated ? ['env', 'skin'] : null) : ['memory', 'gates', 'env'];
+  const keys = level === 'worker' ? (isolated ? ['env', 'skin'] : null) : ['memory', 'rules', 'gates', 'env'];
   return keys ? capabilities.filter(c => keys.includes(c.key)) : capabilities;
 }
 
@@ -12007,12 +12007,9 @@ async function _scopeLoad(scope, targetId) {
               + '<span class="grp-members">: ' + (members.length ? chips(members.slice(0, 8)) : '<i>none</i>') + '</span>' : '')
           + '</div>'
           + '<div class="grp-scope-tiles"><div class="scope-tiles">';
-    // Group/global panel shows ONLY memory, board gates and env (Ethan,
-    // 2026-08-06: "remove rules(binding) from group configs. it should just be
-    // memory, board gates and env variables for now"). A DISPLAY trim, not a
-    // capability removal: _SCOPE_CAPS, GET/PUT /api/scope and the worker peek
-    // Configurations tab still carries rules and status_mode — "for now" means the panel,
-    // and hiding a tile must not silently delete the API behind it.
+    // Restore the owner-only Rules editor at global/group scope (Max,
+    // hq#165, 2026-11-01). The 2026-08-06 display trim hid that control;
+    // status_mode, skin and connectors remain worker-only in this panel.
     const _visCaps = _visibleScopeCapabilities(lvl, sessions.find(s => s.name === w)?.isolated, d.capabilities);
     _visCaps.forEach((c, i) => {
       const here = c.set_here, gset = G[c.key] && G[c.key].set_here;

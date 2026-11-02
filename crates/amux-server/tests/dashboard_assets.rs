@@ -1315,6 +1315,10 @@ fn worker_configurations_are_editable_from_backlog_through_terminal_states() {
         "a non-isolated worker must see every capability; an isolated one only env and skin"
     );
     assert!(
+        vis.contains("['memory', 'rules', 'gates', 'env']"),
+        "global and group panels must expose the owner's Rules editor (hq#165)"
+    );
+    assert!(
         !app.contains("Edited where it lives"),
         "a writable worker configuration must not send the user to an unnamed second UI"
     );

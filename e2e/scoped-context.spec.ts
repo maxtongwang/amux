@@ -55,6 +55,30 @@ test('SCOPED-CONTEXT: group panel, single detail, honest memory save and reach',
     const panel = page.locator(`[id="grp-scope-body-${group}"]`);
     await expect(panel.locator('.scope-tile', { hasText: 'Memory' })).toBeVisible({ timeout: 15_000 });
 
+    // hq#165: the existing Rules tile/editor must fit phone and desktop
+    // ratios in both orientations, through the same group configuration view.
+    const viewport = page.viewportSize();
+    for (const [width, height] of [[390, 844], [844, 390], [1440, 900], [900, 1440]]) {
+      await page.setViewportSize({ width, height });
+      await panel.locator('.scope-tile', { hasText: 'Rules' }).click();
+      const edit = panel.locator('.scope-detail button', { hasText: 'Edit Rules' });
+      await expect(edit).toBeVisible();
+      await edit.click();
+      await expect(page.locator('#scope-edit-input')).toBeVisible();
+      await page.screenshot({ path: info.outputPath(`rules-${width}x${height}.png`) });
+      await page.locator('#scope-edit-backdrop button', { hasText: 'Close' }).click();
+      await panel.locator('.scope-tile', { hasText: 'Rules' }).click();
+    }
+    if (viewport) await page.setViewportSize(viewport);
+    await panel.locator('.scope-tile', { hasText: 'Rules' }).click();
+    await panel.locator('.scope-detail button', { hasText: 'Edit Rules' }).click();
+    await page.fill('#scope-edit-input', `GRULE-${sfx}`);
+    const rulesSaved = page.waitForResponse(r => r.url().endsWith('/api/scope') && r.request().method() === 'PUT');
+    await page.locator('#scope-edit-backdrop button', { hasText: 'Save', exact: true }).click();
+    expect((await rulesSaved).status()).toBe(200);
+    await expect(page.locator('#scope-edit-msg')).toHaveText('Saved');
+    await page.locator('#scope-edit-backdrop button', { hasText: 'Close' }).click();
+
     // One detail at a time: Memory, then Environment, shows Environment.
     await panel.locator('.scope-tile', { hasText: 'Memory' }).click();
     await expect(panel.locator('.scope-detail')).toContainText('Memory');
@@ -78,12 +102,24 @@ test('SCOPED-CONTEXT: group panel, single detail, honest memory save and reach',
     const stored = await (await request.get(`/api/sessions/${a}/memory`, { headers: auth })).json();
     expect(stored.content).toBe(`WMEM-${sfx}`);
 
+    // The shared renderer also exposes Rules globally and for managed workers.
+    await page.click('#peek-tab-scope');
+    const workerPanel = page.locator('#peek-scope-body');
+    await expect(workerPanel.locator('.scope-tile', { hasText: 'Rules' })).toBeVisible();
+    await page.evaluate(() => (window as any)._scopeLoad({ level: 'global' }, 'peek-scope-body'));
+    await expect(workerPanel.locator('.scope-tile', { hasText: 'Rules' })).toBeVisible();
+
     // An isolated worker's memory editor says the text never reaches it.
     await page.evaluate((n) => (window as any).openPeek(n), iso);
     await page.click('#peek-tab-memory');
     await expect(page.locator('#peek-memory-shared')).toContainText('Isolated worker');
+    await page.click('#peek-tab-scope');
+    await expect(workerPanel.locator('.scope-tile', { hasText: 'Rules' })).toHaveCount(0);
+
   } finally {
     await cleanup('delete scoped-context workers', () => deleteOwnedWorkers(page, request, auth, [a, b, iso]), info);
+    await cleanup('clear group rules', () => request.put('/api/scope', { headers: auth,
+      data: { level: 'group', name: group, capability: 'rules', value: { text: '' } } }), info);
     await cleanup('clear group memory', () => request.put('/api/scope', { headers: auth,
       data: { level: 'group', name: group, capability: 'memory', value: { text: '' } } }), info);
   }

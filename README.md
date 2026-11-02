@@ -17,7 +17,7 @@ What the fleet gets that a single agent never had:
 - **@ each other**: origin-stamped inter-worker messaging; the server records the true sender, so provenance is a fact rather than a claim
 - **Steering**: type into any running session from the dashboard or phone; redirect mid-task without stopping the run
 - **Schedules & loops**: cron-style recurring prompts (`daily at 9am`, `every 15m`) plus self-pacing autonomous loops for overnight runs
-- **Groups & scope**: workers organize into lanes that share memory, environment, and gates; settings resolve card → worker → group → global
+- **Groups & scope**: workers organize into lanes that share memory, rules, environment, and gates; settings resolve card → worker → group → global
 - **Model switching**: swap the model or provider on a running worker; pick the brain per task, keep the context
 - **Message history**: every prompt, reply, and delivery is a ledger row you can fetch later
 - **Self-healing**: a watchdog that auto-compacts, restarts crashed sessions, and replays the last message
@@ -122,7 +122,7 @@ Everything in amux is built on **eight primitives**, and new capability is expre
 - **environment** — layered env vars the same way (which 3p APIs a worker can reach)
 - **messages** — inter-worker and human-to-worker text, delivered at turn boundaries
 
-The uniform way to read/write per-scope configuration (memory, rules, env, board gates, status availability at global/group/worker level) is one endpoint: `GET`/`PUT /api/scope`.
+The uniform way to read/write per-scope configuration (memory, rules, env, board gates, status availability at global/group/worker level) is one endpoint: `GET`/`PUT /api/scope`. Global and group panels expose the owner-only Rules tile through the existing editor; non-isolated workers expose it too. Saving refreshes affected workers' context and queues a re-read notice for running workers. Isolated workers receive no scoped rules and show only Environment and Skin.
 
 Useful pointers:
 

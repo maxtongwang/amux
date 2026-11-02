@@ -6173,3 +6173,14 @@ FIX: Withhold completion while scans or entries fail, persist pending paths, and
   retry at startup or once per minute on identity operations. Successful entries
   leave the pending list; WARN identity_migration_pending reports counts and
   identity_migration_attempt records each bounded pass.
+
+## Scoped Rules have no owner editor at global or group level
+AREA: browser
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-11-01
+SESSION: rules-165
+CARD: hq#165
+SYMPTOM: The shared capability visibility predicate filters out rules at global/group scope although GET/PUT /api/scope supports them; regression assertion failed with rules missing.
+COST: The owner cannot edit those rules through their dashboard tiles.
+FIX: Restore rules in the shared visibility list and reuse the tile editor. Existing scope mutation audit rows and scoped_context_delivered_live/not_running/skipped_isolated verdicts expose saves and reach in logs; regressions cover all visibility levels and global/group reread queues.
