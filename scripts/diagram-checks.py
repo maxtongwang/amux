@@ -37,6 +37,9 @@ PROBE_PREFIX = '# probe:'
 # '# store: index.md — <reason>'. It counts as excluded, and its citation is allowed.
 STORE_PREFIX = '# store:'
 REASON_SEP = ' — '
+# A store is content, never code: a code file declared a store would skip the diagram update its edits need.
+CODE_SUFFIXES = frozenset(('.py', '.js', '.mjs', '.cjs', '.jsx', '.ts', '.mts', '.cts', '.tsx', '.sh', '.bash', '.zsh', '.rs', '.go',
+                           '.rb', '.java', '.kt', '.swift', '.c', '.h', '.cc', '.cpp', '.hpp', '.cs', '.php', '.pl', '.lua'))
 # Arrow heads stop short of a box edge by the marker length; starts sit on the edge.
 START_SLACK_PX, END_SLACK_PX = 6, 14
 # A label further than this from every arrow is a drawing error, not a caption.
@@ -350,6 +353,7 @@ def check_inventory(repo):
     cited = cited_paths(repo, files)
     errors += [f'diagram cites {f} ({where}) but it is not an architecture path' for f, where in sorted(cited.items())
                if not match(includes, f) and f not in stores]
+    errors += [f'store is a code file: {f}' for f in stores if Path(f).suffix.lower() in CODE_SUFFIXES]
     errors += [f'store is not a tracked file: {f}' for f in stores if f not in files]
     errors += [f'store is also an architecture path: {f}' for f in stores if match(includes, f)]
     errors += [f'store is not cited by any diagram: {f}' for f in stores if f in files and f not in cited]
@@ -364,6 +368,24 @@ def check_inventory(repo):
     return {'tracked_files': len(files), 'architecture_files': sum(match(includes, f) for f in files),
             'excluded_files': sum(not match(includes, f) for f in files), 'cited_files': len(cited),
             'fixture': results, 'inventory_errors': errors}
+
+
+def selftest_code_store(repo, svg, paths):
+    """A code file declared '# store:' must be refused, even though a diagram cites it."""
+    with tempfile.TemporaryDirectory(prefix='diagram-selftest-') as tmp:
+        fx = Path(tmp)
+        files = {'app.py': 'x = 1\n', 'tool.py': 'y = 2\n', 'README.md': 'r\n', 'notes/a.md': 'a\n',
+                 'scripts/check-diagrams.py': (repo / 'scripts' / 'check-diagrams.py').read_text(),
+                 str(DIAGRAMS / 'README.md'): 'index\n',
+                 str(DIAGRAMS / 'ARCHITECTURE_PATHS'): paths + '# store: tool.py — code drawn as content\n'}
+        files.update({str(DIAGRAMS / v): f'<html><body>{svg.replace("Home.md", "tool.py")}</body></html>\n' for v in VIEWS})
+        for f, text in files.items():
+            (fx / f).parent.mkdir(parents=True, exist_ok=True)
+            (fx / f).write_text(text)
+        git(fx, 'init', '-q')
+        git(fx, 'add', '-A')
+        got = check_inventory(fx)['inventory_errors']
+    return [] if 'store is a code file: tool.py' in got else ['selftest code store: a code file declared a store was not refused']
 
 
 def selftest(repo):
@@ -389,6 +411,7 @@ def selftest(repo):
             got = [e.split()[2] for e in check_inventory(fx)['inventory_errors'] if e.startswith('diagram cites ')]
             if got != want:
                 errors.append(f'selftest {case}: diagram citation errors for {got}, expected {want}')
+    errors += selftest_code_store(repo, svg, paths)
     return {'selftest_errors': errors}
 
 
