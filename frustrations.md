@@ -6173,3 +6173,14 @@ FIX: Withhold completion while scans or entries fail, persist pending paths, and
   retry at startup or once per minute on identity operations. Successful entries
   leave the pending list; WARN identity_migration_pending reports counts and
   identity_migration_attempt records each bounded pass.
+
+## Worker startup accepts a failed vault import
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-11-05
+SESSION: build-amux-token (fix/worker-token-every-launch)
+CARD: maxtongwang/ai-config#982, refs maxtongwang/ai-config#981
+SYMPTOM: In both Bash and Zsh, eval of a failing tmux show-environment command returned 0 while AMUX_WORKER_TOKEN remained absent. Existing fresh and surviving launch branches both used this expression. The handoff reports live rule-10 hook refusals; this reproduction proves the silent failure but does not identify which live tmux read failed.
+COST: Hook reports refused since 2026-10-31 per the supplied hook-sweep handoff; four private-tmux lifecycle checks cannot run in this builder sandbox because socket binding is denied.
+FIX: This candidate moves checked imports into the shared provider invocation and adds a names-only process probe. The live incident cause and private-tmux lifecycle results remain unverified; no live worker was relaunched.

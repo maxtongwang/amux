@@ -93,6 +93,17 @@ resolves the current worker name through its env file. Rename preserves these
 paths, so a run guard revokes the exact file it created. Deletion and retirement
 remove that incarnation's launch hash and run directory.
 
+Interactive provider invocations import vault keys and the worker token by name
+inside their final launch shell, after profile and scope setup. Fresh starts,
+surviving-pane restarts, resume fallbacks and provider retries use the same import
+program. A failed or empty tmux read refuses the provider with exit 125 and
+`vault_env_import_failed`; it cannot silently reuse a previous token.
+After a rule-10 launch becomes live, a process-environment probe reads names only:
+`worker_token_missing_in_process` is a WARN with `measured=true` when the provider
+lacks the token. An unreadable environment or unresolved provider pid emits
+`worker_token_process_check_unmeasured` with `measured=false`, never a passing
+measurement. No environment values are logged.
+
 Worker env creation, duplication and CLI registration assign the incarnation
 before launch. Env rewrites preserve it under the same env mutex and
 `sessions/.incarnation.lock` flock used by the legacy first-mint fallback;

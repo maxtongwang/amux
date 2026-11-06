@@ -16642,21 +16642,6 @@ pub(crate) async fn start_session(
     // e2e/chaos/vault-secrets.mjs). The session holds the values, so it is the
     // one record that cannot disagree with them.
     let mut stale_vault_keys: Vec<String> = Vec::new();
-    // Names only, sh-safe by construction (valid_key admits [A-Z0-9_]).
-    let vault_import = |target: &str, stale_vault_keys: &[String]| -> String {
-        let mut line = vault_keys
-            .iter()
-            .map(|k| format!("eval \"$(tmux show-environment -s -t {} {k})\"", sh_quote(target)))
-            .collect::<Vec<_>>()
-            .join("; ");
-        if !stale_vault_keys.is_empty() {
-            if !line.is_empty() {
-                line.push_str("; ");
-            }
-            line.push_str(&format!("unset {}", stale_vault_keys.join(" ")));
-        }
-        line
-    };
 
     let tmux_sess = tmux_name(name);
     let tmux_exists = tmux_sessions_set().await.contains(&tmux_sess);
@@ -16768,7 +16753,7 @@ pub(crate) async fn start_session(
             .strip_prefix("AMUX_VAULT_KEYS=")
             .unwrap_or("")
             .split(',')
-            .filter(|k| !k.is_empty() && super::vault_secrets::valid_key(k).is_ok() && !vault_keys.iter().any(|v| v == k))
+            .filter(|k| super::worker_launch_env::valid_import_key(k) && !vault_keys.iter().any(|v| v == k))
             .map(str::to_string)
             .collect();
         for key in &stale_vault_keys {
@@ -16831,10 +16816,6 @@ pub(crate) async fn start_session(
         shell_step!(&profile_rc, false);
         // Scope settings and workspace isolation, as a fresh start applies them.
         shell_step!(&surviving_shell_scope_rc(name), false);
-        let vault_line = vault_import(&target, &stale_vault_keys);
-        if !vault_line.is_empty() {
-            shell_step!(&vault_line, false);
-        }
         // The surviving shell skips shell_rc, so give it the same isolated
         // server CLI priority as a fresh shell after the environment import.
         if local_cli_dir.join("amux").is_file() {
@@ -16943,16 +16924,15 @@ pub(crate) async fn start_session(
         }
         let _ = tmux(&["set-environment", "-t", &stq, "AMUX_VAULT_KEYS", &vault_keys.join(",")]).await;
         shell_step!(&shell_rc, false);
-        let vault_line = vault_import(&stq, &stale_vault_keys);
-        if !vault_line.is_empty() {
-            shell_step!(&vault_line, false);
-        }
     }
-    // What this process now holds, by item id and version (never a value), so
-    // the Vault can say which running workers need a restart after a rotation.
-    super::vault_secrets::record_running(&home(), name, &vault_manifest);
+    // One import program for every provider invocation, including resume
+    // fallbacks and self-update retries. Execute inside the launch shell so
+    // profiles/preexec hooks cannot discard the imported environment between
+    // setup and exec. It contains variable names only, never secret values.
+    let mut vault_line = super::worker_launch_env::import_command(&st(name), &vault_keys, &stale_vault_keys);
     if has_oauth && provider != "codex" && provider != "gemini" && provider != "grok" && provider != "muse" {
-        shell_step!("unset ANTHROPIC_API_KEY", false);
+        // Preserve OAuth suppression AFTER the vault import, including retries.
+        vault_line.push_str("unset ANTHROPIC_API_KEY; ");
     }
     // Startup profiles and scoped environment files may change directory.
     // Pin the actual provider invocation to the resolved workspace, even when
@@ -16985,7 +16965,7 @@ pub(crate) async fn start_session(
         String::new()
     };
     let cmd =
-        provider_command_in_workspace(&work_dir, &format!("{observer_prefix}{cmd}"), isolated);
+        provider_command_in_workspace(&work_dir, &format!("{observer_prefix}{cmd}"), isolated, &vault_line);
     tracing::info!(session = name, cwd = %work_dir, verdict = "provider_launch_workspace_pinned",
         "launching provider in resolved worker workspace");
     // Snapshot muse's session directory BEFORE the process exists, so the set
@@ -17117,6 +17097,7 @@ pub(crate) async fn start_session(
                         + &rules_opts
                 ),
                 isolated,
+                &vault_line,
             );
             shell_step!(&cmd_fresh, true);
             for _ in 0..10 {
@@ -17194,6 +17175,12 @@ pub(crate) async fn start_session(
             "provider launch ended without a live process or confirmed UI",
         );
     }
+    if vault_keys.iter().any(|key| key == super::worker_identity::TOKEN_ENV) {
+        let pids = native_target_pids(name).await.unwrap_or_default();
+        super::worker_launch_env::check(name, launch_base_binary(&provider), &pids);
+    }
+    // Record delivery only after a provider survived the guarded import.
+    super::vault_secrets::record_running(&home(), name, &vault_manifest);
     // Stream output to the session log (py:24800).
     let _ = std::fs::create_dir_all(logs_dir());
     let lp = log_path(name);
@@ -17338,17 +17325,18 @@ pub(crate) async fn start_session(
     (true, "started".into())
 }
 
-fn provider_command_in_workspace(work_dir: &str, command: &str, isolated: bool) -> String {
+pub(super) fn provider_command_in_workspace(work_dir: &str, command: &str, isolated: bool, vault_import: &str) -> String {
     // Not adding routing variables is insufficient: tmux and login profiles
     // can inherit them from the server or a previous managed launch. Scrub at
     // the final invocation, after profile/scoped-env loading, on fresh and
     // resumed launches alike. Provider authentication remains untouched.
     let scrub = if isolated {
-        "unset AMUX_SESSION AMUX_WORKER AMUX_URL AMUX_API AMUX_API_URL AMUX_HOME CC_HOME TMUX_SESSION_NAME AMUX_AUTH_TOKEN AMUX_TOKEN; "
+        "unset AMUX_SESSION AMUX_WORKER AMUX_URL AMUX_API AMUX_API_URL AMUX_HOME CC_HOME TMUX_SESSION_NAME AMUX_AUTH_TOKEN AMUX_TOKEN AMUX_WORKER_TOKEN; "
     } else {
         ""
     };
-    crate::backend::tmux::native_shell_launch(&format!("{scrub}cd {} && {command}", sh_quote(work_dir)))
+    let program = format!("set +x; {vault_import}{scrub}cd {} && {command}", sh_quote(work_dir));
+    crate::backend::tmux::native_shell_launch(&format!("/bin/sh -c {}", sh_quote(&program)))
 }
 
 /// Start the exact provider configured for a board-driven worker, and do not
@@ -35773,7 +35761,7 @@ mod tests {
     fn isolated_launch_scrubs_inherited_harness_routing_but_keeps_provider_auth() {
         for isolated in [true, false] {
             let script = super::provider_command_in_workspace(
-                "/", "printf '%s|%s|%s|%s|%s|%s|%s|%s' \"${AMUX_SESSION-unset}\" \"${AMUX_WORKER-unset}\" \"${AMUX_URL-unset}\" \"${AMUX_API-unset}\" \"${AMUX_HOME-unset}\" \"${CC_HOME-unset}\" \"${AMUX_AUTH_TOKEN-unset}\" \"$OPENAI_API_KEY\"", isolated);
+                "/", "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s' \"${AMUX_SESSION-unset}\" \"${AMUX_WORKER-unset}\" \"${AMUX_URL-unset}\" \"${AMUX_API-unset}\" \"${AMUX_HOME-unset}\" \"${CC_HOME-unset}\" \"${AMUX_AUTH_TOKEN-unset}\" \"${AMUX_WORKER_TOKEN-unset}\" \"$OPENAI_API_KEY\"", isolated, "");
             let output = std::process::Command::new("sh")
                 .args(["-c", &script])
                 .envs([
@@ -35784,6 +35772,7 @@ mod tests {
                     ("AMUX_HOME", "inherited"),
                     ("CC_HOME", "inherited"),
                     ("AMUX_AUTH_TOKEN", "inherited"),
+                    ("AMUX_WORKER_TOKEN", "inherited"),
                     ("OPENAI_API_KEY", "fixture-auth"),
                 ])
                 .output()
@@ -35792,7 +35781,7 @@ mod tests {
             let routing = if isolated { "unset" } else { "inherited" };
             assert_eq!(
                 String::from_utf8(output.stdout).unwrap(),
-                format!("{}|fixture-auth", [routing; 7].join("|"))
+                format!("{}|fixture-auth", [routing; 8].join("|"))
             );
         }
     }
@@ -35808,7 +35797,7 @@ mod tests {
             String::from_utf8(out.stdout).unwrap().trim().to_string()
         };
         assert_eq!(probe(bare), "1", "the fixture must reproduce tmux's inherited translation");
-        let script = super::provider_command_in_workspace("/", bare, false);
+        let script = super::provider_command_in_workspace("/", bare, false, "");
         let expected = if std::env::var("AMUX_NATIVE_ARCH").ok().as_deref() == Some("0") { "1" } else { "0" };
         assert_eq!(probe(&script), expected, "the actual worker launcher must reset the preference seen by provider children");
     }
@@ -35819,7 +35808,7 @@ mod tests {
         let workspace = dir.path().join("worker's checkout");
         std::fs::create_dir(&workspace).unwrap();
         let command =
-            super::provider_command_in_workspace(workspace.to_str().unwrap(), "pwd -P", false);
+            super::provider_command_in_workspace(workspace.to_str().unwrap(), "pwd -P", false, "");
         let output = std::process::Command::new("sh")
             .args(["-c", &command])
             .current_dir("/")
@@ -35834,6 +35823,7 @@ mod tests {
             "/nonexistent-amux-fixture-workspace",
             "printf provider-started",
             false,
+            "",
         );
         let output = std::process::Command::new("sh")
             .args(["-c", &absent])
@@ -35843,9 +35833,9 @@ mod tests {
         assert!(output.stdout.is_empty());
     }
     #[derive(Clone)]
-    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    pub(super) struct CapturedLogs(pub(super) std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
-    struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    pub(super) struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
         type Writer = CapturedLogWriter;
@@ -55873,27 +55863,21 @@ mod spawn_argv_secret_tests {
         );
     }
 
-    /// AMUX-5375. Vault values never travel in the new-session argv, and they
-    /// are imported AFTER the scope env files are sourced, on both the fresh
-    /// and the surviving shell, so the vault wins over a plaintext line for
-    /// the same key.
+    /// Vault imports belong to the common invocation boundary, after both
+    /// branches have finished their profile/scoped-env setup.
     #[test]
     fn vault_secrets_are_deferred_and_imported_after_the_scope_files() {
         let src = include_str!("session_verbs.rs");
-        let fresh_rc = src.find("        shell_step!(&shell_rc, false);\n        let vault_line = vault_import(&stq, &stale_vault_keys);")
-            .expect("fresh shell: vault import directly after shell_rc");
-        assert!(fresh_rc > 0);
-        let surviving = src.find("        shell_step!(&surviving_shell_scope_rc(name), false);\n        let vault_line = vault_import(&target, &stale_vault_keys);")
-            .expect("surviving shell: vault import directly after the scope rc");
-        assert!(surviving > 0);
-        let new_session = src.find("\"new-session\".into(),").expect("new-session argv");
-        let argv_end = src[new_session..].find("args.push(user_shell());").expect("argv ends at the shell");
-        let argv_block = &src[new_session..new_session + argv_end];
-        assert!(!argv_block.contains("vault_values"), "vault values must not reach new-session argv");
-        let import_fn = src.find("let vault_import = |target: &str, stale_vault_keys: &[String]|").expect("importer");
-        let body = &src[import_fn..import_fn + 600];
-        assert!(body.contains("show-environment -s -t") && !body.contains("value"),
-            "the typed import names keys only: {body}");
+        let start = src.split_once("pub(crate) async fn start_session(").unwrap().1;
+        let body = start.split_once("fn provider_command_in_workspace(").unwrap().0;
+        let import = body.find("super::worker_launch_env::import_command(").unwrap();
+        assert!(import > body.find("shell_step!(&shell_rc, false);").unwrap());
+        assert!(import > body.find("shell_step!(&surviving_shell_scope_rc(name), false);").unwrap());
+        assert!(import < body.find("provider_command_in_workspace(").unwrap());
+        assert_eq!(body.matches("super::worker_launch_env::import_command(").count(), 1);
+        let new_session = body.find("\"new-session\".into(),").unwrap();
+        let argv_end = body[new_session..].find("args.push(user_shell());").unwrap();
+        assert!(!body[new_session..new_session + argv_end].contains("vault_values"));
     }
 
     /// Deferring is only half of it: a set-environment nobody imports leaves the
@@ -57446,3 +57430,7 @@ mod composer_guard_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "worker_launch_env_tests.rs"]
+mod worker_launch_env_tests;
