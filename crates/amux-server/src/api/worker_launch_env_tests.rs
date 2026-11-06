@@ -4,6 +4,7 @@ use crate::api::{rename_identity, worker_identity, worker_launch_env};
 use std::process::{Command, Output};
 
 const LANE: &str = "token-proof";
+const SESSION: &str = "amux-token-proof";
 const TIMEOUT: Duration = Duration::from_secs(10);
 // Short socket paths work on both macOS and Linux, even with a long user TMPDIR.
 const PRIVATE_TMUX_ROOT: &str = "/tmp";
@@ -49,12 +50,13 @@ impl PrivateTmux {
             "new-session",
             "-d",
             "-s",
-            "amux-token-proof",
+            SESSION,
             "/bin/bash --noprofile --norc",
         ]);
         assert!(created.status.success(), "private tmux creation failed");
         // tmux can report exit 0 even when sandbox policy refused socket bind.
-        let readback = fixture.tmux(&["has-session", "-t", "=amux-token-proof"]);
+        let st = session_target(SESSION);
+        let readback = fixture.tmux(&["has-session", "-t", &st]);
         assert!(
             readback.status.success(),
             "private tmux socket unavailable: create={}, readback={}",
@@ -88,9 +90,8 @@ time.sleep(60)
     }
 
     async fn submit(&self, line: String) -> bool {
-        self.tmux(&shell_line_args("=amux-token-proof:0.0", &line))
-            .status
-            .success()
+        let pt = pane_target(SESSION);
+        self.tmux(&shell_line_args(&pt, &line)).status.success()
     }
 
     async fn launch(&self, resume: bool, import: bool) -> (Value, String) {
@@ -101,11 +102,12 @@ time.sleep(60)
             .root
             .path()
             .join(format!("result-{}.json", ulid::Ulid::new()));
+        let st = session_target(SESSION);
         assert!(self
             .tmux(&[
                 "set-environment",
                 "-t",
-                "=amux-token-proof",
+                &st,
                 worker_identity::TOKEN_ENV,
                 &token
             ])
@@ -121,7 +123,7 @@ time.sleep(60)
             .unwrap();
         let keys = vec![worker_identity::TOKEN_ENV.to_string()];
         let imports = if import {
-            worker_launch_env::import_command("=amux-token-proof", &keys, &[])
+            worker_launch_env::import_command(&st, &keys, &[])
         } else {
             String::new()
         };
@@ -192,14 +194,9 @@ async fn worker_token_surviving_tmux_restart_matches_rotated_digest() {
     let fixture = PrivateTmux::new();
     let (first, old_digest) = fixture.launch(false, true).await;
     assert_eq!(first["digest"], old_digest);
+    let pt = pane_target(SESSION);
     let pane = fixture
-        .tmux(&[
-            "display-message",
-            "-p",
-            "-t",
-            "=amux-token-proof:0.0",
-            "#{pane_pid}",
-        ])
+        .tmux(&["display-message", "-p", "-t", &pt, "#{pane_pid}"])
         .stdout;
     fixture.stop_provider(&first).await;
     let (second, digest) = fixture.launch(false, true).await;
@@ -207,13 +204,7 @@ async fn worker_token_surviving_tmux_restart_matches_rotated_digest() {
     assert_eq!(second["digest"], digest);
     assert_eq!(
         fixture
-            .tmux(&[
-                "display-message",
-                "-p",
-                "-t",
-                "=amux-token-proof:0.0",
-                "#{pane_pid}"
-            ])
+            .tmux(&["display-message", "-p", "-t", &pt, "#{pane_pid}"])
             .stdout,
         pane
     );
@@ -271,8 +262,8 @@ fn worker_token_refused_handoff_preserves_resume_keys() {
         }))
         .unwrap(),
     );
-    let import =
-        worker_launch_env::import_command("=amux-token-proof", &["FIXTURE_SECRET".into()], &[]);
+    let st = session_target(SESSION);
+    let import = worker_launch_env::import_command(&st, &["FIXTURE_SECRET".into()], &[]);
     let provider = provider_command_in_workspace(
         root.path().to_str().unwrap(),
         "printf provider-started",
@@ -339,15 +330,10 @@ fn worker_token_failed_set_environment_preserves_resume_keys() {
         .with_writer(logs.clone())
         .finish();
     tracing::subscriber::with_default(subscriber, || {
+        let st = session_target(SESSION);
         for key in ["FIXTURE_SECRET", worker_identity::TOKEN_ENV] {
             let refused = Command::new(&fake_tmux)
-                .args([
-                    "set-environment",
-                    "-t",
-                    "=amux-token-proof",
-                    key,
-                    "never-print-this-value",
-                ])
+                .args(["set-environment", "-t", &st, key, "never-print-this-value"])
                 .output()
                 .unwrap();
             assert!(!refused.status.success());
