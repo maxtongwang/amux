@@ -5,6 +5,43 @@ use std::io;
 
 // Separate setup refusal from a provider's own exit status.
 const IMPORT_REFUSED_EXIT: i32 = 125;
+// Reserved AMUX_ namespace: vault keys cannot overwrite the private handshake.
+pub(super) const LAUNCH_RECEIPT_ENV: &str = "AMUX_LAUNCH_RECEIPT";
+
+/// Never surface tmux stderr here: it can echo the secret-bearing setter argv.
+pub(super) fn confirm_handoff(
+    lane: &str,
+    key: &str,
+    output: Option<&std::process::Output>,
+) -> Result<(), String> {
+    if output.is_some_and(|out| out.status.success()) {
+        return Ok(());
+    }
+    let why = match output {
+        Some(out) => format!("tmux set-environment exited {}", out.status),
+        None => "tmux set-environment did not run or timed out".into(),
+    };
+    tracing::warn!(
+        lane, key, measured = output.is_some(), n_considered = usize::from(output.is_some()),
+        operation = "set-environment", verdict = "vault_env_import_failed", %why,
+        "secret hand-off refused; provider launch not submitted"
+    );
+    Err(format!(
+        "vault_env_import_failed key={key}: {why}; launch not started"
+    ))
+}
+
+/// The provider boundary settles this exact submission after imports, rather
+/// than acknowledging entry before a child launch shell can refuse a key.
+pub(super) fn receipt_command(status: &str) -> String {
+    use super::session_verbs::sh_quote;
+    format!(
+        "if [ -n \"${{{LAUNCH_RECEIPT_ENV}-}}\" ]; then \
+         [ -d \"${{{LAUNCH_RECEIPT_ENV}%/*}}\" ] || exit {IMPORT_REFUSED_EXIT}; \
+         printf '%s' {} > \"${LAUNCH_RECEIPT_ENV}\" || exit {IMPORT_REFUSED_EXIT}; fi; ",
+        sh_quote(status)
+    )
+}
 
 pub(super) fn valid_import_key(key: &str) -> bool {
     key == super::worker_identity::TOKEN_ENV || super::vault_secrets::valid_key(key).is_ok()
@@ -18,11 +55,13 @@ pub(super) fn import_command(target: &str, keys: &[String], stale: &[String]) ->
     let mut command = String::new();
     for key in keys {
         assert!(valid_import_key(key));
+        let failure = format!("verdict=vault_env_import_failed key={key}");
+        let receipt = receipt_command(&failure);
         command.push_str(&format!(
             "unset {key}; _amux_vault_env=$(tmux show-environment -s -t {} {key} 2>/dev/null) && \
              [ -n \"$_amux_vault_env\" ] && eval \"$_amux_vault_env\" 2>/dev/null && \
              [ \"${{{key}+present}}\" = present ] && export {key} || \
-             {{ printf '%s\\n' 'verdict=vault_env_import_failed key={key}' >&2; exit {IMPORT_REFUSED_EXIT}; }}; ",
+             {{ {receipt}printf '%s\\n' '{failure}' >&2; exit {IMPORT_REFUSED_EXIT}; }}; ",
             sh_quote(target)
         ));
     }
@@ -159,6 +198,8 @@ fn is_provider(argv: &[String], binary: &str) -> bool {
     }
     // Match only an interpreter's entry point, never a shell's -c text or
     // another tool's ordinary argument that happens to name the provider.
+    // Framework Python on macOS re-execs with the basename `Python`.
+    let executable = executable.to_ascii_lowercase();
     let interpreter = ["node", "nodejs", "bun", "python", "python3"].contains(&executable.as_str())
         || executable.starts_with("python3.");
     interpreter
@@ -279,6 +320,27 @@ mod tests {
         assert!(out.status.success());
         assert_eq!(out.stdout, b"inherited");
         assert!(out.stderr.is_empty());
+    }
+
+    #[test]
+    fn worker_token_framework_python_provider_is_measured() {
+        for executable in [
+            "/opt/homebrew/Cellar/python@3.15/Frameworks/Python.framework/Versions/3.15/Resources/Python.app/Contents/MacOS/Python",
+            "/usr/bin/python3",
+            "/usr/bin/python3.15",
+            "/usr/bin/node",
+            "/usr/bin/nodejs",
+            "/usr/bin/bun",
+        ] {
+            assert!(is_provider(
+                &[executable.into(), "/private/fixture/claude.py".into(), "--resume".into()],
+                "claude"
+            ), "provider interpreter not recognized: {executable}");
+            assert!(!is_provider(
+                &[executable.into(), "/private/fixture/other.py".into(), "claude".into()],
+                "claude"
+            ));
+        }
     }
 
     #[test]

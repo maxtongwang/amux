@@ -14872,6 +14872,8 @@ const SHELL_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 /// A prompt in scrollback is not completion evidence. Source a short private
 /// file instead of filling the canonical PTY input buffer while profiles run.
 /// The receipt belongs to this exact submission, never to an earlier prompt.
+/// Launch lines use `provider_command_in_workspace`, which settles the receipt
+/// after importing credentials and before invoking the provider.
 async fn shell_command_with<F, Fut>(
     session: &str,
     line: &str,
@@ -14906,7 +14908,11 @@ where
         sh_quote(&entry.to_string_lossy())
     );
     let body = if launch {
-        format!("{entered}[ -d {directory} ] || return 125\nprintf 0 > {receipt_path}\n{line}\n")
+        // The final provider shell acknowledges only after its imports pass.
+        // A key refusal writes its names-only error to this same receipt, so
+        // start_session returns before Claude's resume recovery can clear IDs.
+        let receipt_env = super::worker_launch_env::LAUNCH_RECEIPT_ENV;
+        format!("{entered}[ -d {directory} ] || return 125\n{receipt_env}={receipt_path} {line}\n")
     } else {
         format!("{entered}_amux_setup_receipt() {{ {ack}; }}\n{line}\n_amux_setup_receipt \"$?\"\nunset -f _amux_setup_receipt\n")
     };
@@ -16739,10 +16745,9 @@ pub(crate) async fn start_session(
             }
         }
         for (key, value) in &vault_values {
-            if !tmux(&["set-environment", "-t", &st, key, value]).await.is_some_and(|o| o.status.success()) {
-                tracing::warn!(session = name, key, measured = true, n_considered = 1,
-                    verdict = "vault_env_refresh_failed",
-                    "vault: a secret could not be handed to the existing tmux session (AMUX-5375)");
+            let output = tmux(&["set-environment", "-t", &st, key, value]).await;
+            if let Err(error) = super::worker_launch_env::confirm_handoff(name, key, output.as_ref()) {
+                return shell_start_failed(name, &error);
             }
         }
         let prev = tmux(&["show-environment", "-t", &st, "AMUX_VAULT_KEYS"]).await
@@ -16907,7 +16912,10 @@ pub(crate) async fn start_session(
         // already running, so the import below is what actually gives the
         // provider its key. Same two steps, same order, as the auto-wake path.
         for (key, value) in &deferred_secrets {
-            let _ = tmux(&["set-environment", "-t", &stq, key, value]).await;
+            let output = tmux(&["set-environment", "-t", &stq, key, value]).await;
+            if let Err(error) = super::worker_launch_env::confirm_handoff(name, key, output.as_ref()) {
+                return shell_start_failed(name, &error);
+            }
         }
         if !deferred_secrets.is_empty() {
             shell_step!(
@@ -16916,10 +16924,9 @@ pub(crate) async fn start_session(
             );
         }
         for (key, value) in &vault_values {
-            if !tmux(&["set-environment", "-t", &stq, key, value]).await.is_some_and(|o| o.status.success()) {
-                tracing::warn!(session = name, key, measured = true, n_considered = 1,
-                    verdict = "vault_env_refresh_failed",
-                    "vault: a secret could not be handed to the new tmux session (AMUX-5375)");
+            let output = tmux(&["set-environment", "-t", &stq, key, value]).await;
+            if let Err(error) = super::worker_launch_env::confirm_handoff(name, key, output.as_ref()) {
+                return shell_start_failed(name, &error);
             }
         }
         let _ = tmux(&["set-environment", "-t", &stq, "AMUX_VAULT_KEYS", &vault_keys.join(",")]).await;
@@ -17335,7 +17342,9 @@ pub(super) fn provider_command_in_workspace(work_dir: &str, command: &str, isola
     } else {
         ""
     };
-    let program = format!("set +x; {vault_import}{scrub}cd {} && {command}", sh_quote(work_dir));
+    let receipt = super::worker_launch_env::receipt_command("0");
+    let receipt_env = super::worker_launch_env::LAUNCH_RECEIPT_ENV;
+    let program = format!("set +x; {vault_import}{scrub}{receipt}unset {receipt_env}; cd {} && {command}", sh_quote(work_dir));
     crate::backend::tmux::native_shell_launch(&format!("/bin/sh -c {}", sh_quote(&program)))
 }
 
@@ -36248,6 +36257,7 @@ mod tests {
             super::sh_quote(&payload),
             quote(&result)
         );
+        let launch = super::provider_command_in_workspace(dir.path().to_str().unwrap(), &launch, false, "");
         super::shell_command_with("startup-proof", &launch, true, timeout, submit)
             .await
             .unwrap();
@@ -36358,7 +36368,7 @@ mod tests {
         if setup.is_ok() {
             super::shell_command_with(
                 "startup-proof",
-                &format!("touch {}", quote(&never)),
+                &super::provider_command_in_workspace(dir.path().to_str().unwrap(), &format!("touch {}", quote(&never)), false, ""),
                 true,
                 timeout,
                 submit,

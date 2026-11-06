@@ -258,6 +258,168 @@ async fn worker_token_missing_import_emits_process_warning() {
 }
 
 #[test]
+fn worker_token_refused_handoff_preserves_resume_keys() {
+    // Exercise the production hand-off gate with a refused tmux command. The
+    // failure recorder must update startup status without replacing identity.
+    let root = tempfile::tempdir().unwrap();
+    let _home = crate::api::settings::test_env::set_home(root.path());
+    save_meta(
+        LANE,
+        &serde_json::from_value(json!({
+            "cc_session_name": "original-name",
+            "cc_conversation_id": "original-conversation"
+        }))
+        .unwrap(),
+    );
+    let import =
+        worker_launch_env::import_command("=amux-token-proof", &["FIXTURE_SECRET".into()], &[]);
+    let provider = provider_command_in_workspace(
+        root.path().to_str().unwrap(),
+        "printf provider-started",
+        false,
+        &import,
+    );
+    write_executable(&root.path().join("tmux"), "#!/bin/sh\nexit 1\n");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let root_path = root.path();
+    let error = runtime
+        .block_on(shell_command_with(
+            LANE,
+            &provider,
+            true,
+            TIMEOUT,
+            |line| async move {
+                let output = Command::new("/bin/sh")
+                    .args(["-c", &line])
+                    .env_clear()
+                    .env("PATH", format!("{}:/usr/bin:/bin", root_path.display()))
+                    .env("HOME", root_path)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.stdout.is_empty(),
+                    "provider launched despite refused import"
+                );
+                true
+            },
+        ))
+        .expect_err("launch must not be admitted before its imports succeed");
+    let (ok, error) = shell_start_failed(LANE, &error);
+    assert!(!ok);
+    assert!(
+        error.contains("vault_env_import_failed key=FIXTURE_SECRET"),
+        "{error}"
+    );
+    let meta = load_meta(LANE);
+    assert_eq!(meta["cc_session_name"], "original-name");
+    assert_eq!(meta["cc_conversation_id"], "original-conversation");
+    assert_eq!(meta["start_error"], error);
+}
+
+#[test]
+fn worker_token_failed_set_environment_preserves_resume_keys() {
+    let root = tempfile::tempdir().unwrap();
+    let _home = crate::api::settings::test_env::set_home(root.path());
+    save_meta(
+        LANE,
+        &serde_json::from_value(json!({
+            "cc_session_name": "original-name",
+            "cc_conversation_id": "original-conversation"
+        }))
+        .unwrap(),
+    );
+    let fake_tmux = root.path().join("tmux");
+    // A refused control command can echo its argv; never copy its stderr into
+    // the returned error, durable meta or diagnostic log.
+    write_executable(&fake_tmux, "#!/bin/sh\nprintf '%s\\n' \"$*\" >&2\nexit 1\n");
+    let logs = super::tests::CapturedLogs(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        for key in ["FIXTURE_SECRET", worker_identity::TOKEN_ENV] {
+            let refused = Command::new(&fake_tmux)
+                .args([
+                    "set-environment",
+                    "-t",
+                    "=amux-token-proof",
+                    key,
+                    "never-print-this-value",
+                ])
+                .output()
+                .unwrap();
+            assert!(!refused.status.success());
+            assert!(String::from_utf8_lossy(&refused.stderr).contains("never-print-this-value"));
+            for outcome in [Some(&refused), None] {
+                let error = worker_launch_env::confirm_handoff(LANE, key, outcome).unwrap_err();
+                let (ok, error) = shell_start_failed(LANE, &error);
+                assert!(!ok);
+                assert!(
+                    error.contains(&format!("vault_env_import_failed key={key}")),
+                    "{error}"
+                );
+                let meta = load_meta(LANE);
+                assert_eq!(meta["cc_session_name"], "original-name");
+                assert_eq!(meta["cc_conversation_id"], "original-conversation");
+                assert_eq!(meta["start_error"], error);
+                assert!(!error.contains("never-print-this-value"));
+            }
+        }
+        let accepted = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .output()
+            .unwrap();
+        worker_launch_env::confirm_handoff(LANE, "FIXTURE_SECRET", Some(&accepted)).unwrap();
+    });
+    let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("vault_env_import_failed") && logs.contains("set-environment"));
+    assert!(!logs.contains("never-print-this-value"));
+}
+
+#[test]
+fn worker_token_launch_receipt_is_not_inherited_by_provider() {
+    let root = tempfile::tempdir().unwrap();
+    let receipt = root.path().join("receipt");
+    let program = provider_command_in_workspace(
+        root.path().to_str().unwrap(),
+        "/bin/sh -c 'printf %s \"${AMUX_LAUNCH_RECEIPT-unset}\"'",
+        false,
+        "",
+    );
+    let out = Command::new("/bin/sh")
+        .args(["-c", &program])
+        .env(worker_launch_env::LAUNCH_RECEIPT_ENV, &receipt)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(std::fs::read_to_string(&receipt).unwrap(), "0");
+    assert_eq!(out.stdout, b"unset");
+}
+
+#[test]
+fn worker_token_expired_launch_receipt_refuses_provider() {
+    let root = tempfile::tempdir().unwrap();
+    let program = provider_command_in_workspace(
+        root.path().to_str().unwrap(),
+        "printf provider-started",
+        false,
+        "",
+    );
+    let out = Command::new("/bin/sh")
+        .args(["-c", &program])
+        .env(
+            worker_launch_env::LAUNCH_RECEIPT_ENV,
+            root.path().join("expired/receipt"),
+        )
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(125));
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
 fn worker_token_missing_process_probe_warns_without_exposing_values() {
     use std::os::unix::process::CommandExt;
     // Direct provider stand-in: no tmux or server is involved. argv[0] names

@@ -1,5 +1,9 @@
 # Worker token launch evidence
 
+PR 95 review fixes and their verification are recorded in
+[worker-token-review-fixes.md](worker-token-review-fixes.md). The evidence below
+describes the original candidate before those fixes.
+
 Candidate: `fix/worker-token-every-launch`, based on `33594ab48`.
 Tracking: maxtongwang/ai-config#982 F6, refs maxtongwang/ai-config#981.
 

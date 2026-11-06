@@ -98,6 +98,13 @@ inside their final launch shell, after profile and scope setup. Fresh starts,
 surviving-pane restarts, resume fallbacks and provider retries use the same import
 program. A failed or empty tmux read refuses the provider with exit 125 and
 `vault_env_import_failed`; it cannot silently reuse a previous token.
+Every secret `set-environment` must succeed before startup continues. A refusal
+or timeout returns `vault_env_import_failed key=<name>` without the value.
+The provider launch receipt is acknowledged only after its imports succeed;
+an import refusal therefore returns through the startup failure path before any
+resume-to-fresh fallback. Both Claude resume identifiers survive these failures,
+and `start_error` records the failed hand-off or import. Receipt paths are private
+to startup and are removed from the provider environment.
 After a rule-10 launch becomes live, a process-environment probe reads names only:
 `worker_token_missing_in_process` is a WARN with `measured=true` when the provider
 lacks the token. An unreadable environment or unresolved provider pid emits
