@@ -1,0 +1,6 @@
+{
+  "status": "interrupted",
+  "exit_code": 130,
+  "rust_test_verdict": null,
+  "reason": "Stopped compilation when free disk dropped below 250 MiB; no Rust tests executed. Private Unix socket bind is also denied by the sandbox."
+}

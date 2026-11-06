@@ -89,3 +89,4 @@ CLAUDE.local.md
 
 # Cargo lifetime leases stay outside target/ so reclaim cannot remove their inode.
 .*.reclaim.lock
+.*.reclaim.pending.lock

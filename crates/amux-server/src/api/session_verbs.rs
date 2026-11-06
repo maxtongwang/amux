@@ -36257,7 +36257,8 @@ mod tests {
             super::sh_quote(&payload),
             quote(&result)
         );
-        let launch = super::provider_command_in_workspace(dir.path().to_str().unwrap(), &launch, false, "");
+        let launch =
+            super::provider_command_in_workspace(cwd.to_str().unwrap(), &launch, false, "");
         super::shell_command_with("startup-proof", &launch, true, timeout, submit)
             .await
             .unwrap();

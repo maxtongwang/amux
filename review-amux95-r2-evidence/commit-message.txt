@@ -1,0 +1,47 @@
+fix(test): canonicalize startup receipt workspace on macOS
+
+refs #95
+
+Pass the already canonicalized cwd to provider_command_in_workspace in
+startup_shell_receipts_preserve_long_input_and_wait_for_setup. Keep all
+existing assertions unchanged, including the strict cwd/input/env check.
+Remove the accidental root .target.reclaim.pending.lock and ignore
+.*.reclaim.pending.lock runtime locks.
+
+Verification on macOS arm64 (this sandbox; INCOMPLETE):
+
+Pre-fix command:
+TMPDIR=/private/tmp CARGO_TARGET_DIR=target nice -n 10 cargo test --offline --locked -p amux-server --lib -- startup_shell_receipts_preserve_long_input_and_wait_for_setup
+Result: interrupted during dependency compilation (exit 130) to avoid
+filling the disk; no Rust test verdict.
+
+Post-fix command (after stripping inherited AMUX_* and TMUX/TMUX_PANE):
+TMPDIR=/private/tmp CARGO_TARGET_DIR=/Users/mwang/build-wt/fix-amux95-r2/target CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_INCREMENTAL=false CARGO_NET_OFFLINE=true AMUX_HOME=/Users/mwang/build-wt/fix-amux95-r2/review-amux95-r2-evidence/amux-home TMUX_TMPDIR=/Users/mwang/build-wt/fix-amux95-r2/review-amux95-r2-evidence/tmux AMUX_URL=http://127.0.0.1:9 AMUX_API=http://127.0.0.1:9 AMUX_ISOLATED_RUN=1 nice -n 10 cargo test --offline --locked -p amux-server --lib -- worker_token spawn_argv_secret_tests isolated_launch_scrubs provider_launch_and_recovery_pin vault startup native_arch
+Result: interrupted during dependency compilation (runner exit 130) when
+free disk fell below 250 MiB; no Rust tests executed, no passing verdict.
+Debug symbols and incremental compilation were disabled solely to reduce
+build storage. The filtered command includes worker_token, vault, startup
+(including session_verbs startup tests), native_arch, and the round-2
+reviewer's other launch filters. Raw log and exact environment:
+review-amux95-r2-evidence/filtered-tests.log and command.json.
+
+Both invocations emitted: nice: setpriority: Operation not permitted.
+An independent private AF_UNIX bind probe was denied with Operation not
+permitted, so the tmux startup runtime tests require an unrestricted host.
+
+Additional checks:
+git diff --check -> PASS (exit 0).
+git check-ignore --no-index -v .target.reclaim.pending.lock .other-target.reclaim.pending.lock -> PASS (exit 0); both match .gitignore:92.
+Byte comparison against HEAD -> PASS: the launch argument is the only
+source edit and every original assertion remains byte-for-byte unchanged.
+Real /bin/bash cwd probe -> old /tmp launch mismatches canonical
+/private/tmp expected path; canonicalized launch passes strict equality.
+
+Commit blocked: git add -- .gitignore .target.reclaim.pending.lock crates/amux-server/src/api/session_verbs.rs
+-> fatal: Unable to create .git/index.lock: Operation not permitted.
+The sandbox makes .git read-only; this is a prepared commit message,
+not evidence that a commit was created. GitHub DNS is unavailable, so
+PR/CI/remote tracking were not updated. No merge or deployment performed.
+
+Generated target cleanup was refused by the sanctioned cleanup tools;
+the ignored target/ directory remains for the owner to reclaim.

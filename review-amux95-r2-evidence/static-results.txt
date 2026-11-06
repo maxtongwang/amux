@@ -1,0 +1,7 @@
+git diff --check -> PASS (exit 0)
+git check-ignore --no-index -v .target.reclaim.pending.lock .other-target.reclaim.pending.lock -> PASS (exit 0); both match .gitignore:92:.*.reclaim.pending.lock
+Source comparison against HEAD -> PASS: only the launch argument changed; every original assertion is byte-for-byte unchanged.
+macOS /bin/bash cwd probe -> original /tmp path differs from canonical expected /private/tmp; canonical launch path passes strict equality.
+Private AF_UNIX socket bind -> PermissionError: [Errno 1] Operation not permitted.
+git add -- .gitignore .target.reclaim.pending.lock crates/amux-server/src/api/session_verbs.rs -> fatal: Unable to create .git/index.lock: Operation not permitted.
+Cleanup: storage-janitor run denied writing ~/.amux/storage/janitor.lock; scratch-rm dry run refused target because of uncommitted or untracked changes; target retained.
