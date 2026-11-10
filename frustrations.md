@@ -6173,3 +6173,14 @@ FIX: Withhold completion while scans or entries fail, persist pending paths, and
   retry at startup or once per minute on identity operations. Successful entries
   leave the pending list; WARN identity_migration_pending reports counts and
   identity_migration_attempt records each bounded pass.
+
+## Passing test binaries left their private tmux servers running
+AREA: gates
+SEVERITY: slows
+STATUS: open
+DATE: 2026-11-09
+SESSION: amux-test-tmux-teardown (Codex)
+CARD: maxtongwang/ai-config#1213
+SYMPTOM: The exact pre-fix socket/command helpers from 33594ab left amux-test-84524 running exit-probe after a child test exited successfully. The regression assertion failed after observing that real session for five seconds.
+COST: Test-owned server outlived its owner; proof required explicit cleanup of the specimen's private socket. The affected crate check could not run because this sandbox cannot write the shared build target or test receipts.
+FIX: Uncommitted test-only process exit owner and shared per-session Drop guard. Exact-helper child-process proof passes for success, failed assertion, explicit exit and changed TMUX_TMPDIR; session return/unwind cleanup preserves a sibling. Full crate validation and shipping remain with dev-lead. Evidence: /Users/mwang/.amux/handoffs/dev-lead/result-amux-test-tmux-teardown.md.

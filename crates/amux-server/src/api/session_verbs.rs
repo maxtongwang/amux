@@ -1376,10 +1376,7 @@ pub(crate) async fn run_cmd(
     // stop or delete exercised by a test can only touch that private server.
     #[cfg(test)]
     if bin == "tmux" {
-        cmd.arg("-L")
-            .arg(test_tmux_socket())
-            .env_remove("TMUX")
-            .env_remove("TMUX_PANE");
+        cmd = tmux_command_async();
     }
     cmd.args(args)
         .stdin(std::process::Stdio::null())
@@ -1392,13 +1389,19 @@ pub(crate) async fn run_cmd(
     }
 }
 
-/// The private tmux socket name every test-build tmux call uses (`-L`).
-/// Minimal on purpose: amux #17 adds a shared tmux_guard, and this guard and
-/// the two builders below collapse into it on rebase.
+#[cfg(test)]
+#[path = "session_verbs/test_tmux.rs"]
+mod test_tmux;
+
+/// The process-owned private socket every test-build tmux call uses (`-L`).
 #[cfg(test)]
 pub(crate) fn test_tmux_socket() -> String {
-    format!("amux-test-{}", std::process::id())
+    test_tmux::socket()
 }
+
+#[cfg(test)]
+#[path = "session_verbs/test_tmux_teardown_tests.rs"]
+mod test_tmux_teardown_tests;
 
 /// A blocking `tmux` command for sites that cannot go through [`run_cmd`]. In
 /// a test build it carries the same guard: private `-L` socket, no $TMUX.
@@ -1406,17 +1409,13 @@ pub(crate) fn tmux_command() -> std::process::Command {
     #[allow(unused_mut)]
     let mut cmd = std::process::Command::new("tmux");
     #[cfg(test)]
-    cmd.arg("-L").arg(test_tmux_socket()).env_remove("TMUX").env_remove("TMUX_PANE");
+    test_tmux::configure(&mut cmd);
     cmd
 }
 
 /// [`tmux_command`] for async sites.
 pub(crate) fn tmux_command_async() -> tokio::process::Command {
-    #[allow(unused_mut)]
-    let mut cmd = tokio::process::Command::new("tmux");
-    #[cfg(test)]
-    cmd.arg("-L").arg(test_tmux_socket()).env_remove("TMUX").env_remove("TMUX_PANE");
-    cmd
+    tokio::process::Command::from(tmux_command())
 }
 
 async fn tmux(args: &[&str]) -> Option<std::process::Output> {
@@ -45802,13 +45801,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
     /// showing after a worker rename (rename-session), on a private socket.
     #[tokio::test]
     async fn worker_status_bar_shows_the_plain_name_across_a_rename() {
-        struct Pane(String);
-        impl Drop for Pane {
-            fn drop(&mut self) {
-                let st = session_target(&self.0);
-                let _ = tmux_command().args(["kill-session", "-t", &st]).output();
-            }
-        }
+        use crate::api::session_verbs::test_tmux::SessionGuard as Pane;
         let name = format!("status-name-{}", std::process::id());
         let mut pane = Pane(tmux_name(&name));
         let created = tmux(&["new-session", "-d", "-s", &pane.0, "/bin/sh"])
@@ -45843,15 +45836,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             "CC_PROVIDER=claude\n",
         )
         .unwrap();
-        struct Pane(String);
-        impl Drop for Pane {
-            fn drop(&mut self) {
-                let st = session_target(&self.0);
-                let _ = tmux_command()
-                    .args(["kill-session", "-t", &st])
-                    .output();
-            }
-        }
+        use crate::api::session_verbs::test_tmux::SessionGuard as Pane;
         let pane = Pane(tmux_name(&name));
         let created = tmux(&["new-session", "-d", "-s", &pane.0, "/bin/sh"])
             .await
@@ -46330,6 +46315,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
     /// change that is exactly where `client-left-fixture` was born.
     #[tokio::test]
     async fn start_session_refuses_to_spawn_from_a_test_home() {
+        let _session = test_tmux::SessionGuard(tmux_name("amux-4724-guard-probe"));
         let home = tempfile::tempdir().unwrap();
         let _home = crate::api::settings::test_env::set_home(home.path());
         std::fs::create_dir_all(home.path().join("sessions")).unwrap();
@@ -49890,15 +49876,7 @@ mod submission_gate_tests {
     #[tokio::test]
     #[ignore = "real tmux retry replay; no model or production worker; run explicitly"]
     async fn real_tmux_paste_retry_never_sends_escape() {
-        struct Pane(String);
-        impl Drop for Pane {
-            fn drop(&mut self) {
-                let st = session_target(&self.0);
-                let _ = tmux_command()
-                    .args(["kill-session", "-t", &st])
-                    .output();
-            }
-        }
+        use crate::api::session_verbs::test_tmux::SessionGuard as Pane;
         let dir = tempfile::tempdir().unwrap();
         let initial = dir.path().join("pending.txt");
         let cleared = dir.path().join("cleared.txt");
@@ -49984,15 +49962,7 @@ with open(sys.argv[3],'ab',buffering=0) as log:
     #[tokio::test]
     #[ignore = "real tmux capture replay; no model or production worker; run explicitly"]
     async fn real_tmux_submission_replay_keeps_generating_input_unconfirmed() {
-        struct Pane(String);
-        impl Drop for Pane {
-            fn drop(&mut self) {
-                let stq = session_target(&self.0);
-                let _ = tmux_command()
-                    .args(["kill-session", "-t", &stq])
-                    .output();
-            }
-        }
+        use crate::api::session_verbs::test_tmux::SessionGuard as Pane;
         for (frame, expected) in [
             (frame_stuck_active(GHOST), Submission::Stuck),
             (frame_cleared(), Submission::Confirmed),
@@ -57415,13 +57385,7 @@ mod composer_guard_tests {
     #[tokio::test]
     #[ignore = "real tmux pane; no model or production worker; run explicitly"]
     async fn real_tmux_pane_with_an_owner_draft_never_gets_enter() {
-        struct Pane(String);
-        impl Drop for Pane {
-            fn drop(&mut self) {
-                let st = session_target(&self.0);
-                let _ = tmux_command().args(["kill-session", "-t", &st]).output();
-            }
-        }
+        use crate::api::session_verbs::test_tmux::SessionGuard as Pane;
         for (label, frame) in [("claude", claude("yes add both")), ("codex", codex("yes add both"))] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("frame.txt");

@@ -22,6 +22,28 @@ scripts/test-contended.sh -p amux-server
 
 Pass: clippy exits 0, and `test result: ok` with a non-zero pass count.
 
+For test tmux ownership, run the targeted child-process proof:
+
+```bash
+python3 scripts/test-tmux-teardown.py
+```
+
+Pass: both Cargo cases pass and print `verdict=test_tmux_cargo_teardown_pass`.
+The script runs the guard-probe and session-lifetime tests through the wrapper,
+then checks each recorded `amux-test-<pid>` socket after Cargo exits. The lifetime
+tests cover passing tests, failed assertions, explicit process exit, a changed
+`TMUX_TMPDIR`, and session cleanup during unwinding without killing a sibling.
+Cleanup emits `test_tmux_cleanup_stopped` or `test_tmux_cleanup_failed` verdicts
+to the test log. These exit hooks cover normal process exit and Rust unwinding;
+they cannot run after SIGKILL or abort.
+
+`python3 scripts/test-tmux-teardown.py --leaf` compiles the exact synchronous
+helpers and cleanup leaf with `rustc` for a small local check. It does not run
+the guard-probe, asynchronous adapters, or the crate suite. To check the
+regression against old wiring without modifying the checkout, add
+`--source-revision <pre-fix-sha>`; this compiles the old socket/command helpers
+against the current cleanup leaf and regression tests.
+
 **`--lib` IS A PARTIAL RUN THAT READS LIKE A FULL ONE.** `cargo test -p amux-server
 --lib` skips every `tests/*.rs` integration target — 1,625 tests pass and the
 number looks total. The wrapper runs all of them (1,831 on the same tree). On
