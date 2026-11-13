@@ -173,8 +173,9 @@ fn live_server_codesign() -> Result<(String, String), String> {
 pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     let mut out = Vec::new();
     let mut tm = SectionTimer::new();
+    // -- R. does every worker's fleet roster list exactly the live workers? (ai-config#1492)
     out.extend(crate::api::session_verbs::fleet_roster_invariants().await);
-    tm.mark(&out, "memory fleet roster");
+    tm.mark(&out, "R. memory fleet roster");
 
     // -- 0. does the live server use the stable macOS signing identity?
     out.push(checks::server_codesign_identity(live_server_codesign()));
