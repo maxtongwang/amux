@@ -1478,7 +1478,7 @@ async fn set_credentials(Path(id): Path<String>, Json(body): Json<Value>) -> Res
     // So it is refreshed on the WRITE, which is the signal that doc asks for
     // rather than the timer it rejects. O(fleet) small file writes, on an action
     // a human takes by hand a few times a year.
-    let refreshed = crate::api::session_verbs::refresh_fleet_rosters();
+    let refreshed = crate::api::session_verbs::refresh_fleet_rosters().await;
     tracing::info!(
         marker = "connector_credentials_republished",
         connector = %id,

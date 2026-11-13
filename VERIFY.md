@@ -43,6 +43,22 @@ applies one exact string, runs the command, and reverts in a trap even if the
 command is killed. Do not use `cp file bak` on this shared checkout; it is a
 whole-file write and has reverted a peer's in-flight work twice.
 
+## Fleet memory roster
+
+```bash
+TMPDIR=/private/tmp nice -n 10 scripts/safe-cargo.sh test -p amux-server --test fleet_roster -- --test-threads=1
+curl --fail-with-body -sk "$(amux url)/api/health/fleet-roster"
+```
+
+Run the targeted test with an isolated `HOME` and `AMUX_HOME`, retaining the real
+`CARGO_HOME`, `RUSTUP_HOME` and shared `CARGO_TARGET_DIR`. The router fixtures use
+a fake tmux command and never contact live workers. Pass: every test passes;
+the API returns HTTP 200, `measured: true`, `exit_status: 0` and the number of
+composed files checked. HTTP 503 and `exit_status: 1` mean drift or an unavailable
+measurement; each result names its file and extra/missing workers. The existing
+invariant monitor records the same check as `memory.fleet_roster_matches_live`,
+and drift logs `verdict=fleet_roster_stale`. No new timer is used.
+
 ## Native Claude delivery
 
 ```bash

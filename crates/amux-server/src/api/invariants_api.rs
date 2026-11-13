@@ -49,8 +49,20 @@ fn verdict_build_agreement(
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/health/fleet-roster", axum::routing::get(fleet_roster))
         .route("/api/health/invariants", axum::routing::get(health))
         .route("/api/debug/invariants", axum::routing::get(debug))
+}
+
+async fn fleet_roster() -> Response {
+    let results = super::session_verbs::fleet_roster_invariants().await;
+    let measured = results.iter().all(|r| r.status != Status::Unknown);
+    let ok = measured && results.iter().all(|r| r.status == Status::Pass);
+    let n_considered = results.iter().filter(|r| !r.entity_key.is_empty()).count();
+    let status = if ok { axum::http::StatusCode::OK } else { axum::http::StatusCode::SERVICE_UNAVAILABLE };
+    (status, Json(json!({"ok": ok, "measured": measured, "n_considered": n_considered,
+        "why_unmeasured": if measured { None } else { Some("fleet or composed memory discovery failed; see results") },
+        "exit_status": if ok { 0 } else { 1 }, "results": results}))).into_response()
 }
 
 /// GET /api/health/invariants — rollup + counts + producer liveness.
