@@ -309,6 +309,7 @@ impl ChatAdapter {
             if let Dispatch::Handled((false, why)) = self.start(state, name).await {
                 return Dispatch::Handled((false, why));
             }
+            super::session_verbs::refresh_fleet_rosters().await;
         }
         if text.trim().is_empty() {
             return Dispatch::Handled((false, "empty message".into()));
@@ -2336,6 +2337,31 @@ fn interrupt_turn(name: &str) -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fleet_roster_refreshes_when_owner_delivery_wakes_a_chat_worker() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        std::env::set_var("HOME", home.path());
+        let work_dir = home.path().join("work");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(env_path("chat-roster"), format!("CC_WORKER_TYPE=chat\nCC_DIR={}\n", work_dir.display())).unwrap();
+        let state = AppState {
+            store: Arc::new(crate::db::Store::open(&home.path().join("test.db")).unwrap()),
+            started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
+            reconciled: Arc::new(AtomicBool::new(true)),
+        };
+        super::super::session_verbs::memory_post_verb("chat-roster", &json!({"content":"fixture"})).await;
+        let project = std::fs::read_dir(home.path().join(".claude/projects")).unwrap().next().unwrap().unwrap().path();
+        let file = project.join("memory/MEMORY.md");
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("| `chat-roster` |"));
+        // Empty input exercises the wake without launching a provider turn.
+        let result = ChatAdapter.deliver_with_id(&state, "chat-roster", "", SendOrigin::Owner, None).await;
+        assert!(matches!(result, Dispatch::Handled((false, _))));
+        assert!(running("chat-roster"));
+        assert!(std::fs::read_to_string(file).unwrap().contains("| `chat-roster` |"));
+    }
 
     #[test]
     fn chat_tab_key_belongs_to_its_worker_and_no_worker_can_own_it() {

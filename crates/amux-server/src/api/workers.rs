@@ -2112,7 +2112,7 @@ pub async fn memory_worker(
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
-    crate::api::session_verbs::memory_post_verb(&name, &body)
+    crate::api::session_verbs::memory_post_verb(&name, &body).await
 }
 
 /// The read sub-verbs of the git group: `commits`, `commit-detail`, `diff`.

@@ -16,6 +16,71 @@ use super::{InvariantResult, Status};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Compare the generated fleet section with the same live sessions it renders.
+pub fn fleet_roster_matches_live(file: &str, content: &str, live: &BTreeSet<String>) -> InvariantResult {
+    const ID: &str = "memory.fleet_roster_matches_live";
+    let mut in_roster = false;
+    let mut observed = BTreeSet::new();
+    let mut duplicates = Vec::new();
+    let mut malformed = Vec::new();
+    for line in content.lines() {
+        if line.starts_with("## ") {
+            in_roster = line.starts_with("## Fleet — who else is running");
+        }
+        if !in_roster || !line.starts_with('|') || line.starts_with("| worker |") || line.starts_with("|---") {
+            continue;
+        }
+        let name = line.split('|').nth(1).unwrap_or("").trim();
+        match name.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
+            Some(name) if !name.is_empty() => {
+                if !observed.insert(name.to_string()) { duplicates.push(name.to_string()); }
+            },
+            _ => malformed.push(line.to_string()),
+        }
+    }
+    let extra: Vec<_> = observed.difference(live).collect();
+    let missing: Vec<_> = live.difference(&observed).collect();
+    let ok = extra.is_empty() && missing.is_empty() && duplicates.is_empty() && malformed.is_empty();
+    let result = if ok { InvariantResult::pass(ID) } else {
+        InvariantResult::fail(ID, format!("live workers: {live:?}"),
+            format!("extra: {extra:?}; missing: {missing:?}; duplicates: {duplicates:?}; malformed: {malformed:?}"))
+    };
+    result.entity(file).evidence(json!({"file": file, "extra": extra, "missing": missing,
+        "duplicates": duplicates, "malformed": malformed, "live": live, "listed": observed}))
+}
+
+#[cfg(test)]
+mod fleet_roster_tests {
+    use super::*;
+    const HEADER: &str = "## Fleet — who else is running (auto-generated, do not edit)\n| worker | groups | description |\n|---|---|---|\n";
+
+    #[test]
+    fn invariant_negative_control_stale_fleet_roster_names_file_and_both_differences() {
+        let result = fleet_roster_matches_live("project/MEMORY.md", &format!("{HEADER}| `retired` | dev | old |\n"),
+            &BTreeSet::from(["live".to_string()]));
+        assert_eq!(result.status, Status::Fail);
+        assert_eq!(result.entity_key, "project/MEMORY.md");
+        assert_eq!(result.evidence["extra"], json!(["retired"]));
+        assert_eq!(result.evidence["missing"], json!(["live"]));
+    }
+
+    #[test]
+    fn fleet_roster_fresh_and_empty_tables_pass() {
+        assert_eq!(fleet_roster_matches_live("memory", &format!("{HEADER}| `live` | dev | here |\n## Other\n| `unrelated` |\n"),
+            &BTreeSet::from(["live".to_string()])).status, Status::Pass);
+        assert_eq!(fleet_roster_matches_live("memory", "no fleet section", &BTreeSet::new()).status, Status::Pass);
+    }
+
+    #[test]
+    fn invariant_negative_control_malformed_duplicate_and_absent_fleet_tables_fail() {
+        let live = BTreeSet::from(["live".to_string()]);
+        for rows in ["| `live` |\n| `live` |\n", "| live |\n", ""] {
+            assert_eq!(fleet_roster_matches_live("memory", &format!("{HEADER}{rows}"), &live).status, Status::Fail, "{rows}");
+        }
+        assert_eq!(fleet_roster_matches_live("memory", "no section", &live).status, Status::Fail);
+    }
+}
+
 /// The running image must keep the same certificate and identifier across
 /// rebuilds, or macOS grants a new TCC principal on every deployment.
 pub fn server_codesign_identity(probe: Result<(String, String), String>) -> InvariantResult {

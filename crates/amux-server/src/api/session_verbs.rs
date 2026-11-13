@@ -15592,6 +15592,17 @@ pub(crate) async fn start_session(
     extra_flags: &str,
     skip_conv_id: bool,
 ) -> (bool, String) {
+    let result = start_session_inner(state, name, extra_flags, skip_conv_id).await;
+    refresh_fleet_rosters().await;
+    result
+}
+
+async fn start_session_inner(
+    state: &AppState,
+    name: &str,
+    extra_flags: &str,
+    skip_conv_id: bool,
+) -> (bool, String) {
     if !valid_session_name(name) {
         return (false, "invalid session name".into());
     }
@@ -18132,6 +18143,12 @@ async fn clear_stopped_report(state: &AppState, name: &str) -> anyhow::Result<()
 }
 
 async fn stop_session_process(name: &str) -> (bool, String) {
+    let result = stop_session_process_inner(name).await;
+    refresh_fleet_rosters().await;
+    result
+}
+
+async fn stop_session_process_inner(name: &str) -> (bool, String) {
     if !valid_session_name(name) {
         return (false, "invalid session name".into());
     }
@@ -18388,6 +18405,7 @@ async fn archive_session(state: &AppState, name: &str) -> (bool, String) {
         return (false, "could not write session env".into());
     }
     archive_session_issues(state, name, 1).await;
+    refresh_fleet_rosters().await;
     (true, "archived".into())
 }
 
@@ -18508,6 +18526,12 @@ pub(crate) fn set_legacy_paused(name: &str, paused: bool) -> anyhow::Result<()> 
 /// No slash command is typed into a busy provider's composer. Conversation
 /// metadata and terminal history remain available to the ordinary resume path.
 pub(crate) async fn stop_for_pause(state: &AppState, name: &str) -> anyhow::Result<()> {
+    let result = stop_for_pause_inner(state, name).await;
+    refresh_fleet_rosters().await;
+    result
+}
+
+async fn stop_for_pause_inner(state: &AppState, name: &str) -> anyhow::Result<()> {
     let lock = session_op_lock(name);
     let _guard = lock.lock().await;
     let adapter = crate::api::worker_exec::adapter_for_session(name);
@@ -20261,11 +20285,11 @@ fn credential_preflight_from(n: usize, gaps: &[(&'static str, Vec<&'static str>)
     out
 }
 
-fn fleet_roster() -> String {
+async fn fleet_rows() -> std::io::Result<Vec<(String, String, String)>> {
     let mut rows: Vec<(String, String, String)> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
-        let mut names: Vec<String> = rd
-            .flatten()
+    {
+        let mut names: Vec<String> = std::fs::read_dir(sessions_dir())?
+            .collect::<std::io::Result<Vec<_>>>()?.into_iter()
             .map(|e| e.path())
             .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("env"))
             .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
@@ -20293,6 +20317,9 @@ fn fleet_roster() -> String {
             if env_flag_on(env.get("CC_ISOLATED").map(String::as_str)) {
                 continue;
             }
+            if !is_running(&other).await {
+                continue;
+            }
             let groups = env
                 .get("CC_TAGS")
                 .map(|t| {
@@ -20307,11 +20334,26 @@ fn fleet_roster() -> String {
             rows.push((other, groups, desc));
         }
     }
+    Ok(rows)
+}
+
+async fn fleet_roster() -> String {
+    match fleet_rows().await {
+        Ok(rows) => render_fleet_roster(&rows),
+        Err(error) => {
+            tracing::warn!(%error, verdict = "fleet_roster_unmeasured", measured = false,
+                "could not discover live workers for memory composition");
+            String::new()
+        }
+    }
+}
+
+fn render_fleet_roster(rows: &[(String, String, String)]) -> String {
     if rows.is_empty() {
         return String::new();
     }
     let mut out = String::from(FLEET_ROSTER_HEADER);
-    for (n, g, d) in rows.iter().take(120) {
+    for (n, g, d) in rows {
         let cell = |s: &str, max: usize| {
             let escaped = s.replace('|', "\\|").replace('\n', " ");
             let trimmed = escaped.chars().take(max).collect::<String>();
@@ -20324,7 +20366,7 @@ fn fleet_roster() -> String {
         // Three columns (orchestration contract rule 13, AH-385): the
         // provider/model and workspace columns doubled the roster for facts a
         // lane rarely needs and can read from `amux ls`.
-        out.push_str(&format!("| `{}` | {} | {} |\n", cell(n, 64), cell(g, 60), cell(d, 90)));
+        out.push_str(&format!("| `{}` | {} | {} |\n", cell(n, usize::MAX), cell(g, 60), cell(d, 90)));
     }
     out.push_str(&roster_footer(rows.len()));
     out
@@ -20346,7 +20388,8 @@ fn roster_footer(n: usize) -> String {
     format!(
         "\n{n} discoverable peer worker(s). {WORKER_MESSAGING_POLICY}{open_line} To reach a worker outside \
          your groups, ask the owner on your card (the owner can put you in a shared group); a \
-         refused send is not retried or rerouted.\n"
+         refused send is not retried or rerouted.\n\n\
+         This table lists amux sessions only; native subagents (Agent tool) are not listed and cannot be messaged with SendMessage by name.\n"
     )
 }
 
@@ -20361,11 +20404,20 @@ fn roster_footer(n: usize) -> String {
 /// at all. Capability that reaches nobody is the ethos-1 failure, and a roster
 /// nobody has is indistinguishable from no roster.
 ///
-/// Called when a worker's IDENTITY changes (description, groups, name) — rare,
-/// and O(fleet) small file writes when it happens. Deliberately not on a timer:
-/// nothing about the roster decays on its own, so a periodic rewrite would be
-/// churn with no signal behind it.
-pub(crate) fn refresh_fleet_rosters() -> usize {
+/// Called on identity and lifecycle changes. One live snapshot is shared by
+/// all writes; serialization prevents an older refresh overwriting a newer one.
+static FLEET_ROSTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub(crate) async fn refresh_fleet_rosters() -> usize {
+    let _lock = FLEET_ROSTER_LOCK.lock().await;
+    let roster = match fleet_rows().await {
+        Ok(rows) => render_fleet_roster(&rows),
+        Err(error) => {
+            tracing::warn!(%error, verdict = "fleet_roster_unmeasured", measured = false,
+                "fleet refresh left existing memory intact because discovery failed");
+            return 0;
+        }
+    };
     let Ok(entries) = std::fs::read_dir(sessions_dir()) else {
         return 0;
     };
@@ -20385,10 +20437,96 @@ pub(crate) fn refresh_fleet_rosters() -> usize {
         if wd.is_empty() {
             continue; // no project dir means no MEMORY.md to compose into
         }
-        write_claude_memory(name, &wd);
+        write_claude_memory_with_roster(name, &wd, &roster);
         n += 1;
     }
+    // Deleted and archived workers can leave composed files in projects no
+    // current worker owns. Keep their roster accurate without rebuilding notes.
+    match composed_memory_files() {
+        Ok(files) => for path in files {
+            match std::fs::read_to_string(&path).and_then(|content| {
+                std::fs::write(&path, replace_fleet_roster(&content, &roster))
+            }) {
+                Ok(()) => {},
+                Err(error) => tracing::warn!(file = %path.display(), %error,
+                    verdict = "fleet_roster_refresh_failed", "could not refresh composed fleet table"),
+            }
+        },
+        Err(error) => tracing::warn!(%error, verdict = "fleet_roster_refresh_failed",
+            "could not discover composed memory files during fleet refresh"),
+    }
+    tracing::info!(refreshed = n, measured = true, n_considered = n,
+        verdict = "fleet_rosters_refreshed", "refreshed fleet memory after a registry or lifecycle change");
     n
+}
+
+fn composed_memory_files() -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let entries = match std::fs::read_dir(claude_home().join("projects")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(files),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let path = entry?.path().join("memory/MEMORY.md");
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if content.contains(MEM_MARKER) || content.contains("## Fleet — who else is running") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn replace_fleet_roster(content: &str, roster: &str) -> String {
+    let mut in_roster = false;
+    let mut kept = Vec::new();
+    for line in content.lines() {
+        if line.starts_with("## ") {
+            in_roster = line.starts_with("## Fleet — who else is running");
+            if in_roster { continue; }
+        }
+        if in_roster && (line.is_empty() || line.starts_with('|')
+            || line.starts_with("Every live worker,")
+            || line.contains(" discoverable peer worker(s).")
+            || line.starts_with("This table lists amux sessions only;")) {
+            continue;
+        }
+        kept.push(line);
+    }
+    format!("{}\n{roster}", kept.join("\n").trim_end())
+}
+
+pub(crate) async fn fleet_roster_invariants() -> Vec<crate::invariants::InvariantResult> {
+    let _lock = FLEET_ROSTER_LOCK.lock().await;
+    let snapshot = async {
+        let rows = fleet_rows().await?;
+        let names = rows.into_iter().map(|r| r.0).collect();
+        let mut results = Vec::new();
+        for file in composed_memory_files()? {
+            let content = std::fs::read_to_string(&file)?;
+            let result = crate::invariants::checks::fleet_roster_matches_live(
+                &file.to_string_lossy(), &content, &names);
+            if result.status == crate::invariants::Status::Fail {
+                tracing::warn!(file = %file.display(), observed = %result.observed,
+                    verdict = "fleet_roster_stale", measured = true, n_considered = 1,
+                    "composed fleet table disagrees with live workers");
+            }
+            results.push(result);
+        }
+        Ok::<_, std::io::Error>(results)
+    }.await;
+    match snapshot {
+        Ok(results) if !results.is_empty() => results,
+        Ok(_) => vec![crate::invariants::InvariantResult::unknown(
+            "memory.fleet_roster_matches_live", "no composed MEMORY.md files found")],
+        Err(error) => vec![crate::invariants::InvariantResult::unknown(
+            "memory.fleet_roster_matches_live", error.to_string())],
+    }
 }
 
 /// The worker-memory block as it appears in Claude's MEMORY.md, NAMED with the
@@ -20690,7 +20828,13 @@ fn budget_pointers(mem_dir: &std::path::Path, section: &str) -> String {
     )
 }
 
-fn write_claude_memory(name: &str, work_dir: &str) {
+async fn write_claude_memory(name: &str, work_dir: &str) {
+    let _lock = FLEET_ROSTER_LOCK.lock().await;
+    let roster = fleet_roster().await;
+    write_claude_memory_with_roster(name, work_dir, &roster);
+}
+
+fn write_claude_memory_with_roster(name: &str, work_dir: &str, roster: &str) {
     let pname = project_name(work_dir);
     let session_file = mem_file(name);
     let global_file = memory_dir().join("_global.md");
@@ -20703,7 +20847,9 @@ fn write_claude_memory(name: &str, work_dir: &str) {
     let claude_mem_dir = claude_home().join("projects").join(&pname).join("memory");
     let claude_mem_file = claude_mem_dir.join("MEMORY.md");
 
-    if std::fs::create_dir_all(&claude_mem_dir).is_err() {
+    if let Err(error) = std::fs::create_dir_all(&claude_mem_dir) {
+        tracing::warn!(file = %claude_mem_file.display(), %error,
+            verdict = "fleet_roster_refresh_failed", "could not create composed memory directory");
         return;
     }
     if !global_content.trim().is_empty() {
@@ -20725,8 +20871,7 @@ fn write_claude_memory(name: &str, work_dir: &str) {
     // (`compose_lane_context`), so each lane sees its own rather than the last
     // writer's (AMUX-5270's purpose, without the shared-file defect).
     let creds = credential_preflight();
-    let roster = fleet_roster();
-    let composed = composed + &preserved + &creds + &roster;
+    let composed = composed + &preserved + &creds + roster;
     let bytes = composed.len();
     if bytes > MEMORY_BUDGET_BYTES {
         tracing::warn!(dir = %claude_mem_dir.display(), bytes, budget = MEMORY_BUDGET_BYTES,
@@ -20736,7 +20881,10 @@ fn write_claude_memory(name: &str, work_dir: &str) {
         tracing::debug!(dir = %claude_mem_dir.display(), bytes, budget = MEMORY_BUDGET_BYTES, measured = true,
             n_considered = 1, verdict = "memory_within_budget", "shared MEMORY.md composed");
     }
-    let _ = std::fs::write(&claude_mem_file, &composed);
+    if let Err(error) = std::fs::write(&claude_mem_file, &composed) {
+        tracing::warn!(file = %claude_mem_file.display(), %error,
+            verdict = "fleet_roster_refresh_failed", "could not write composed memory");
+    }
 }
 
 fn memory_shared_with(name: &str) -> Vec<String> {
@@ -27437,7 +27585,7 @@ async fn post_dispatch(
         // end-to-end and reached nobody. The durable replacement is
         // GET .../subagents (AMUX-2635). Resurrection: git log -S agent_nav.
         "memory" => {
-            let resp = memory_post_verb(name, body);
+            let resp = memory_post_verb(name, body).await;
             // The OWNER changing a worker's memory reaches the running worker
             // now; a worker writing its own memory needs no notice of it.
             let origin = hdr_worker(headers);
@@ -29871,7 +30019,7 @@ pub(crate) async fn steer_history_verb(
 
 /// `memory` as a callable verb, extracted for the promoted
 /// `/api/workers/{id}/memory` route (AF-293).
-pub(crate) fn memory_post_verb(name: &str, body: &Value) -> Response {
+pub(crate) async fn memory_post_verb(name: &str, body: &Value) -> Response {
     let content = body_str(body, "content");
     let mf = mem_file(name);
     let _ = std::fs::create_dir_all(memory_dir());
@@ -29883,7 +30031,7 @@ pub(crate) fn memory_post_verb(name: &str, body: &Value) -> Response {
     }
     let wd = session_work_dir(name);
     if !wd.is_empty() {
-        write_claude_memory(name, &wd);
+        write_claude_memory(name, &wd).await;
     }
     j200(json!({"ok": true}))
 }
@@ -30881,7 +31029,7 @@ pub fn codex_resume_context_prompt(
 /// a stale one keeps handing a neighbour's rules to every lane sharing it until
 /// something happens to recompose. Returns the number of stale files found.
 /// Logs verdict=stale_rules_memory_purged when it acts.
-pub(crate) fn purge_stale_rules_from_memory() -> usize {
+pub(crate) async fn purge_stale_rules_from_memory() -> usize {
     let Ok(rd) = std::fs::read_dir(claude_home().join("projects")) else {
         return 0;
     };
@@ -30891,7 +31039,7 @@ pub(crate) fn purge_stale_rules_from_memory() -> usize {
         .filter(|f| std::fs::read_to_string(f).is_ok_and(|t| t.contains("# Rules — binding")))
         .count();
     if stale > 0 {
-        let refreshed = refresh_fleet_rosters();
+        let refreshed = refresh_fleet_rosters().await;
         tracing::info!(stale, refreshed, measured = true, n_considered = stale,
             verdict = "stale_rules_memory_purged",
             "recomposed worker memory: rules now ride each worker's launch, not a shared MEMORY.md");
@@ -31424,6 +31572,7 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
     // served a ghost of this worker for the next TTL (AMUX-2960 — the same
     // hole create_session_legacy had on the grow side).
     crate::api::sessions_legacy::invalidate_sessions_cache();
+    refresh_fleet_rosters().await;
     // DB-side per-session state (Python clears in-memory maps; the durable
     // equivalents here are the steering queue rows).
     let n = name.to_string();
@@ -33296,6 +33445,7 @@ async fn rename_session_inner(state: &AppState, name: &str, raw_new: &str) -> Re
         "config-rename",
     )
     .await;
+    refresh_fleet_rosters().await;
     j200(json!({
         "ok": true,
         "name": new_name,
@@ -35003,7 +35153,7 @@ async fn config_patch_with_liveness(
         // worker's roster names this one. Refresh the fleet so the change is
         // visible where peers actually read it, rather than only in this
         // worker's env file where nobody looks.
-        let refreshed = refresh_fleet_rosters();
+        let refreshed = refresh_fleet_rosters().await;
         return j200(json!({
             "ok": true,
             "message": "description updated",
@@ -35063,7 +35213,7 @@ async fn config_patch_with_liveness(
         }
         // The roster peers read is fleet-wide data; toggling isolation adds or
         // removes this worker from it, so refresh like desc/tags do.
-        let refreshed = refresh_fleet_rosters();
+        let refreshed = refresh_fleet_rosters().await;
         tracing::info!(
             session = %name, isolated = on,
             "config: isolated toggled; harness suppression + peer-undiscoverable apply at next spawn"
@@ -35362,7 +35512,9 @@ async fn config_patch_with_liveness(
         }
         // Echo what was stored: the caller sent an array and a bare "ok" is what
         // let the silent clear go unnoticed for as long as it did.
-        return j200(json!({"ok": true, "message": "tags updated", "tags": joined}));
+        let refreshed = refresh_fleet_rosters().await;
+        return j200(json!({"ok": true, "message": "tags updated", "tags": joined,
+            "rosters_refreshed": refreshed}));
     }
 
     // MCP config (py:76731).
@@ -53662,10 +53814,7 @@ mod roster_tests {
 
     #[test]
     fn the_roster_lists_every_live_worker_because_the_file_is_shared() {
-        let r = super::fleet_roster();
-        if r.is_empty() {
-            return; // no live workers on this machine; nothing to assert
-        }
+        let r = super::render_fleet_roster(&[("reader".into(), "dev".into(), "".into())]);
         // It must say so, or a reader seeing its own name concludes the roster
         // is buggy — which is what a correct shared roster looks like.
         assert!(
@@ -53676,6 +53825,15 @@ mod roster_tests {
             r.contains("$AMUX_SESSION"),
             "and how to identify themselves in it: {r}"
         );
+    }
+
+    #[test]
+    fn fleet_roster_keeps_all_worker_names_without_truncation() {
+        let rows: Vec<_> = (0..125).map(|i| (format!("{}-{i}", "worker".repeat(15)), String::new(), String::new())).collect();
+        let names = rows.iter().map(|r| r.0.clone()).collect();
+        let roster = super::render_fleet_roster(&rows);
+        let result = crate::invariants::checks::fleet_roster_matches_live("fixture", &roster, &names);
+        assert_eq!(result.status, crate::invariants::Status::Pass, "{result:?}");
     }
 
     /// AMUX-4715: archiving a lane makes its live cards terminal, and
@@ -53903,25 +54061,18 @@ mod roster_tests {
     /// drops the tail and the roster is the re-derivable half.
     #[test]
     fn the_preflight_sits_above_the_roster() {
-        let composed = String::new() + &super::credential_preflight() + &super::fleet_roster();
+        let roster = super::render_fleet_roster(&[("reader".into(), "dev".into(), "".into())]);
+        let composed = String::new() + &super::credential_preflight() + &roster;
         let pre = composed.find("## Credentials").expect("preflight present");
-        if let Some(roster) = composed.find("## Fleet") {
-            assert!(
-                pre < roster,
-                "credentials must precede the roster: {pre} vs {roster}"
-            );
-        }
+        let roster = composed.find("## Fleet").expect("roster present");
+        assert!(pre < roster, "credentials must precede the roster: {pre} vs {roster}");
     }
 
     /// Empty means EMPTY — a single-worker install must not get a table header
     /// with no rows under it, which reads as "the fleet is broken".
     #[test]
     fn a_roster_with_no_peers_is_the_empty_string() {
-        let r = super::fleet_roster();
-        assert!(
-            r.is_empty() || r.contains("| `"),
-            "header without rows: {r}"
-        );
+        assert_eq!(super::render_fleet_roster(&[]), "");
     }
 }
 

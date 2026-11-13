@@ -1413,6 +1413,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET"],
     },
     RouteEntry {
+        path: "/api/health/fleet-roster",
+        methods: &["GET"],
+    },
+    RouteEntry {
         path: "/api/debug/invariants",
         methods: &["GET"],
     },

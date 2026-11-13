@@ -583,7 +583,7 @@ async fn async_main() {
         let state = state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            crate::api::session_verbs::purge_stale_rules_from_memory();
+            crate::api::session_verbs::purge_stale_rules_from_memory().await;
             let (workers, interrupted, resumed) =
                 crate::api::chat_worker::recover_all(&state).await;
             let delegates = crate::api::chat_delegate::recover_all(&state).await;
@@ -702,8 +702,8 @@ async fn async_main() {
     // a worker's identity changes: 2026-10-06 ~/Dev/mixpeek's file was still in
     // the pre-budget shape (35.6 KB against a 12 KB budget) a day after the
     // budget shipped, because only lanes' own pointer appends had touched it.
-    tokio::task::spawn_blocking(|| {
-        let n = crate::api::session_verbs::refresh_fleet_rosters();
+    tokio::spawn(async {
+        let n = crate::api::session_verbs::refresh_fleet_rosters().await;
         tracing::info!(lanes = n, measured = true, n_considered = n, verdict = "memory_recomposed_at_boot",
             "recomposed every live lane's MEMORY.md with this build's composer");
     });
