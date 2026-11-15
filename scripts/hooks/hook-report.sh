@@ -45,7 +45,23 @@ case "$OSTYPE:$HOSTTYPE" in
     fi
     ;;
 esac
+# Contract rule 10: the lane's minted identity. A lane whose process env lacks
+# AMUX_WORKER_TOKEN (the launch's tmux import did not reach it) is refused 403
+# worker_identity_refused on every report. The token still sits in the lane's own
+# tmux session environment, so resolve it from there once, then export it so the
+# curl path and the detached drains (which inherit this env) all send it. The
+# value is never echoed or logged; no tmux, an error or no value leaves it unset.
+amux_resolve_worker_token() {
+  [ -z "${AMUX_WORKER_TOKEN:-}" ] && [ -n "${1:-}" ] || return 0
+  command -v tmux >/dev/null 2>&1 || return 0
+  _awt=$(tmux show-environment -t "=amux-$1" AMUX_WORKER_TOKEN 2>/dev/null) || return 0
+  case "$_awt" in
+    AMUX_WORKER_TOKEN=?*) export AMUX_WORKER_TOKEN="${_awt#AMUX_WORKER_TOKEN=}" ;;
+  esac
+  _awt=
+}
 if [ "${1:-}" = "--drain-subagents" ]; then
+  amux_resolve_worker_token "${4:-}"
   /usr/bin/python3 - "${2:-}" "${3:-}" "${4:-}" "${5:-lifecycle_queue}" <<'PY'
 import fcntl,json,os,ssl,sys,tempfile,time,urllib.error,urllib.request
 queue,url,session,queue_kind=sys.argv[1:5]
@@ -242,6 +258,7 @@ if [ -n "$AMUX_SESSION" ] && [ -n "${TMUX_PANE:-}" ] && [ ! -f "$HOME/.amux/sess
   esac
 fi
 [ -n "$AMUX_SESSION" ] || exit 0
+amux_resolve_worker_token "$AMUX_SESSION"
 # ISOLATED WORKERS (AMUX-3232). An isolated worker has AMUX_SESSION stripped at
 # spawn, so DERIVED=1 is the discriminator. But "derived" also covers a real lane
 # that lost its env var mid-run (the original MR-43 case). The two are separated
@@ -687,8 +704,8 @@ case "$CODE" in
   # amux is unreachable would be worse than the silence it replaces.
   D="$HOME/.amux/logs"; [ -d "$D" ] || mkdir -p "$D" 2>/dev/null
   F="$D/hook-report-failures.log"
-  printf '%s %s source=%s url=%s http=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-    "$AMUX_SESSION" "$SRC" "$U" "$CODE" >> "$F" 2>/dev/null
+  printf '%s %s source=%s url=%s http=%s worker_token=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    "$AMUX_SESSION" "$SRC" "$U" "$CODE" "$([ -n "${AMUX_WORKER_TOKEN:-}" ] && echo sent || echo absent)" >> "$F" 2>/dev/null
   if [ "$(wc -l < "$F" 2>/dev/null || echo 0)" -gt 2000 ]; then
     tail -n 500 "$F" > "$F.tmp" 2>/dev/null && mv "$F.tmp" "$F" 2>/dev/null
   fi
