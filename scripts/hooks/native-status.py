@@ -14,6 +14,8 @@ import subprocess
 import sys
 import time
 import urllib.request
+import tempfile
+import uuid
 
 
 def state_for(data):
@@ -34,6 +36,15 @@ def state_for(data):
 
 def deliver(root, worker, run):
     folder = root / 'status-events' / worker / run
+    # Folding is serialized independently of HTTP: an outage cannot delay
+    # observation persistence, and waiting happens only in detached children.
+    with (folder / 'fold.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for pending in sorted((folder / 'pending').glob('*.json')):
+            value = json.loads(pending.read_text())
+            observe(value['data'], root, worker, run, value['provider'],
+                    value['occurred_at'], receipt_id=pending.name)
+            pending.unlink()
     with (folder / 'deliver.lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -59,7 +70,7 @@ def deliver(root, worker, run):
                 break
 
 
-def observe(data, root, worker, run, provider, occurred_at):
+def observe(data, root, worker, run, provider, occurred_at, receipt_id=None):
     state = state_for(data)
     if state is None:
         return False
@@ -74,9 +85,20 @@ def observe(data, root, worker, run, provider, occurred_at):
     folder = root / 'status-events' / worker / run
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (folder / 'write.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            try:
+                with (root / 'status-observer-errors.jsonl').open('a') as out:
+                    out.write(json.dumps({'at': time.time(), 'worker': worker,
+                                          'verdict': 'native_status_lock_contended'}) + '\n')
+            except OSError:
+                pass
+            fcntl.flock(lock, fcntl.LOCK_EX)
         counter = folder / 'counter.json'
         previous = json.loads(counter.read_text()) if counter.exists() else {}
+        if receipt_id and previous.get('receipt_id') == receipt_id:
+            return False
         if agent and state == 'active' and not (
                 previous.get('state') in ('blocked', 'waiting') and previous.get('agent') == agent):
             return False
@@ -102,7 +124,7 @@ def observe(data, root, worker, run, provider, occurred_at):
         target = folder / ('%020d.json' % seq)
         if agent:
             payload['subagent'] = True
-        for path, value in ((counter, {'sequence': seq, 'state': state, 'agent': agent}), (target, payload)):
+        for path, value in ((target, payload), (counter, {'sequence': seq, 'state': state, 'agent': agent, 'receipt_id': receipt_id})):
             temp = path.with_suffix('.tmp')
             with temp.open('w') as out:
                 json.dump(value, out)
@@ -126,10 +148,27 @@ def main():
     provider = sys.argv[1] if len(sys.argv) > 1 else ''
     if provider not in ('codex', 'claude'):
         return
-    if observe(json.load(sys.stdin), root, worker, run, provider, occurred_at):
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--deliver'],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    data = json.load(sys.stdin)
+    if state_for(data) is None:
+        return
+    # The prompt process never takes a shared lock or touches the network.
+    # Retain only fields observe consumes, bounded like its final report.
+    fields = ('hook_event_name', 'notification_type', 'tool_name', 'agent_id',
+              'subagent_id', 'source', 'session_id', 'turn_id', 'model')
+    data = {key: data[key] for key in fields if key in data} | (
+        {'prompt': data['prompt'][:20000]} if data.get('hook_event_name') == 'UserPromptSubmit'
+        and isinstance(data.get('prompt'), str) else {})
+    folder = root / 'status-events' / worker / run / 'pending'
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temp = tempfile.mkstemp(prefix='pending.', dir=folder)
+    with os.fdopen(fd, 'w') as out:
+        json.dump({'data': data, 'provider': provider, 'occurred_at': occurred_at}, out)
+        out.flush()
+        os.fsync(out.fileno())
+    Path(temp).replace(folder / f'{time.time_ns():020d}-{uuid.uuid4().hex}.json')
+    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--deliver'],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
 
 
 if __name__ == '__main__':
