@@ -43,6 +43,46 @@ applies one exact string, runs the command, and reverts in a trap even if the
 command is killed. Do not use `cp file bak` on this shared checkout; it is a
 whole-file write and has reverted a peer's in-flight work twice.
 
+## Status hook contention
+
+```bash
+amux-isolated bash scripts/test-status-hooks.sh
+amux-isolated python3 scripts/test-native-status.py
+amux-isolated python3 scripts/test-hook-report-contention.py
+```
+
+Pass: existing durability cells pass; native status reports six tests `OK`;
+contention reports three tests `OK`. The latter holds both report queue locks
+from another process for 30 seconds, checks each hook returns within one second,
+and verifies delivery afterward, plus native write/delivery lock contention and
+SIGKILL recovery without duplicate observation. It prints enqueue timings for
+comparison with the 200 ms target; the one-second assertion allows host jitter.
+
+Report producers take queue locks nonblocking. Contended events publish unique
+spool files by atomic rename; the detached single drainer folds them under the
+queue lock, deduplicates lifecycle identities and retains the latest state.
+Native hooks persist observations before spawning a detached folding/delivery
+process; write locks and HTTP run there. Contention logs
+`queue_lock_contended` or `native_status_lock_contended`.
+
+```text
+~/.amux/
+├── hook-report-queue/
+│   ├── <worker>.json / <worker>.state.json
+│   └── <queue>.spool/<timestamp>-<uuid>.json
+├── logs/hook-report-failures.log
+├── status-events/<worker>/<run>/
+│   ├── pending/<timestamp>-<uuid>.json
+│   ├── counter.json
+│   └── <sequence>.json
+└── status-observer-errors.jsonl
+```
+
+After publication and updating `origin/main`, `bash install.sh` installs both
+hook sources through the existing committed-source installer. Compare the
+installed `~/.amux/hook-report.sh` and `~/.amux/native-status.py` SHA-256 hashes
+with the published sources; an uncommitted worktree is not deployment evidence.
+
 ## Native Claude delivery
 
 ```bash

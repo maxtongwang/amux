@@ -99,8 +99,17 @@ def locked_rows(change=None,release_on_empty=False):
                 preserved=queue+f":preserve_failed:{type(move_exc).__name__}"
             corrupt_note(preserved,exc)
             rows=[]
-        if change is not None:
-            rows=change(rows)
+        import glob
+        spooled=sorted(glob.glob(queue+".spool/*.json"))
+        for path in spooled:
+            with open(path) as stream: pending=json.load(stream)
+            if not any(r.get("event_id")==pending["event_id"] for r in rows):
+                rows.append(pending)
+        if spooled:
+            rows.sort(key=lambda row: row.get("queued_ns",0))
+            if queue_kind == "state_queue": rows=rows[-1:]
+        if change is not None or spooled:
+            if change is not None: rows=change(rows)
             fd,tmp=tempfile.mkstemp(prefix="queue.",dir=os.path.dirname(queue))
             try:
                 os.fchmod(fd,0o600)
@@ -108,6 +117,7 @@ def locked_rows(change=None,release_on_empty=False):
                     json.dump(rows,stream,separators=(",",":")); stream.write("\n")
                     stream.flush(); os.fsync(stream.fileno())
                 os.replace(tmp,queue)
+                for path in spooled: os.unlink(path)
             except BaseException:
                 try: os.unlink(tmp)
                 except FileNotFoundError: pass
@@ -281,7 +291,7 @@ command -v amux_endpoint_guard >/dev/null 2>&1 || amux_endpoint_guard() {  # sta
   fi
 }
 # <<< amux-endpoint-guard
-IN=$(cat 2>/dev/null)
+IN=""; IFS= read -r -d '' IN || true
 E="$HOME/.amux/endpoint.json"
 C=$(sed -n 's/.*"canonical_url":"\([^"]*\)".*/\1/p' "$E" 2>/dev/null)
 L=$(sed -n 's/.*"legacy_port":\([0-9]*\).*/\1/p' "$E" 2>/dev/null)
@@ -363,10 +373,26 @@ case "${MODE/subagent-/subagent:}" in
     esac
     ;;
 esac
-BODY=$(printf '%s' "$IN" | /usr/bin/python3 -c '
-import json,sys,os,time,uuid
+# State and lifecycle share one atomic producer; only their merge policy differs.
+QD="$HOME/.amux/hook-report-queue"
+QF="$QD/$AMUX_SESSION.json"
+KIND=lifecycle_queue
+case "${MODE/subagent-/subagent:}" in
+  subagent:*) ;;
+  *)
+    # Later hooks also revive stranded lifecycle queues.
+    if [ -s "$QF" ] || [ -d "$QF.spool" ]; then
+      nohup bash "$0" --drain-subagents "$QF" "$REPORT_URL" "$AMUX_SESSION" \
+        </dev/null >/dev/null 2>&1 &
+      disown "$!" 2>/dev/null || true
+    fi
+    QF="$QD/$AMUX_SESSION.state.json"; KIND=state_queue
+    ;;
+esac
+QUEUE_NOTE=$(printf '%s' "$IN" | /usr/bin/python3 -c '
+import fcntl,json,sys,os,time,uuid,tempfile
 raw=sys.stdin.read()
-mode,src=sys.argv[1],sys.argv[2]
+mode,src,path,derived,corrected,stale=sys.argv[1:7]
 norm=mode.replace("subagent-","subagent:",1)
 if norm.startswith("subagent:"):
     out={"subagent":norm.split(":",1)[1],"source":src}
@@ -480,218 +506,86 @@ if "subagent" not in out and (not out.get("model") or not out.get("tokens")):
         if os.path.exists(lg) and os.path.getsize(lg)>2000000: os.remove(lg)
         with open(lg,"a") as f: f.write(json.dumps(d2)+"\n")
     except Exception: pass
-print(json.dumps(out))
-' "$MODE" "$SRC" 2>/dev/null)
-# One parser above now owns both subagent spellings, reset, conversation
-# attribution, and main-turn reports. Keeping a fast hand-built JSON branch for
-# subagents dropped the hook payload's session_id and made subagent status less
-# attributable than the parent status it augments.
-[ -n "$BODY" ] || BODY="{\"state\":\"$MODE\",\"source\":\"$SRC\"}"
-# Surgery, not a third JSON encoder: BODY is always a flat object ending in
-# "}" (python's json.dumps above, or the fallback literal on this same line),
-# so appending before the final brace is safe and avoids a second place this
-# script can break on stdin shape (MR-43).
-[ "$DERIVED" = "1" ] && BODY="${BODY%\}}, \"amux_session_derived\": true}"
-# Same surgery, same reason: a rename that silently de-attributed a lane should
-# be COUNTABLE in /api/logs/analyze, not something a human notices weeks later
-# by wondering why a worker stopped reporting (ethos rule 4).
-[ "$CORRECTED" = "1" ] && BODY="${BODY%\}}, \"amux_session_corrected_from\": \"$STALE_FROM\"}"
-# Lifecycle facts are ordered and durable. Main-turn state uses a separate
-# singleton queue below: latest-wins replacement prevents an old queued idle
-# heartbeat from overwriting a newer active turn.
-QD="$HOME/.amux/hook-report-queue"
-QF="$QD/$AMUX_SESSION.json"
-case "${MODE/subagent-/subagent:}" in
-  subagent:*)
-    mkdir -p "$QD" 2>/dev/null; chmod 700 "$QD" 2>/dev/null || true
-    QUEUE_NOTE=$(/usr/bin/python3 - "$QF" "$BODY" "$REPORT_URL" <<'PY'
-import fcntl,json,os,sys,tempfile,time,uuid
-path,raw,url=sys.argv[1:4]
-try: body=json.loads(raw)
-except Exception: raise SystemExit(0)
-event_id=str(body.get("event_id") or "")
-if not event_id:
-    event_id=f"queue-anonymous:{time.time_ns()}:{os.getpid()}:{uuid.uuid4().hex}"
-    body["event_id"]=event_id
+if derived == "1": out["amux_session_derived"]=True
+if corrected == "1": out["amux_session_corrected_from"]=stale
+is_state="subagent" not in out
+queued_ns=time.time_ns()
+event_id=out.get("event_id") or f"state:{queued_ns}:{uuid.uuid4().hex}"
+row={"event_id":event_id,"body":out,"attempts":0,"queued_ns":queued_ns}
+folder=os.path.dirname(path)
+os.makedirs(folder,mode=0o700,exist_ok=True)
+
+def publish(value,destination,prefix):
+    fd,tmp=tempfile.mkstemp(prefix=prefix,dir=os.path.dirname(destination))
+    try:
+        with os.fdopen(fd,"w") as stream:
+            json.dump(value,stream,separators=(",",":")); stream.write("\n")
+            stream.flush(); os.fsync(stream.fileno())
+        os.replace(tmp,destination)
+    except BaseException:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+        raise
+
+def note(message):
+    session=os.environ.get("AMUX_SESSION", "")
+    log=os.path.expanduser("~/.amux/logs/hook-report-failures.log")
+    os.makedirs(os.path.dirname(log),exist_ok=True)
+    with open(log,"a") as stream:
+        stream.write(f"{time.time()} {session} queue={path} {message}\n")
+
 with open(path+".lock","a+") as guard:
-    fcntl.flock(guard,fcntl.LOCK_EX)
+    try:
+        fcntl.flock(guard,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError:
+        spool=path+".spool"
+        os.makedirs(spool,mode=0o700,exist_ok=True)
+        publish(row,os.path.join(spool,f"{queued_ns:020d}-{uuid.uuid4().hex}.json"),"pending.")
+        note("verdict=queue_lock_contended spooled=1")
+        print("1 0 128")
+        raise SystemExit(0)
     try:
         with open(path) as stream: rows=json.load(stream)
         if not isinstance(rows,list) or any(
-            not isinstance(row,dict) or not isinstance(row.get("body"),dict)
-            for row in rows
-        ):
-            raise ValueError("invalid lifecycle queue schema")
+            not isinstance(item,dict) or not isinstance(item.get("body"),dict) for item in rows
+        ): raise ValueError("invalid hook queue schema")
     except FileNotFoundError:
         rows=[]
     except Exception as exc:
         preserved=path+f".corrupt.{time.time_ns()}"
-        try: os.replace(path,preserved)
-        except FileNotFoundError: preserved="missing-before-preserve"
-        except Exception as move_exc:
-            preserved=path+f":preserve_failed:{type(move_exc).__name__}"
-        log=os.path.expanduser("~/.amux/logs/hook-report-failures.log")
-        try:
-            os.makedirs(os.path.dirname(log),exist_ok=True)
-            with open(log,"a") as stream:
-                stream.write(time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())+
-                    f" {os.environ.get('AMUX_SESSION','')} lifecycle_queue=corrupt "+
-                    f"verdict=preserved_corrupt_queue queue={path} preserved={preserved} "+
-                    f"error={type(exc).__name__}\n")
-        except Exception: pass
+        os.replace(path,preserved)
+        kind="state_queue" if is_state else "lifecycle_queue"
+        note(f"{kind}=corrupt verdict=preserved_corrupt_queue preserved={preserved} error={type(exc).__name__}")
         rows=[]
-    if not any(str(row.get("event_id") or "")==event_id for row in rows):
-        rows.append({"event_id":event_id,"body":body,"url":url,"attempts":0})
+    if is_state:
+        row["attempts"]=max(0,int(rows[0].get("attempts",0))) if rows else 0
+        rows=[row]
+    elif not any(item.get("event_id")==event_id for item in rows):
+        rows.append(row)
     try: limit=max(1,min(128,int(os.environ.get("AMUX_HOOK_QUEUE_LIMIT","128"))))
     except Exception: limit=128
     dropped=max(0,len(rows)-limit)
     if dropped: rows=rows[-limit:]
-    fd,tmp=tempfile.mkstemp(prefix="queue.",dir=os.path.dirname(path))
-    try:
-        os.fchmod(fd,0o600)
-        with os.fdopen(fd,"w") as stream:
-            json.dump(rows,stream,separators=(",",":")); stream.write("\n")
-            stream.flush(); os.fsync(stream.fileno())
-        os.replace(tmp,path)
-    except BaseException:
-        try: os.unlink(tmp)
-        except FileNotFoundError: pass
-        raise
+    publish(rows,path,"queue.")
 print(f"{len(rows)} {dropped} {limit}")
-PY
-    )
-    if [ -z "$QUEUE_NOTE" ]; then
-      D="$HOME/.amux/logs"; mkdir -p "$D" 2>/dev/null
-      printf '%s %s source=%s lifecycle_queue=enqueue_failed fallback=immediate\n' \
-        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$AMUX_SESSION" "$SRC" \
-        >> "$D/hook-report-failures.log" 2>/dev/null
-    else
-      set -- $QUEUE_NOTE
-    if [ "${2:-0}" -gt 0 ] 2>/dev/null; then
-      D="$HOME/.amux/logs"; mkdir -p "$D" 2>/dev/null
-      printf '%s %s source=%s lifecycle_queue=overflow pending=%s dropped=%s limit=%s\n' \
-        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$AMUX_SESSION" "$SRC" "${1:-0}" "${2:-0}" "${3:-128}" \
-        >> "$D/hook-report-failures.log" 2>/dev/null
-    fi
-    nohup bash "$0" --drain-subagents "$QF" "$REPORT_URL" "$AMUX_SESSION" \
-      </dev/null >/dev/null 2>&1 &
-    exit 0
-    fi
-    ;;
-esac
-# A durable queue may outlive the detached drain retry window. Any later hook
-# is proof the worker is alive and an opportunity to heal it; do not wait for
-# another subagent lifecycle edge that may never occur after the final stop.
-if [ -s "$QF" ]; then
-  nohup bash "$0" --drain-subagents "$QF" "$REPORT_URL" "$AMUX_SESSION" \
-    </dev/null >/dev/null 2>&1 &
-fi
-# Main-turn state has the same outage problem as lifecycle. Primis returned to
-# a prompt at 15:22, but its Stop hook received http=000 during a rebuild; the
-# preceding active report remained authoritative for another 139 seconds. A
-# one-row atomic queue preserves the newest state through that outage. The
-# shared drain's compare-by-event-id removal means a drain posting an older row
-# cannot delete or overtake a newer replacement.
-SF="$QD/$AMUX_SESSION.state.json"
-mkdir -p "$QD" 2>/dev/null; chmod 700 "$QD" 2>/dev/null || true
-STATE_NOTE=$(/usr/bin/python3 - "$SF" "$BODY" <<'PY'
-import fcntl,json,os,sys,tempfile,time,uuid
-path,raw=sys.argv[1:3]
-try: body=json.loads(raw)
-except Exception: raise SystemExit(0)
-event_id=f"state:{time.time_ns()}:{os.getpid()}:{uuid.uuid4().hex}"
-with open(path+".lock","a+") as guard:
-    fcntl.flock(guard,fcntl.LOCK_EX)
-    previous=[]
-    try:
-        with open(path) as stream: previous=json.load(stream)
-        if not isinstance(previous,list) or any(
-            not isinstance(row,dict) or not isinstance(row.get("body"),dict)
-            for row in previous
-        ):
-            raise ValueError("invalid state queue schema")
-    except FileNotFoundError:
-        pass
-    except Exception as exc:
-        preserved=path+f".corrupt.{time.time_ns()}"
-        try: os.replace(path,preserved)
-        except FileNotFoundError: preserved="missing-before-preserve"
-        except Exception as move_exc:
-            preserved=path+f":preserve_failed:{type(move_exc).__name__}"
-        log=os.path.expanduser("~/.amux/logs/hook-report-failures.log")
-        try:
-            os.makedirs(os.path.dirname(log),exist_ok=True)
-            with open(log,"a") as stream:
-                stream.write(time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())+
-                    f" {os.environ.get('AMUX_SESSION','')} state_queue=corrupt "+
-                    f"verdict=preserved_corrupt_queue queue={path} preserved={preserved} "+
-                    f"error={type(exc).__name__}\n")
-        except Exception: pass
-        previous=[]
-    attempts=max(0,int(previous[0].get("attempts",0))) if previous else 0
-    row={"event_id":event_id,"body":body,"attempts":attempts}
-    fd,tmp=tempfile.mkstemp(prefix="state.",dir=os.path.dirname(path))
-    try:
-        os.fchmod(fd,0o600)
-        with os.fdopen(fd,"w") as stream:
-            json.dump([row],stream,separators=(",",":")); stream.write("\n")
-            stream.flush(); os.fsync(stream.fileno())
-        os.replace(tmp,path)
-    except BaseException:
-        try: os.unlink(tmp)
-        except FileNotFoundError: pass
-        raise
-print(event_id)
-PY
-)
-if [ -n "$STATE_NOTE" ]; then
-  nohup bash "$0" --drain-subagents "$SF" "$REPORT_URL" "$AMUX_SESSION" state_queue \
-    </dev/null >/dev/null 2>&1 &
+
+' "$MODE" "$SRC" "$QF" "$DERIVED" "$CORRECTED" "${STALE_FROM:-}" 2>/dev/null)
+D="$HOME/.amux/logs"
+if [ -z "$QUEUE_NOTE" ]; then
+  mkdir -p "$D" 2>/dev/null
+  printf '%s %s source=%s %s=enqueue_failed verdict=enqueue_failed\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$AMUX_SESSION" "$SRC" "$KIND" \
+    >> "$D/hook-report-failures.log" 2>/dev/null
   exit 0
 fi
-D="$HOME/.amux/logs"; mkdir -p "$D" 2>/dev/null
-printf '%s %s source=%s state_queue=enqueue_failed fallback=immediate\n' \
-  "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$AMUX_SESSION" "$SRC" \
-  >> "$D/hook-report-failures.log" 2>/dev/null
-# X-Amux-Session stamps the write server-side (AMUX-1768). report_post's own
-# comment names its absence as the standing residual: "the shipped hooks send no
-# header, so an UNSTAMPED write is still accepted". This IS the shipped hook.
-# Status, NOT exit code (AF-100). `curl -s` exits 0 for an HTTP 404 — a 404 is a
-# successful HTTP transaction — so `if ! curl` caught only TRANSPORT failures and
-# treated every server REJECTION as a delivered report. On 2026-08-19 a lane ran
-# for 4h15m with AMUX_SESSION=amax-gtm (a typo for amux-gtm): 138 reports, every
-# one a 404 "session not found", zero 200s, and nothing logged here. The block
-# below calls itself "THE ONE FAILURE NOTHING ELSE CAN SEE" and could not see it.
-#
-# `%{http_code}` prints 000 when the transfer never completed, so one branch now
-# covers both classes: 000 = could not reach the server (the AMUX-3046 stranded-
-# port case this was written for), 4xx/5xx = reached it and was refused.
-# Contract rule 10 (AH-387): the lane's minted identity, when it has one.
-ID_HDR=()
-[ -n "${AMUX_WORKER_TOKEN:-}" ] && ID_HDR=(-H "X-Amux-Worker-Token: $AMUX_WORKER_TOKEN")
-CODE=$(curl -sk -m 3 -o /dev/null -w '%{http_code}' \
-  -X POST -H 'Content-Type: application/json' ${ID_HDR[@]+"${ID_HDR[@]}"} \
-  -H "X-Amux-Session: $AMUX_SESSION" -d "$BODY" \
-  "$REPORT_URL" 2>/dev/null) || CODE=000
-case "$CODE" in
-  2*) ;;
-  *)
-  # A successful report is visible twice over — in the structured request log and
-  # in the stored report's `source` — but a report that never landed reaches no
-  # server, so "the hook never ran" and "the hook ran and was refused" are the
-  # same silence. That is what a lane stranded on the retired port looks like
-  # (AMUX-3046), and it is the reason AMUX-2936 sat unmeasurable: the degraded
-  # verdict went back to the hook and was recorded nowhere.
-  #
-  # Still fails OPEN — this logs and exits 0. A hook that blocks a turn because
-  # amux is unreachable would be worse than the silence it replaces.
-  D="$HOME/.amux/logs"; [ -d "$D" ] || mkdir -p "$D" 2>/dev/null
-  F="$D/hook-report-failures.log"
-  printf '%s %s source=%s url=%s http=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-    "$AMUX_SESSION" "$SRC" "$U" "$CODE" >> "$F" 2>/dev/null
-  if [ "$(wc -l < "$F" 2>/dev/null || echo 0)" -gt 2000 ]; then
-    tail -n 500 "$F" > "$F.tmp" 2>/dev/null && mv "$F.tmp" "$F" 2>/dev/null
-  fi
-  ;;
-esac
+set -- $QUEUE_NOTE
+if [ "${2:-0}" -gt 0 ] 2>/dev/null; then
+  mkdir -p "$D" 2>/dev/null
+  printf '%s %s source=%s %s=overflow pending=%s dropped=%s limit=%s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$AMUX_SESSION" "$SRC" "$KIND" "$1" "$2" "$3" \
+    >> "$D/hook-report-failures.log" 2>/dev/null
+fi
+nohup bash "$0" --drain-subagents "$QF" "$REPORT_URL" "$AMUX_SESSION" "$KIND" \
+  </dev/null >/dev/null 2>&1 &
+disown "$!" 2>/dev/null || true
 exit 0

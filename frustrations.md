@@ -6173,3 +6173,19 @@ FIX: Withhold completion while scans or entries fail, persist pending paths, and
   retry at startup or once per minute on identity operations. Successful entries
   leave the pending list; WARN identity_migration_pending reports counts and
   identity_migration_attempt records each bounded pass.
+
+
+## Status hooks wait behind their own queue drainer
+AREA: hooks
+SEVERITY: degrades
+STATUS: fixed
+DATE: 2026-11-14
+SESSION: b1749
+CARD: none
+SYMPTOM: UserPromptSubmit waits on a blocking queue flock until its 10s timeout;
+  native-status also waits on its shared write lock inside its 3s hook budget.
+COST: A foreign 30s queue lock reproduces a prompt hook exceeding 1s on origin/main.
+FIX: Nonblocking enqueue with atomic per-event contention spools; detached single
+  drainers fold pending rows. Native observation persists before detached locking.
+  hook-report emits verdict=queue_lock_contended with spooled=1; enqueue failure
+  logs verdict=enqueue_failed without falling back to inline HTTP.
