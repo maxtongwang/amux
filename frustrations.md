@@ -6173,3 +6173,21 @@ FIX: Withhold completion while scans or entries fail, persist pending paths, and
   retry at startup or once per minute on identity operations. Successful entries
   leave the pending list; WARN identity_migration_pending reports counts and
   identity_migration_attempt records each bounded pass.
+
+## Direct Codex launch has no server identity preparation
+AREA: identity
+SEVERITY: blocks
+STATUS: in-progress
+DATE: 2026-11-14
+SESSION: bprep
+CARD: none
+SYMPTOM: H9 must start Codex directly, but only start_session prepares the
+  worker's routing, credential and passive status run; starting a pane merely
+  to obtain those values violates the launch-only contract.
+COST: H9 fails closed, blocking herdr Stage 1.
+FIX: Candidate prepare-launch route and CLI share scope and status preparation
+  with start_session, use mint_run, reserve the external launch durably, and
+  emit launch_prepared / prepare_launch_refused without credential values.
+  Verification incomplete: sandbox-exec is unavailable in this runner sandbox;
+  safe-cargo's slot directory is outside writable roots and its failed mkdir
+  appears as a capacity wait. No Rust test result or live delivery is claimed.

@@ -112,7 +112,7 @@ pub fn mint(home: &Path, lane: &str) -> std::io::Result<Option<String>> {
 // its own token instead, accepted beside the launch token while the run lives
 // and removed when it ends (RunToken's Drop). A hash left by a run that died
 // with the server is ignored and removed after RUN_TOKEN_MAX_AGE_S.
-const RUN_TOKEN_MAX_AGE_S: u64 = 6 * 3600;
+pub(crate) const RUN_TOKEN_MAX_AGE_S: u64 = 6 * 3600;
 
 pub(crate) fn runs_dir(home: &Path, incarnation: &str) -> PathBuf {
     home.join("worker-tokens").join(format!("{incarnation}.runs"))
@@ -123,10 +123,20 @@ pub(crate) fn runs_dir(home: &Path, incarnation: &str) -> PathBuf {
 pub struct RunToken {
     path: PathBuf,
     pub value: String,
+    retained: bool,
+}
+
+impl RunToken {
+    /// Transfer revocation to the existing maximum-age check for an external run.
+    pub(crate) fn retain_until_expiry(mut self) -> String {
+        self.retained = true;
+        std::mem::take(&mut self.value)
+    }
 }
 
 impl Drop for RunToken {
     fn drop(&mut self) {
+        if self.retained { return; }
         if let Err(error) = std::fs::remove_file(&self.path) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(error = %error, verdict = "worker_run_token_revoke_failed",
@@ -146,7 +156,7 @@ pub fn mint_run(home: &Path, lane: &str) -> std::io::Result<Option<RunToken>> {
         std::fs::create_dir_all(&dir)?;
         let d = digest(&token);
         let path = dir.join(format!("{}.sha256", &d[..16]));
-        let guard = RunToken { path, value: token };
+        let guard = RunToken { path, value: token, retained: false };
         std::fs::write(&guard.path, &d)?;
         #[cfg(unix)]
         {
@@ -463,6 +473,18 @@ mod tests {
         std::fs::create_dir_all(d.path().join("sessions")).unwrap();
         std::fs::write(d.path().join("sessions/w.env"), env).unwrap();
         d
+    }
+
+    #[test]
+    fn prepared_run_token_survives_transfer_but_ordinary_run_revokes_on_drop() {
+        let root = home_with("AMUX_CONTRACT_DONE=1\n");
+        let retained = mint_run(root.path(), "w").unwrap().unwrap().retain_until_expiry();
+        assert_eq!(check(root.path(), "w", Some(&retained)), Check::Valid);
+        let ordinary = mint_run(root.path(), "w").unwrap().unwrap();
+        let value = ordinary.value.clone();
+        drop(ordinary);
+        assert_eq!(check(root.path(), "w", Some(&value)), Check::Invalid);
+        assert_eq!(check(root.path(), "w", Some(&retained)), Check::Valid);
     }
 
     #[test]
