@@ -372,3 +372,26 @@ amux is growing into the durable operating system around agents: it owns executi
 - iOS app: [App Store](https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435) · Managed onboarding: [amux.io/concierge](https://amux.io/concierge/)
 
 If amux saves you time, a ⭐ helps others find it.
+
+### Prepare a direct launch
+
+`amux prepare-launch <name> --json` prepares an already registered and configured
+coding worker without starting a process or delivering input. It calls
+`POST /api/sessions/{name}/prepare-launch` with owner authentication, or a verified
+lead's worker credential within that lead's team. Isolated workers and held,
+paused, running or concurrently starting workers are refused.
+
+The JSON response has `name`, `env` (the child environment), `run_identity`,
+`token_env_key` and `expires_at` (Unix seconds). Use the token only from
+`env[token_env_key]`; the response contains credentials and must never be logged,
+put in process arguments, or persisted as a launch transcript. The response is
+served with `Cache-Control: no-store`. Routing and scope construction are shared
+with ordinary starts, and the credential uses the existing expiring run-token
+store. Preparation reserves the worker until credential expiry, including across
+server restarts; another prepare or ordinary start is refused during that period.
+The reservation stores only the run identifier and expiry, never credentials.
+A prepared response proves preparation only; the caller must verify the actual
+child and receiving endpoint before reporting a successful start. CLI exit 5
+means the HTTP outcome is uncertain: verify state before attempting another
+preparation. HTTP refusals exit 1; unknown workers return `unknown_worker` with
+HTTP 404, and missing authentication returns `authentication_required` with 401.
