@@ -649,6 +649,27 @@ server_owns_start() { # <provider> <CC_PROJECT> <CC_EPHEMERAL>
   [[ -n "${2:-}" || "${3:-}" == "1" ]]
 }
 
+# Prepare only: response stdout is credential-bearing JSON; never echo it to stderr.
+cmd_prepare_launch() {
+  [[ $# -eq 2 && "$2" == "--json" ]] || die "Usage: amux prepare-launch <name> --json"
+  local name="$1" token="" rc=0
+  [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || die "Invalid worker name"
+  if [[ -s "$CC_HOME/auth_token" ]]; then
+    token="$(tr -d '\r\n' < "$CC_HOME/auth_token")"
+  fi
+  # Header stdin keeps the owner credential out of argv and transport breadcrumbs.
+  printf 'Authorization: Bearer %s\n' "$token" | _curl -fsk -m 30 -X POST -H @- \
+    -H "X-Amux-Session: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
+    "$AMUX_API/api/sessions/$name/prepare-launch" || rc=$?
+  [[ "$rc" -eq 0 ]] && return 0
+  if [[ "$rc" -eq 22 ]]; then
+    echo "prepare-launch refused by server; inspect server logs for prepare_launch_refused" >&2
+    return 1
+  fi
+  echo "prepare-launch outcome uncertain; verify worker state before retrying" >&2
+  return 5
+}
+
 _start_via_api() {
   local name="$1"
   local AMUX_API="${AMUX_API:-https://localhost:8824}"
@@ -6531,6 +6552,7 @@ ${BOLD}Worker management:${RESET}
   amux worktree <name> [show|profiles|widen <p>...|profile <p>]   Sparse worktree profile, size, widen
   amux model <name> [<model>] [--effort E]   Show or switch a worker's model (see amux model --help)
   amux usage [--json]            Provider budget windows: Claude 5-hour/weekly, Codex
+  amux prepare-launch <name> --json  Reserve launch identity and return child env (no process started)
   amux start <name> [--detach]   Start a registered worker in tmux (-d = don't attach)
                                 (--dry-run: print the command without spawning)
   amux exec <name> [flags]       Register + start in one step
@@ -9780,6 +9802,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     worktree|wt)      shift; cmd_worktree "$@" ;;
     model)            shift; cmd_model "$@" ;;
     usage)            shift; cmd_usage "$@" ;;
+    prepare-launch)   shift; cmd_prepare_launch "$@" ;;
     start)            shift; cmd_start "$@" ;;
     exec|run)         shift; cmd_exec "$@" ;;
     attach|a)         shift; cmd_attach "$@" ;;

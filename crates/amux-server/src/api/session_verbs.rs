@@ -15533,6 +15533,9 @@ pub(crate) fn start_block_reason(name: &str, cfg: &EnvFile) -> Option<String> {
     if !valid_session_name(name) {
         return Some("invalid session name".into());
     }
+    if launch_reserved(name).unwrap_or(true) {
+        return Some("direct launch is reserved or its reservation cannot be read".into());
+    }
     if !env_path(name).exists() {
         return Some(format!("session '{name}' not found"));
     }
@@ -15586,6 +15589,268 @@ fn gemini_session_flag(meta: &mut Map<String, Value>, fresh: bool) -> String {
     format!("--session-id {}", sh_quote(&id))
 }
 
+/// A prepared credential remains reserved for exactly its accepted lifetime.
+/// Store no plaintext token: the run-token owner keeps only its digest on disk.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PreparedLaunch {
+    name: String,
+    env: BTreeMap<String, String>,
+    run_identity: String,
+    token_env_key: String,
+    expires_at: i64,
+}
+
+fn launch_reservation_path(name: &str) -> PathBuf {
+    let identity = super::rename_identity::incarnation(&home(), name)
+        .map(|id| format!("inc-{id}"))
+        .unwrap_or_else(|| format!("name-{name}"));
+    home().join("launch-reservations").join(format!("{identity}.json"))
+}
+
+fn launch_reserved(name: &str) -> std::io::Result<bool> {
+    match std::fs::read(launch_reservation_path(name)) {
+        Ok(bytes) => {
+            let row: Value = serde_json::from_slice(&bytes)?;
+            let expiry = row["expires_at"].as_i64()
+                .ok_or_else(|| std::io::Error::other("invalid launch reservation"))?;
+            Ok(expiry >= now_i64())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn prepare_refused(status: StatusCode, name: &str, code: &str) -> Response {
+    tracing::warn!(session=name, verdict="prepare_launch_refused", code,
+        measured=true, n_considered=1, "direct launch preparation refused");
+    jresp(status, json!({"ok": false, "code": code, "error": code}))
+}
+
+/// Run the same scope construction as start_session with a clean base rather
+/// than inheriting the caller's identity or the server's credentials.
+async fn direct_launch_env(name: &str, provider: &str, cwd: &str) -> std::io::Result<BTreeMap<String, String>> {
+    let user_home = std::env::var("HOME").map_err(std::io::Error::other)?;
+    let (has_oauth, auth_prelude) = launch_auth_prelude(provider);
+    let shell = format!("{{ {} {} {} {} {} }} >/dev/null; /usr/bin/env -0",
+        auth_prelude, startup_profile_command(Path::new(&user_home), cwd), launch_scope_shell(name, cwd),
+        WORKER_SYSTEM_PATH_RC, worker_tmux_guard_rc(name));
+    let mut command = tokio::process::Command::new("/bin/bash");
+    command.env_clear().env("HOME", user_home)
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .arg("-c").arg(shell).kill_on_drop(true);
+    let output = tokio::time::timeout(OP_TIMEOUT, command.output()).await
+        .map_err(|_| std::io::Error::other("scope environment timed out"))??;
+    if !output.status.success() {
+        return Err(std::io::Error::other("scope environment failed"));
+    }
+    let mut env = BTreeMap::new();
+    for item in output.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        let item = std::str::from_utf8(item).map_err(std::io::Error::other)?;
+        let (key, value) = item.split_once('=').ok_or_else(|| std::io::Error::other("invalid environment"))?;
+        env.insert(key.to_string(), value.to_string());
+    }
+    env.extend(super::settings::runtime_provider_env(&home()));
+    let secrets = super::vault_secrets::deliver(&home(), name, super::vault_secrets::DeliveryPath::Launch)
+        .map_err(std::io::Error::other)?;
+    env.extend(secrets.values);
+    if has_oauth { env.remove("ANTHROPIC_API_KEY"); }
+    // Profiles and scope files cannot override the prepared worker identity.
+    env.extend(worker_harness_env(name, &home(), &launch_endpoint()));
+    Ok(env)
+}
+
+async fn prepare_launch(state: &AppState, name: &str, headers: &HeaderMap) -> Response {
+    let origin = worker_origin(headers);
+    let authenticated = if origin.is_empty() {
+        super::auth::has_owner_token(state, headers, &axum::http::Uri::from_static("/"))
+    } else {
+        super::worker_identity::authenticated_incarnation(&home(), headers, &origin).is_some()
+    };
+    if !authenticated {
+        return prepare_refused(StatusCode::UNAUTHORIZED, name, "authentication_required");
+    }
+    if !valid_session_name(name) {
+        return prepare_refused(StatusCode::BAD_REQUEST, name, "invalid_worker_name");
+    }
+    if !env_path(name).is_file() {
+        return prepare_refused(StatusCode::NOT_FOUND, name, "unknown_worker");
+    }
+    let tags: Vec<String> = lane_groups(name).into_iter().collect();
+    if crate::api::worker_exec::worker_type_of(name).as_str() != amux_core::worker_type::WorkerTypeId::CODING {
+        return prepare_refused(StatusCode::CONFLICT, name, "unsupported_worker_type");
+    }
+    if let Some(refusal) = worker_create_refusal(headers, &CreateRequest { name: Some(name), tags: &tags, owner_only: None }) {
+        return refusal;
+    }
+    let lock = session_op_lock(name);
+    let Ok(_guard) = lock.try_lock() else {
+        return prepare_refused(StatusCode::CONFLICT, name, "worker_busy");
+    };
+    let cfg = parse_env(name);
+    match launch_reserved(name) {
+        Ok(false) => {},
+        Ok(true) => return prepare_refused(StatusCode::CONFLICT, name, "launch_already_prepared"),
+        Err(_) => return prepare_refused(StatusCode::SERVICE_UNAVAILABLE, name, "reservation_unavailable"),
+    }
+    if start_block_reason(name, &cfg).is_some() || env_flag_on(cfg.get("CC_ISOLATED")) {
+        return prepare_refused(StatusCode::CONFLICT, name, "launch_not_permitted");
+    }
+    if let Some(project) = cfg.get("CC_PROJECT") {
+        let permit = state.store.read().map_err(|e| e.to_string())
+            .and_then(|c| crate::project_execution::checkout::start_permit(&c, project, name));
+        if permit.is_err() {
+            return prepare_refused(StatusCode::CONFLICT, name, "project_checkout_required");
+        }
+    }
+    if is_running(name).await {
+        return prepare_refused(StatusCode::CONFLICT, name, "worker_running");
+    }
+    let cwd = expanduser(cfg.get_or("CC_DIR", ""));
+    if !cwd.is_absolute() || !cwd.is_dir() {
+        return prepare_refused(StatusCode::BAD_REQUEST, name, "work_directory_required");
+    }
+    let provider = provider_of(&cfg);
+    let Ok(mut env) = direct_launch_env(name, &provider, &cwd.to_string_lossy()).await else {
+        return prepare_refused(StatusCode::SERVICE_UNAVAILABLE, name, "environment_unavailable");
+    };
+    let Ok(Some(token)) = super::worker_identity::mint_run(&home(), name) else {
+        return prepare_refused(StatusCode::SERVICE_UNAVAILABLE, name, "worker_identity_unavailable");
+    };
+    let Ok(Some((run, _))) = launch_status(name, &provider) else {
+        return prepare_refused(StatusCode::SERVICE_UNAVAILABLE, name, "run_identity_unavailable");
+    };
+    env.extend(launch_status_env(name, &run));
+    let expires_at = now_i64() + super::worker_identity::RUN_TOKEN_MAX_AGE_S as i64;
+    let path = launch_reservation_path(name);
+    let tmp = path.with_extension(format!("{}.tmp", ulid::Ulid::new()));
+    let reserve = || -> std::io::Result<()> {
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&tmp, json!({"run_identity": run, "expires_at": expires_at}).to_string())?;
+        std::fs::rename(&tmp, &path)
+    };
+    if reserve().is_err() {
+        let _ = std::fs::remove_file(tmp);
+        return prepare_refused(StatusCode::SERVICE_UNAVAILABLE, name, "reservation_unavailable");
+    }
+    env.insert(super::worker_identity::TOKEN_ENV.into(), token.retain_until_expiry());
+    tracing::info!(session=name, run_identity=run, expires_at, verdict="launch_prepared",
+        measured=true, n_considered=1, "reserved direct launch; no process started");
+    let mut response = Json(PreparedLaunch { name: name.into(), env, run_identity: run,
+        token_env_key: super::worker_identity::TOKEN_ENV.into(), expires_at }).into_response();
+    response.headers_mut().insert(axum::http::header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
+}
+
+/// Authentication setup shared by server-owned and direct launches.
+fn launch_auth_prelude(provider: &str) -> (bool, String) {
+    let mut has_oauth = false;
+    let mut shell_rc = String::new();
+    if provider != "codex"
+        && provider != "gemini"
+        && provider != "ollama"
+        && provider != "grok"
+        && provider != "muse"
+    {
+        shell_rc.push_str("unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; ");
+        if let Ok(t) = std::fs::read_to_string(
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".claude.json"),
+        ) {
+            if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                has_oauth = py_truthy(&v["oauthAccount"]);
+            }
+        }
+        if has_oauth {
+            shell_rc.push_str("unset ANTHROPIC_API_KEY; ");
+        }
+    }
+    (has_oauth, shell_rc)
+}
+
+/// Scope precedence and workspace exports for both server and direct launches.
+fn launch_scope_shell(name: &str, work_dir: &str) -> String {
+    let mut shell_rc = String::new();
+    let amux_env = home().join("amux.env");
+    if amux_env.exists() {
+        shell_rc.push_str(&format!(
+            "set -a; source {} 2>/dev/null; set +a; ",
+            sh_quote(&amux_env.to_string_lossy())
+        ));
+    } else {
+        shell_rc.push_str(&format!("cd {}; ", sh_quote(work_dir)));
+    }
+    // SCOPE LAYERS: global -> group(s) -> worker (AMUX-3106).
+    //
+    // `/api/scope` has advertised `env` at ["global","group","worker"] since the
+    // cutover and the scope UI writes all three files (scope.rs `env_file`), but
+    // launch sourced ONLY the global `amux.env` above — so setting anything at
+    // group or worker level wrote a file that never reached the running session.
+    // It saved, and it changed nothing. Same shape as the standing-order bug that
+    // produced `scoped_setting_in`: that fixed the READ path for one key at a
+    // time; this fixes DELIVERY of the whole layer into the process.
+    //
+    // Ordering is the mechanism, not a detail: `source` lets the LAST assignment
+    // win, so global-then-group-then-worker yields worker > group > global —
+    // exactly `scoped_setting_in`'s precedence. If the two ever disagreed, a key
+    // would resolve one way when a gate read it and another way inside the lane's
+    // shell, which is the kind of split nobody would think to look for.
+    //
+    // Groups come from CC_TAGS in the worker's own env file — the same source
+    // `lane_groups` reads. Deliberately not a second spelling of "which groups
+    // is this in".
+    //
+    // This is the prerequisite the connectors design names (docs/design/connectors.md,
+    // "The one real gap"): scoping a connector to a worker has nowhere to land
+    // until below-global scope actually reaches the worker.
+    //
+    // The global layer is sourced just above (unchanged, so its `cd` fallback
+    // behaviour is untouched); scope_env_layers returns it too, so skip it here
+    // rather than sourcing it twice.
+    for f in scope_env_layers(&home(), name) {
+        if f == amux_env {
+            continue;
+        }
+        shell_rc.push_str(&format!(
+            "set -a; source {} 2>/dev/null; set +a; ",
+            sh_quote(&f.to_string_lossy())
+        ));
+    }
+    shell_rc.push_str(&workspace_isolation_exports(name));
+    shell_rc.push_str(&docker_vm_exports(name));
+    // Profiles often prepend ~/.local/bin again. An isolated server with its
+    // own installed CLI must put that CLI first AFTER profile/scope sourcing;
+    // otherwise its workers silently call the unrelated main-server binary.
+    let local_cli_dir = home().join("bin");
+    if local_cli_dir.join("amux").is_file() {
+        shell_rc.push_str(&format!(
+            "export PATH={}:\"$PATH\"; ",
+            sh_quote(&local_cli_dir.to_string_lossy())
+        ));
+    }
+    shell_rc
+}
+
+fn launch_endpoint() -> String {
+    let scheme = if std::env::args().any(|a| a == "--no-tls") { "http" } else { "https" };
+    format!("{scheme}://localhost:{}", crate::config::canonical_port())
+}
+
+fn launch_status_env(name: &str, run: &str) -> Vec<(String, String)> {
+    vec![
+        ("AMUX_STATUS_WORKER".into(), name.into()),
+        ("AMUX_STATUS_RUN_ID".into(), run.into()),
+        ("AMUX_STATUS_HOME".into(), home().to_string_lossy().into_owned()),
+        ("AMUX_STATUS_URL".into(), launch_endpoint()),
+    ]
+}
+
+fn launch_status(name: &str, provider: &str) -> std::io::Result<Option<(String, f64)>> {
+    if matches!(provider, "codex" | "claude") {
+        super::native_status::begin_launch(name, provider).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 pub(crate) async fn start_session(
     state: &AppState,
     name: &str,
@@ -15601,6 +15866,11 @@ pub(crate) async fn start_session(
     // leg takes the lock in turn (no re-entrancy).
     let op_lock = session_op_lock(name);
     let _op = op_lock.lock().await;
+    match launch_reserved(name) {
+        Ok(false) => {},
+        Ok(true) => return (false, "direct launch is reserved; verify the prepared run before retrying".into()),
+        Err(error) => return (false, format!("launch reservation unavailable: {error}")),
+    }
     update_meta(name, &[("boot_start_scheduled", json!(false))]);
     // A start interrupted by a server restart must come back by itself; the
     // marker is what the next boot reads (see `resume_interrupted_starts`).
@@ -16428,86 +16698,11 @@ pub(crate) async fn start_session(
 
     // Shell setup line (py:24532): unset Claude env markers, source profile,
     // cd, source the global agent credentials.
-    let mut has_oauth = false;
-    let mut shell_rc = String::new();
-    if provider != "codex"
-        && provider != "gemini"
-        && provider != "ollama"
-        && provider != "grok"
-        && provider != "muse"
-    {
-        shell_rc.push_str("unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; ");
-        if let Ok(t) = std::fs::read_to_string(
-            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".claude.json"),
-        ) {
-            if let Ok(v) = serde_json::from_str::<Value>(&t) {
-                has_oauth = py_truthy(&v["oauthAccount"]);
-            }
-        }
-        if has_oauth {
-            shell_rc.push_str("unset ANTHROPIC_API_KEY; ");
-        }
-    }
+    let (has_oauth, mut shell_rc) = launch_auth_prelude(&provider);
     let home_dir = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let profile_rc = startup_profile_command(&home_dir, &work_dir);
     shell_rc.push_str(&profile_rc);
-    let amux_env = home().join("amux.env");
-    if amux_env.exists() {
-        shell_rc.push_str(&format!(
-            "set -a; source {} 2>/dev/null; set +a; ",
-            sh_quote(&amux_env.to_string_lossy())
-        ));
-    } else {
-        shell_rc.push_str(&format!("cd {}; ", sh_quote(&work_dir)));
-    }
-    // SCOPE LAYERS: global -> group(s) -> worker (AMUX-3106).
-    //
-    // `/api/scope` has advertised `env` at ["global","group","worker"] since the
-    // cutover and the scope UI writes all three files (scope.rs `env_file`), but
-    // launch sourced ONLY the global `amux.env` above — so setting anything at
-    // group or worker level wrote a file that never reached the running session.
-    // It saved, and it changed nothing. Same shape as the standing-order bug that
-    // produced `scoped_setting_in`: that fixed the READ path for one key at a
-    // time; this fixes DELIVERY of the whole layer into the process.
-    //
-    // Ordering is the mechanism, not a detail: `source` lets the LAST assignment
-    // win, so global-then-group-then-worker yields worker > group > global —
-    // exactly `scoped_setting_in`'s precedence. If the two ever disagreed, a key
-    // would resolve one way when a gate read it and another way inside the lane's
-    // shell, which is the kind of split nobody would think to look for.
-    //
-    // Groups come from CC_TAGS in the worker's own env file — the same source
-    // `lane_groups` reads. Deliberately not a second spelling of "which groups
-    // is this in".
-    //
-    // This is the prerequisite the connectors design names (docs/design/connectors.md,
-    // "The one real gap"): scoping a connector to a worker has nowhere to land
-    // until below-global scope actually reaches the worker.
-    //
-    // The global layer is sourced just above (unchanged, so its `cd` fallback
-    // behaviour is untouched); scope_env_layers returns it too, so skip it here
-    // rather than sourcing it twice.
-    for f in scope_env_layers(&home(), name) {
-        if f == amux_env {
-            continue;
-        }
-        shell_rc.push_str(&format!(
-            "set -a; source {} 2>/dev/null; set +a; ",
-            sh_quote(&f.to_string_lossy())
-        ));
-    }
-    shell_rc.push_str(&workspace_isolation_exports(name));
-    shell_rc.push_str(&docker_vm_exports(name));
-    // Profiles often prepend ~/.local/bin again. An isolated server with its
-    // own installed CLI must put that CLI first AFTER profile/scope sourcing;
-    // otherwise its workers silently call the unrelated main-server binary.
-    let local_cli_dir = home().join("bin");
-    if local_cli_dir.join("amux").is_file() {
-        shell_rc.push_str(&format!(
-            "export PATH={}:\"$PATH\"; ",
-            sh_quote(&local_cli_dir.to_string_lossy())
-        ));
-    }
+    shell_rc.push_str(&launch_scope_shell(name, &work_dir));
     if provider != "codex"
         && provider != "gemini"
         && provider != "ollama"
@@ -16529,12 +16724,7 @@ pub(crate) async fn start_session(
             .find(|(name, _)| name == key)
             .map(|(_, value)| value.clone())
     };
-    let scheme = if std::env::args().any(|a| a == "--no-tls") {
-        "http"
-    } else {
-        "https"
-    };
-    let endpoint = format!("{scheme}://localhost:{}", crate::config::canonical_port());
+    let endpoint = launch_endpoint();
     let harness_env = if isolated {
         vec![]
     } else {
@@ -16837,6 +17027,7 @@ pub(crate) async fn start_session(
         }
         // The surviving shell skips shell_rc, so give it the same isolated
         // server CLI priority as a fresh shell after the environment import.
+        let local_cli_dir = home().join("bin");
         if local_cli_dir.join("amux").is_file() {
             shell_step!(
                 &format!(
@@ -16959,31 +17150,18 @@ pub(crate) async fn start_session(
     // an earlier shell setup line was delayed by interactive initialization.
     // Passive status identity survives raw-mode routing scrubbing. It grants no
     // board, prompt, or automation capability. Bind it before the first hook.
-    let status_launch = if matches!(provider.as_str(), "codex" | "claude") {
-        match super::native_status::begin_launch(name, &provider) {
-            Ok(launch) => Some(launch),
-            Err(error) => {
-                tracing::warn!(session=name, %error, verdict="status_observer_launch_failed", "using process/transcript status fallback");
-                None
-            }
+    let status_launch = match launch_status(name, &provider) {
+        Ok(launch) => launch,
+        Err(error) => {
+            tracing::warn!(session=name, %error, verdict="status_observer_launch_failed", "using process/transcript status fallback");
+            None
         }
-    } else {
-        None
     };
-    let observer_prefix = if let Some((run, _)) = &status_launch {
-        format!(
-            "AMUX_STATUS_WORKER={} AMUX_STATUS_RUN_ID={} AMUX_STATUS_HOME={} AMUX_STATUS_URL={} ",
-            sh_quote(name),
-            sh_quote(run),
-            sh_quote(&home().to_string_lossy()),
-            sh_quote(&format!(
-                "https://localhost:{}",
-                crate::config::canonical_port()
-            ))
-        )
-    } else {
-        String::new()
-    };
+    let observer_prefix = status_launch.as_ref().map(|(run, _)| {
+        launch_status_env(name, run).into_iter()
+            .map(|(key, value)| format!("{key}={} ", sh_quote(&value)))
+            .collect::<String>()
+    }).unwrap_or_default();
     let cmd =
         provider_command_in_workspace(&work_dir, &format!("{observer_prefix}{cmd}"), isolated);
     tracing::info!(session = name, cwd = %work_dir, verdict = "provider_launch_workspace_pinned",
@@ -25311,6 +25489,9 @@ async fn dispatch(
     let subid = parts.next().unwrap_or("").to_string();
     if parts.next().is_some() {
         return not_found();
+    }
+    if method == Method::POST && action == "prepare-launch" && subid.is_empty() {
+        return prepare_launch(&state, &name, &headers).await;
     }
     // Rust-managed worker? Its LIFECYCLE verbs are the modern API's (kept from
     // the retired proxy's guard — a legacy-path call gets a pointer, never a
@@ -35707,6 +35888,63 @@ fn getrandom_fill(buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn prepare_launch_authenticated_shape_scope_and_reservation() {
+        let fixture = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(fixture.path());
+        std::env::set_var("HOME", fixture.path());
+        std::fs::create_dir_all(fixture.path().join("sessions")).unwrap();
+        std::fs::write(fixture.path().join("sessions/probe.env"), format!(
+            "CC_PROVIDER=codex\nCC_DIR={}\nCC_ISOLATED=0\nAMUX_CONTRACT_DONE=1\nBPREP_SCOPE=worker\n", fixture.path().display())).unwrap();
+        std::fs::write(fixture.path().join("amux.env"), "BPREP_SCOPE=global\n").unwrap();
+        let (mut state, _db) = state();
+        state.auth_token = Some("test-owner".into());
+        let app: Router = routes().with_state(state.clone());
+        let path = "/api/sessions/probe/prepare-launch";
+        let (status, row) = call(&app, "POST", path, Some(json!({}))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(row["code"], "authentication_required");
+        assert!(!launch_reservation_path("probe").exists());
+        let auth = [("authorization", "Bearer test-owner")];
+        let (status, row) = call_with(&app, "POST", "/api/sessions/missing/prepare-launch", Some(json!({})), &auth).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(row["code"], "unknown_worker");
+        let forged = [("x-amux-worker", "probe"), ("authorization", "Bearer test-owner")];
+        let (status, _) = call_with(&app, "POST", path, Some(json!({})), &forged).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "a worker claim requires its own credential");
+        let response = app.clone().oneshot(Request::builder().method("POST").uri(path)
+            .header("authorization", "Bearer test-owner").body(Body::from("{}")).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let prepared: PreparedLaunch = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(prepared.name, "probe");
+        assert!(prepared.expires_at > now_i64());
+        assert!(!prepared.run_identity.is_empty());
+        assert_eq!(prepared.env["AMUX_STATUS_RUN_ID"], prepared.run_identity);
+        for (key, value) in worker_harness_env("probe", fixture.path(), &launch_endpoint()) {
+            assert_eq!(prepared.env[&key], value, "same routing as start_session: {key}");
+        }
+        assert_eq!(prepared.env["BPREP_SCOPE"], "worker");
+        assert_eq!(super::super::worker_identity::check(fixture.path(), "probe",
+            Some(&prepared.env[&prepared.token_env_key])), super::super::worker_identity::Check::Valid);
+        let stored = std::fs::read_to_string(launch_reservation_path("probe")).unwrap();
+        assert!(!stored.contains(&prepared.env[&prepared.token_env_key]));
+        let (status, _) = call_with(&app, "POST", path, Some(json!({})), &auth).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(start_block_reason("probe", &parse_env("probe")).is_some());
+        let (ok, _) = start_session(&state, "probe", "", false).await;
+        assert!(!ok, "ordinary start must respect the external launch reservation");
+        // Re-reading the durable reservation models a newly started server;
+        // no in-memory entry or plaintext credential is required.
+        assert!(launch_reserved("probe").unwrap());
+        std::fs::write(launch_reservation_path("probe"), json!({"expires_at": now_i64() - 1}).to_string()).unwrap();
+        assert!(!launch_reserved("probe").unwrap());
+        std::fs::write(launch_reservation_path("probe"), "{broken").unwrap();
+        assert!(launch_reserved("probe").is_err());
+        assert!(start_block_reason("probe", &parse_env("probe")).is_some());
+    }
+
     #[test]
     fn codex_latest_message_reads_real_rollout_text_and_skips_later_tools() {
         let records = vec![
