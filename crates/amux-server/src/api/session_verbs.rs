@@ -5644,7 +5644,13 @@ fn split_flags(s: &str) -> Result<Vec<String>, String> {
 
 /// POSIX single-quote escaping (shlex.quote parity).
 pub(crate) fn sh_quote(s: &str) -> String {
+    // A leading `=` is a zsh EQUALS expansion (`=amux-x` becomes the path of a
+    // command named `amux-x`), so it must be quoted even though `=` is safe
+    // elsewhere in a word. Without this, every `tmux show-environment -t
+    // =amux-<lane>` import typed into a zsh pane failed silently and the lane
+    // never received its vault keys or AMUX_WORKER_TOKEN.
     if !s.is_empty()
+        && !s.starts_with('=')
         && s.bytes().all(|b| {
             b.is_ascii_alphanumeric()
                 || matches!(
@@ -55877,6 +55883,26 @@ mod spawn_argv_secret_tests {
     /// are imported AFTER the scope env files are sourced, on both the fresh
     /// and the surviving shell, so the vault wins over a plaintext line for
     /// the same key.
+    /// Regression: the typed import `eval "$(tmux show-environment -s -t =amux-x K)"`
+    /// must survive zsh, the pane shell. Unquoted, `=amux-x` is a zsh command-path
+    /// expansion, so nothing was imported (mrpopo: 403 worker_identity_refused).
+    #[test]
+    fn session_target_is_quoted_for_zsh_so_the_token_import_works() {
+        assert_eq!(super::sh_quote("=amux-mrpopo"), "'=amux-mrpopo'");
+        assert_eq!(super::sh_quote("a=b"), "a=b");
+        let Some(zsh) = ["/bin/zsh", "/usr/bin/zsh"].into_iter().find(|p| std::path::Path::new(p).exists()) else { return };
+        // Same word shape the launcher types for every variant: fresh, surviving, vault.
+        let target = "=amux-mrpopo";
+        for line in [
+            format!("print -r -- {}", super::sh_quote(target)),
+            format!("print -r -- \"$(print -r -- {})\"", super::sh_quote(target)),
+        ] {
+            let out = std::process::Command::new(zsh).args(["-fc", &line]).output().unwrap();
+            assert!(out.status.success(), "zsh rejected {line}: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), target);
+        }
+    }
+
     #[test]
     fn vault_secrets_are_deferred_and_imported_after_the_scope_files() {
         let src = include_str!("session_verbs.rs");
