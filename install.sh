@@ -399,39 +399,20 @@ if [[ -f "$SCRIPT_DIR/scripts/hooks/ask-guard.py" ]]; then
   say "ask guard: $AMUX_HOME/hooks/ask-guard.py"
 fi
 
-# State-report hook (AMUX-2936), installed from the repo for the same reason as
-# the guard above: it was an unversioned runtime file, and unversioned runtime
-# files fork. There were already THREE spellings of "report state to amux" on
-# this machine — an inline one-liner in settings.json, ~/.amux/hooks/amux-report.sh,
-# and this script — and settings.json pointed at the POOREST of them, so model and
-# token reporting silently regressed to nothing and auto-compact lost its only
-# input. That is the failure amux-report.sh header already warned about in
-# 2026-08-11 ("two implementations of one thing is what produced this bug; do not
-# re-fork it"), recurring because nothing made the canonical copy authoritative.
-#
-# It reports state + model + tokens + the lane conversation id. The last one is
-# what lets the staged-commit guard resolve a lane transcript at all; without it
-# a lane is BLIND, which is the one class where a commit absorbing another
-# session work passes silently.
-if [[ -f "$SCRIPT_DIR/scripts/hooks/hook-report.sh" ]]; then
-  install_hook_from_head scripts/hooks/hook-report.sh "$AMUX_HOME/hook-report.sh"
-  chmod +x "$AMUX_HOME/hook-report.sh"
-  _rep_sha="$(shasum -a 256 "$AMUX_HOME/hook-report.sh" | cut -d' ' -f1)"
-  rm -f "${AMUX_HOME:?}/hook-report.sh.sha256"
-  say "report hook: $AMUX_HOME/hook-report.sh (sha ${_rep_sha:0:12})"
-
-  # Copying a hook that settings.json never invokes is an inert installation.
-  # Wire the real lifecycle: prompt -> active, tool -> heartbeat, stop -> idle,
-  # and explicit subagent start/stop counts. Do this only for the canonical
+# The state-report hook (hook-report.sh) is retired: it is no longer copied to
+# $AMUX_HOME and no lifecycle entry is registered. The status installer below
+# removes any older registration, so a reinstall cannot bring it back.
+if true; then
+  # Remove retired status-report registrations and wire read routing. Do this only for the canonical
   # AMUX_HOME; hermetic/test installs deliberately must not mutate the operator's
   # real Claude settings. AMUX_CLAUDE_SETTINGS is the explicit test/custom escape.
   if [[ "$AMUX_HOME" == "$HOME/.amux" || -n "${AMUX_CLAUDE_SETTINGS:-}" ]]; then
     _claude_settings="${AMUX_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
     if /usr/bin/python3 "$SCRIPT_DIR/scripts/hooks/install-claude-status-hooks.py" \
-      --settings "$_claude_settings" --hook-path '$HOME/.amux/hook-report.sh' \
+      --settings "$_claude_settings" \
       --read-guard-path '$HOME/.amux/hooks/large-read-guard.py' \
       --ask-guard-path '$HOME/.amux/hooks/ask-guard.py'; then
-      say "Claude status + read-routing hooks: $_claude_settings"
+      say "Claude read-routing hooks (status-report hook retired): $_claude_settings"
     else
       warn "could not wire Claude status hooks; the report-hook invariant will remain unhealthy"
     fi
@@ -440,9 +421,9 @@ if [[ -f "$SCRIPT_DIR/scripts/hooks/hook-report.sh" ]]; then
     _codex_home="${CODEX_HOME:-$HOME/.codex}"
     if [[ -d "$_codex_home" ]]; then
       if /usr/bin/python3 "$SCRIPT_DIR/scripts/hooks/install-claude-status-hooks.py" --provider codex \
-        --settings "$_codex_home/hooks.json" --hook-path '$HOME/.amux/hook-report.sh' \
+        --settings "$_codex_home/hooks.json" \
         --read-guard-path '$HOME/.amux/hooks/large-read-guard.py'; then
-        say "Codex labelled status + read-routing hooks: $_codex_home/hooks.json (review changed hooks once in Codex: /hooks)"
+        say "Codex read-routing hooks (status-report hook retired): $_codex_home/hooks.json (review changed hooks once in Codex: /hooks)"
       else
         warn "could not wire Codex status hooks"
       fi

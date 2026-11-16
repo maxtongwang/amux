@@ -28,7 +28,15 @@ printf '%s\n' '{
   "hooks": {
     "Stop": [{"hooks": [
       {"type":"command","command":"echo unrelated"},
-      {"type":"command","command":"curl $AMUX_URL/api/sessions/$AMUX_SESSION/report"}
+      {"type":"command","command":"curl $AMUX_URL/api/sessions/$AMUX_SESSION/report"},
+      {"type":"command","command":"bash \"$HOME/.amux/hook-report.sh\" idle stop-hook"}
+    ]}],
+    "Notification": [{"hooks":[
+      {"type":"command","command":"bash \"$HOME/.amux/hook-report.sh\" blocked notification-hook"}
+    ]}],
+    "SubagentStart": [{"hooks":[
+      {"type":"command","command":"bash \"$HOME/.amux/hook-report.sh\" subagent-start subagent-start-hook"},
+      {"type":"command","command":"echo keep-sibling"}
     ]}],
     "PostToolUse": [{"matcher":"Write","hooks":[
       {"type":"command","command":"bash check-format.sh"}
@@ -47,19 +55,15 @@ import json, sys
 v=json.load(open(sys.argv[1]))
 assert v["model"] == "keep-me"
 hooks=v["hooks"]
-required={"SessionStart","UserPromptSubmit","PostToolUse","Stop","SubagentStart","SubagentStop","Notification"}
-assert required <= set(hooks)
 rows=[]
 for event, groups in hooks.items():
     for group in groups:
         for hook in group.get("hooks", []):
             rows.append((event, group.get("matcher"), hook.get("command", "")))
-reports=[r for r in rows if "hook-report.sh" in r[2]]
-assert len(reports) == 7, reports
-# Notification is the `blocked` producer (AMUX-4723). Named here, not just
-# counted: a bumped number would pass on any seventh hook at all.
-assert any(r[0]=="Notification" and " blocked " in r[2] for r in reports), reports
-assert len([r for r in reports if r[0] == "PostToolUse" and r[1] == ".*"]) == 1
+# The status-report hook is retired: every old registration is removed and none is added.
+assert not [r for r in rows if "hook-report.sh" in r[2]], rows
+assert "Notification" not in hooks, sorted(hooks)
+assert any(r[0] == "SubagentStart" and r[2] == "echo keep-sibling" for r in rows), "a sibling of a removed report hook must survive"
 read_guards=[r for r in rows if "large-read-guard.py" in r[2]]
 assert sorted((r[0],r[1]) for r in read_guards)==[("PreToolUse","Bash"),("PreToolUse","Read")],read_guards
 # AMUX-5234: exactly one anchored AskUserQuestion guard after two installs.
@@ -67,8 +71,8 @@ ask_guards=[r for r in rows if "ask-guard.py" in r[2]]
 assert [(r[0],r[1]) for r in ask_guards]==[("PreToolUse","^AskUserQuestion$")],ask_guards
 assert any(r[2] == "echo unrelated" for r in rows)
 assert any(r[2] == "bash check-format.sh" for r in rows)
-assert not any("/api/sessions/" in r[2] and "hook-report.sh" not in r[2] for r in rows)
-print("ok   installer is idempotent and preserves unrelated hooks/settings")
+assert not any("/api/sessions/" in r[2] for r in rows)
+print("ok   installer removes retired report hooks, is idempotent and preserves unrelated hooks/settings")
 PY
 
 # Drive the shipped hook against a disposable HTTP endpoint. The endpoint can
@@ -462,30 +466,8 @@ assert not empty, f"an unreadable payload must fail CLOSED, not claim a human is
 print("ok   an unrecognised payload reports nothing")
 PY2
 
-# The producer has to be installed, not merely supported. `blocked` was
-# accepted by the server, read by lane_is_blocked and covered by a test for the
-# whole life of the feature while nothing emitted it.
-/usr/bin/python3 - <<'PY2'
-import importlib.util,sys
-sys.path.insert(0, "scripts/hooks")
-spec=importlib.util.spec_from_file_location("inst","scripts/hooks/install-claude-status-hooks.py")
-m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-c=m.canonical("/tmp/hook-report.sh")
-assert "Notification" in c, sorted(c)
-cmd=c["Notification"]["hooks"][0]["command"]
-assert " blocked " in cmd, cmd
-# Clearing edges must stay installed: an approval runs the tool (PostToolUse ->
-# active) and a rejection or ended turn reports idle (Stop). Without BOTH, a
-# blocked lane could never return.
-assert " active " in c["PostToolUse"]["hooks"][0]["command"], c["PostToolUse"]
-assert " idle " in c["Stop"]["hooks"][0]["command"], c["Stop"]
-print("ok   Notification is installed as the blocked producer, with both clearing edges intact")
-PY2
-
-# AMUX-4783. Wiring an event and shipping its handler are two different
-# commands, and on 2026-09-18 they came apart for ~4h: Notification wired
-# against a 2026-09-04 script with no notification_type, so every notification
-# type reported blocked. The installer now refuses that combination.
+# The status-report hook is retired: canonical sets are empty for both providers, and a handler
+# lacking the old notification discriminator is no longer refused (nothing is wired against it).
 /usr/bin/python3 - <<'PY2'
 import importlib.util, json, subprocess, sys, tempfile
 from pathlib import Path
@@ -493,41 +475,24 @@ from pathlib import Path
 sys.path.insert(0, "scripts/hooks")
 spec = importlib.util.spec_from_file_location("inst", "scripts/hooks/install-claude-status-hooks.py")
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-
-# The pure seam, both directions. A handler missing the discriminator is
-# unsupported; one carrying it is not.
-assert m.unsupported_events("case $notification_type in") == [], "a handler WITH the discriminator must be accepted"
-assert m.unsupported_events("no discriminator here") == ["Notification"], "a handler without it must be refused"
-# Unreadable is not silently 'fine': read_hook_source reports None and the
-# caller decides, rather than this function inventing an empty source.
-assert m.read_hook_source("/nonexistent/hook-report.sh") is None
-print("ok   the handler-support seam accepts and refuses on the discriminator")
+assert m.canonical("/tmp/hook-report.sh") == {}
+assert m.canonical_codex("/tmp/hook-report.sh") == {}
+print("ok   no report hook is registered by either provider")
 
 with tempfile.TemporaryDirectory() as d:
     d = Path(d)
     settings = d / "settings.json"
-    old, new = d / "old.sh", d / "new.sh"
+    old = d / "old.sh"
     old.write_text("#!/bin/sh\necho old\n")
-    new.write_text("#!/bin/sh\ncase $notification_type in permission_prompt) : ;; esac\n")
-
     settings.write_text("{}")
     r = subprocess.run([sys.executable, "scripts/hooks/install-claude-status-hooks.py",
                         "--settings", str(settings), "--hook-path", str(old)],
                        capture_output=True, text=True)
-    assert r.returncode != 0, r
-    assert "refusing to wire Notification" in r.stderr, r.stderr
-    assert "install.sh" in r.stderr, "the remedy must name the command that ships the handler"
-    assert settings.read_text() == "{}", "a refusal must not half-write settings"
-    print("ok   an unsupported handler is refused BEFORE settings are written")
-
-    settings.write_text("{}")
-    r = subprocess.run([sys.executable, "scripts/hooks/install-claude-status-hooks.py",
-                        "--settings", str(settings), "--hook-path", str(new)],
-                       capture_output=True, text=True)
     assert r.returncode == 0, r
     hooks = json.loads(settings.read_text())["hooks"]
-    assert "Notification" in hooks, sorted(hooks)
-    print("ok   a supported handler still wires Notification")
+    assert "Notification" not in hooks and "Stop" not in hooks, sorted(hooks)
+    assert "hook-report" not in settings.read_text()
+    print("ok   --hook-path stays accepted, wires no report event and refuses nothing")
 PY2
 
 # MO-3622: on an Apple Silicon Mac whose pane tree is translated, the hook
@@ -569,7 +534,9 @@ fi
 # Read tool), no ask guard (owner-ask goal detection reads Claude transcripts), unrelated hooks kept.
 CODEX_HOOKS="$TMP/codex-hooks.json"
 printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Edit|Write","hooks":[{"type":"command","command":"~/.codex/scripts/worktree-guard.sh"}]}],
-  "Stop":[{"hooks":[{"type":"command","command":"python3 /x/.amux/native-status.py codex"}]}]}}' > "$CODEX_HOOKS"
+  "Stop":[{"hooks":[{"type":"command","command":"python3 /x/.amux/native-status.py codex"},{"type":"command","command":"bash \"$HOME/.amux/hook-report.sh\" idle stop-hook","statusMessage":"amux status report"}]}],
+  "SessionStart":[{"hooks":[{"type":"command","command":"bash \"$HOME/.amux/hook-report.sh\" subagent-reset session-start-hook","statusMessage":"amux status report"}]}],
+  "PostToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"bash \"$HOME/.amux/hook-report.sh\" active tool-hook","statusMessage":"amux status report"}]}]}}' > "$CODEX_HOOKS"
 for _ in 1 2; do
   /usr/bin/python3 scripts/hooks/install-claude-status-hooks.py --provider codex \
     --settings "$CODEX_HOOKS" --hook-path '$HOME/.amux/hook-report.sh' >/dev/null
@@ -578,18 +545,16 @@ done
 import json, sys
 hooks=json.load(open(sys.argv[1]))["hooks"]
 rows=[(e, g.get("matcher"), h.get("command","")) for e, gs in hooks.items() for g in gs for h in g.get("hooks",[])]
-reports={(e, c.split()[-2]) for e, _, c in rows if "hook-report.sh" in c}
-want={("SessionStart","subagent-reset"),("UserPromptSubmit","active"),("PostToolUse","active"),("Stop","idle"),
-      ("SubagentStart","subagent-start"),("SubagentStop","subagent-stop")}
-assert reports == want, reports
-assert sum("hook-report.sh" in c for _, _, c in rows) == 6, "a second install must not duplicate reports"
+assert not [c for _, _, c in rows if "hook-report.sh" in c], rows
+for ev in ("SessionStart", "PostToolUse", "UserPromptSubmit", "SubagentStart", "SubagentStop"):
+    assert ev not in hooks, ev
 assert "Notification" not in hooks
 guards=[(e, m) for e, m, c in rows if "large-read-guard.py" in c]
 assert guards == [("PreToolUse", "Bash")], guards
 assert not any("ask-guard.py" in c for _, _, c in rows)
 assert ("PreToolUse", "Edit|Write", "~/.codex/scripts/worktree-guard.sh") in rows
 assert ("Stop", None, "python3 /x/.amux/native-status.py codex") in rows
-print("ok   codex: six native report events, Bash read router, no Notification or ask guard, unrelated hooks kept, idempotent")
+print("ok   codex: old report hooks removed, Bash read router, no Notification or ask guard, unrelated hooks kept, idempotent")
 PY
 
 # Codex trust is keyed to group and handler position. Labels belong on the
@@ -618,18 +583,16 @@ def run(args):
     assert result.returncode == 0, result.stderr
     return result.stdout
 original = path.read_bytes()
-assert "7 hooks would change" in run(installer + ["--dry-run"])
+assert "2 hooks would change" in run(installer + ["--dry-run"]), run(installer + ["--dry-run"])
 assert path.read_bytes() == original, "dry run wrote hooks.json"
 run(installer)
 hooks = json.loads(path.read_text())["hooks"]
 stop = hooks["Stop"][0]["hooks"]
-assert [h["command"] for h in stop[:3]] == ["echo before", 'bash "$HOME/.amux/hook-report.sh" idle stop-hook', "echo after"]
-assert stop[1]["statusMessage"] == "my report label"
+assert [h["command"] for h in stop] == ["echo before", "echo after"], stop
 router = hooks["PreToolUse"][0]["hooks"]
 assert router[0]["command"] == "echo neighbor" and router[1]["statusMessage"] == "amux read router"
 reports = [h for groups in hooks.values() for g in groups for h in g["hooks"] if "hook-report.sh" in h["command"]]
-assert len(reports) == 6
-assert all(h["statusMessage"] in ("my report label", "amux status report") for h in reports)
+assert reports == [], reports
 installed = path.read_bytes()
 assert "0 hooks would change" in run(installer + ["--dry-run"])
 run(installer)
@@ -652,7 +615,7 @@ installed = path.read_bytes()
 assert "0 hooks would change" in run(native + ["--dry-run"])
 run(native)
 assert path.read_bytes() == installed
-print("ok   codex: labels, positions, user labels, dry-run counts, and both installers are idempotent")
+print("ok   codex: report hook removed, neighbors and labels kept, dry-run counts, and both installers are idempotent")
 PY
 if /usr/bin/python3 scripts/hooks/install-claude-status-hooks.py --provider codex --settings "$TMP/codex-ask.json" \
   --hook-path '$HOME/.amux/hook-report.sh' --ask-guard-path '$HOME/.amux/hooks/ask-guard.py' 2>"$TMP/codex-ask.err"; then
@@ -680,7 +643,7 @@ for codex_home_mode in default custom; do
   [ "$(cat "$SENTINEL/hooks.json")" = '{"hooks":{}}' ] || { echo "FAIL the test wrote an inherited CODEX_HOME ($codex_home_mode)" >&2; exit 1; }
   cmp -s "$FAKE_HOME/.claude/settings.json" "$TMP/claude-before.json" || { echo "FAIL --provider codex rewrote Claude's settings ($codex_home_mode)" >&2; exit 1; }
   [ -f "$want" ] || { echo "FAIL --provider codex did not write $want" >&2; exit 1; }
-  /usr/bin/python3 -c 'import json,sys; h=json.load(open(sys.argv[1]))["hooks"]; assert "SubagentStart" in h and "Notification" not in h' "$want"
+  /usr/bin/python3 -c 'import json,sys; h=json.load(open(sys.argv[1]))["hooks"]; assert "SubagentStart" not in h and "Notification" not in h and "PreToolUse" in h' "$want"
 done
 echo "ok   codex: with no --settings the default is Codex's hooks.json (CODEX_HOME honoured); Claude settings untouched"
 

@@ -433,8 +433,32 @@ def run_sweep():
     check("the sweep saw client files (it can fail)", swept >= 20, "swept=%d" % swept)
 
 
+def run_report_hook_retired():
+    """The status-report hook is retired: the installer writes no hook-report entry for either
+    provider and removes seeded ones, leaving every other hook intact."""
+    old = 'bash "$HOME/.amux/hook-report.sh" idle stop-hook'
+    seed = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": old},
+                                          {"type": "command", "command": "echo keep"}]}],
+                      "Notification": [{"hooks": [{"type": "command", "command": old}]}]}}
+    installer = os.path.join(ROOT, "scripts", "hooks", "install-claude-status-hooks.py")
+    for provider in ("claude", "codex"):
+        path = os.path.join(W, "retired-%s.json" % provider)
+        with open(path, "w") as fh:
+            json.dump(seed, fh)
+        proc = subprocess.run([sys.executable, installer, "--provider", provider, "--settings", path],
+                              capture_output=True, text=True)
+        text = open(path).read()
+        hooks = json.loads(text)["hooks"]
+        check("%s installer exits 0 and leaves no hook-report entry" % provider,
+              proc.returncode == 0 and "hook-report" not in text, proc.stderr)
+        check("%s installer keeps the other hooks" % provider,
+              hooks.get("Stop", [{}])[0].get("hooks") == [{"type": "command", "command": "echo keep"}]
+              and "Notification" not in hooks, hooks)
+
+
 try:
     setup()
+    run_report_hook_retired()
     run_table()
     run_identity()
     run_clients()

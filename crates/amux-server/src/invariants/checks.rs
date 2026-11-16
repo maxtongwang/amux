@@ -8551,60 +8551,31 @@ mod negative_controls {
         assert_eq!(reports_are_attributed(0, 0)[0].status, Status::Unknown);
     }
 
-    /// AMUX-4783: [`CANONICAL_REPORT_HOOKS`] and the installer's `canonical()`
-    /// are one fact, so they are compared rather than trusted.
-    ///
-    /// This is the check that was missing when it mattered. AMUX-4723 added
-    /// `Notification` to the installer and nothing required the invariant's copy
-    /// to follow, so for three days the check could not see the event whose
-    /// absence it existed to catch, and once the hook WAS installed it began
-    /// failing in production on a correct configuration. Both directions are
-    /// asserted, because each catches a different drift: an event added to the
-    /// installer and not here goes unchecked, and one removed there but left
-    /// here fails every correctly-configured box.
-    ///
-    /// `include_str!` reads the installer AT BUILD TIME, so this cannot quietly
-    /// pass because the repo was absent — the crate would not compile.
+    /// The status-report hook is retired: the installer's `canonical()` must register
+    /// nothing, so no box is ever (re)wired with `hook-report.sh`. [`CANONICAL_REPORT_HOOKS`]
+    /// now only describes the legacy shape the invariant recognises on a box that has not
+    /// been reinstalled yet. `include_str!` reads the installer at build time, so this
+    /// cannot pass because the repo was absent.
     #[test]
-    fn canonical_report_hooks_match_the_installer() {
+    fn installer_registers_no_report_hooks() {
         const INSTALLER: &str = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../scripts/hooks/install-claude-status-hooks.py"
         ));
-        // `canonical()` only — `canonical_read_guard()` below it wires a
-        // different script and must not be swept in.
-        let body = INSTALLER
-            .split_once("def canonical(")
-            .expect("installer must define canonical()")
-            .1;
-        let body = body
-            .split_once("\ndef ")
-            .map(|(head, _)| head)
-            .unwrap_or(body);
-        let re = regex::Regex::new(r#""(\w+)": group\(f"\{base\} ([^"]+)""#).unwrap();
-        let from_installer: Vec<(String, String)> = re
-            .captures_iter(body)
-            .map(|c| (c[1].to_string(), c[2].to_string()))
-            .collect();
-        assert!(
-            from_installer.len() >= 7,
-            "parsed {} entries from canonical(); the regex has stopped matching the installer, \
-             which would make this test vacuous: {from_installer:?}",
-            from_installer.len()
-        );
-        let ours: Vec<(String, String)> = CANONICAL_REPORT_HOOKS
-            .iter()
-            .map(|(e, a)| (e.to_string(), a.to_string()))
-            .collect();
-        let mut a = from_installer.clone();
-        let mut b = ours.clone();
-        a.sort();
-        b.sort();
-        assert_eq!(
-            a, b,
-            "CANONICAL_REPORT_HOOKS has drifted from install-claude-status-hooks.py's canonical(). \
-             installer={from_installer:?} invariant={ours:?}"
-        );
+        for name in ["def canonical(", "def canonical_codex("] {
+            let body = INSTALLER
+                .split_once(name)
+                .unwrap_or_else(|| panic!("installer must define {name}"))
+                .1;
+            let body = body
+                .split_once("\ndef ")
+                .map(|(head, _)| head)
+                .unwrap_or(body);
+            assert!(
+                body.contains("return {}") && !body.contains("group("),
+                "{name} must register no report hook"
+            );
+        }
     }
 
     fn ent(event: &str, command: &str, matcher: Option<&str>) -> ReportHookEntry {
